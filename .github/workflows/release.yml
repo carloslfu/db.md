@@ -298,8 +298,11 @@ jobs:
     name: Publish to crates.io
     needs: [version, build]
     runs-on: ubuntu-latest
-    # Manual-approval gate: the irreversible crates.io publish waits for a
-    # reviewer's one-click approval on the `crates-io` environment.
+    # The `crates-io` environment binds Trusted Publishing: crates.io only
+    # accepts an OIDC publish from a job running in this environment. No
+    # required reviewers are configured (solo maintainer), so a tag push
+    # publishes without a manual approval step; add required reviewers on the
+    # environment if a human gate is ever wanted.
     environment: crates-io
     permissions:
       id-token: write   # OIDC -> short-lived crates.io token (Trusted Publishing)
