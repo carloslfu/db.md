@@ -102,6 +102,14 @@ do the work; `rg` is the thin binary.)
       source file
 - [ ] CLA signed via the bot on your first PR
 
+## Releasing
+
+Maintainers: to cut a release, bump the version, push `main`, then push a
+`vX.Y.Z` tag — the tag triggers CI, which builds all platforms and
+auto-publishes to crates.io via Trusted Publishing (OIDC, no token) and
+creates the GitHub release. Pushing to `main` alone never publishes. Full
+step-by-step in [RELEASING.md](RELEASING.md).
+
 ## Reporting security issues
 
 **Do not file public issues for security problems.** Use GitHub's

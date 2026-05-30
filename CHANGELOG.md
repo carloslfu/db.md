@@ -8,9 +8,24 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — stable at **v0.1**.
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.2.2**.
+  `Cargo.toml`, currently **v0.2.3**.
 
 ## [Unreleased]
+
+## [0.2.3] — 2026-05-30
+
+- **First release published from CI via Trusted Publishing.** Both
+  crates are published by the `release.yml` GitHub Actions workflow on a
+  version tag, using crates.io Trusted Publishing (OIDC, no stored API
+  token), with SLSA build-provenance attestations on the release
+  binaries. No functional changes to the toolkit. See
+  [RELEASING.md](RELEASING.md).
+
+## [0.2.2] — 2026-05-30
+
+- **Crate READMEs.** `dbmd-core` and `dbmd-cli` now ship `README.md`
+  files (with the `readme` field set) so their crates.io pages render
+  documentation. No functional change to the toolkit.
 
 ## [0.2.1] — 2026-05-30
 
