@@ -24,6 +24,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 description = "The `dbmd` command-line tool for db.md — the open database in plain files. A thin wrapper over dbmd-core: validate, search, query, graph, write, index, and log over a db.md store. Zero AI dependencies."
 
 # One binary, named `dbmd` (git / cargo / kubectl shape). The crate is
@@ -33,7 +34,7 @@ name = "dbmd"
 path = "src/main.rs"
 
 [dependencies]
-dbmd-core = { path = "../dbmd-core", version = "0.2.1" }
+dbmd-core = { path = "../dbmd-core", version = "0.2.2" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

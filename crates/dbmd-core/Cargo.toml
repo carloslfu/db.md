@@ -16,6 +16,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 description = "Reference library for db.md — the open database in plain files. Parsing, store walk, wiki-link graph, validation, query, and write-through indexes. Zero AI dependencies."
 
 [dependencies]
