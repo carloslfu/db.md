@@ -1,0 +1,10 @@
+Invoice 2026-0042
+
+Bill to: NorthStar Logistics
+Date: 2026-04-15
+Due: 2026-05-15
+
+Description: Managed hosting, April 2026
+Amount: USD 3450.00
+
+Payment is due within 30 days. Thank you for your business.

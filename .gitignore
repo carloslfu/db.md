@@ -1,0 +1,22 @@
+# Rust build output (`cargo build` / `make build`). The single `dbmd`
+# binary lands under target/; Cargo.lock IS tracked (this workspace ships a
+# binary, so the lockfile is committed for reproducible release builds).
+/target/
+
+# Local working stores (created by `dbmd init` etc.)
+/db/
+/inbox/
+
+# Generated scale corpus — a deterministic build artifact, not source.
+# Regenerate with `tests/gen-scale.rs` (see its header). The GENERATOR is
+# tracked; the multi-thousand-file output it produces is not. CI rebuilds the
+# 10k tier on demand; the 1M tier is an opt-in scale job written elsewhere.
+/tests/corpora/corpus-d-scale/
+/tests/corpora/corpus-d-scale-1m/
+
+# OS noise
+.DS_Store
+
+# Editor files
+*.swp
+*~

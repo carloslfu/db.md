@@ -1,0 +1,151 @@
+{
+  "_comment": "Coverage map. Maps each SEEDED SPEC.md § Validation code to the EXPECTED fixture(s) that fire it. This IS a full-coverage guarantee: the SPEC table has 44 codes and this corpus now seeds all 44, so `uncovered_spec_codes` is empty and `all_spec_codes_covered` is true. The e2e_corpus_b.rs test `expected_validate_json_is_intent_derived_not_a_snapshot` asserts (1) coverage keys are a subset of the SPEC table (no invented codes), and (2) `uncovered_spec_codes` exactly equals SPEC-codes minus seeded-codes (both directions), so this file cannot drift out of sync with the SPEC table — if a future SPEC code is added without a seeding fixture, this file's bookkeeping forces CI to fail. The three DB_MD_* codes are seeded by the bad-db-md/ sub-store (a separate invocation, EXPECTED/bad-db-md.json — its DB.md violates the identity contract; the corpus-b root sweep never descends into it). LAYER_TYPE_MISMATCH is seeded by wiki/contacts/misplaced-contact.md in the main --all sweep. INDEX_JSONL_DESYNC is plan-mandated (db-md-rust-toolkit.md line 494) and also a SPEC table row; it is grouped under plan_extensions for provenance but counts as a seeded SPEC code in the coverage math.",
+  "spec_code_count": 44,
+  "all_spec_codes_covered": true,
+  "uncovered_spec_codes": [],
+  "coverage": {
+    "DB_MD_BAD_TYPE": [
+      "EXPECTED/bad-db-md.json"
+    ],
+    "DB_MD_MISSING_FIELD": [
+      "EXPECTED/bad-db-md.json"
+    ],
+    "DB_MD_UNKNOWN_SECTION": [
+      "EXPECTED/bad-db-md.json"
+    ],
+    "DUP_COMPANY_DOMAIN": [
+      "EXPECTED/validate.json"
+    ],
+    "DUP_CONTACT_EMAIL": [
+      "EXPECTED/validate.json"
+    ],
+    "DUP_EMAIL_REINGEST": [
+      "EXPECTED/validate.json"
+    ],
+    "DUP_EXPENSE_TUPLE": [
+      "EXPECTED/validate.json"
+    ],
+    "DUP_ID": [
+      "EXPECTED/validate.json"
+    ],
+    "DUP_INVOICE_TUPLE": [
+      "EXPECTED/validate.json"
+    ],
+    "DUP_MEETING_TUPLE": [
+      "EXPECTED/validate.json"
+    ],
+    "FM_BAD_TIMESTAMP": [
+      "EXPECTED/validate.json"
+    ],
+    "FM_MALFORMED_YAML": [
+      "EXPECTED/validate.json"
+    ],
+    "FM_MISSING_TYPE": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_JSONL_MISSING": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_JSONL_STALE": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_MISSING": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_MISSING_ENTRY": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_ORPHAN": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_STALE_ENTRY": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_SUMMARY_MISMATCH": [
+      "EXPECTED/validate.json"
+    ],
+    "INDEX_WRONG_SCOPE": [
+      "EXPECTED/validate.json"
+    ],
+    "LAYER_TYPE_MISMATCH": [
+      "EXPECTED/validate.json"
+    ],
+    "LOG_BAD_TIMESTAMP": [
+      "EXPECTED/validate.json"
+    ],
+    "LOG_OUT_OF_ORDER": [
+      "EXPECTED/validate.json"
+    ],
+    "LOG_UNKNOWN_KIND": [
+      "EXPECTED/validate.json"
+    ],
+    "NOT_A_STORE": [
+      "EXPECTED/not-a-store.json"
+    ],
+    "POLICY_FROZEN_PAGE": [
+      "EXPECTED/policy-refusal/fm-set.json",
+      "EXPECTED/policy-refusal/link.json",
+      "EXPECTED/policy-refusal/rename.json",
+      "EXPECTED/policy-refusal/write-nonexistent-frozen.json",
+      "EXPECTED/policy-refusal/write.json"
+    ],
+    "POLICY_IGNORED_TYPE_DERIVED": [
+      "EXPECTED/validate.json"
+    ],
+    "POLICY_IGNORED_TYPE_PRESENT": [
+      "EXPECTED/validate.json"
+    ],
+    "SCHEMA_ENUM_VIOLATION": [
+      "EXPECTED/validate.json"
+    ],
+    "SCHEMA_LINK_PREFIX_MISMATCH": [
+      "EXPECTED/validate.json"
+    ],
+    "SCHEMA_MISSING_REQUIRED": [
+      "EXPECTED/validate.json"
+    ],
+    "SCHEMA_SHAPE_MISMATCH": [
+      "EXPECTED/validate.json"
+    ],
+    "SUMMARY_EMPTY": [
+      "EXPECTED/validate.json"
+    ],
+    "SUMMARY_MISSING": [
+      "EXPECTED/validate.json"
+    ],
+    "SUMMARY_MULTILINE": [
+      "EXPECTED/validate.json"
+    ],
+    "SUMMARY_TOO_LONG": [
+      "EXPECTED/validate.json"
+    ],
+    "TAGS_MALFORMED": [
+      "EXPECTED/validate.json"
+    ],
+    "WIKI_LINK_AMBIGUOUS": [
+      "EXPECTED/validate.json"
+    ],
+    "WIKI_LINK_BROKEN": [
+      "EXPECTED/validate.json"
+    ],
+    "WIKI_LINK_FLOW_FORM_LIST": [
+      "EXPECTED/validate.json"
+    ],
+    "WIKI_LINK_HAS_EXTENSION": [
+      "EXPECTED/validate.json"
+    ],
+    "WIKI_LINK_SHORT_FORM": [
+      "EXPECTED/validate.json"
+    ]
+  },
+  "plan_extensions": {
+    "INDEX_JSONL_DESYNC": [
+      "EXPECTED/validate.json"
+    ]
+  },
+  "fixture_files": {
+    "validate_all": "EXPECTED/validate.json  (dbmd validate --all --json <store>)",
+    "not_a_store": "EXPECTED/not-a-store.json  (dbmd validate --json <store>/not-a-store)",
+    "policy_refusals": "EXPECTED/policy-refusal/*.json  (write-time POLICY_FROZEN_PAGE)"
+  }
+}

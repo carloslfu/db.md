@@ -1,0 +1,102 @@
+{
+  "_comment": "Golden-master for `dbmd graph backlinks` and `dbmd graph neighborhood` over corpus-a-canonical. INTENT-DERIVED, not copied from tool output: every expected value below was hand-derived from the corpus content (which file wiki-links which) plus the SPEC graph contract (SPEC § Linking + the Block 5 graph subcommands), then cross-checked. The graph engine walks wiki-links over CONTENT files only (sources/records/wiki); meta files (DB.md / index.md / index.jsonl / log.md) are never nodes and never edges — an index naming a file is catalog, not a relationship edge. Wiki-links resolve in BOTH frontmatter (scalar `company:`, sequences `attendees:` / `derived_from:`) and body prose. Result keys are the canonical BARE wiki-link form (store-relative path, no `.md`); `backlinks` returns a sorted string array; `neighborhood` returns `{seed, nodes[]}` where each node carries `path`, `hops`, `direction` (outgoing = seed-side links to it; incoming = it links to the seed-side node), `via` (the parent it was reached through — the seed for hop 1, the intermediate node for hop 2), plus the reached file's own `type` and `summary`. An empty result (orphan seed) is success (exit 0), never an error.",
+
+  "backlinks": [
+    {
+      "seed": "records/contacts/sarah-chen.md",
+      "intent": "Hub contact. Five CONTENT files reference Sarah: the Northstar company record (primary-contact list + body), both meetings (one via `attendees:` + body, one body-only), her wiki bio (`derived_from:` + body), and the renewal project (`derived_from:` + body). The records/contacts/index.md catalog also names her, but indexes are catalog not edges, so it must NOT appear. Sorted ascending, bare form.",
+      "matches": [
+        "records/companies/northstar",
+        "records/meetings/2026/04/2026-04-15-northstar-quarterly-review",
+        "records/meetings/2026/05/2026-05-22-northstar-renewal-call",
+        "wiki/people/sarah-chen",
+        "wiki/projects/northstar-renewal"
+      ]
+    },
+    {
+      "seed": "records/companies/northstar.md",
+      "intent": "The most-linked node in the store. Every Northstar-affiliated record points its `company:` scalar here (the four contacts) and the two people wiki bios + the renewal project reference it in body/`derived_from:`. Seven incoming edges in total — exercises a high-fan-in backlink set spanning two layers.",
+      "matches": [
+        "records/contacts/david-kim",
+        "records/contacts/elena-rodriguez",
+        "records/contacts/marcus-okafor",
+        "records/contacts/sarah-chen",
+        "wiki/people/elena-rodriguez",
+        "wiki/people/sarah-chen",
+        "wiki/projects/northstar-renewal"
+      ]
+    },
+    {
+      "seed": "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md",
+      "intent": "A meeting reached from a mix of frontmatter and body edges. David Kim and Sarah Chen link to the call; the two people wiki bios + the renewal project + the signed-off synthesis plan all cite it. Elena does NOT — her record links the renewal EMAIL, not the call. Five incoming edges; confirms backlinks reads `derived_from:` sequences and body prose, and does not invent the Elena edge.",
+      "matches": [
+        "records/contacts/david-kim",
+        "records/contacts/sarah-chen",
+        "wiki/people/sarah-chen",
+        "wiki/projects/northstar-renewal",
+        "wiki/synthesis/2026-renewal-plan"
+      ]
+    },
+    {
+      "seed": "wiki/projects/northstar-renewal.md",
+      "intent": "A dense wiki synthesis page that is itself heavily back-referenced. The company record, Sarah's contact record, the Q1 meeting, the MSA source doc, both people wiki bios, and the signed-off synthesis plan all link to the renewal narrative. Seven incoming edges across all three layers (sources + records + wiki).",
+      "matches": [
+        "records/companies/northstar",
+        "records/contacts/sarah-chen",
+        "records/meetings/2026/04/2026-04-15-northstar-quarterly-review",
+        "sources/docs/2026-03-15-northstar-msa",
+        "wiki/people/elena-rodriguez",
+        "wiki/people/sarah-chen",
+        "wiki/synthesis/2026-renewal-plan"
+      ]
+    },
+    {
+      "seed": "sources/emails/2026/05/2026-05-12-marcus-intro.md",
+      "intent": "Orphan source. The Marcus-intro email carries no wiki-links and nothing links to it (it is on the curation worklist). Backlinks is the empty set — and an empty result is SUCCESS (exit 0, no stdout), not an error. Pins the empty-is-success contract.",
+      "matches": []
+    }
+  ],
+
+  "neighborhood": [
+    {
+      "seed": "records/contacts/sarah-chen.md",
+      "hops": 1,
+      "intent": "One hop = the seed's direct neighbors in BOTH directions, deduped. Sarah's own file links OUT to the company, the renewal call, and the renewal project (direction outgoing). The Q1 meeting and her wiki bio link IN to her but are not linked from her file (direction incoming). Five nodes, all at hop 1, all reached `via` the seed. The reached `type`/`summary` belong to each reached file (audited against that file's frontmatter), proving hydration reads the neighbor, not the seed.",
+      "seed_normalized": "records/contacts/sarah-chen",
+      "nodes": [
+        { "path": "records/companies/northstar", "hops": 1, "direction": "outgoing", "via": "records/contacts/sarah-chen", "type": "company" },
+        { "path": "records/meetings/2026/05/2026-05-22-northstar-renewal-call", "hops": 1, "direction": "outgoing", "via": "records/contacts/sarah-chen", "type": "meeting" },
+        { "path": "wiki/projects/northstar-renewal", "hops": 1, "direction": "outgoing", "via": "records/contacts/sarah-chen", "type": "wiki-page" },
+        { "path": "records/meetings/2026/04/2026-04-15-northstar-quarterly-review", "hops": 1, "direction": "incoming", "via": "records/contacts/sarah-chen", "type": "meeting" },
+        { "path": "wiki/people/sarah-chen", "hops": 1, "direction": "incoming", "via": "records/contacts/sarah-chen", "type": "wiki-page" }
+      ]
+    },
+    {
+      "seed": "records/contacts/sarah-chen.md",
+      "hops": 2,
+      "intent": "Two hops adds the frontier reachable through the hop-1 nodes (not already seen, BFS, nearest-hop-wins). The five hop-1 nodes are unchanged. New at hop 2, each carrying a `via` pointing at the INTERMEDIATE node it was reached through (not the seed): through the Northstar company → Elena (contact, outgoing), David Kim + Marcus (contacts, incoming), Elena's wiki bio (incoming); through the renewal call → the Elena renewal email (outgoing) and the synthesis plan (incoming); through the renewal project → the MSA source doc (outgoing). Sarah herself is the seed and is never re-emitted. This pins both the hop-2 frontier set AND the parent-tracking (`via` is the intermediate, proving real BFS rather than a flat 2-ring union).",
+      "seed_normalized": "records/contacts/sarah-chen",
+      "nodes": [
+        { "path": "records/companies/northstar", "hops": 1, "direction": "outgoing", "via": "records/contacts/sarah-chen", "type": "company" },
+        { "path": "records/meetings/2026/05/2026-05-22-northstar-renewal-call", "hops": 1, "direction": "outgoing", "via": "records/contacts/sarah-chen", "type": "meeting" },
+        { "path": "wiki/projects/northstar-renewal", "hops": 1, "direction": "outgoing", "via": "records/contacts/sarah-chen", "type": "wiki-page" },
+        { "path": "records/meetings/2026/04/2026-04-15-northstar-quarterly-review", "hops": 1, "direction": "incoming", "via": "records/contacts/sarah-chen", "type": "meeting" },
+        { "path": "wiki/people/sarah-chen", "hops": 1, "direction": "incoming", "via": "records/contacts/sarah-chen", "type": "wiki-page" },
+        { "path": "records/contacts/elena-rodriguez", "hops": 2, "direction": "outgoing", "via": "records/companies/northstar", "type": "contact" },
+        { "path": "records/contacts/david-kim", "hops": 2, "direction": "incoming", "via": "records/companies/northstar", "type": "contact" },
+        { "path": "records/contacts/marcus-okafor", "hops": 2, "direction": "incoming", "via": "records/companies/northstar", "type": "contact" },
+        { "path": "wiki/people/elena-rodriguez", "hops": 2, "direction": "incoming", "via": "records/companies/northstar", "type": "wiki-page" },
+        { "path": "sources/emails/2026/05/2026-05-22-elena-renewal", "hops": 2, "direction": "outgoing", "via": "records/meetings/2026/05/2026-05-22-northstar-renewal-call", "type": "email" },
+        { "path": "wiki/synthesis/2026-renewal-plan", "hops": 2, "direction": "incoming", "via": "records/meetings/2026/05/2026-05-22-northstar-renewal-call", "type": "wiki-page" },
+        { "path": "sources/docs/2026-03-15-northstar-msa", "hops": 2, "direction": "outgoing", "via": "wiki/projects/northstar-renewal", "type": "pdf-source" }
+      ]
+    },
+    {
+      "seed": "sources/emails/2026/05/2026-05-12-marcus-intro.md",
+      "hops": 2,
+      "intent": "Orphan seed: no edges in or out, so even a two-hop neighborhood is the empty node set. The response is still well-formed — `{seed, nodes:[]}` with the seed normalized to bare form — and exit 0. Pins that an isolated seed hydrates to nothing rather than erroring.",
+      "seed_normalized": "sources/emails/2026/05/2026-05-12-marcus-intro",
+      "nodes": []
+    }
+  ]
+}

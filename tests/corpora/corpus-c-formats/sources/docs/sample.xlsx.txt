@@ -1,0 +1,3 @@
+Vendor	Category	Amount
+Acme Cloud	Hosting	1200
+NorthStar	Logistics	3450

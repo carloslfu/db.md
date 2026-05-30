@@ -1,0 +1,82 @@
+{
+  "_comment": "Golden-master for `dbmd log tail 20 --json` over corpus-a-canonical. INTENT-DERIVED from the corpus `log.md` (the curator's recorded session history) plus the SPEC log contract (SPEC § `log.md`), not copied from tool output. The active `log.md` holds 12 entries (all in 2026, no rotation), so `tail 20` returns ALL of them; `tail N` for N >= 12 is the whole log. Tail returns entries in CHRONOLOGICAL order (oldest first, newest last) — the same on-disk order — and each `--json` entry is the object `{kind, note, object, timestamp}`. Object-slot encoding (a SPEC distinction this golden pins): a per-file action carries the RAW wiki-link form verbatim in `object` (e.g. `[[records/contacts/marcus-okafor]]`, brackets included, exactly as written in the header); the store-wide `index-rebuild` header uses a literal `-` placeholder, so its `object` is the string \"-\"; the final `validate` header has NO object slot at all, so its `object` is JSON null. `timestamp` is the header's `YYYY-MM-DD HH:MM` rendered back verbatim. `expected_count` is the count for a tail of 20 (capped by the 12 that exist). The list below is the complete, ordered expectation; the test asserts the full array equality after normalizing each entry to these four keys.",
+
+  "tail_n": 20,
+  "expected_count": 12,
+  "chronological_oldest_first": true,
+
+  "entries": [
+    {
+      "timestamp": "2026-04-03 08:05",
+      "kind": "ingest",
+      "object": "[[sources/emails/2026/04/2026-04-03-figma-renewal-notice]]",
+      "note": "Figma annual-renewal notice received; flagged for an expense + invoice once the charge posts."
+    },
+    {
+      "timestamp": "2026-04-15 16:50",
+      "kind": "create",
+      "object": "[[records/meetings/2026/04/2026-04-15-northstar-quarterly-review]]",
+      "note": "Logged the Q1 review with Sarah Chen. Renewal-expansion intent noted."
+    },
+    {
+      "timestamp": "2026-04-18 08:10",
+      "kind": "create",
+      "object": "[[records/invoices/2026/04/2026-04-18-figma-annual]]",
+      "note": "Figma annual charge posted; created the invoice record and the matching expense ledger entry."
+    },
+    {
+      "timestamp": "2026-04-30 07:35",
+      "kind": "ingest",
+      "object": "[[sources/docs/2026-04-30-aws-invoice]]",
+      "note": "AWS April invoice PDF dropped into sources/docs; extracted text and reconciled."
+    },
+    {
+      "timestamp": "2026-05-02 09:05",
+      "kind": "update",
+      "object": "[[records/invoices/2026/04/2026-04-30-aws-april]]",
+      "note": "Marked the AWS April invoice paid (paid_at 2026-05-02)."
+    },
+    {
+      "timestamp": "2026-05-12 13:45",
+      "kind": "create",
+      "object": "[[records/contacts/marcus-okafor]]",
+      "note": "New sender on the renewal thread; created a contact (default summary), linked to Northstar."
+    },
+    {
+      "timestamp": "2026-05-22 09:20",
+      "kind": "ingest",
+      "object": "[[sources/emails/2026/05/2026-05-22-elena-renewal]]",
+      "note": "Elena confirms the 120 → 175 seat expansion by email."
+    },
+    {
+      "timestamp": "2026-05-22 11:05",
+      "kind": "create",
+      "object": "[[records/meetings/2026/05/2026-05-22-northstar-renewal-call]]",
+      "note": "Logged the renewal call; 175 seats agreed, volume discount confirmed at 150."
+    },
+    {
+      "timestamp": "2026-05-22 12:30",
+      "kind": "update",
+      "object": "[[wiki/projects/northstar-renewal]]",
+      "note": "Refreshed the renewal narrative with the call outcome and the confirming email."
+    },
+    {
+      "timestamp": "2026-05-23 09:00",
+      "kind": "link",
+      "object": "[[wiki/synthesis/2026-renewal-plan]]",
+      "note": "Cross-linked the signed-off renewal plan from the project page; page is now frozen."
+    },
+    {
+      "timestamp": "2026-05-31 10:00",
+      "kind": "index-rebuild",
+      "object": "-",
+      "note": "Full `dbmd index rebuild` after the May expense drop; root + layer + type-folder catalogs reconciled."
+    },
+    {
+      "timestamp": "2026-05-31 10:05",
+      "kind": "validate",
+      "object": null,
+      "note": "PASS — 0 errors, 0 warnings. Store is clean across all three layers."
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+Vendor Security Review
+
+NorthStar Logistics completed the annual security review on 2026 March 18.
+
+The review covered access controls, data retention, and incident response.
+
+No critical findings were reported. Two low-severity items remain open.
+
+Next review is scheduled for March 2027.

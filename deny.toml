@@ -1,0 +1,113 @@
+# cargo-deny configuration for the db.md Rust toolkit
+# (crates/dbmd-core + crates/dbmd-cli → the single `dbmd` binary).
+#
+# This is the machine-enforced form of the dependency policy that
+# THIRD_PARTY_NOTICES states in prose. Run locally with:
+#
+#     cargo deny check licenses bans
+#
+# CI runs the same gate (.github/workflows/licenses.yml) so the NOTICES
+# file and the shipped dependency tree can no longer silently drift.
+#
+# Schema: https://embarkstudios.github.io/cargo-deny/
+
+# ---------------------------------------------------------------------------
+# License policy: permissive only.
+#
+# The `allow` set below is the SPDX closure of every license actually present
+# in the resolved graph (run `cargo deny check licenses` to re-verify). An
+# SPDX expression passes if the allow-list satisfies it: for `A OR B` any one
+# allowed branch suffices; for `A AND B` every term must be allowed. So:
+#
+#   * `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` (rustix, wasm-*,
+#     wit-*) passes via the bare `Apache-2.0 OR MIT` branch — LLVM-exception
+#     need not be listed.
+#   * `MIT OR Apache-2.0 OR LGPL-2.1-or-later` (r-efi) passes via MIT/Apache —
+#     LGPL is NOT allowed and is never selected.
+#   * `(Apache-2.0 OR MIT) AND BSD-3-Clause` (encoding_rs) requires
+#     BSD-3-Clause to be allowed (the WHATWG encoding tables) — hence it is.
+#   * `(MIT OR Apache-2.0) AND Unicode-3.0` (unicode-ident) requires
+#     Unicode-3.0 to be allowed — hence it is.
+#   * `Apache-2.0 OR BSL-1.0` (ryu) passes via Apache-2.0, so BSL-1.0 is NOT
+#     listed (kept minimal — every entry below is actually load-bearing).
+#
+# This set is kept byte-identical to `ALLOWED` in
+# crates/dbmd-cli/tests/license_policy.rs (the `allow_list_matches_deny_toml`
+# test fails if they drift). No GPL / AGPL / LGPL-static anywhere. Adding a
+# dependency under any license not in this set fails the build until the license
+# is reviewed and added to BOTH files (and recorded in THIRD_PARTY_NOTICES).
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "Unlicense",
+    # MPL-2.0 is permitted by policy but no MPL crate is in the tree today, so
+    # `cargo deny` emits a (non-fatal) "license-not-encountered" warning for it.
+    # That warning is expected; keep MPL-2.0 listed so a future weak-copyleft
+    # MPL dep passes without a policy change. Add nothing stronger (no LGPL/GPL).
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+]
+# Crates that publish no SPDX `license` field must be confirmed by hash here.
+# Empty: every crate in the current graph carries a recognized SPDX expression.
+exceptions = []
+confidence-threshold = 0.9
+
+# ---------------------------------------------------------------------------
+# Banned crates: the hard rules of the toolkit, enforced.
+#
+# ZERO AI/LLM dependencies, and NO embeddings / vectors / ANN of any kind.
+# These are the crate families that would violate that bet; listing them here
+# turns "we will not add an LLM/vector dep" from a code-review promise into a
+# build failure. Extend this list when a new offender appears upstream.
+[bans]
+multiple-versions = "allow"
+# Wildcards are allowed: the only `*` req in the tree is the intra-workspace
+# path dep dbmd-cli -> dbmd-core. (cargo-deny's allow-wildcard-paths exemption
+# does not apply to publishable crates, so we scope this check off rather than
+# fail on our own workspace edge; license + AI/vector bans are the policy here.)
+wildcards = "allow"
+deny = [
+    # --- AI / LLM provider SDKs and orchestration ---
+    { name = "openai" },
+    { name = "openai-api-rs" },
+    { name = "async-openai" },
+    { name = "anthropic" },
+    { name = "anthropic-sdk" },
+    { name = "ollama-rs" },
+    { name = "langchain-rust" },
+    { name = "llm" },
+    { name = "llm-chain" },
+    { name = "rust-bert" },
+    { name = "tiktoken-rs" },
+    # --- Embeddings / vectors / ANN (never, by policy) ---
+    { name = "qdrant-client" },
+    { name = "instant-distance" },
+    { name = "hnsw" },
+    { name = "hnsw_rs" },
+    { name = "faiss" },
+    { name = "usearch" },
+    { name = "annoy-rs" },
+    { name = "fastembed" },
+    { name = "candle-core" },
+    { name = "candle-transformers" },
+    { name = "tch" },
+    { name = "ort" },
+    # --- Bundled ripgrep binary: ripgrep is EMBEDDED via grep + ignore ---
+    { name = "ripgrep" },
+]
+
+# ---------------------------------------------------------------------------
+# Advisories / sources: scope this config to licenses + bans for now.
+# `cargo deny check licenses bans` is what CI runs; advisory + source policy
+# can be tightened later without changing the license gate above.
+[advisories]
+version = 2
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"

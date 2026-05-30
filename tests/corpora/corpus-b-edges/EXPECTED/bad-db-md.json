@@ -1,0 +1,43 @@
+{
+  "_comment": "Hand-derived from SPEC.md § Validation (the DB.md-structure rules) and from exactly what bad-db-md/DB.md breaks — never copied from tool output. Running `dbmd validate --all --json tests/corpora/corpus-b-edges/bad-db-md` (a sub-store whose DB.md violates the identity contract) MUST emit exactly these three issues and exit non-zero. This is a SEPARATE invocation from the corpus-b --all sweep: the sweep checks only `<root>/DB.md` and walks sources/records/wiki under the root, so it never descends into this sibling. Line numbers are intent-derived: DB_MD_BAD_TYPE anchors to the `type:` key line (file line 2); DB_MD_MISSING_FIELD for an ABSENT field anchors to the frontmatter block top (line 1); DB_MD_UNKNOWN_SECTION anchors to the offending `##` heading's file line (the `## Glossary` heading at line 18). Issues sorted by (file, line, code).",
+  "invocation": "dbmd validate --all --json tests/corpora/corpus-b-edges/bad-db-md",
+  "exit_code_nonzero": true,
+  "summary": {
+    "errors": 2,
+    "warnings": 1,
+    "info": 0,
+    "total": 3
+  },
+  "issues": [
+    {
+      "severity": "error",
+      "code": "DB_MD_MISSING_FIELD",
+      "file": "DB.md",
+      "line": 1,
+      "key": "owner",
+      "message": "DB.md frontmatter is missing required field `owner`",
+      "suggestion": "add `owner:` to the DB.md frontmatter",
+      "related": []
+    },
+    {
+      "severity": "error",
+      "code": "DB_MD_BAD_TYPE",
+      "file": "DB.md",
+      "line": 2,
+      "key": "type",
+      "message": "DB.md has `type: notes`; a store's DB.md must be `type: db-md`",
+      "suggestion": "set `type: db-md` in the DB.md frontmatter",
+      "related": []
+    },
+    {
+      "severity": "warning",
+      "code": "DB_MD_UNKNOWN_SECTION",
+      "file": "DB.md",
+      "line": 18,
+      "key": null,
+      "message": "DB.md has an unrecognized `## Glossary` section",
+      "suggestion": "DB.md sections are `## Agent instructions`, `## Policies`, `## Schemas` — remove or rename this heading",
+      "related": []
+    }
+  ]
+}

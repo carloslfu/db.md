@@ -1,0 +1,3 @@
+Times Roman heading line.
+Courier monospaced body line 0123456789.
+Helvetica oblique closing line.

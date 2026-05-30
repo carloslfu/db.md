@@ -1,0 +1,337 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Cross-compile + release pipeline for the single `dbmd` binary
+# (plan: db-md-rust-toolkit.md, Block 8).
+#
+# Four targets, built on runners that match the target arch where possible
+# (no QEMU for the host-arch builds) and via `cross` (Docker) for the one
+# cross-arch case:
+#
+#   darwin-x86_64        x86_64-apple-darwin          macos-13   (Intel runner, native)
+#   darwin-aarch64       aarch64-apple-darwin         macos-14   (Apple Silicon, native)
+#   linux-x86_64-musl    x86_64-unknown-linux-musl    ubuntu     (native + musl-tools)
+#   linux-aarch64-musl   aarch64-unknown-linux-musl   ubuntu     (cross / Docker)
+#
+# Per-target output is a tarball `dbmd-<version>-<target>.tar.gz` containing
+# the `dbmd` binary + NOTICE + THIRD_PARTY_NOTICES + LICENSE. A single
+# `SHA256SUMS` manifest covers every tarball (standard `sha256sum -c` format).
+#
+# The `publish` job then creates a GitHub Release on this repo
+# (carloslfu/db.md) carrying every tarball + SHA256SUMS as immutable assets,
+# with a signed SLSA build-provenance attestation. The install script
+# (scripts/install.sh) and Homebrew tap download from those release assets;
+# crates.io is published separately by the `publish-crates` job.
+#
+# IMPORTANT (CI-gated, cannot run on a single dev host): cross-platform
+# execution is exercised only by CI runners. The macOS/musl/aarch64 builds and
+# their smoke tests run in GitHub Actions; they are authored + self-linted
+# here, not executed locally. See `smoke.yml` for the post-publish smoke job.
+
+name: release
+
+on:
+  push:
+    tags:
+      # Cut a release by pushing a SemVer tag, e.g. `v0.2.0`.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without leading v), e.g. 0.2.0. Defaults to the workspace version.'
+        required: false
+        type: string
+
+permissions:
+  contents: read  # least privilege by default; jobs elevate locally as needed
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY: dbmd
+
+jobs:
+  # ── Resolve the version once, so every job agrees on it ──────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            ver="${{ inputs.version }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            # Strip a leading `v` from the tag (vX.Y.Z -> X.Y.Z).
+            ver="${GITHUB_REF_NAME#v}"
+          else
+            # Fall back to the workspace [workspace.package] version.
+            ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          # Sanity-check it looks like SemVer.
+          echo "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$' || {
+            echo "::error::resolved version '$ver' is not SemVer" >&2; exit 1; }
+          # If a tag triggered this, it must match the workspace version
+          # (release tag and Cargo.toml must never disagree).
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            cargo_ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+            if [ "$ver" != "$cargo_ver" ]; then
+              echo "::error::tag version '$ver' != Cargo.toml version '$cargo_ver'" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $ver"
+
+  # ── Build one tarball per target ────────────────────────────────────────
+  build:
+    needs: version
+    name: build (${{ matrix.target_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_name: darwin-x86_64
+            rust_target: x86_64-apple-darwin
+            os: macos-15-intel
+            use_cross: false
+          - target_name: darwin-aarch64
+            rust_target: aarch64-apple-darwin
+            os: macos-14
+            use_cross: false
+          - target_name: linux-x86_64-musl
+            rust_target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: false
+          - target_name: linux-aarch64-musl
+            rust_target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target_name }}
+
+      # musl on the native x86_64 runner needs the musl gcc wrapper + headers.
+      - name: Install musl tools (linux x86_64)
+        if: matrix.target_name == 'linux-x86_64-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # cross (Docker-based) handles the aarch64-musl sysroot/linker cleanly,
+      # so we never hand-wire a cross GCC. Pinned to a release tag.
+      - name: Install cross (linux aarch64)
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
+
+      # Assemble the per-target tarball: binary + the three legal files.
+      # Tarball name: dbmd-<version>-<target>.tar.gz
+      - name: Assemble tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          target="${{ matrix.target_name }}"
+          stage="dbmd-${version}-${target}"
+          bin_path="target/${{ matrix.rust_target }}/release/${BINARY}"
+
+          test -f "$bin_path" || { echo "::error::binary not found at $bin_path" >&2; exit 1; }
+
+          mkdir -p "dist/$stage"
+          cp "$bin_path"            "dist/$stage/${BINARY}"
+          cp NOTICE                 "dist/$stage/NOTICE"
+          cp THIRD_PARTY_NOTICES    "dist/$stage/THIRD_PARTY_NOTICES"
+          cp LICENSE                "dist/$stage/LICENSE"
+          chmod +x "dist/$stage/${BINARY}"
+
+          # Build the tarball. Prefer a GNU tar (gtar on macOS, or tar when it
+          # is GNU) so we can emit a deterministic, reproducible archive
+          # (sorted entries, fixed mtime/owner). macOS ships BSD tar, which
+          # rejects --sort/--mtime/--owner, so we fall back to a plain portable
+          # tar there. Either way the contents are identical.
+          tarcmd=tar
+          if command -v gtar >/dev/null 2>&1; then
+            tarcmd=gtar
+          fi
+          if "$tarcmd" --version 2>/dev/null | grep -qi 'GNU tar'; then
+            "$tarcmd" \
+              --sort=name \
+              --mtime='2026-01-01 00:00:00 UTC' \
+              --owner=0 --group=0 --numeric-owner \
+              -czf "dist/${stage}.tar.gz" \
+              -C dist "$stage"
+          else
+            # BSD tar (macOS) — portable, non-reproducible-but-correct.
+            tar -czf "dist/${stage}.tar.gz" -C dist "$stage"
+          fi
+
+          # Per-tarball checksum line (merged into one manifest in `publish`).
+          # shasum ships on both macOS and the Linux runners (Perl preinstalled).
+          ( cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )
+          echo "Built dist/${stage}.tar.gz"
+          cat "dist/${stage}.tar.gz.sha256"
+
+      # Quick sanity: the freshly-built binary at least answers --version with
+      # the version we think we built (only for host-runnable targets — the
+      # cross aarch64-musl binary can't execute on the x86_64 runner).
+      - name: Verify --version (host-runnable targets)
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          stage="dbmd-${version}-${{ matrix.target_name }}"
+          out="$("dist/$stage/$BINARY" --version)"
+          echo "$out"
+          echo "$out" | grep -q "dbmd ${version}" || {
+            echo "::error::--version output '$out' does not contain 'dbmd ${version}'" >&2
+            exit 1
+          }
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target_name }}
+          path: |
+            dist/dbmd-*-${{ matrix.target_name }}.tar.gz
+            dist/dbmd-*-${{ matrix.target_name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Collect tarballs, build the manifest, create the GitHub Release ─────
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the GitHub Release + upload assets
+      id-token: write        # OIDC, for the build-provenance attestation
+      attestations: write    # write the provenance attestation
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          path: incoming
+          merge-multiple: true
+
+      - name: Build release tree + SHA256 manifest
+        id: tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          rel="release/${version}"
+          mkdir -p "$rel"
+
+          # Gather every tarball (one per target). Expect exactly 4.
+          shopt -s nullglob
+          tarballs=(incoming/dbmd-*.tar.gz)
+          count="${#tarballs[@]}"
+          echo "Found $count tarball(s)."
+          if [ "$count" -ne 4 ]; then
+            echo "::error::expected 4 tarballs, found $count" >&2
+            printf '  %s\n' "${tarballs[@]}" >&2
+            exit 1
+          fi
+          cp "${tarballs[@]}" "$rel/"
+
+          # One manifest covering all tarballs, standard `sha256sum -c` format
+          # (relative names, so it verifies from inside the release dir).
+          ( cd "$rel" && shasum -a 256 dbmd-*.tar.gz > SHA256SUMS )
+          echo "----- SHA256SUMS -----"
+          cat "$rel/SHA256SUMS"
+
+          # Self-check: the manifest verifies against the files we just wrote.
+          ( cd "$rel" && shasum -a 256 -c SHA256SUMS )
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dir=$rel" >> "$GITHUB_OUTPUT"
+
+      # GitHub Release on carloslfu/db.md with every tarball + the manifest.
+      # softprops/gh-release is the standard immutable-asset path; assets get
+      # stable download URLs the install script's GitHub fallback reads.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: dbmd v${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz
+            release/${{ needs.version.outputs.version }}/SHA256SUMS
+
+      - name: Attest build provenance for the release tarballs
+        # Signed SLSA provenance. Anyone can verify a downloaded tarball was
+        # built by this CI from this source:
+        #   gh attestation verify <tarball> --repo carloslfu/db.md
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
+
+  # ── Publish the crates to crates.io (Trusted Publishing, manual-gated) ───
+  publish-crates:
+    name: Publish to crates.io
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    # Manual-approval gate: the irreversible crates.io publish waits for a
+    # reviewer's one-click approval on the `crates-io` environment.
+    environment: crates-io
+    permissions:
+      id-token: write   # OIDC -> short-lived crates.io token (Trusted Publishing)
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Same packaging guard as publish-check.yml: build each crate from its
+      # tarball before any upload, so a packaging bug fails here, not midway.
+      - name: Verify publishability (cargo package --workspace)
+        run: cargo package --workspace --locked
+      # Trusted Publishing: exchange GitHub OIDC for a short-lived crates.io
+      # token at runtime. No token is stored in the repo or in CI.
+      - name: Authenticate to crates.io via OIDC (Trusted Publishing, no token)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish dbmd-core then dbmd-cli (skip versions already on crates.io)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          publish_if_new() {
+            crate="$1"
+            if curl -sf "https://crates.io/api/v1/crates/$crate/$VERSION" \
+                 -H "User-Agent: db.md release CI" >/dev/null 2>&1; then
+              echo "$crate $VERSION already on crates.io — skipping (idempotent)."
+            else
+              echo "Publishing $crate $VERSION..."
+              cargo publish -p "$crate" --locked
+            fi
+          }
+          publish_if_new dbmd-core   # dependency first; cargo waits for the index
+          publish_if_new dbmd-cli

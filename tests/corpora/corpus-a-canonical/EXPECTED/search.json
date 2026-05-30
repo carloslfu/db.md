@@ -1,0 +1,100 @@
+{
+  "_comment": "Golden-master for `dbmd search` over corpus-a-canonical. Each case lists the store-relative paths that MUST match, derived from the corpus content and the SPEC search contract (embedded ripgrep over the frontmatter block + body of every CONTENT file under sources/records/wiki; meta files DB.md/index.md/index.jsonl/log.md are not content and never match). `matches` is the complete set, sorted by store-relative path ascending. Filters: --type narrows to frontmatter `type`; --in narrows to a layer; --updated-after compares the frontmatter `updated` timestamp (strictly after). Query strings are ripgrep regexes (default case-sensitive). This golden is intent-derived, not copied from tool output.",
+  "queries": [
+    {
+      "query": "volume discount",
+      "args": [],
+      "intent": "Plain phrase, no filter. The body-only phrase appears in the renewal call record and the project wiki page.",
+      "matches": [
+        "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md",
+        "wiki/projects/northstar-renewal.md"
+      ]
+    },
+    {
+      "query": "master services agreement",
+      "args": [],
+      "intent": "Distinctive body phrase that occurs in exactly one source doc (the Northstar MSA extraction).",
+      "matches": [
+        "sources/docs/2026-03-15-northstar-msa.md"
+      ]
+    },
+    {
+      "query": "async",
+      "args": [],
+      "intent": "Case-sensitive default match on a working-style term present in Elena's contact record and her wiki bio.",
+      "matches": [
+        "records/contacts/elena-rodriguez.md",
+        "wiki/people/elena-rodriguez.md"
+      ]
+    },
+    {
+      "query": "renewal",
+      "args": ["--in", "wiki"],
+      "intent": "Layer-scoped search: only wiki/ content files that contain `renewal` survive the --in filter.",
+      "matches": [
+        "wiki/people/elena-rodriguez.md",
+        "wiki/people/sarah-chen.md",
+        "wiki/projects/northstar-renewal.md",
+        "wiki/synthesis/2026-renewal-plan.md"
+      ]
+    },
+    {
+      "query": "175",
+      "args": ["--type", "meeting"],
+      "intent": "Type-scoped: of all meeting records, only the renewal call mentions the 175-seat number.",
+      "matches": [
+        "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md"
+      ]
+    },
+    {
+      "query": "Northstar",
+      "args": ["--type", "contact"],
+      "intent": "Type-scoped to contacts. All four contacts reference Northstar (three Northstar staff plus the internal AE who owns the account).",
+      "matches": [
+        "records/contacts/david-kim.md",
+        "records/contacts/elena-rodriguez.md",
+        "records/contacts/marcus-okafor.md",
+        "records/contacts/sarah-chen.md"
+      ]
+    },
+    {
+      "query": "(unpaid|void)",
+      "args": ["--type", "invoice"],
+      "intent": "Regex alternation, type-scoped to invoices. Only the May AWS invoice carries the `unpaid` status; no invoice is `void`.",
+      "matches": [
+        "records/invoices/2026/05/2026-05-31-aws-may.md"
+      ]
+    },
+    {
+      "query": "Figma",
+      "args": ["--type", "company"],
+      "intent": "Type-scoped to companies. Only the Figma company record matches (the term also appears in emails/invoices/expenses, which the --type filter excludes).",
+      "matches": [
+        "records/companies/figma.md"
+      ]
+    },
+    {
+      "query": "2026-05-31",
+      "args": ["--type", "expense"],
+      "intent": "Type-scoped to the near-cap expense folder, narrowed by a single shard date. Seven expense records are dated the last day of May, spanning all three vendors.",
+      "matches": [
+        "records/expenses/2026/05/2026-05-31-aws-0031.md",
+        "records/expenses/2026/05/2026-05-31-aws-0124.md",
+        "records/expenses/2026/05/2026-05-31-aws-0217.md",
+        "records/expenses/2026/05/2026-05-31-figma-0062.md",
+        "records/expenses/2026/05/2026-05-31-figma-0155.md",
+        "records/expenses/2026/05/2026-05-31-github-0093.md",
+        "records/expenses/2026/05/2026-05-31-github-0186.md"
+      ]
+    },
+    {
+      "query": "renewal",
+      "args": ["--type", "contact", "--updated-after", "2026-05-15"],
+      "intent": "Combined type + recency filter. Of the contacts mentioning renewal, only Elena and Sarah were updated after 2026-05-15 (Marcus and David predate the cutoff).",
+      "matches": [
+        "records/contacts/elena-rodriguez.md",
+        "records/contacts/sarah-chen.md"
+      ]
+    }
+  ]
+}

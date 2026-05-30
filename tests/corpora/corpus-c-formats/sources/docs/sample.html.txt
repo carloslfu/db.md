@@ -1,0 +1,18 @@
+Quarterly Operations Summary
+
+This document summarizes operations for Acme Corp in Q1 2026. It is used as an extraction fixture for the db.md toolkit.
+
+Highlights
+
+* Revenue grew 12 percent over the prior quarter.
+* Two new enterprise contracts were signed.
+* Support response time dropped to under four hours.
+
+Open Items
+
+1. Renew the NorthStar contract before June 30.
+2. Finalize the vendor security review.
+
+For questions contact ops@acme.example or see the operations handbook.
+
+Generated 2026-04-01. Internal use only.

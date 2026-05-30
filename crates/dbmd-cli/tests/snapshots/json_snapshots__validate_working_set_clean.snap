@@ -1,0 +1,15 @@
+---
+source: crates/dbmd-cli/tests/json_snapshots.rs
+expression: out
+---
+{
+  "issues": [],
+  "scope": "working-set",
+  "store": ".",
+  "summary": {
+    "errors": 0,
+    "info": 0,
+    "total": 0,
+    "warnings": 0
+  }
+}

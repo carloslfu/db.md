@@ -1,0 +1,62 @@
+# dbmd-cli — the single `dbmd` binary.
+#
+# This crate is a THIN arg-parse / format wrapper. It owns NO toolkit logic:
+# every subcommand parses its args, calls into `dbmd-core`, and formats the
+# result (text by default, structured JSON under `--json`). All parsing, store
+# walk, graph, validation, query, render, summary, index, and log behavior
+# lives in `dbmd-core` — keep it that way (ripgrep precedent: the lib does the
+# work, the binary is thin).
+#
+# Hard invariants enforced here:
+#   - Zero AI/LLM dependencies. clap + serde + dbmd-core, plus the embedded-
+#     ripgrep trio (grep + ignore + regex) that `dbmd search`'s free-text scan
+#     needs in-handler (plan Block 4) — never a bundled `rg`, never a shell-out.
+#   - No interactive prompts ever — flags only (agent-primary ergonomics).
+#   - Every dependency is permissive — MIT / Apache-2.0 / BSD-2/3-Clause+0BSD /
+#     Unlicense / MPL-2.0 / Zlib / Unicode-3.0 — and is recorded in
+#     /THIRD_PARTY_NOTICES. No GPL/AGPL/LGPL-static.
+
+[package]
+name = "dbmd-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The `dbmd` command-line tool for db.md — the open database in plain files. A thin wrapper over dbmd-core: validate, search, query, graph, write, index, and log over a db.md store. Zero AI dependencies."
+
+# One binary, named `dbmd` (git / cargo / kubectl shape). The crate is
+# `dbmd-cli`; the artifact the user installs is `dbmd`.
+[[bin]]
+name = "dbmd"
+path = "src/main.rs"
+
+[dependencies]
+dbmd-core = { path = "../dbmd-core", version = "0.2.1" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `dbmd fm`/`dbmd log` build a `dbmd_core::LogEntry`, parse user RFC3339/date
+# timestamps, and render frontmatter YAML scalars (`fm get`). chrono + serde_yml
+# are the minimal glue for that — already `dbmd-core` deps, so MIT OR Apache-2.0
+# is vetted; recorded in /THIRD_PARTY_NOTICES.
+chrono = { workspace = true }
+serde_yml = { workspace = true }
+# `dbmd search`'s free-text step is an embedded-ripgrep scan run in the handler
+# over the candidate set that `dbmd-core` (`query` + `graph`) already resolved.
+# Plan Block 4 names these three explicitly; the same crates back `dbmd-core`,
+# so licenses (MIT / Unlicense / Apache-2.0) are already vetted in
+# /THIRD_PARTY_NOTICES.
+grep = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+insta = { workspace = true }
+# Integration-test driver for the `dbmd` binary (spawn, assert exit code +
+# stdout/stderr). Dev-only — never shipped in the binary. MIT OR Apache-2.0
+# (transitive `predicates`, `bstr`, `doc-comment`); recorded in
+# /THIRD_PARTY_NOTICES.
+assert_cmd = { workspace = true }

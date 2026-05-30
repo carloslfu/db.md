@@ -1,0 +1,21 @@
+{
+  "_comment": "`dbmd write` targeting a frozen page MUST refuse before writing. Hand-derived from SPEC § Validation (POLICY_FROZEN_PAGE) + DB.md ## Policies.",
+  "invocation": "dbmd write records/decisions/2026-q1-strategy --type decision --summary 'overwrite attempt' --json",
+  "exit_code_nonzero": true,
+  "no_write_occurred": true,
+  "error": {
+    "severity": "error",
+    "code": "POLICY_FROZEN_PAGE",
+    "file": "records/decisions/2026-q1-strategy.md",
+    "line": null,
+    "key": null,
+    "message": "write refused: 'records/decisions/2026-q1-strategy.md' is a frozen page per DB.md ## Policies → ### Frozen pages",
+    "suggestion": "escalate to the operator, or write to a different (non-frozen) path",
+    "related": [],
+    "policy_source": {
+      "file": "DB.md",
+      "heading": "## Policies → ### Frozen pages",
+      "line": 29
+    }
+  }
+}

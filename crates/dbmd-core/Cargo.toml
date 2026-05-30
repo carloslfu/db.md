@@ -1,0 +1,41 @@
+# dbmd-core — the db.md reference library.
+#
+# Owns ALL toolkit logic: parsing, store walk, graph, validation, stats,
+# query, render, summary composition, index maintenance, and the log.
+# Zero AI/LLM dependencies; no embeddings/vectors/ANN; embedded ripgrep
+# via the `grep` + `ignore` crates (never a bundled `rg`, never shelling
+# out). Every dependency is permissive — MIT / Apache-2.0 / BSD-2/3-Clause+0BSD
+# / Unlicense / MPL-2.0 / Zlib / Unicode-3.0 — and is recorded in
+# /THIRD_PARTY_NOTICES. No GPL/AGPL/LGPL-static.
+
+[package]
+name = "dbmd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reference library for db.md — the open database in plain files. Parsing, store walk, wiki-link graph, validation, query, and write-through indexes. Zero AI dependencies."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+regex = { workspace = true }
+grep = { workspace = true }
+ignore = { workspace = true }
+walkdir = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+# Document text extraction adapters (`extract` module). Deterministic format
+# decoders — zero AI/LLM, zero embeddings. All MIT; recorded in THIRD_PARTY_NOTICES.
+pdf-extract = { workspace = true }
+calamine = { workspace = true }
+html2text = { workspace = true }
+quick-xml = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+insta = { workspace = true }

@@ -1,0 +1,58 @@
+# db.md reference toolkit — Cargo workspace root.
+#
+# All logic lives in `dbmd-core`; `dbmd-cli` is a thin arg-parse/format
+# wrapper that produces the single `dbmd` binary. Any Rust tool wanting to
+# be db.md-aware does `cargo add dbmd-core` and gets the full library
+# (ripgrep precedent: the `grep`/`ignore` libs do the work, `rg` is thin).
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0"
+repository = "https://github.com/carloslfu/db.md"
+authors = ["Carlos Galarza"]
+
+# Shared dependency versions pinned once for the whole workspace.
+# Licenses are recorded in THIRD_PARTY_NOTICES (permissive only — MIT /
+# Apache-2.0 / BSD-2/3-Clause+0BSD / Unlicense / MPL-2.0 / Zlib / Unicode-3.0;
+# no GPL/AGPL/LGPL-static, and zero AI/LLM deps). The full allowlist and the
+# shipped crates that carry the non-MIT/Apache terms (Unicode-3.0, BSD-3-Clause,
+# Zlib) are enumerated in THIRD_PARTY_NOTICES and enforced by the
+# `license_policy` test in crates/dbmd-cli/tests/license_policy.rs.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+grep = "0.3"
+ignore = "0.4"
+walkdir = "2"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+thiserror = "2"
+# Document text extraction (dbmd extract). All MIT — recorded in THIRD_PARTY_NOTICES.
+# Zero AI/LLM, zero embeddings: these are deterministic format decoders.
+pdf-extract = "0.10"      # PDF text layer (MIT)
+calamine = "0.35"         # XLSX/ODS spreadsheet reader (MIT)
+html2text = "0.17"        # HTML → plain text (MIT)
+quick-xml = "0.40"        # docx/epub OOXML + XHTML parse (MIT)
+# `zip` with only the DEFLATE backend: docx/xlsx/epub containers use STORED +
+# DEFLATE only. Dropping default features removes the bzip2/lzma/zstd backends
+# (and the `bzip2-1.0.6`-licensed `libbz2-rs-sys`), shrinking the tree. The
+# DEFLATE backend it keeps pulls in `flate2` → `zlib-rs` (Zlib) + `zopfli`
+# (Apache-2.0); both are permissive and recorded in THIRD_PARTY_NOTICES (the
+# Zlib obligation is why `Zlib` is on the allowlist).
+zip = { version = "8", default-features = false, features = ["deflate"] }
+tempfile = "3"
+insta = "1"
+assert_cmd = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

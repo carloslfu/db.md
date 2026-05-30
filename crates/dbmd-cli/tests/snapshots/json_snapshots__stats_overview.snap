@@ -1,0 +1,5 @@
+---
+source: crates/dbmd-cli/tests/json_snapshots.rs
+expression: out
+---
+{"broken_link_count":0,"custom_types_present":[],"files_per_layer":{"records":505,"sources":6,"wiki":4},"orphan_count":2,"recognized_types_present":["company","contact","email","expense","invoice","meeting","pdf-source","wiki-page"],"top_types":[["expense",490],["company",5],["contact",4],["email",4],["wiki-page",4],["invoice",3],["meeting",3],["pdf-source",2]],"total_files":515,"total_size_bytes":199800,"type_distribution":{"company":5,"contact":4,"email":4,"expense":490,"invoice":3,"meeting":3,"pdf-source":2,"wiki-page":4}}

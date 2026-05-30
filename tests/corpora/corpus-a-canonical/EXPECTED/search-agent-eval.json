@@ -1,0 +1,245 @@
+{
+  "_comment": "Golden-master for the Block 7 agent-eval `dbmd search` eval over corpus-a-canonical: 20 representative queries spanning --type, --in, and --updated-after (the plan's Block 7 search-eval requirement). Queries 1-10 mirror this corpus's own EXPECTED/search.json (already-audited goldens); queries 11-20 are additional intent-derived cases. `matches` is the complete set, sorted by store-relative path ascending, derived from corpus content + the SPEC search contract (embedded ripgrep over the frontmatter+body of every CONTENT file; meta files DB.md/index.md/index.jsonl/log.md never match; --type narrows by frontmatter type, --in by layer, --updated-after compares the frontmatter `updated` strictly-after). Query strings are ripgrep regexes, case-sensitive by default. Consumed by crates/dbmd-cli/tests/agent_eval.rs.",
+  "queries": [
+    {
+      "query": "volume discount",
+      "args": [],
+      "intent": "Plain phrase, no filter; appears in the renewal call record and the project wiki page.",
+      "matches": [
+        "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md",
+        "wiki/projects/northstar-renewal.md"
+      ]
+    },
+    {
+      "query": "master services agreement",
+      "args": [],
+      "intent": "Distinctive body phrase in exactly one source doc (the MSA extraction).",
+      "matches": [
+        "sources/docs/2026-03-15-northstar-msa.md"
+      ]
+    },
+    {
+      "query": "async",
+      "args": [],
+      "intent": "Case-sensitive default term in Elena's contact record and her wiki bio.",
+      "matches": [
+        "records/contacts/elena-rodriguez.md",
+        "wiki/people/elena-rodriguez.md"
+      ]
+    },
+    {
+      "query": "renewal",
+      "args": [
+        "--in",
+        "wiki"
+      ],
+      "intent": "Layer-scoped: only wiki/ content files containing `renewal`.",
+      "matches": [
+        "wiki/people/elena-rodriguez.md",
+        "wiki/people/sarah-chen.md",
+        "wiki/projects/northstar-renewal.md",
+        "wiki/synthesis/2026-renewal-plan.md"
+      ]
+    },
+    {
+      "query": "175",
+      "args": [
+        "--type",
+        "meeting"
+      ],
+      "intent": "Type-scoped: only the renewal call mentions the 175-seat number.",
+      "matches": [
+        "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md"
+      ]
+    },
+    {
+      "query": "Northstar",
+      "args": [
+        "--type",
+        "contact"
+      ],
+      "intent": "Type-scoped to contacts; all four reference Northstar.",
+      "matches": [
+        "records/contacts/david-kim.md",
+        "records/contacts/elena-rodriguez.md",
+        "records/contacts/marcus-okafor.md",
+        "records/contacts/sarah-chen.md"
+      ]
+    },
+    {
+      "query": "(unpaid|void)",
+      "args": [
+        "--type",
+        "invoice"
+      ],
+      "intent": "Regex alternation, type-scoped; only the May AWS invoice is unpaid.",
+      "matches": [
+        "records/invoices/2026/05/2026-05-31-aws-may.md"
+      ]
+    },
+    {
+      "query": "Figma",
+      "args": [
+        "--type",
+        "company"
+      ],
+      "intent": "Type-scoped to companies; only the Figma company record.",
+      "matches": [
+        "records/companies/figma.md"
+      ]
+    },
+    {
+      "query": "2026-05-31",
+      "args": [
+        "--type",
+        "expense"
+      ],
+      "intent": "Type-scoped to expenses, narrowed by one shard date.",
+      "matches": [
+        "records/expenses/2026/05/2026-05-31-aws-0031.md",
+        "records/expenses/2026/05/2026-05-31-aws-0124.md",
+        "records/expenses/2026/05/2026-05-31-aws-0217.md",
+        "records/expenses/2026/05/2026-05-31-figma-0062.md",
+        "records/expenses/2026/05/2026-05-31-figma-0155.md",
+        "records/expenses/2026/05/2026-05-31-github-0093.md",
+        "records/expenses/2026/05/2026-05-31-github-0186.md"
+      ]
+    },
+    {
+      "query": "renewal",
+      "args": [
+        "--type",
+        "contact",
+        "--updated-after",
+        "2026-05-15"
+      ],
+      "intent": "Type + recency: contacts mentioning renewal, updated after 2026-05-15.",
+      "matches": [
+        "records/contacts/elena-rodriguez.md",
+        "records/contacts/sarah-chen.md"
+      ]
+    },
+    {
+      "query": "vendor",
+      "args": [
+        "--type",
+        "company"
+      ],
+      "intent": "Type-scoped to companies; the three vendors (aws, figma, github). acme=partner, northstar=customer excluded.",
+      "matches": [
+        "records/companies/aws.md",
+        "records/companies/figma.md",
+        "records/companies/github.md"
+      ]
+    },
+    {
+      "query": "renewal",
+      "args": [
+        "--type",
+        "meeting"
+      ],
+      "intent": "Type-scoped to meetings; the three renewal-themed meetings.",
+      "matches": [
+        "records/meetings/2026/04/2026-04-15-northstar-quarterly-review.md",
+        "records/meetings/2026/05/2026-05-12-internal-renewal-sync.md",
+        "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md"
+      ]
+    },
+    {
+      "query": "Acme",
+      "args": [
+        "--in",
+        "records"
+      ],
+      "intent": "Layer-scoped to records; the Acme company, the Northstar account it owns, and the two contacts that name Acme.",
+      "matches": [
+        "records/companies/acme.md",
+        "records/companies/northstar.md",
+        "records/contacts/david-kim.md",
+        "records/contacts/sarah-chen.md"
+      ]
+    },
+    {
+      "query": "175",
+      "args": [
+        "--in",
+        "wiki"
+      ],
+      "intent": "Layer-scoped to wiki; the three synthesis pages that cite the 175-seat figure.",
+      "matches": [
+        "wiki/people/sarah-chen.md",
+        "wiki/projects/northstar-renewal.md",
+        "wiki/synthesis/2026-renewal-plan.md"
+      ]
+    },
+    {
+      "query": "Director",
+      "args": [
+        "--type",
+        "contact"
+      ],
+      "intent": "Type-scoped to contacts; the two Directors (Elena, Sarah).",
+      "matches": [
+        "records/contacts/elena-rodriguez.md",
+        "records/contacts/sarah-chen.md"
+      ]
+    },
+    {
+      "query": "MSA",
+      "args": [
+        "--in",
+        "sources"
+      ],
+      "intent": "Layer-scoped to sources; the one MSA source doc.",
+      "matches": [
+        "sources/docs/2026-03-15-northstar-msa.md"
+      ]
+    },
+    {
+      "query": "github.com",
+      "args": [
+        "--type",
+        "company"
+      ],
+      "intent": "Type-scoped to companies; only the GitHub record carries that domain.",
+      "matches": [
+        "records/companies/github.md"
+      ]
+    },
+    {
+      "query": "logistics",
+      "args": [
+        "--in",
+        "records"
+      ],
+      "intent": "Layer-scoped to records; only the Northstar company is in logistics.",
+      "matches": [
+        "records/companies/northstar.md"
+      ]
+    },
+    {
+      "query": "Elena",
+      "args": [
+        "--type",
+        "contact"
+      ],
+      "intent": "Type-scoped to contacts; only Elena's record.",
+      "matches": [
+        "records/contacts/elena-rodriguez.md"
+      ]
+    },
+    {
+      "query": "renewal",
+      "args": [
+        "--type",
+        "wiki-page",
+        "--updated-after",
+        "2026-05-23"
+      ],
+      "intent": "Type + recency cutoff that excludes the 2026-05-22 bios/project, keeping only the 2026-05-23 synthesis page.",
+      "matches": [
+        "wiki/synthesis/2026-renewal-plan.md"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI: publishability guard. Runs the REAL crate-packaging operation
+# (`cargo package --workspace`) on every push & PR, so a packaging bug fails
+# HERE instead of at `cargo publish` time.
+#
+# Why this exists (incident 2026-05-30): `dbmd-cli` failed to publish because
+# `dbmd spec` used `include_str!("../../../../SPEC.md")` — a path that escapes
+# the crate root, so SPEC.md was absent from the package tarball. A second
+# issue surfaced the same day: a path-only dependency
+# (`dbmd-core = { path = "../dbmd-core" }`, no `version`) is rejected at publish.
+#
+# Neither is caught by `cargo build` / `cargo test`, because those build from
+# the workspace using the PATH dependency and the on-disk root files. `cargo
+# package` builds each crate from its packaged TARBALL — the same form
+# `cargo publish` ships — so it catches both, plus missing required metadata.
+# `--workspace` makes members verify against their locally-packaged versions,
+# so this needs nothing on crates.io and works across version bumps.
+name: publish-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: cargo package --workspace (publishability)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # Packages AND verify-builds every crate from its tarball. Exits non-zero
+      # on an include_str!/include_bytes! path that escapes the crate, a
+      # path-only dependency missing a version, or missing publish metadata.
+      - name: cargo package --workspace (catches the publish bugs build/test miss)
+        run: cargo package --workspace --locked

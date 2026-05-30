@@ -1,0 +1,21 @@
+{
+  "_comment": "A frozen page need not exist on disk for the refusal to fire — refusal is by policy path, not file presence. `wiki/synthesis/2026-annual-plan.md` is frozen in DB.md but absent from the corpus; creating it MUST still be refused.",
+  "invocation": "dbmd write wiki/synthesis/2026-annual-plan --type wiki-page --summary 'create attempt' --json",
+  "exit_code_nonzero": true,
+  "no_write_occurred": true,
+  "error": {
+    "severity": "error",
+    "code": "POLICY_FROZEN_PAGE",
+    "file": "wiki/synthesis/2026-annual-plan.md",
+    "line": null,
+    "key": null,
+    "message": "write refused: 'wiki/synthesis/2026-annual-plan.md' is a frozen page per DB.md ## Policies → ### Frozen pages",
+    "suggestion": "escalate to the operator, or write to a different (non-frozen) path",
+    "related": [],
+    "policy_source": {
+      "file": "DB.md",
+      "heading": "## Policies → ### Frozen pages",
+      "line": 30
+    }
+  }
+}

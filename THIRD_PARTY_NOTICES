@@ -1,0 +1,341 @@
+db.md — Third-party notices
+
+This file lists third-party software included in or relied on by the
+db.md reference toolkit (`crates/dbmd-core` + `crates/dbmd-cli`, building
+the single `dbmd` binary), with their licenses.
+
+Dependency licensing policy (enforced): permissive only. The allowlist of
+accepted SPDX license identifiers is:
+
+    MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, 0BSD, Unlicense,
+    MPL-2.0, Zlib, Unicode-3.0
+
+No GPL, no AGPL, no LGPL-static. Zero AI/LLM dependencies — no provider
+SDKs, no API keys, no model calls, no embeddings/vector/ANN crates of any
+kind. Ripgrep is embedded via the `grep` + `ignore` libraries (no bundled
+`rg` binary, no shelling out).
+
+This policy is mechanically enforced by TWO gates over the whole resolved
+tree, not by hand-maintaining this prose:
+
+1. `cargo deny check licenses bans` against `/deny.toml` (repo root), wired
+   into CI on every PR via `.github/workflows/licenses.yml`. `deny.toml`
+   carries the allowlist above and a banned-crate list (the AI/LLM provider
+   SDKs, every embeddings/vector/ANN crate, and any bundled `ripgrep`
+   binary), so a forbidden license OR a forbidden crate fails the build.
+2. The `license_policy` test in `crates/dbmd-cli/tests/license_policy.rs`,
+   run by `cargo test`: it walks the *shipped* (normal-edge) dependency
+   closure of the `dbmd` binary via `cargo metadata` and fails if any
+   crate's SPDX expression cannot be satisfied entirely from the allowlist
+   above (correct `AND`/`OR` semantics — a conjunctive term that is not on
+   the list, e.g. a copyleft `AND`, fails the build). Build/dev-only and
+   platform-foreign crates (Windows/wasm/etc.) are excluded because they do
+   not ship in the released Linux/macOS binary. This test also asserts its
+   allowlist is byte-identical to `deny.toml`'s, so the two gates can never
+   silently disagree.
+
+Re-run either gate after any dependency change; together they are the
+source of truth, this prose is the summary. Adding a dependency under any
+license not on the allowlist fails BOTH until the license is reviewed and
+added to `deny.toml` AND the test — and recorded in this file.
+
+Three shipped crates carry an obligation beyond plain MIT/Apache and so are
+called out explicitly (all three remain permissive and on the allowlist):
+
+- unicode-ident  (MIT OR Apache-2.0) AND Unicode-3.0
+    The `Unicode-3.0` term is CONJUNCTIVE — it cannot be opted out of by
+    choosing MIT or Apache, so the Unicode License v3 (a permissive
+    attribution license) always binds. The crate ships a separate
+    LICENSE-UNICODE file. Pulled in transitively by proc-macro2 / quote /
+    syn (the proc-macro toolchain behind serde_derive, clap_derive,
+    thiserror-impl), whose generated code is compiled into `dbmd`.
+- encoding_rs    (Apache-2.0 OR MIT) AND BSD-3-Clause
+    The `BSD-3-Clause` term is CONJUNCTIVE and always binds (covering the
+    bundled WHATWG encoding tables). BSD-3-Clause is on the allowlist.
+    Pulled in transitively under html2text (HTML/EPUB -> text).
+- zlib-rs        Zlib
+    A single (non-OR) Zlib license — the permissive Zlib license binds.
+    Pulled in under flate2's `zlib-rs` backend (docx/xlsx/epub DEFLATE).
+
+All other shipped crates resolve to MIT and/or Apache-2.0 (often as one
+branch of an `OR` expression alongside BSD/0BSD/Zlib/BSL-1.0 alternatives,
+which we discharge via the MIT/Apache branch).
+
+============================================================
+Direct Rust dependencies (dbmd-core)
+============================================================
+
+The following crates are direct dependencies of `dbmd-core`. The full
+transitive, shipped graph is enumerated and license-checked by the
+`license_policy` test (`crates/dbmd-cli/tests/license_policy.rs`,
+`cargo metadata`-driven); run `cargo test -p dbmd-cli license_policy`
+after any dependency change.
+
+- serde            1.x      MIT OR Apache-2.0   — serialization framework
+- serde_json       1.x      MIT OR Apache-2.0   — JSON (index.jsonl, --json output)
+- serde_yml        0.0.x    MIT OR Apache-2.0   — YAML frontmatter parse/emit
+                                                  (maintained fork of the
+                                                  now-deprecated serde_yaml)
+- regex            1.x      MIT OR Apache-2.0   — wiki-link + section extraction
+- grep             0.3.x    MIT OR Unlicense    — embedded ripgrep search engine
+- ignore           0.4.x    MIT OR Unlicense    — embedded ripgrep dir walk / gitignore
+- walkdir          2.x      MIT OR Unlicense    — recursive store walk (sweep ops)
+- chrono           0.4.x    MIT OR Apache-2.0   — RFC3339 / ISO-8601 timestamps
+- thiserror        2.x      MIT OR Apache-2.0   — error enum derive
+
+Document text extraction (the `extract` module — `dbmd extract`). These are
+deterministic format decoders only: no AI/LLM, no OCR, no embeddings.
+
+- pdf-extract      0.10.x   MIT                 — PDF text-layer extraction
+- calamine         0.35.x   MIT                 — XLSX/XLSM/XLSB/ODS spreadsheet reader
+- html2text        0.17.x   MIT                 — HTML → plain text (also used for
+                                                  EPUB chapter XHTML)
+- quick-xml        0.40.x   MIT                 — docx (WordprocessingML) + EPUB
+                                                  container/OPF/XHTML parsing
+- zip              8.x      MIT                 — docx/xlsx/epub ZIP container reader;
+                                                  built with default-features = false
+                                                  + only the `deflate` feature (drops
+                                                  the bzip2/lzma/zstd backends, incl.
+                                                  the `bzip2-1.0.6`-licensed
+                                                  `libbz2-rs-sys`). The kept DEFLATE
+                                                  backend pulls `flate2` → `zlib-rs`
+                                                  (Zlib) + `zopfli` (Apache-2.0); both
+                                                  permissive, both on the allowlist
+                                                  (zlib-rs's Zlib notice is reproduced
+                                                  in the attribution section below)
+
+EPUB crate choice — license exclusion: the popular `epub` crate is
+GPL-3.0, which violates this toolkit's permissive-only policy, so it is
+NOT used. EPUB is a ZIP whose OPF package declares a reading-order spine
+of XHTML documents; `dbmd` reads it with `zip` + `quick-xml` (container →
+OPF → spine) and flattens each chapter with `html2text` — all already
+present and all MIT. Same result, no GPL.
+
+DOCX crate choice: `docx-rs` was an option, but `quick-xml` is already a
+dependency (for EPUB) and `.docx` text is just the `<w:t>` runs of
+`word/document.xml`; reading them directly avoids a second XML/zip stack.
+
+PDF fallback (noted, not taken): if `pdf-extract` quality regresses, the
+plan permits swapping to `pdfium-render` + `bblanchon/pdfium-binaries`
+(BSD-3-Clause). That remains permissive-compliant; it is not in the tree
+today.
+
+YAML crate choice: `serde_yml` (the maintained continuation of
+`serde_yaml`, which was archived/deprecated upstream). Same
+MIT OR Apache-2.0 license; chosen for ongoing maintenance.
+
+============================================================
+Dev-only dependencies (not shipped in the binary)
+============================================================
+
+- tempfile         3.x      MIT OR Apache-2.0   — temp dirs for fixture tests
+- insta            1.x      MIT OR Apache-2.0   — snapshot / golden-master tests
+- assert_cmd       2.x      MIT OR Apache-2.0   — drive the `dbmd` binary in the
+                                                  dbmd-cli integration tests
+                                                  (spawn, assert exit code +
+                                                  stdout/stderr)
+  (transitive: predicates, predicates-core, predicates-tree, bstr, difflib,
+   termtree, wait-timeout — all MIT OR Apache-2.0 / MIT)
+
+============================================================
+Direct Rust dependencies (dbmd-cli — the thin `dbmd` binary)
+============================================================
+
+`dbmd-cli` parses args + formats output. Beyond the shared library deps
+(serde / serde_json) it adds the argument parser, plus the embedded-
+ripgrep trio that `dbmd search`'s free-text step runs in-handler over the
+candidate set `dbmd-core` resolves (plan Block 4). The ripgrep crates are
+the same ones `dbmd-core` already depends on (re-listed here because they
+are now also direct dependencies of the binary crate):
+
+- clap             4.x      MIT OR Apache-2.0   — derive-based subcommand
+                                                  parser, --help, exit codes
+  (transitive: clap_builder, clap_derive, clap_lex, anstream, anstyle,
+   anstyle-parse, anstyle-query, colorchoice, is_terminal_polyfill,
+   utf8parse, strsim — all MIT OR Apache-2.0)
+- grep             0.3.x    MIT OR Unlicense    — embedded ripgrep search engine
+                                                  (`dbmd search` free-text scan)
+- ignore           0.4.x    MIT OR Unlicense    — embedded ripgrep dir walk
+                                                  (no-filter candidate set)
+- regex            1.x      MIT OR Apache-2.0   — query-regex validation +
+                                                  link-target normalization
+- chrono           0.4.x    MIT OR Apache-2.0   — RFC3339/date parsing for
+                                                  `dbmd log` (entry timestamp,
+                                                  `since`) + `index query` windows
+- serde_yml        0.0.x    MIT OR Apache-2.0   — render a frontmatter YAML
+                                                  scalar for `dbmd fm get`
+
+============================================================
+Transitive dependency attribution notices (mandatory)
+============================================================
+
+Some transitive crates carry a *conjunctive* license term whose
+attribution must be preserved even though the crate is not a direct
+dependency. These are reproduced here because § 4(d) below requires
+redistributors to carry forward every attribution notice that ships in
+the binary.
+
+encoding_rs
+-----------
+- SPDX: `(Apache-2.0 OR MIT) AND BSD-3-Clause`
+- Repository: https://github.com/hsivonen/encoding_rs
+- Pulled in (shipped, not dev-only) transitively via: calamine,
+  codepage, quick-xml (spreadsheet/XML decoding); grep-searcher →
+  encoding_rs_io (the embedded-ripgrep search stack); and lopdf →
+  pdf-extract (PDF text extraction).
+
+The `(Apache-2.0 OR MIT)` half is permissive-or and covers the crate's
+own code (we take it under Apache-2.0, consistent with this toolkit). The
+`AND BSD-3-Clause` half is *conjunctive and mandatory*: it covers the
+character-encoding lookup tables derived from the data files of the
+WHATWG Encoding Standard, and its attribution cannot be waived by
+choosing Apache-or-MIT. encoding_rs ships this obligation as its
+`COPYRIGHT` + `LICENSE-WHATWG` files; both are reproduced verbatim below.
+
+COPYRIGHT (encoding_rs):
+
+    encoding_rs is copyright Mozilla Foundation.
+
+    Licensed under the Apache License, Version 2.0
+    <LICENSE-APACHE or
+    https://www.apache.org/licenses/LICENSE-2.0> or the MIT
+    license <LICENSE-MIT or https://opensource.org/licenses/MIT>,
+    at your option. All files in the project carrying such
+    notice may not be copied, modified, or distributed except
+    according to those terms.
+
+    This crate includes data derived from the data files supplied
+    with the WHATWG Encoding Standard, which, when incorporated into
+    source code, are licensed under the BSD 3-Clause License
+    <LICENSE-WHATWG>.
+
+LICENSE-WHATWG (BSD-3-Clause, encoding_rs):
+
+    Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice, this
+       list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright notice,
+       this list of conditions and the following disclaimer in the documentation
+       and/or other materials provided with the distribution.
+
+    3. Neither the name of the copyright holder nor the names of its
+       contributors may be used to endorse or promote products derived from
+       this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+    OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+unicode-ident
+-------------
+- SPDX: `(MIT OR Apache-2.0) AND Unicode-3.0`
+- Repository: https://github.com/dtolnay/unicode-ident
+- Pulled in (shipped, not dev-only) transitively via proc-macro2 / quote /
+  syn — the proc-macro toolchain behind serde_derive, clap_derive, and
+  thiserror-impl, whose generated code is compiled into `dbmd`.
+
+The `(MIT OR Apache-2.0)` half is permissive-or and covers the crate's own
+code (we take it under Apache-2.0). The `AND Unicode-3.0` half is
+*conjunctive and mandatory*: it covers the Unicode Character Database
+tables the crate embeds, and its attribution cannot be waived by choosing
+MIT-or-Apache. The crate ships it as a separate `LICENSE-UNICODE` file,
+reproduced verbatim below.
+
+LICENSE-UNICODE (Unicode License v3, unicode-ident):
+
+    UNICODE LICENSE V3
+
+    COPYRIGHT AND PERMISSION NOTICE
+
+    Copyright © 1991-2023 Unicode, Inc.
+
+    NOTICE TO USER: Carefully read the following legal agreement. BY
+    DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+    SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+    TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+    DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of data files and any associated documentation (the "Data Files") or
+    software and any associated documentation (the "Software") to deal in the
+    Data Files or Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, and/or sell
+    copies of the Data Files or Software, and to permit persons to whom the
+    Data Files or Software are furnished to do so, provided that either (a)
+    this copyright and permission notice appear with all copies of the Data
+    Files or Software, or (b) this copyright and permission notice appear in
+    associated Documentation.
+
+    THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+    KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+    THIRD PARTY RIGHTS.
+
+    IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+    BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+    OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+    WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+    FILES OR SOFTWARE.
+
+    Except as contained in this notice, the name of a copyright holder shall
+    not be used in advertising or otherwise to promote the sale, use or other
+    dealings in these Data Files or Software without prior written
+    authorization of the copyright holder.
+
+zlib-rs
+-------
+- SPDX: `Zlib` (single license, no `OR` alternative)
+- Repository: https://github.com/trifectatechfoundation/zlib-rs
+- Pulled in (shipped, not dev-only) transitively as the `flate2` DEFLATE
+  backend, which `zip` (docx/xlsx/epub) and lopdf → pdf-extract use.
+
+The Zlib license is permissive; its clause 3 requires the notice be
+preserved in source distributions, so it is reproduced verbatim below.
+`zopfli` (Apache-2.0, https://github.com/zopfli-rs/zopfli), the other crate
+the DEFLATE backend pulls in, is plain Apache-2.0 and is covered by the
+Apache-2.0 requirements at the end of this file.
+
+LICENSE (Zlib, zlib-rs):
+
+    (C) 2024 Trifecta Tech Foundation
+
+    This software is provided 'as-is', without any express or implied
+    warranty. In no event will the authors be held liable for any damages
+    arising from the use of this software.
+
+    Permission is granted to anyone to use this software for any purpose,
+    including commercial applications, and to alter it and redistribute it
+    freely, subject to the following restrictions:
+
+    1. The origin of this software must not be misrepresented; you must not
+       claim that you wrote the original software. If you use this software
+       in a product, an acknowledgment in the product documentation would be
+       appreciated but is not required.
+
+    2. Altered source versions must be plainly marked as such, and must not be
+       misrepresented as being the original software.
+
+    3. This notice may not be removed or altered from any source distribution.
+
+============================================================
+Apache-2.0 redistribution requirements
+============================================================
+
+Per § 4(d) of the Apache-2.0 LICENSE, redistributions must:
+1. Include a copy of the LICENSE file.
+2. Include this NOTICE / THIRD_PARTY_NOTICES content with any
+   attribution notices preserved.
+3. State any modifications you made to the files.

@@ -1,0 +1,5 @@
+---
+source: crates/dbmd-cli/tests/json_snapshots.rs
+expression: out
+---
+["records/companies/northstar","records/contacts/sarah-chen","records/meetings/2026/04/2026-04-15-northstar-quarterly-review","sources/docs/2026-03-15-northstar-msa","wiki/people/elena-rodriguez","wiki/people/sarah-chen","wiki/synthesis/2026-renewal-plan"]

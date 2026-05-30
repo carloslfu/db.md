@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# License + dependency-ban gate for the db.md Rust toolkit.
+#
+# Enforces THIRD_PARTY_NOTICES' policy as a build gate so the NOTICES file
+# and the shipped dependency tree can no longer silently drift:
+#   * licenses — every crate's SPDX expression must be satisfiable by the
+#     permissive allow-list in deny.toml (no GPL/AGPL/LGPL-static).
+#   * bans     — the zero-AI/LLM and no-embeddings/vectors/ANN hard rules,
+#     plus "no bundled ripgrep binary" (ripgrep is embedded via grep+ignore).
+#
+# Mirrors the local command exactly:  cargo deny check licenses bans
+
+name: licenses
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'deny.toml'
+      - '.github/workflows/licenses.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'deny.toml'
+      - '.github/workflows/licenses.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: cargo-deny (licenses + bans)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans
