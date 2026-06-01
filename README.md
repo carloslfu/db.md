@@ -45,6 +45,8 @@ Point any agent harness at the store — the SPEC becomes its contract:
 claude --append-system "$(dbmd spec)"     # Claude Code, Codex, or any harness
 ```
 
+The format is at **v0.1** — tagged [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1); changes are additive only.
+
 ## The curator is your agent
 
 db.md ships **no LLM runtime and no API keys**. "Curator" is a role
