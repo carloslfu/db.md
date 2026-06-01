@@ -8,9 +8,16 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — stable at **v0.1**.
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.2.3**.
+  `Cargo.toml`, currently **v0.2.4**.
 
 ## [Unreleased]
+
+## [0.2.4] — 2026-06-01
+
+- **Release process documented.** Added `RELEASING.md` (a cold-start release
+  runbook) and `AGENTS.md`, and referenced the tagged `SPEC.md` v0.1 from the
+  README. The `crates-io` publish environment no longer requires a manual
+  approval click (solo maintainer). No functional changes to the toolkit.
 
 ## [0.2.3] — 2026-05-30
 
