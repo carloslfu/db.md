@@ -12,7 +12,7 @@ One directory, three layers, one config file. Raw evidence lives in
 narrative in `wiki/`. Identity, agent instructions, policies, and
 schemas all live in a single `DB.md` file at the root. An agent
 runtime you bring (Claude Code, Codex, or your own) plays the curator
-role, guided by the SPEC and the store's `DB.md`.
+role, guided by the [SPEC](SPEC.md) and the store's `DB.md`.
 
 ```
 db/
@@ -39,7 +39,7 @@ dbmd links records/contacts/sarah-chen    # who links to this record?
 dbmd index rebuild db                     # regenerate the index hierarchy
 ```
 
-Point any agent runtime at the store. The SPEC becomes its contract:
+Point any agent runtime at the store. The [SPEC](SPEC.md) becomes its contract:
 
 ```bash
 claude --append-system "$(dbmd spec)"     # Claude Code, Codex, or any runtime
@@ -51,10 +51,10 @@ The format is at **v0.1**, tagged [`v0.1`](https://github.com/carloslfu/db.md/re
 
 db.md ships **no LLM runtime and no API keys**. "Curator" is a role
 any agent runtime plays: Claude Code, Codex, or your own. The agent
-reads the SPEC (`dbmd spec`), follows the curator contract, and
+reads the [SPEC](SPEC.md) (`dbmd spec`), follows the curator contract, and
 operates the store through `dbmd` subcommands. The toolkit is
 deterministic file/data plumbing; the agent does the reasoning. See
-SPEC.md § The curator contract and § The agent session.
+[SPEC.md](SPEC.md) § The curator contract and § The agent session.
 
 ## Why files
 
@@ -179,7 +179,7 @@ The question under every alternative is the same: what sits between you and your
 
 For the genuinely hard remainder (high write concurrency, ACID, sub-millisecond reads, billions-row aggregates), a real database still backs db.md. That is the roadmap, not the claim for today.
 
-db.md composes with the rest of the agent stack: AGENTS.md for instructions, MCP for tools. Different layers, not alternatives.
+db.md composes with the rest of the agent stack: [computer.md](https://github.com/carloslfu/computer.md/blob/main/spec/SPEC.md) for the agentic computer that runs it, AGENTS.md for instructions, MCP for tools. Different layers, not alternatives.
 
 Your data belongs in files you own, not behind a server, a vendor, or a cache. The tool stays small and model-free; the intelligence is the agent's, rented not built. Bet on the model, not the machinery.
 
@@ -189,7 +189,7 @@ db.md is a self-contained standard. A plain markdown vault becomes a
 db.md store: Obsidian users, researchers running a topic wiki, an
 agentic computer keeping its company brain, any agent runtime with a
 folder of markdown. No platform, no account, no hosted service
-required. The spec is the contract; the runtime is replaceable.
+required. [The spec](SPEC.md) is the contract; the runtime is replaceable.
 
 ## Contributing
 
