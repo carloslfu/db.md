@@ -4,10 +4,12 @@
 # This is the machine-enforced form of the dependency policy that
 # THIRD_PARTY_NOTICES states in prose. Run locally with:
 #
-#     cargo deny check licenses bans
+#     cargo deny check advisories licenses bans
 #
-# CI runs the same gate (.github/workflows/licenses.yml) so the NOTICES
-# file and the shipped dependency tree can no longer silently drift.
+# CI runs these gates so the NOTICES file, the shipped dependency tree, and
+# the advisory status can no longer silently drift:
+#   * .github/workflows/licenses.yml  -> licenses + bans
+#   * .github/workflows/audit.yml     -> advisories (also on a daily schedule)
 #
 # Schema: https://embarkstudios.github.io/cargo-deny/
 
@@ -102,12 +104,21 @@ deny = [
 ]
 
 # ---------------------------------------------------------------------------
-# Advisories / sources: scope this config to licenses + bans for now.
-# `cargo deny check licenses bans` is what CI runs; advisory + source policy
-# can be tightened later without changing the license gate above.
+# Advisories: fail on any open RustSec advisory in the resolved tree
+# (vulnerability, unsound, unmaintained, or yanked). Enforced by CI in
+# .github/workflows/audit.yml (`cargo deny check advisories`), on dependency
+# changes and on a daily schedule. With `version = 2`, every matching advisory
+# is an error; to accept a specific one, add its RUSTSEC id to `ignore` below
+# WITH a justifying comment. Empty today: the tree is advisory-clean (the
+# serde_yml -> serde_norway migration cleared RUSTSEC-2025-0067/0068).
 [advisories]
 version = 2
+ignore = []
 
+# ---------------------------------------------------------------------------
+# Sources: warn (not deny) on crates from outside crates.io, so the
+# intra-workspace path dep (dbmd-cli -> dbmd-core) does not fail. Tighten to
+# "deny" if a git or unknown-registry dependency is ever introduced.
 [sources]
 unknown-registry = "warn"
 unknown-git = "warn"

@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Advisory gate for the db.md Rust toolkit.
+#
+# Fails the build when any crate in the resolved dependency tree carries an
+# open RustSec advisory (vulnerability, unsound, unmaintained, or yanked).
+# This is the gate that turns "Dependabot alert after merge" into "fail the
+# PR": it would have caught serde_yml / libyml (RUSTSEC-2025-0067/0068)
+# before they shipped.
+#
+# License + dependency-ban policy is a separate gate (licenses.yml). Advisory
+# policy lives in deny.toml [advisories]. Runs on dependency changes AND on a
+# daily schedule, so a newly-published advisory against an unchanged
+# dependency is caught even with no code change (which is how serde_yml became
+# a problem in the first place).
+
+name: audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
+  schedule:
+    # Daily at 07:00 UTC: catch advisories published against existing deps.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: cargo-deny (advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
