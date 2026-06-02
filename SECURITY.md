@@ -29,7 +29,7 @@ files only — no telemetry, no provider calls, no key handling. If
 an agent harness driving `dbmd` sends file contents to an LLM, that
 data flow belongs to the harness; review its configuration.
 
-**Frontmatter parsing uses `serde_yml`.** YAML deserialization has
+**Frontmatter parsing uses `serde_norway`.** YAML deserialization has
 historically been a source of exploits when parsing untrusted
 input. `dbmd` deserializes into typed structures, not arbitrary
 code paths, which limits the attack surface. If you parse db.md

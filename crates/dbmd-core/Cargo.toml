@@ -22,7 +22,7 @@ description = "Reference library for db.md — the open database in plain files.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
+serde_norway = { workspace = true }
 regex = { workspace = true }
 grep = { workspace = true }
 ignore = { workspace = true }

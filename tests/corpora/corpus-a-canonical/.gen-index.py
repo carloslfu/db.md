@@ -61,7 +61,7 @@ def parse_frontmatter(path):
 
 
 # A YAML loader that does NOT implicitly resolve dates/timestamps, mirroring
-# serde_yml: an unquoted `2026-04-01` is a String, not a date type (serde_json
+# serde_norway: an unquoted `2026-04-01` is a String, not a date type (serde_json
 # then serializes it as a JSON string). PyYAML's SafeLoader otherwise coerces
 # ISO dates to datetime.date / datetime.datetime, which (a) aren't
 # JSON-serializable and (b) wouldn't match the Rust string form.

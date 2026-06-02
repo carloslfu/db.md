@@ -73,9 +73,9 @@ after any dependency change.
 
 - serde            1.x      MIT OR Apache-2.0   — serialization framework
 - serde_json       1.x      MIT OR Apache-2.0   — JSON (index.jsonl, --json output)
-- serde_yml        0.0.x    MIT OR Apache-2.0   — YAML frontmatter parse/emit
-                                                  (maintained fork of the
-                                                  now-deprecated serde_yaml)
+- serde_norway     0.9.x    MIT OR Apache-2.0   — YAML frontmatter parse/emit
+                                                  (maintained serde_yaml fork;
+                                                  advisory-free backend)
 - regex            1.x      MIT OR Apache-2.0   — wiki-link + section extraction
 - grep             0.3.x    MIT OR Unlicense    — embedded ripgrep search engine
 - ignore           0.4.x    MIT OR Unlicense    — embedded ripgrep dir walk / gitignore
@@ -120,9 +120,12 @@ plan permits swapping to `pdfium-render` + `bblanchon/pdfium-binaries`
 (BSD-3-Clause). That remains permissive-compliant; it is not in the tree
 today.
 
-YAML crate choice: `serde_yml` (the maintained continuation of
-`serde_yaml`, which was archived/deprecated upstream). Same
-MIT OR Apache-2.0 license; chosen for ongoing maintenance.
+YAML crate choice: `serde_norway` (a maintained `serde_yaml` fork).
+`serde_yaml` is archived/deprecated upstream, and the previously-used
+`serde_yml` plus its `libyml` backend were both flagged unsound and
+unmaintained (RUSTSEC-2025-0068 / RUSTSEC-2025-0067). `serde_norway` and
+its `unsafe-libyaml-norway` backend carry no open advisories. Same
+MIT OR Apache-2.0 license.
 
 ============================================================
 Dev-only dependencies (not shipped in the binary)
@@ -162,7 +165,7 @@ are now also direct dependencies of the binary crate):
 - chrono           0.4.x    MIT OR Apache-2.0   — RFC3339/date parsing for
                                                   `dbmd log` (entry timestamp,
                                                   `since`) + `index query` windows
-- serde_yml        0.0.x    MIT OR Apache-2.0   — render a frontmatter YAML
+- serde_norway     0.9.x    MIT OR Apache-2.0   — render a frontmatter YAML
                                                   scalar for `dbmd fm get`
 
 ============================================================

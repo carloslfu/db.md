@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset};
-use serde_yml::{Mapping, Value};
+use serde_norway::{Mapping, Value};
 
 /// The three canonical layer folder names. A path is "content" / a wiki-link is
 /// "full-path" only when it resolves under one of these.
@@ -30,7 +30,7 @@ pub enum ParseError {
         /// The file whose frontmatter failed to parse.
         file: PathBuf,
         /// The underlying YAML error.
-        source: serde_yml::Error,
+        source: serde_norway::Error,
     },
 
     /// The file has no `---`-delimited frontmatter block at its very start.
@@ -108,7 +108,7 @@ impl Frontmatter {
         let value: Value = if yaml.trim().is_empty() {
             Value::Mapping(Mapping::new())
         } else {
-            serde_yml::from_str(yaml).map_err(|source| ParseError::MalformedYaml {
+            serde_norway::from_str(yaml).map_err(|source| ParseError::MalformedYaml {
                 file: file.to_path_buf(),
                 source,
             })?
@@ -120,10 +120,10 @@ impl Frontmatter {
             Value::Mapping(m) => m,
             Value::Null => Mapping::new(),
             other => {
-                // serde_yml::Error has no public constructor, so manufacture a
+                // serde_norway::Error has no public constructor, so manufacture a
                 // representative one by deserializing the (sequence/scalar)
                 // value into a Mapping, which always fails with a type error.
-                let source = serde_yml::from_value::<Mapping>(other)
+                let source = serde_norway::from_value::<Mapping>(other)
                     .expect_err("non-mapping frontmatter top level deserializes to Mapping");
                 return Err(ParseError::MalformedYaml {
                     file: file.to_path_buf(),
@@ -163,7 +163,7 @@ impl Frontmatter {
         //   type, id, created, updated, summary  (universal head)
         //   <type-specific extra, BTreeMap-sorted>
         //   status, tags                          (universal tail)
-        // serde_yml::Mapping preserves insertion order, so one serialize call
+        // serde_norway::Mapping preserves insertion order, so one serialize call
         // emits the block in exactly this order with correct YAML quoting.
         let mut map = Mapping::new();
 
@@ -219,7 +219,7 @@ impl Frontmatter {
         if map.is_empty() {
             return String::new();
         }
-        serde_yml::to_string(&Value::Mapping(map)).unwrap_or_default()
+        serde_norway::to_string(&Value::Mapping(map)).unwrap_or_default()
     }
 
     /// True if the file is content (under `sources/`, `records/`, or `wiki/`)
@@ -299,7 +299,7 @@ impl Frontmatter {
                 // Accept either a YAML flow list (`[a, b]`) or a single scalar
                 // tag. Anything that parses to a sequence becomes the tag list;
                 // otherwise the whole string is one tag.
-                self.tags = match serde_yml::from_str::<Value>(value) {
+                self.tags = match serde_norway::from_str::<Value>(value) {
                     Ok(Value::Sequence(seq)) => parse_tags(&Value::Sequence(seq)),
                     _ => vec![value.to_string()],
                 };
@@ -700,7 +700,7 @@ pub fn extract_markdown_links(body: &str, file: &Path) -> Vec<MarkdownLink> {
 /// item that is itself a sequence-of-sequences, whereas a scalar inline link's
 /// single item is a sequence-of-scalars.
 pub fn detect_flow_form_link_lists(frontmatter_yaml: &str) -> Vec<String> {
-    let value: Value = match serde_yml::from_str(frontmatter_yaml) {
+    let value: Value = match serde_norway::from_str(frontmatter_yaml) {
         Ok(v) => v,
         // Malformed YAML is FM_MALFORMED_YAML's job, not ours; report nothing.
         Err(_) => return Vec::new(),
@@ -1076,7 +1076,7 @@ fn links_in_field_value(value: &Value) -> Vec<WikiLink> {
 /// a value back into the canonical emitted form before it is written:
 ///
 /// - a **scalar** wiki-link (quoted `String("[[x]]")` or unquoted `Seq[Seq[String]]`,
-///   one element) → a quoted scalar `Value::String("[[x]]")`, which serde_yml emits
+///   one element) → a quoted scalar `Value::String("[[x]]")`, which serde_norway emits
 ///   inline as `'[[x]]'` — the form the finding confirms survives a round-trip and
 ///   that [`links_in_field_value`] reads back as the same scalar link;
 /// - a **list** of wiki-links (in any spelling [`links_in_field_value`] accepts) →
@@ -1193,7 +1193,7 @@ fn parse_link_list_value(value: &str) -> Option<Value> {
     if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
         return None;
     }
-    let Ok(Value::Sequence(items)) = serde_yml::from_str::<Value>(trimmed) else {
+    let Ok(Value::Sequence(items)) = serde_norway::from_str::<Value>(trimmed) else {
         return None;
     };
     // A single inline `[[x]]` parses to `Seq[ Seq[String(x)] ]` (one item, itself

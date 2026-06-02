@@ -707,7 +707,7 @@ impl Store {
     fn read_updated(&self, abs: &Path) -> Option<DateTime<FixedOffset>> {
         let text = std::fs::read_to_string(abs).ok()?;
         let yaml = frontmatter_block(&text)?;
-        let value: serde_yml::Value = serde_yml::from_str(yaml).ok()?;
+        let value: serde_norway::Value = serde_norway::from_str(yaml).ok()?;
         let raw = value.get("updated")?;
         value_to_datetime(raw)
     }
@@ -896,7 +896,7 @@ fn primary_date_field(type_: &str) -> Option<&'static str> {
 
 /// Parse a YAML value into an RFC3339 [`DateTime`], accepting both an explicit
 /// string and a YAML-native scalar rendered to string.
-fn value_to_datetime(value: &serde_yml::Value) -> Option<DateTime<FixedOffset>> {
+fn value_to_datetime(value: &serde_norway::Value) -> Option<DateTime<FixedOffset>> {
     let s = yaml_scalar_string(value)?;
     DateTime::parse_from_rfc3339(s.trim()).ok()
 }
@@ -904,7 +904,7 @@ fn value_to_datetime(value: &serde_yml::Value) -> Option<DateTime<FixedOffset>> 
 /// Extract `(YYYY, MM)` from a YAML date/timestamp value. Lenient: matches a
 /// leading `YYYY-MM` so a bare `2026-05-22` date and a full
 /// `2026-05-22T10:00:00-07:00` timestamp both work.
-fn value_to_year_month(value: &serde_yml::Value) -> Option<(String, String)> {
+fn value_to_year_month(value: &serde_norway::Value) -> Option<(String, String)> {
     let s = yaml_scalar_string(value)?;
     year_month_from_str(s.trim())
 }
@@ -938,14 +938,14 @@ fn year_month_from_str(s: &str) -> Option<(String, String)> {
 /// Render a YAML scalar as a string: a real `String` verbatim, otherwise the
 /// value's compact YAML serialization (covers timestamps that the YAML engine
 /// may surface as a non-string scalar).
-fn yaml_scalar_string(value: &serde_yml::Value) -> Option<String> {
+fn yaml_scalar_string(value: &serde_norway::Value) -> Option<String> {
     if let Some(s) = value.as_str() {
         return Some(s.to_string());
     }
     match value {
-        serde_yml::Value::Null => None,
-        serde_yml::Value::Mapping(_) | serde_yml::Value::Sequence(_) => None,
-        other => serde_yml::to_string(other)
+        serde_norway::Value::Null => None,
+        serde_norway::Value::Mapping(_) | serde_norway::Value::Sequence(_) => None,
+        other => serde_norway::to_string(other)
             .ok()
             .map(|s| s.trim().to_string()),
     }
@@ -1428,7 +1428,7 @@ mod tests {
     fn fm_with_extra(key: &str, value: &str) -> Frontmatter {
         let mut fm = Frontmatter::default();
         fm.extra
-            .insert(key.to_string(), serde_yml::Value::String(value.to_string()));
+            .insert(key.to_string(), serde_norway::Value::String(value.to_string()));
         fm
     }
 
@@ -1492,7 +1492,7 @@ mod tests {
         let store = open(&dir);
         let mut fm = fm_with_created("2020-01-01T00:00:00Z");
         fm.extra
-            .insert("date".into(), serde_yml::Value::String("2026-05-22".into()));
+            .insert("date".into(), serde_norway::Value::String("2026-05-22".into()));
         let p = store.shard_path_for("expense", &fm, "x").unwrap();
         // The primary `date` (2026/05), not `created` (2020/01), drives the shard.
         assert_eq!(p, PathBuf::from("records/expenses/2026/05/x.md"));

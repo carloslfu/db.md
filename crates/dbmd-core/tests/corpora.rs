@@ -655,7 +655,7 @@ fn corpus_a_db_md_schemas_and_policies_parse_per_spec() {
         .expect("expense.currency");
     assert_eq!(
         currency.default,
-        Some(serde_yml::Value::String("USD".to_string())),
+        Some(serde_norway::Value::String("USD".to_string())),
         "`default USD` must parse into the field's default value"
     );
 

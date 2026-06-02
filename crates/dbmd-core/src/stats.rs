@@ -266,9 +266,9 @@ fn is_full_path(target: &Path) -> bool {
 /// `---` fences, parse the block as a YAML mapping, read `type` as a string.
 fn parse_type(text: &str) -> Option<String> {
     let yaml = frontmatter_block(text)?;
-    let value: serde_yml::Value = serde_yml::from_str(&yaml).ok()?;
+    let value: serde_norway::Value = serde_norway::from_str(&yaml).ok()?;
     let mapping = value.as_mapping()?;
-    let type_val = mapping.get(serde_yml::Value::String("type".to_string()))?;
+    let type_val = mapping.get(serde_norway::Value::String("type".to_string()))?;
     let s = type_val.as_str()?.trim();
     if s.is_empty() {
         None

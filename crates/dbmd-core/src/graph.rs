@@ -646,7 +646,7 @@ fn read_summary_and_type(store: &Store, rel: &Path) -> (String, Option<String>) 
         Some(y) => y,
         None => return (String::new(), None),
     };
-    let value: serde_yml::Value = match serde_yml::from_str(yaml) {
+    let value: serde_norway::Value = match serde_norway::from_str(yaml) {
         Ok(v) => v,
         Err(_) => return (String::new(), None),
     };

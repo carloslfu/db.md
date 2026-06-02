@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime};
-use serde_yml::Value;
+use serde_norway::Value;
 
 use crate::parser::{FieldSpec, Schema, Shape};
 use crate::store::Store;
@@ -382,7 +382,7 @@ fn check_content_file(
     };
 
     // Parse the YAML block.
-    let fm: Option<BTreeMap<String, Value>> = match serde_yml::from_str::<Value>(&fm_yaml) {
+    let fm: Option<BTreeMap<String, Value>> = match serde_norway::from_str::<Value>(&fm_yaml) {
         Ok(Value::Mapping(map)) => Some(yaml_map_to_btree(&map)),
         // An empty frontmatter block parses as Null; treat as an empty mapping.
         Ok(Value::Null) => Some(BTreeMap::new()),
@@ -1770,7 +1770,7 @@ fn check_index_scope(
     let Some((yaml, _, _)) = split_frontmatter(&text) else {
         return;
     };
-    let Ok(Value::Mapping(map)) = serde_yml::from_str::<Value>(&yaml) else {
+    let Ok(Value::Mapping(map)) = serde_norway::from_str::<Value>(&yaml) else {
         return;
     };
     let fm = yaml_map_to_btree(&map);
@@ -1957,7 +1957,7 @@ fn check_db_md(store: &Store, issues: &mut Vec<Issue>) {
 
     // Parse the frontmatter mapping. If it doesn't parse, we can still say the
     // identity contract is unmet (no provable `type: db-md`, no provable fields).
-    let fm: Option<BTreeMap<String, Value>> = match serde_yml::from_str::<Value>(&fm_yaml) {
+    let fm: Option<BTreeMap<String, Value>> = match serde_norway::from_str::<Value>(&fm_yaml) {
         Ok(Value::Mapping(map)) => Some(yaml_map_to_btree(&map)),
         Ok(Value::Null) => Some(BTreeMap::new()),
         _ => None,
@@ -2174,7 +2174,7 @@ fn split_frontmatter(text: &str) -> Option<(String, String, u32)> {
 fn read_summary(abs: &Path) -> Option<String> {
     let text = std::fs::read_to_string(abs).ok()?;
     let (yaml, _, _) = split_frontmatter(&text)?;
-    let value: Value = serde_yml::from_str(&yaml).ok()?;
+    let value: Value = serde_norway::from_str(&yaml).ok()?;
     if let Value::Mapping(m) = value {
         m.get(Value::String("summary".into()))
             .and_then(scalar_string)
@@ -2183,9 +2183,9 @@ fn read_summary(abs: &Path) -> Option<String> {
     }
 }
 
-/// Convert a `serde_yml` mapping into a string-keyed [`BTreeMap`], dropping
+/// Convert a `serde_norway` mapping into a string-keyed [`BTreeMap`], dropping
 /// non-string keys (frontmatter keys are always strings).
-fn yaml_map_to_btree(map: &serde_yml::Mapping) -> BTreeMap<String, Value> {
+fn yaml_map_to_btree(map: &serde_norway::Mapping) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     for (k, v) in map {
         if let Value::String(s) = k {
@@ -2761,7 +2761,7 @@ fn link_target_type(store: &Store, target: &str) -> Option<String> {
     let abs = store.root.join(format!("{bare}.md"));
     let text = std::fs::read_to_string(&abs).ok()?;
     let (yaml, _, _) = split_frontmatter(&text)?;
-    let value: Value = serde_yml::from_str(&yaml).ok()?;
+    let value: Value = serde_norway::from_str(&yaml).ok()?;
     if let Value::Mapping(m) = value {
         m.get(Value::String("type".into())).and_then(scalar_string)
     } else {

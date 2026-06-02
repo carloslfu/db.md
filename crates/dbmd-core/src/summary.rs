@@ -10,7 +10,7 @@
 //! bound). The tool generates a deterministic floor; the agent provides the
 //! ceiling via `dbmd fm set <file> summary='...'`.
 
-use serde_yml::Value;
+use serde_norway::Value;
 
 use crate::parser::Frontmatter;
 use crate::store::Store;
@@ -460,7 +460,7 @@ fn wiki_link_target(s: &str) -> Option<String> {
 fn read_frontmatter_name(abs: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(abs).ok()?;
     let yaml = frontmatter_block(&text)?;
-    let value: Value = serde_yml::from_str(&yaml).ok()?;
+    let value: Value = serde_norway::from_str(&yaml).ok()?;
     // `&str` indexes a YAML mapping; `None` for non-mappings or absent `name`.
     value.get("name")?.as_str().map(str::to_string)
 }
@@ -530,10 +530,10 @@ mod tests {
     }
 
     /// Build a [`Frontmatter`] from a YAML map literal so tests state intent in
-    /// YAML, not by hand-poking `extra`. This goes through `serde_yml` exactly
+    /// YAML, not by hand-poking `extra`. This goes through `serde_norway` exactly
     /// like a real file's frontmatter would.
     fn fm(yaml: &str) -> Frontmatter {
-        let value: Value = serde_yml::from_str(yaml).expect("test yaml parses");
+        let value: Value = serde_norway::from_str(yaml).expect("test yaml parses");
         let mapping = value.as_mapping().expect("test yaml is a mapping").clone();
         let mut f = Frontmatter::default();
         for (k, v) in mapping {

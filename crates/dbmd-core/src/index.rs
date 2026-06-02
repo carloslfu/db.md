@@ -18,7 +18,7 @@
 //!
 //! - **Self-contained, by design.** This module does its own shard-aware folder
 //!   walk, its own minimal frontmatter read, and its own atomic write, using
-//!   only `store.root` (a public field) and the `serde_yml` / `serde_json` /
+//!   only `store.root` (a public field) and the `serde_norway` / `serde_json` /
 //!   `chrono` / `walkdir` crates rather than routing through the sibling
 //!   `store`/`parser` helpers ([`Store::walk_type_folder`],
 //!   [`Store::recent_in_type_folder`], [`parser::read_file`], …). The index has
@@ -781,10 +781,10 @@ struct FileMeta {
 fn read_frontmatter(abs: &Path) -> crate::Result<FileMeta> {
     let text = fs::read_to_string(abs)?;
     let yaml = extract_frontmatter_block(&text).unwrap_or_default();
-    let map: serde_yml::Mapping = if yaml.trim().is_empty() {
-        serde_yml::Mapping::new()
+    let map: serde_norway::Mapping = if yaml.trim().is_empty() {
+        serde_norway::Mapping::new()
     } else {
-        serde_yml::from_str(&yaml).map_err(|e| {
+        serde_norway::from_str(&yaml).map_err(|e| {
             crate::Error::Store(crate::store::StoreError::BadTypeIndex {
                 path: abs.to_path_buf(),
                 message: format!("frontmatter YAML: {e}"),
@@ -857,10 +857,10 @@ fn extract_frontmatter_block(text: &str) -> Option<String> {
 
 /// Read a string scalar or a sequence-of-string-scalars into a `Vec<String>`.
 /// Wiki-link items keep their `[[…]]` form verbatim.
-fn yaml_string_list(v: &serde_yml::Value) -> Vec<String> {
+fn yaml_string_list(v: &serde_norway::Value) -> Vec<String> {
     match v {
-        serde_yml::Value::String(s) => vec![s.clone()],
-        serde_yml::Value::Sequence(seq) => seq
+        serde_norway::Value::String(s) => vec![s.clone()],
+        serde_norway::Value::Sequence(seq) => seq
             .iter()
             .filter_map(|item| item.as_str().map(str::to_string))
             .collect(),

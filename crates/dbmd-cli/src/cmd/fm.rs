@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use serde_yml::Value as YamlValue;
+use serde_norway::Value as YamlValue;
 
 use crate::cli::{FmArgs, FmCommand, FmGetArgs, FmInitArgs, FmQueryArgs, FmSetArgs};
 use crate::cmd::log::{into_cli, open_store};
@@ -296,7 +296,7 @@ fn render_scalar(v: &YamlValue) -> String {
             .map(render_scalar)
             .collect::<Vec<_>>()
             .join(", "),
-        YamlValue::Mapping(_) | YamlValue::Tagged(_) => serde_yml::to_string(v)
+        YamlValue::Mapping(_) | YamlValue::Tagged(_) => serde_norway::to_string(v)
             .unwrap_or_default()
             .trim()
             .to_string(),

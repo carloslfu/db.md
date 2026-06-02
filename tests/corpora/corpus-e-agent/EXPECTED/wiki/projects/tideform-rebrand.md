@@ -1,7 +1,7 @@
 ---
 type: wiki-page
-created: '2026-05-29T17:12:00+00:00'
-updated: '2026-05-29T17:12:00+00:00'
+created: 2026-05-29T17:12:00+00:00
+updated: 2026-05-29T17:12:00+00:00
 summary: Tideform phase-one mobile rebrand; $45k fixed fee, eight-week term
 derived_from:
 - '[[sources/emails/2026/04/2026-04-09-tideform-project-intro]]'

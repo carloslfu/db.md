@@ -476,7 +476,7 @@ fn read_file_timestamps(
         Some(y) => y,
         None => return (None, None),
     };
-    let value: serde_yml::Value = match serde_yml::from_str(yaml) {
+    let value: serde_norway::Value = match serde_norway::from_str(yaml) {
         Ok(v) => v,
         Err(_) => return (None, None),
     };
@@ -509,15 +509,15 @@ fn frontmatter_block(text: &str) -> Option<&str> {
 
 /// Render a YAML scalar as a string (a real string verbatim; otherwise its
 /// compact serialization, covering YAML-native timestamps).
-fn yaml_scalar_string(value: &serde_yml::Value) -> Option<String> {
+fn yaml_scalar_string(value: &serde_norway::Value) -> Option<String> {
     if let Some(s) = value.as_str() {
         return Some(s.to_string());
     }
     match value {
-        serde_yml::Value::Null | serde_yml::Value::Mapping(_) | serde_yml::Value::Sequence(_) => {
+        serde_norway::Value::Null | serde_norway::Value::Mapping(_) | serde_norway::Value::Sequence(_) => {
             None
         }
-        other => serde_yml::to_string(other)
+        other => serde_norway::to_string(other)
             .ok()
             .map(|s| s.trim().to_string()),
     }
