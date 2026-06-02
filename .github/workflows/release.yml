@@ -338,3 +338,71 @@ jobs:
           }
           publish_if_new dbmd-core   # dependency first; cargo waits for the index
           publish_if_new dbmd-cli
+
+  # ── Update the Homebrew tap formula (no-op without HOMEBREW_TAP_TOKEN) ────
+  # Renders HomebrewFormula/dbmd.rb.template with this release's version +
+  # the per-target sha256s from the published SHA256SUMS, then pushes
+  # Formula/dbmd.rb to github.com/carloslfu/homebrew-tap so
+  # `brew install carloslfu/tap/dbmd` tracks the latest release with no
+  # hand-render. Needs `publish` (reads the release's SHA256SUMS). Skips
+  # cleanly on forks or when HOMEBREW_TAP_TOKEN is unset — same gate shape
+  # as computer.md's tap job. Until that secret is set on this repo the job
+  # is inert; the formula is then maintained by hand (HomebrewFormula/render.sh
+  # <version> <SHA256SUMS> > Formula/dbmd.rb).
+  homebrew:
+    name: Update Homebrew tap
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tap token
+        id: tok
+        run: |
+          if [ -z "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN unset — skipping tap update"
+          fi
+
+      - name: Download SHA256SUMS from the release
+        if: steps.tok.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "v${{ needs.version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'SHA256SUMS' --dir .
+
+      - name: Render formula
+        if: steps.tok.outputs.skip != 'true'
+        run: |
+          chmod +x HomebrewFormula/render.sh
+          HomebrewFormula/render.sh "${{ needs.version.outputs.version }}" SHA256SUMS > dbmd.rb
+          echo "--- rendered formula ---"
+          cat dbmd.rb
+
+      - name: Push to tap repo
+        if: steps.tok.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="carloslfu/homebrew-tap"
+          if ! gh repo view "$REPO" >/dev/null 2>&1; then
+            echo "tap repo $REPO not accessible with HOMEBREW_TAP_TOKEN; skipping"
+            exit 0
+          fi
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" tap-repo
+          mkdir -p tap-repo/Formula
+          cp dbmd.rb tap-repo/Formula/dbmd.rb
+          cd tap-repo
+          git config user.name  "dbmd-release-bot"
+          git config user.email "release-bot@vibecraft.so"
+          git add Formula/dbmd.rb
+          if git diff --cached --quiet; then
+            echo "no formula changes"
+            exit 0
+          fi
+          git commit -m "dbmd: update to v${{ needs.version.outputs.version }}"
+          git push origin HEAD

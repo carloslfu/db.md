@@ -1185,8 +1185,8 @@ operations. See `TOOLS.md` for the full toolkit reference.
 **Agent bootstrap (two lines, any harness):**
 
 ```bash
-# 1 — install the binary (one Rust binary, ~5MB, MIT/Apache)
-cargo install dbmd-cli
+# 1 — install the binary (~5MB, prebuilt, no toolchain; or cargo with Rust)
+curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
 # 2 — load the SPEC into the harness's system prompt
 claude --append-system "$(dbmd spec)"                     # Claude Code

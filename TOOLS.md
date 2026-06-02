@@ -103,16 +103,17 @@ validation, stats, query, index/log ops. Precedent: ripgrep's
 
 ## Install
 
-**Primary — from crates.io** (needs the Rust toolchain):
+**Recommended — prebuilt binary, no toolchain** (macOS + Linux):
 
 ```bash
-cargo install dbmd-cli
+curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 ```
 
 **Alternatives** (same binary, different mechanism):
 
 ```bash
 brew install carloslfu/tap/dbmd     # Homebrew tap
+cargo install dbmd-cli              # if you already have the Rust toolchain
 # or download a prebuilt tarball from the GitHub releases page:
 #   https://github.com/carloslfu/db.md/releases
 ```
@@ -123,8 +124,8 @@ attestations (`gh attestation verify <tarball> --repo carloslfu/db.md`).
 ## Agent bootstrap
 
 ```bash
-# 1 — install
-cargo install dbmd-cli
+# 1 — install (prebuilt binary; or `cargo install dbmd-cli` with Rust)
+curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
 # 2 — load the SPEC into the harness's system prompt
 claude --append-system "$(dbmd spec)"            # Claude Code

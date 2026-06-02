@@ -29,9 +29,18 @@ Then watch the run and verify (see "Verify" below).
 | Version bump + changelog | **you / agent** (before tagging) |
 | Build 4 platforms, GitHub release, SHA256SUMS, provenance attestation | CI (`release.yml`, on tag) |
 | Publish `dbmd-core` then `dbmd-cli` to crates.io via OIDC | CI (`publish-crates` job, on tag) |
+| Bump the Homebrew tap formula (`carloslfu/homebrew-tap`) | CI (`homebrew` job, on tag) — **only if `HOMEBREW_TAP_TOKEN` is set** |
 | Approval click | **none** — the `crates-io` environment has no required reviewers |
 
 Pushing to `main` never publishes. Only a `vX.Y.Z` tag does.
+
+**Homebrew tap:** the `homebrew` job renders `HomebrewFormula/dbmd.rb.template`
+(via `HomebrewFormula/render.sh <version> SHA256SUMS`) and pushes
+`Formula/dbmd.rb` to `carloslfu/homebrew-tap`. It needs a
+`HOMEBREW_TAP_TOKEN` secret (a PAT with push access to the tap) on this repo;
+without it the job **skips cleanly** and the formula must be bumped by hand:
+`HomebrewFormula/render.sh X.Y.Z SHA256SUMS > Formula/dbmd.rb` (download
+`SHA256SUMS` from the release first), then commit it to the tap.
 
 ## Files to bump (must all agree on the version)
 
