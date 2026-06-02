@@ -215,3 +215,10 @@ The `dbmd-cli` and `dbmd-core` crates publish to crates.io through Trusted
 Publishing (OIDC), so no long-lived registry token exists to leak. The
 toolkit ships zero AI/LLM dependencies and its tree is MIT/Apache, so you
 can audit it or build from source. See [RELEASING.md](RELEASING.md).
+
+**Dependencies are continuously audited.** Every pull request runs
+`cargo deny check advisories`, so the build fails on any open RustSec
+advisory (vulnerability, unsound, or unmaintained). The tree is also
+watched by GitHub Dependabot and Socket supply-chain scanning (malware,
+typosquats, suspicious install scripts), and every crate plus its license
+is recorded in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

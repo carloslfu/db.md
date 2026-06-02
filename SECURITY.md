@@ -63,3 +63,9 @@ store you operate on.
 tree (every crate + its license is recorded in
 [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES); MIT/Apache/BSD/
 Unlicense/MPL only, zero AI/LLM crates). Build from source to verify.
+
+Every pull request runs `cargo deny check advisories` (the build fails
+on any open RustSec advisory) and `cargo deny check licenses bans` (the
+permissive-only license policy is machine-enforced). GitHub Dependabot
+and Socket supply-chain scanning watch the dependency tree continuously.
+See [`deny.toml`](deny.toml) and the workflows under `.github/workflows/`.
