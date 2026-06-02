@@ -11,7 +11,7 @@ One directory, three layers, one config file. Raw evidence lives in
 `sources/`, atomic typed data in `records/`, curator-synthesized
 narrative in `wiki/`. Identity, agent instructions, policies, and
 schemas all live in a single `DB.md` file at the root. An agent
-harness you bring (Claude Code, Codex, or your own) plays the curator
+runtime you bring (Claude Code, Codex, or your own) plays the curator
 role, guided by the SPEC and the store's `DB.md`.
 
 ```
@@ -39,18 +39,18 @@ dbmd links records/contacts/sarah-chen    # who links to this record?
 dbmd index rebuild db                     # regenerate the index hierarchy
 ```
 
-Point any agent harness at the store — the SPEC becomes its contract:
+Point any agent runtime at the store. The SPEC becomes its contract:
 
 ```bash
-claude --append-system "$(dbmd spec)"     # Claude Code, Codex, or any harness
+claude --append-system "$(dbmd spec)"     # Claude Code, Codex, or any runtime
 ```
 
-The format is at **v0.1** — tagged [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1); changes are additive only.
+The format is at **v0.1**, tagged [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1); changes are additive only.
 
 ## The curator is your agent
 
 db.md ships **no LLM runtime and no API keys**. "Curator" is a role
-any agent harness plays — Claude Code, Codex, or your own. The agent
+any agent runtime plays: Claude Code, Codex, or your own. The agent
 reads the SPEC (`dbmd spec`), follows the curator contract, and
 operates the store through `dbmd` subcommands. The toolkit is
 deterministic file/data plumbing; the agent does the reasoning. See
@@ -58,7 +58,7 @@ SPEC.md § The curator contract and § The agent session.
 
 ## Why files
 
-The database has been a service for decades — a daemon, a wire
+The database has been a service for decades: a daemon, a wire
 protocol, a schema migration tool, an admin UI. That made sense when
 storage was expensive and indexes had to live in RAM. It doesn't
 anymore.
@@ -67,8 +67,8 @@ db.md inverts the shape:
 
 - **The database is the directory.** No daemon, no port.
 - **The schema is the frontmatter.** Type-tagged, additive, optional.
-- **The index is derived.** db.md ships its own — a hierarchical
-  `index.md` catalog plus embedded ripgrep — and reaches millions of
+- **The index is derived.** db.md ships its own (a hierarchical
+  `index.md` catalog plus embedded ripgrep) and reaches millions of
   files with no vector database. Build a SQLite or tantivy index on
   top if another tool needs one; the files stay the source of truth.
 
@@ -79,11 +79,11 @@ Three properties files have that tables don't:
 - **LLM-native.** The format an LLM reads best is the format a human
   reads best.
 
-Most databases are not Google-scale — they are records with a form
+Most databases are not Google-scale; they are records with a form
 or a dashboard on top: a CRM, an ops tracker, a contract register,
 the internal tools a company rebuilds, the SaaS apps that are a
 database with a UI bolted on. db.md replaces the database for that
-whole class, and the app over it — the agent reads the records and
+whole class, and the app over it. The agent reads the records and
 builds the view on demand. The genuinely hard remainder (high write
 concurrency, ACID, sub-millisecond reads, billions-row aggregates)
 is where the roadmap takes db.md next (the packed engine, projected
@@ -93,11 +93,11 @@ eventually, all of them, and never by adding vectors.
 
 Extends Karpathy's April 2026 LLM Wiki pattern from topic scope to
 **company scope**: customers, vendors, contracts, decisions,
-meetings, expenses, processes, playbooks — maintained by the
+meetings, expenses, processes, playbooks, all maintained by the
 curator agent the team directs.
 
 The native toolkit holds company scale: a company's full email
-history — hundreds of thousands to millions of records — on plain
+history (hundreds of thousands to millions of records) on plain
 files with embedded ripgrep, no vector database. See
 [SPEC.md § Scale](SPEC.md) for the budgets and the sizing model.
 
@@ -108,10 +108,10 @@ toolkit is **one Rust binary**, `dbmd`:
 
 - **One binary, many subcommands** (git / cargo / kubectl shape) for
   read / write / validate / extract / graph / index / log ops.
-- **Embedded ripgrep** (via the `grep` crate) for fast search — no
-  separate `rg` to install.
+- **Embedded ripgrep** (via the `grep` crate) for fast search, with
+  no separate `rg` to install.
 - **Built-in extraction** (`dbmd extract`) for PDF / docx / xlsx /
-  epub / html via MIT Rust crates — no GPL `pdfgrep`, no AGPL `rga`.
+  epub / html via MIT Rust crates. No GPL `pdfgrep`, no AGPL `rga`.
 - **Zero LLM dependencies.** No provider SDKs, no API keys. The agent
   runtime is BYO.
 - **`dbmd-core` library.** All logic lives in the library crate; the
@@ -119,8 +119,9 @@ toolkit is **one Rust binary**, `dbmd`:
   db.md-aware Rust tools.
 
 Install: `cargo install dbmd-cli` (from crates.io), or
-`brew install carloslfu/tap/dbmd`, or download a prebuilt binary
-from the [GitHub releases](https://github.com/carloslfu/db.md/releases).
+`brew install carloslfu/tap/dbmd`, or download a prebuilt binary from the
+[GitHub releases](https://github.com/carloslfu/db.md/releases) (checksummed
+and provenance-attested; see [Security](#security)).
 See [TOOLS.md](TOOLS.md) for the full subcommand surface and the agent
 bootstrap pattern.
 
@@ -135,7 +136,7 @@ db.md/
 ├── crates/
 │   ├── dbmd-core/      # library: parser, store, graph, validate, stats, query, index, log
 │   └── dbmd-cli/       # the `dbmd` binary (thin wrappers)
-├── db/                 # the project's own db.md store — the dogfood, see below
+├── db/                 # the project's own db.md store (the dogfood, see below)
 ├── examples/           # role-flavored example stores (three-layer: sources/ records/ wiki/)
 │   ├── research-wiki/
 │   ├── ops-store/
@@ -145,19 +146,19 @@ db.md/
 └── tests/corpora/      # test stores (canonical, edges, formats, scale, agent)
 ```
 
-The flagship worked example is `db/` — db.md's own knowledge as a
+The flagship worked example is `db/`, db.md's own knowledge as a
 db.md store: the research that grounds the design under `sources/`,
 every material build decision under `records/decisions/`, and the
 narrative synthesis under `wiki/`. It is how db.md itself was built,
 and the answer to "how do you run db.md at company scale?" is to read
 the store of how db.md itself was built. It is co-located with the
-code and operated by `dbmd` as the toolkit grows — an agentic computer
+code and operated by `dbmd` as the toolkit grows. An agentic computer
 typically ships with its own db.md store at `~/db/`.
 
 ## License
 
 [Apache-2.0](LICENSE). Patent grant, trademark clause, explicit
-modification disclosure. CLA on every PR via CLA Assistant — see
+modification disclosure. CLA on every PR via CLA Assistant. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## How db.md relates to other approaches
@@ -185,10 +186,10 @@ Your data belongs in files you own, not behind a server, a vendor, or a cache. T
 ## Independently usable
 
 db.md is a self-contained standard. A plain markdown vault becomes a
-db.md store — Obsidian users, researchers running a topic wiki, an
-agentic computer keeping its company brain, any harness with a folder
-of markdown. No platform, no account, no hosted service required. The
-spec is the contract; the runtime is replaceable.
+db.md store: Obsidian users, researchers running a topic wiki, an
+agentic computer keeping its company brain, any agent runtime with a
+folder of markdown. No platform, no account, no hosted service
+required. The spec is the contract; the runtime is replaceable.
 
 ## Contributing
 
@@ -197,6 +198,20 @@ the CLA Assistant bot on your first PR.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Report vulnerabilities privately via
-GitHub's "Report a vulnerability" (Security tab); do not open a public
-issue for security problems.
+Report vulnerabilities privately via GitHub's "Report a vulnerability"
+(Security tab); do not open a public issue for security problems. See
+[SECURITY.md](SECURITY.md).
+
+**Releases are auditable and trusted.** Every release is built in CI from
+a tagged commit, not from a developer's machine. Prebuilt tarballs carry
+SHA256 checksums and build-provenance attestations, so anyone can confirm
+a download came from this repo's CI and was not tampered with:
+
+```bash
+gh attestation verify dbmd-<version>-<target>.tar.gz --repo carloslfu/db.md
+```
+
+The `dbmd-cli` and `dbmd-core` crates publish to crates.io through Trusted
+Publishing (OIDC), so no long-lived registry token exists to leak. The
+toolkit ships zero AI/LLM dependencies and its tree is MIT/Apache, so you
+can audit it or build from source. See [RELEASING.md](RELEASING.md).
