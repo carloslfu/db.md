@@ -92,6 +92,9 @@ pub enum IndexLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexRecord {
     /// Store-relative path of the file (the upsert key; last-write-wins).
+    /// Serialized with forward slashes regardless of OS (see [`path_serde`]) so
+    /// the `index.jsonl` catalog is byte-portable across platforms.
+    #[serde(with = "path_serde")]
     pub path: PathBuf,
     /// The file's `type`.
     #[serde(rename = "type")]
@@ -426,6 +429,17 @@ impl Index {
             write_atomic(&root_index_md, render_root_md_with_store(store, &root_idx))?;
         }
         Ok(())
+    }
+
+    /// Rebuild ONE type-folder's `index.md`/`index.jsonl` from a fresh walk, then
+    /// cascade the new child count up to the layer and root rollups — so a
+    /// scoped `dbmd index rebuild --folder` leaves the hierarchy consistent,
+    /// exactly like `rebuild_all` and the loop-path `on_write` already do.
+    /// (Writing only the folder, as the CLI used to, left stale layer/root
+    /// counts that `validate` would then flag as an index desync.)
+    pub fn rebuild_folder(store: &Store, folder: &Path) -> crate::Result<()> {
+        Self::write_level(store, &IndexLevel::TypeFolder(folder.to_path_buf()))?;
+        update_parents(store, folder)
     }
 
     /// Atomically write a single level's artifact(s) to disk.
@@ -1143,6 +1157,25 @@ fn path_to_unix(p: &Path) -> String {
         .filter_map(|c| c.as_os_str().to_str())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Serde for [`IndexRecord::path`]: always forward-slash on the wire, so the
+/// `index.jsonl` catalog is identical whether the store was written on POSIX or
+/// Windows (a git clone across OSes yields the same paths, and the last-write-
+/// wins upsert key never splits on separator style). On POSIX this matches the
+/// default `PathBuf` serialization; on Windows it rewrites `\` to `/`.
+mod path_serde {
+    use super::path_to_unix;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::{Path, PathBuf};
+
+    pub fn serialize<S: Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&path_to_unix(p))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        Ok(PathBuf::from(String::deserialize(d)?))
+    }
 }
 
 /// ASCII-capitalize the first character.

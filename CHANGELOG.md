@@ -8,9 +8,61 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.0**.
+  `Cargo.toml`, currently **v0.3.1**.
 
 ## [Unreleased]
+
+## [0.3.1] — 2026-06-03
+
+A world-class hardening pass — a deep adversarial audit of every core module
+(parser, validate, store, index, log, graph, stats, summary) plus the two gaps
+left open at 0.3.0. Every finding was adversarially verified and fixed with a
+regression test; the toolkit stays clippy-clean (`-D warnings`) and
+`unsafe`-free.
+
+### Format (additive to v0.2)
+
+- **`shard: by-date | flat` schema directive** — on a `### <type>` block in
+  `DB.md ## Schemas`, declare whether that type's records are date-sharded on
+  disk or kept flat. It overrides the built-in default, so a custom event type
+  opts into sharding the generic v0.2 way, and any type can force flat.
+
+### Toolkit
+
+#### Fixed
+
+- **Schema validation no longer silently accepts a non-scalar value.** A shape-
+  or enum-constrained field holding a YAML list or mapping now flags
+  `SCHEMA_SHAPE_MISMATCH` instead of skipping the check entirely.
+- **Frontmatter parsing no longer panics** on a YAML-tagged top-level mapping
+  (a `!tag` on the frontmatter) — it is handled, never aborts the process.
+- **`validate` flags a type-folder `index.md` entry that is missing its summary
+  text** when the file has a `summary` (`INDEX_SUMMARY_MISMATCH`), per the SPEC.
+- **Content files named `log.md` / `DB.md` inside a layer are no longer dropped**
+  from store walks — those names are reserved only at the store root, so a
+  `records/…/log.md` is real content to `validate` / `index` / `stats`.
+- **`dbmd stats` orphan count now agrees with `dbmd graph orphans`** for
+  self-linking files (a self-link is not a graph edge in either surface).
+- **`summary_template` interpolates `{tags}` / `{created}` / `{updated}`** — the
+  typed universal fields, which previously rendered empty.
+- **A bare `enum` schema modifier** (`enum, a, b`, no colon) no longer includes
+  the keyword `enum` itself as an allowed value.
+- **`dbmd index rebuild --folder` cascades to the layer and root rollups**
+  instead of leaving stale counts a later `validate` would flag as an index
+  desync — consistent with `rebuild` and the write-through path.
+- **`index.jsonl` paths are written OS-independently** (forward slashes), so the
+  catalog is byte-portable across platforms (a Windows-written store cloned onto
+  POSIX and vice versa).
+
+#### Internal
+
+- The atomic, **durable** write for primary data (content records, `log.md` and
+  its archives, link rewrites) is now one shared `dbmd_core::write_atomic`
+  primitive (temp file + fsync + rename + parent-dir fsync) instead of four
+  near-identical copies. The rebuildable `index.md` / `index.jsonl` keep their
+  intentionally lighter, atomic-but-not-fsync write — a crash-lost catalog entry
+  is recovered by `dbmd index rebuild`, so a per-write fsync there would be cost
+  without benefit.
 
 ## [0.3.0] — 2026-06-03
 

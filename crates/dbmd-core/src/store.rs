@@ -31,7 +31,15 @@ use crate::parser::{parse_db_md, Config, Frontmatter};
 /// Basenames that are never content files: the config marker and the two
 /// curator-maintained catalogs. The store walks skip these so a SWEEP over the
 /// content layers never mistakes a catalog for a record.
-const NON_CONTENT_BASENAMES: [&str; 3] = ["DB.md", "index.md", "log.md"];
+///
+/// Only `index.md` is excluded by basename, because the content walks traverse
+/// the layer dirs (`sources/`/`records/`/`wiki/`) and `index.md` is the only
+/// meta file that appears INSIDE them. The root `DB.md` / `log.md` (and the
+/// `log/` archive) live at the store root, outside every layer, so they are
+/// never reached by these walks — and a content file that merely happens to be
+/// named `DB.md` or `log.md` inside a layer (e.g. `records/docs/DB.md`) is real
+/// content the SPEC does NOT reserve at type-folder depth.
+const NON_CONTENT_BASENAMES: [&str; 1] = ["index.md"];
 
 /// The complete machine-twin sidecar that backs every structured read.
 const TYPE_INDEX_FILE: &str = "index.jsonl";
@@ -1255,6 +1263,40 @@ mod tests {
                 "sources/emails/2026/05/a.md".to_string(),
                 "wiki/people/sarah.md".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn walk_includes_content_named_log_md_or_db_md_inside_a_layer() {
+        let dir = empty_store();
+        let root = dir.path();
+        // A content file that merely happens to be named log.md / DB.md INSIDE a
+        // layer is real content — those names are reserved only at the store root.
+        write(
+            root,
+            "records/configs/log.md",
+            &content_md("2026-05-01T00:00:00Z"),
+        );
+        write(
+            root,
+            "sources/docs/DB.md",
+            &content_md("2026-05-02T00:00:00Z"),
+        );
+        // The derived catalog twin is still skipped at any depth.
+        write(root, "records/configs/index.md", "---\ntype: index\n---\n");
+        let store = open(&dir);
+        let got = rels(&store.walk().unwrap());
+        assert!(
+            got.contains(&"records/configs/log.md".to_string()),
+            "layer-internal log.md is content: {got:?}"
+        );
+        assert!(
+            got.contains(&"sources/docs/DB.md".to_string()),
+            "layer-internal DB.md is content: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p.ends_with("index.md")),
+            "index.md is still skipped: {got:?}"
         );
     }
 

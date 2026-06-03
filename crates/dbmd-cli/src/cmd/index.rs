@@ -76,9 +76,7 @@ pub fn run_rebuild(ctx: &Context, args: &IndexRebuildArgs) -> CliResult {
     match &scope {
         RebuildScope::Full => Index::rebuild_all(&store)?,
         RebuildScope::Layer(layer) => rebuild_layer(&store, *layer)?,
-        RebuildScope::Folder(folder) => {
-            Index::write_level(&store, &IndexLevel::TypeFolder(folder.clone()))?
-        }
+        RebuildScope::Folder(folder) => Index::rebuild_folder(&store, folder)?,
     }
 
     if ctx.json {

@@ -108,6 +108,12 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
     let mut linked_to: HashSet<PathBuf> = HashSet::new();
     for file in &facts {
         for target in file.resolvable_targets() {
+            // A self-link is not a graph edge — skip it (matches `graph::orphans`,
+            // so the two surfaces agree on whether a self-only-linking file is an
+            // orphan). It is neither incoming nor broken.
+            if target == &file.node_id {
+                continue;
+            }
             if existing_nodes.contains(target) {
                 linked_to.insert(target.clone());
             } else {
@@ -130,7 +136,7 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
 
         let has_outgoing = file
             .resolvable_targets()
-            .any(|t| existing_nodes.contains(t));
+            .any(|t| t != &file.node_id && existing_nodes.contains(t));
         let has_incoming = linked_to.contains(&file.node_id);
         if !has_outgoing && !has_incoming {
             stats.orphan_count += 1;
@@ -486,6 +492,23 @@ mod tests {
 
         let s = compute(&store).expect("compute");
         assert_eq!(s.orphan_count, 1, "only c is an orphan");
+    }
+
+    #[test]
+    fn a_file_with_only_a_self_link_is_an_orphan_matching_graph() {
+        let (_d, store) = temp_store();
+        // A file that links only to ITSELF has no real graph edge, so it must be
+        // an orphan — consistent with `graph::orphans` (which skips self-links).
+        write_rel(
+            &store,
+            "records/contacts/solo.md",
+            "---\ntype: contact\nsummary: solo\n---\n\nSee [[records/contacts/solo]].\n",
+        );
+        let s = compute(&store).expect("compute");
+        assert_eq!(
+            s.orphan_count, 1,
+            "a self-only-linking file is an orphan: {s:?}"
+        );
     }
 
     #[test]

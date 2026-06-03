@@ -14,6 +14,9 @@
 /tests/corpora/corpus-d-scale/
 /tests/corpora/corpus-d-scale-1m/
 
+# Stray compile artifact (an anonymous `rustc` / doctest binary lands here)
+/rust_out
+
 # OS noise
 .DS_Store
 

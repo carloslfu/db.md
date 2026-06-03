@@ -120,15 +120,23 @@ impl Frontmatter {
             Value::Mapping(m) => m,
             Value::Null => Mapping::new(),
             other => {
-                // serde_norway::Error has no public constructor, so manufacture a
-                // representative one by deserializing the (sequence/scalar)
-                // value into a Mapping, which always fails with a type error.
-                let source = serde_norway::from_value::<Mapping>(other)
-                    .expect_err("non-mapping frontmatter top level deserializes to Mapping");
-                return Err(ParseError::MalformedYaml {
-                    file: file.to_path_buf(),
-                    source,
-                });
+                // serde_norway::Error has no public constructor, so let the
+                // deserializer decide: a value that coerces to a Mapping (e.g. a
+                // YAML-tagged mapping `!tag\n k: v`, where the tag is ambient) is
+                // accepted as that mapping; a genuine scalar or sequence top
+                // level fails to coerce and IS the malformed case. (Using a
+                // match here, not `expect_err`, avoids a panic on the
+                // tagged-mapping case, which deserializes to a Mapping just
+                // fine.)
+                match serde_norway::from_value::<Mapping>(other) {
+                    Ok(m) => m,
+                    Err(source) => {
+                        return Err(ParseError::MalformedYaml {
+                            file: file.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
             }
         };
 
@@ -987,11 +995,20 @@ pub fn parse_field_spec(bullet_line: &str) -> FieldSpec {
             // preserving original case.
             let value = token["default ".len()..].trim().to_string();
             spec.default = Some(Value::String(value));
-        } else if lower.starts_with("enum:") || lower == "enum" {
-            // Rejoin this token and every remaining token to recover the full
-            // comma-separated value list.
+        } else if lower == "enum" {
+            // Bare `enum` keyword (`enum, open, closed`): the values are the
+            // REMAINING tokens — the keyword itself must not leak in as a value.
+            let values: Vec<String> = raw[i + 1..]
+                .iter()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect();
+            spec.enum_values = Some(values);
+            break; // enum consumed the rest of the line
+        } else if lower.starts_with("enum:") {
+            // `enum: open, closed` form: rejoin this token and the rest, then
+            // drop everything up to and including the `:`.
             let mut joined = raw[i..].join(",");
-            // Drop the leading `enum:` keyword (case-insensitive).
             if let Some(colon) = joined.find(':') {
                 joined = joined[colon + 1..].to_string();
             }
@@ -1686,6 +1703,20 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_with_yaml_tag_on_mapping_does_not_panic() {
+        // Regression: a YAML tag on the top-level mapping made the old
+        // `expect_err` path PANIC, because a tagged mapping deserializes to a
+        // `Mapping` just fine. It must now be handled — accepted as the inner
+        // mapping, never a panic.
+        let fm = Frontmatter::parse("!mytag\ntype: contact\nsummary: hi\n", Path::new("x.md"))
+            .expect("tagged-mapping frontmatter must parse, not panic");
+        assert_eq!(fm.type_.as_deref(), Some("contact"));
+        // A genuine scalar/sequence top level is still malformed (and still
+        // doesn't panic).
+        assert!(Frontmatter::parse("- a\n- b\n", Path::new("x.md")).is_err());
+    }
+
+    #[test]
     fn parse_empty_block_is_empty_frontmatter() {
         let fm = Frontmatter::parse("", Path::new("f.md")).unwrap();
         assert_eq!(fm, Frontmatter::default());
@@ -2299,6 +2330,18 @@ mod tests {
                 "closed".to_string(),
                 "pending".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn parse_field_spec_bare_enum_keyword_is_not_itself_a_value() {
+        // `enum` with no colon: the values are the remaining tokens; the keyword
+        // itself must NOT leak in as an allowed value.
+        let f = parse_field_spec("- status (required, enum, open, closed)");
+        assert!(f.required);
+        assert_eq!(
+            f.enum_values,
+            Some(vec!["open".to_string(), "closed".to_string()])
         );
     }
 

@@ -121,8 +121,22 @@ fn field_value(fm: &Frontmatter, key: &str) -> Option<Value> {
         "id" => fm.id.clone().map(Value::String),
         "summary" => fm.summary.clone().map(Value::String),
         "status" => fm.status.clone().map(Value::String),
-        // `created` / `updated` are typed timestamps; no composer reads them as
-        // a field, so we don't reconstruct a Value for them here.
+        // Typed universal fields a `summary_template` may legitimately
+        // interpolate. `created`/`updated` render as their canonical RFC3339
+        // string; `tags` as a sequence (which `list_field_texts` comma-joins).
+        // Without these arms, `{created}` / `{updated}` / `{tags}` would
+        // silently render empty even when the value is present.
+        "created" => fm.created.map(|t| Value::String(t.to_rfc3339())),
+        "updated" => fm.updated.map(|t| Value::String(t.to_rfc3339())),
+        "tags" => {
+            if fm.tags.is_empty() {
+                None
+            } else {
+                Some(Value::Sequence(
+                    fm.tags.iter().cloned().map(Value::String).collect(),
+                ))
+            }
+        }
         _ => fm.extra.get(key).cloned(),
     }
 }
@@ -312,6 +326,27 @@ mod tests {
                 "summary" => f.summary = v.as_str().map(str::to_string),
                 "id" => f.id = v.as_str().map(str::to_string),
                 "status" => f.status = v.as_str().map(str::to_string),
+                // Route the typed universal fields to their struct slots (NOT
+                // `extra`) so tests exercise the real `field_value` arms for
+                // `{tags}` / `{created}` / `{updated}` instead of masking them.
+                "tags" => {
+                    if let Value::Sequence(items) = &v {
+                        f.tags = items
+                            .iter()
+                            .filter_map(|i| i.as_str().map(str::to_string))
+                            .collect();
+                    }
+                }
+                "created" => {
+                    f.created = v
+                        .as_str()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                }
+                "updated" => {
+                    f.updated = v
+                        .as_str()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                }
                 _ => {
                     f.extra.insert(key, v);
                 }
@@ -400,6 +435,20 @@ mod tests {
         assert_eq!(
             compose_default(&store, "meeting", &f, "").unwrap(),
             "2026-05-10: alice, bob"
+        );
+    }
+
+    #[test]
+    fn template_interpolates_typed_tags_created_updated() {
+        // Regression: `field_value` skipped the typed `tags` / `created` /
+        // `updated` fields, so these `{…}` placeholders silently rendered empty
+        // even when the values were present.
+        let (_t, store) = store_with_template("note", "{tags} | {created}");
+        let f = fm("type: note\ntags: [urgent, q3]\ncreated: \"2026-05-01T00:00:00Z\"\n");
+        assert_eq!(
+            compose_default(&store, "note", &f, "").unwrap(),
+            // {tags} comma-joins; {created} renders canonical RFC3339 (offset form).
+            "urgent, q3 | 2026-05-01T00:00:00+00:00"
         );
     }
 

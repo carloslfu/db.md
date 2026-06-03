@@ -917,6 +917,30 @@ fn check_schema(
             continue; // a link field is never also shape/enum-checked
         }
 
+        // A shape- or enum-constrained field expects a SCALAR. A YAML sequence
+        // or mapping satisfies neither, and would otherwise slip through both
+        // checks (`scalar_string` returns `None` for non-scalars, so the enum
+        // and shape bodies silently no-op). Flag it as a shape mismatch rather
+        // than let a structurally-wrong value validate clean. (Link fields,
+        // which legitimately take block-form sequences, already `continue`d.)
+        if (spec.shape.is_some() || spec.enum_values.is_some()) && scalar_string(value).is_none() {
+            push(
+                issues,
+                Severity::Error,
+                codes::SCHEMA_SHAPE_MISMATCH,
+                rel,
+                line,
+                Some(spec.name.clone()),
+                format!(
+                    "`{}` must be a scalar value, found a list or mapping",
+                    spec.name
+                ),
+                Some(format!("set `{}` to a single scalar value", spec.name)),
+                vec![],
+            );
+            continue;
+        }
+
         // enum
         if let Some(allowed) = &spec.enum_values {
             if let Some(s) = scalar_string(value) {
@@ -1498,10 +1522,15 @@ fn check_type_folder_index_md(
             );
             continue;
         }
-        // Summary mismatch: the entry text must equal the file's `summary`.
+        // Summary mismatch: the entry text must equal the file's `summary`. A
+        // bare `- [[path]]` entry (no `— <text>`) when the file HAS a non-empty
+        // summary is also a mismatch — the SPEC requires every type-folder index
+        // entry to quote the file's `summary` (`- [[path]] — <summary>`), so a
+        // missing quote can't validate clean just because there's nothing to
+        // compare.
         if let Some(expected) = read_summary(&target_abs) {
-            if let Some(text_part) = &entry.summary_text {
-                if text_part.trim() != expected.trim() {
+            match &entry.summary_text {
+                Some(text_part) if text_part.trim() != expected.trim() => {
                     push(
                         issues,
                         Severity::Error,
@@ -1514,6 +1543,20 @@ fn check_type_folder_index_md(
                         vec![PathBuf::from(format!("{bare}.md"))],
                     );
                 }
+                None if !expected.trim().is_empty() => {
+                    push(
+                        issues,
+                        Severity::Error,
+                        codes::INDEX_SUMMARY_MISMATCH,
+                        index_rel,
+                        Some(entry.line),
+                        None,
+                        format!("index entry for `{bare}` is missing its summary text (the file has a `summary`)"),
+                        Some("run `dbmd index rebuild`".into()),
+                        vec![PathBuf::from(format!("{bare}.md"))],
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -2066,7 +2109,12 @@ fn is_content_file(rel: &Path) -> bool {
         return false;
     }
     let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if matches!(name, "index.md" | "index.jsonl" | "log.md") {
+    // Only the derived catalog twins are meta INSIDE a layer. `DB.md` / `log.md`
+    // are reserved meta only at the store ROOT, which the `first` layer check
+    // above already excludes — so a content file named `log.md` / `DB.md` inside
+    // a layer (e.g. `records/docs/log.md`) is real content, consistent with
+    // `Store::walk`.
+    if matches!(name, "index.md" | "index.jsonl") {
         return false;
     }
     name.ends_with(".md")
@@ -3824,6 +3872,51 @@ mod tests {
                 .any(|i| i.code == codes::SCHEMA_SHAPE_MISMATCH
                     && i.file == *"records/widgets/ok.md"),
             "valid shapes (incl. `USD 1,234.50`) must not fire: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn schema_shape_or_enum_field_with_non_scalar_value_is_shape_mismatch() {
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "contact".into(),
+            Schema {
+                fields: vec![
+                    FieldSpec {
+                        name: "email".into(),
+                        required: true,
+                        shape: Some(Shape::Email),
+                        ..Default::default()
+                    },
+                    FieldSpec {
+                        name: "status".into(),
+                        enum_values: Some(vec!["active".into(), "inactive".into()]),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        // A required EMAIL field and an ENUM field, each holding a LIST. Both
+        // used to slip through entirely (`scalar_string` → None → the shape and
+        // enum bodies silently no-op); now they flag SCHEMA_SHAPE_MISMATCH.
+        fx.write(
+            "records/contacts/bad.md",
+            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: bad\nemail:\n  - a@b.com\n  - c@d.com\nstatus:\n  - active\n---\n\n# bad\n",
+        );
+        let issues = fx.store_all();
+        let mismatched: Vec<_> = issues
+            .iter()
+            .filter(|i| i.code == codes::SCHEMA_SHAPE_MISMATCH)
+            .map(|i| i.key.clone().unwrap_or_default())
+            .collect();
+        assert!(
+            mismatched.contains(&"email".to_string()),
+            "list-valued required email must flag: {issues:#?}"
+        );
+        assert!(
+            mismatched.contains(&"status".to_string()),
+            "list-valued enum must flag: {issues:#?}"
         );
     }
 
