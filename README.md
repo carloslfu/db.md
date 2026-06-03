@@ -193,12 +193,14 @@ The question under every alternative is the same, asked on two axes: what sits b
 | Approach | What sits between you and your data | What it rides on |
 |---|---|---|
 | **db.md** | nothing: the data is the files; you read and edit them directly, and the agent works the same files | the model curve, directly: every new model works the same files better, with nothing to migrate or rebuild |
-| SQL / relational databases | a schema, a query language, and an app to use it | your schema and queries; a better model can write the SQL, but the store itself never gets smarter |
-| Airtable / Notion (the database with a UI) | a vendor's service you rent; export is lossy | the vendor's roadmap; new model power reaches you if and when they ship it |
-| Graphify | a derived knowledge-graph, rebuilt from your files and queried through its API | a better model too, but only on each rebuild and only for what the graph captures |
-| QMD | a search index and its own bundled models, kept beside your files | its bundled models; recall climbs when QMD ships new ones, not when the frontier moves |
-| Vector RAG | a separate vector store and a retrieval service | a separate embedding model, improved apart from the model that reasons |
+| SQL / relational databases | a schema you design up front and migrate when reality changes, a query language, and an app to use it | your schema and the app layer; a better model can write the SQL, but the store sits outside the model curve and never gets smarter |
+| Airtable / Notion (the database with a UI) | a vendor's service you rent, your data on their servers; export is lossy and drops the relations and formulas | the vendor's roadmap; you get the AI they bolt on, when they ship it, and only inside their walls |
+| Graphify | a derived knowledge-graph beside your files, queried through its API, stale until the next rebuild | a better model too, but spent rebuilding a derived graph that drifts from your files, not on the files themselves |
+| QMD | a SQLite search index and bundled small models, kept beside files you still own | its bundled small models, capped at their size; recall climbs when QMD ships new ones, not when the frontier moves |
+| Vector RAG | a vector store of embeddings you cannot read or edit, reached only through a retrieval service | a separate, smaller embedding model and reranker; recall is capped by that retrieval stack, re-paid every query, and a better reasoning model does not lift it |
 | Karpathy's LLM Wiki | nothing: plain markdown the model reads (db.md's lineage) | the model curve, directly on the files (db.md's lineage) |
+
+Vector RAG is the approach db.md bets most directly against: db.md computes, stores, and searches no vector, ever. Where RAG engineers retrieval over embeddings of your data, db.md keeps the data as files and lets the frontier model read them, with semantic recall coming from the agent expanding the query over plain lexical search, not a separate embedding model.
 
 For the genuinely hard remainder (high write concurrency, ACID, sub-millisecond reads, billions-row aggregates), a real database still backs db.md. That is the roadmap, not the claim for today.
 
