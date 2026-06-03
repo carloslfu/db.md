@@ -16,14 +16,15 @@ Two things version independently:
 
 #### Added
 
-- **`dbmd install-skill`** — install a coding-agent skill that teaches Claude
-  Code (`~/.claude/skills/db-md/SKILL.md`) or Codex
-  (`~/.codex/instructions/db-md.md`) to operate a db.md store with `dbmd`. The
-  persistent sibling of `dbmd spec`: where `spec` loads the contract for one
-  session, `install-skill` drops a skill the agent keeps across sessions.
-  Autodetects the target (`--target claude-code|codex` to force one),
-  `--uninstall` removes it. The skill body points at `dbmd spec` as the single
-  source of truth — it never inlines the SPEC, so it cannot drift from it.
+- **`dbmd install-skill`** / **`dbmd uninstall-skill`** — install (or remove) a
+  coding-agent skill that teaches Claude Code (`~/.claude/skills/db-md/SKILL.md`)
+  or Codex (`~/.codex/instructions/db-md.md`) to operate a db.md store with
+  `dbmd`. The persistent sibling of `dbmd spec`: where `spec` loads the contract
+  for one session, `install-skill` drops a skill the agent keeps across sessions,
+  and `uninstall-skill` removes exactly what it wrote. Autodetects the target
+  (`--target claude-code|codex` to force one). The skill body points at `dbmd
+  spec` as the single source of truth — it never inlines the SPEC, so it cannot
+  drift from it.
 
 ### Format — v0.2 (breaking: the type model is now generic)
 

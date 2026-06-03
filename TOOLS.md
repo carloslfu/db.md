@@ -51,7 +51,9 @@ O(store) and run off the interactive loop. See SPEC.md § Scale.
   point: install `dbmd`, run `dbmd spec` to read the standard)
 - `dbmd install-skill` — install a persistent Claude Code / Codex skill
   that teaches the agent `dbmd` (the install-once sibling of `dbmd
-  spec`; `--target claude-code|codex`, `--uninstall`)
+  spec`; `--target claude-code|codex`)
+- `dbmd uninstall-skill` — remove the skill `install-skill` wrote
+  (`--target` to pick the agent)
 - `dbmd fm get DB.md <key>` — read store identity
 
 ### Warm up

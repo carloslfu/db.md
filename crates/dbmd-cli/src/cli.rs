@@ -156,7 +156,11 @@ pub enum Command {
     /// Codex) to operate a db.md store with `dbmd`. The persistent sibling of
     /// `dbmd spec`: where `spec` loads the contract for one session,
     /// `install-skill` drops a skill the agent keeps across every session.
-    InstallSkill(InstallSkillArgs),
+    InstallSkill(SkillArgs),
+
+    /// Remove the coding-agent skill that `install-skill` wrote — the reverse of
+    /// `install-skill`, scoped to only what it installed.
+    UninstallSkill(SkillArgs),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -818,13 +822,14 @@ pub struct SpecArgs {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// install-skill
+// install-skill / uninstall-skill
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Which coding agent `dbmd install-skill` targets. As a clap `ValueEnum`, the
-/// `--target` value is validated by clap itself (kebab-cased to `claude-code` /
-/// `codex`), so a bad value is the usual arg-parse error (exit `2`) and the body
-/// never hand-validates a string. Mirrors how `--color` uses `ColorChoice`.
+/// Which coding agent the `install-skill` / `uninstall-skill` commands act on.
+/// As a clap `ValueEnum`, the `--target` value is validated by clap itself
+/// (kebab-cased to `claude-code` / `codex`), so a bad value is the usual
+/// arg-parse error (exit `2`) and the body never hand-validates a string.
+/// Mirrors how `--color` uses `ColorChoice`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SkillTarget {
     /// Anthropic Claude Code → `~/.claude/skills/db-md/SKILL.md`.
@@ -844,15 +849,12 @@ impl SkillTarget {
     }
 }
 
-/// `dbmd install-skill` — drop a persistent agent skill that teaches `dbmd`.
+/// Shared args for `dbmd install-skill` and `dbmd uninstall-skill` — both act on
+/// the same per-agent skill location, so they take the same `--target`.
 #[derive(Debug, Args)]
-pub struct InstallSkillArgs {
-    /// Which agent to install for. Default: autodetect — Claude Code when
+pub struct SkillArgs {
+    /// Which agent to act on. Default: autodetect — Claude Code when
     /// `~/.claude` exists, else Codex when `~/.codex` exists, else Claude Code.
     #[arg(long, value_enum, value_name = "TARGET")]
     pub target: Option<SkillTarget>,
-
-    /// Remove the skill this command installed instead of installing it.
-    #[arg(long)]
-    pub uninstall: bool,
 }

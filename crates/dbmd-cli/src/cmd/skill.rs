@@ -1,18 +1,18 @@
-//! `dbmd install-skill` — install a coding-agent skill that teaches a local
-//! agent how to operate a db.md store with `dbmd`.
+//! `dbmd install-skill` / `dbmd uninstall-skill` — manage the coding-agent skill
+//! that teaches a local agent how to operate a db.md store with `dbmd`.
 //!
-//! This is the persistent half of the "agent way" install, the sibling of
-//! `dbmd spec`: where `dbmd spec` loads the full contract into a harness's
-//! system prompt for a single session, `install-skill` drops a skill into a
-//! local coding agent (Claude Code or Codex) so the agent knows `dbmd` on every
-//! future session — no per-run bootstrap.
+//! These are the persistent half of the "agent way", the sibling of `dbmd spec`:
+//! where `dbmd spec` loads the full contract into a harness's system prompt for
+//! one session, `install-skill` drops a skill into a local coding agent (Claude
+//! Code or Codex) so the agent knows `dbmd` on every future session — and
+//! `uninstall-skill` cleanly removes exactly what `install-skill` wrote.
 //!
 //! The skill body is a thin pointer at `dbmd spec` (the single source of truth)
 //! plus a phase-grouped cheat sheet; the full SPEC is never inlined, so the
 //! installed skill cannot drift from the standard the binary already carries.
 //!
-//! Layout mirrors the `computer.md` reference CLI's `install-skill`, so the two
-//! standards present the same shape to an agent:
+//! Layout mirrors the `computer.md` reference CLI's `install-skill` /
+//! `uninstall-skill`, so the two standards present the same shape to an agent:
 //!   - Claude Code → `~/.claude/skills/db-md/SKILL.md` (the `name`+`description`
 //!     frontmatter Claude Code auto-discovers it by).
 //!   - Codex       → `~/.codex/instructions/db-md.md` (the exact path db.md's
@@ -20,20 +20,48 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cli::{InstallSkillArgs, SkillTarget};
+use crate::cli::{SkillArgs, SkillTarget};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
-/// Run `dbmd install-skill`.
-pub fn run(ctx: &Context, args: &InstallSkillArgs) -> CliResult {
+/// Run `dbmd install-skill`: create the skill directory (if needed) and write
+/// the skill file for the resolved target.
+pub fn install(ctx: &Context, args: &SkillArgs) -> CliResult {
     let home = home_dir()?;
     let target = resolve_target(args.target, &home);
     let (dir, file) = paths_for(target, &home);
 
-    if args.uninstall {
-        return uninstall(ctx, target, &dir, &file);
+    std::fs::create_dir_all(&dir).map_err(|e| io_err("creating skill directory", &dir, e))?;
+    let body = match target {
+        SkillTarget::ClaudeCode => CLAUDE_CODE_SKILL,
+        SkillTarget::Codex => CODEX_SKILL,
+    };
+    std::fs::write(&file, body).map_err(|e| io_err("writing skill", &file, e))?;
+    emit(ctx, target, &file, "installed");
+    Ok(())
+}
+
+/// Run `dbmd uninstall-skill`: remove only what `install-skill` wrote. A missing
+/// skill is a clean `noop`, not an error.
+pub fn uninstall(ctx: &Context, args: &SkillArgs) -> CliResult {
+    let home = home_dir()?;
+    let target = resolve_target(args.target, &home);
+    let (dir, file) = paths_for(target, &home);
+
+    if !file.exists() {
+        emit(ctx, target, &file, "noop");
+        return Ok(());
     }
-    install(ctx, target, &dir, &file)
+    // Remove only what this command owns: the whole `db-md/` skill dir for
+    // Claude Code, or just the single file for Codex (whose `instructions/` dir
+    // is shared with other tools' files).
+    let removed = match target {
+        SkillTarget::ClaudeCode => std::fs::remove_dir_all(&dir),
+        SkillTarget::Codex => std::fs::remove_file(&file),
+    };
+    removed.map_err(|e| io_err("removing skill", &file, e))?;
+    emit(ctx, target, &file, "uninstalled");
+    Ok(())
 }
 
 /// Resolve the target: an explicit `--target` wins; otherwise autodetect by
@@ -69,35 +97,6 @@ fn paths_for(target: SkillTarget, home: &Path) -> (PathBuf, PathBuf) {
             (dir, file)
         }
     }
-}
-
-/// Create the skill directory (if needed) and write the skill file.
-fn install(ctx: &Context, target: SkillTarget, dir: &Path, file: &Path) -> CliResult {
-    std::fs::create_dir_all(dir).map_err(|e| io_err("creating skill directory", dir, e))?;
-    let body = match target {
-        SkillTarget::ClaudeCode => CLAUDE_CODE_SKILL,
-        SkillTarget::Codex => CODEX_SKILL,
-    };
-    std::fs::write(file, body).map_err(|e| io_err("writing skill", file, e))?;
-    emit(ctx, target, file, "installed");
-    Ok(())
-}
-
-/// Remove only what this command owns: the whole `db-md/` skill dir for Claude
-/// Code, or just the single file for Codex (whose `instructions/` dir is shared
-/// with other tools' files). A missing skill is a clean `noop`, not an error.
-fn uninstall(ctx: &Context, target: SkillTarget, dir: &Path, file: &Path) -> CliResult {
-    if !file.exists() {
-        emit(ctx, target, file, "noop");
-        return Ok(());
-    }
-    let removed = match target {
-        SkillTarget::ClaudeCode => std::fs::remove_dir_all(dir),
-        SkillTarget::Codex => std::fs::remove_file(file),
-    };
-    removed.map_err(|e| io_err("removing skill", file, e))?;
-    emit(ctx, target, file, "uninstalled");
-    Ok(())
 }
 
 /// Resolve `$HOME`, the anchor for every agent config dir. A missing/empty

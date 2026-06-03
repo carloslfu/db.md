@@ -1,12 +1,13 @@
-//! Integration tests for `dbmd install-skill` — the persistent "agent way"
-//! install point (the sibling of `dbmd spec`).
+//! Integration tests for `dbmd install-skill` / `dbmd uninstall-skill` — the
+//! persistent "agent way" install point (the sibling of `dbmd spec`).
 //!
 //! Intent: `install-skill` drops a skill file into a local coding agent's
 //! config dir (Claude Code → `~/.claude/skills/db-md/SKILL.md`, Codex →
-//! `~/.codex/instructions/db-md.md`), `--uninstall` removes it, the target is
-//! explicit (`--target`) or autodetected from which agent dir exists, and clap
-//! rejects an unknown target. Every test points `HOME` at a fresh tempdir so
-//! nothing touches the developer's real `~/.claude` or `~/.codex`.
+//! `~/.codex/instructions/db-md.md`), `uninstall-skill` removes exactly that,
+//! the target is explicit (`--target`) or autodetected from which agent dir
+//! exists, and clap rejects an unknown target. Every test points `HOME` at a
+//! fresh tempdir so nothing touches the developer's real `~/.claude` or
+//! `~/.codex`.
 
 mod common;
 
@@ -102,14 +103,9 @@ fn uninstall_removes_then_noops() {
     let skill = home.path().join(".claude/skills/db-md/SKILL.md");
     assert!(skill.exists());
 
+    // `uninstall-skill` removes exactly what `install-skill` wrote.
     let out = dbmd_home(home.path())
-        .args([
-            "--json",
-            "install-skill",
-            "--target",
-            "claude-code",
-            "--uninstall",
-        ])
+        .args(["--json", "uninstall-skill", "--target", "claude-code"])
         .assert()
         .success();
     assert_eq!(stdout_json(&out)["action"], serde_json::json!("uninstalled"));
@@ -117,13 +113,7 @@ fn uninstall_removes_then_noops() {
 
     // A second uninstall is a clean no-op, not an error.
     let out = dbmd_home(home.path())
-        .args([
-            "--json",
-            "install-skill",
-            "--target",
-            "claude-code",
-            "--uninstall",
-        ])
+        .args(["--json", "uninstall-skill", "--target", "claude-code"])
         .assert()
         .success();
     assert_eq!(stdout_json(&out)["action"], serde_json::json!("noop"));
@@ -132,9 +122,15 @@ fn uninstall_removes_then_noops() {
 #[test]
 fn rejects_unknown_target_with_usage_exit() {
     let home = tempfile::TempDir::new().unwrap();
-    // clap validates the value_enum and exits 2 (usage); the body never runs.
+    // clap validates the value_enum and exits 2 (usage); the body never runs —
+    // on both the install and the uninstall verb.
     dbmd_home(home.path())
         .args(["install-skill", "--target", "emacs"])
+        .assert()
+        .failure()
+        .code(2);
+    dbmd_home(home.path())
+        .args(["uninstall-skill", "--target", "emacs"])
         .assert()
         .failure()
         .code(2);
