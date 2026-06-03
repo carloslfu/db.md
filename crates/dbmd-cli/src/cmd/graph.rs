@@ -38,7 +38,7 @@ pub fn run(ctx: &Context, args: &GraphArgs) -> CliResult {
 /// type-folder `index.jsonl` sidecars are read, so a scoped call is O(folder),
 /// not a whole-store scan.
 pub fn run_backlinks(ctx: &Context, args: &GraphTargetArgs) -> CliResult {
-    let store = Store::open(Path::new(&args.dir)).map_err(dbmd_core::Error::from)?;
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let layer = parse_layer(args.r#in.as_deref())?;
     let types: Vec<String> = args.r#type.clone().into_iter().collect();
     let mut hits = graph::backlinks_filtered(&store, Path::new(&args.path), &types, layer)
@@ -53,7 +53,7 @@ pub fn run_backlinks(ctx: &Context, args: &GraphTargetArgs) -> CliResult {
 /// (by the target's frontmatter `type` / its layer), so the chain can be walked
 /// one type or one layer at a time.
 pub fn run_forwardlinks(ctx: &Context, args: &GraphTargetArgs) -> CliResult {
-    let store = Store::open(Path::new(&args.dir)).map_err(dbmd_core::Error::from)?;
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let layer = parse_layer(args.r#in.as_deref())?;
     let mut hits =
         graph::forwardlinks(&store, Path::new(&args.path)).map_err(dbmd_core::Error::from)?;
@@ -83,7 +83,7 @@ pub fn run_forwardlinks(ctx: &Context, args: &GraphTargetArgs) -> CliResult {
 /// `dbmd graph neighborhood <seed>` — bounded BFS hydration: each reached node,
 /// its `summary`, and how it connects back toward the seed.
 pub fn run_neighborhood(ctx: &Context, args: &NeighborhoodArgs) -> CliResult {
-    let store = Store::open(Path::new(&args.dir)).map_err(dbmd_core::Error::from)?;
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let layer = parse_layer(args.r#in.as_deref())?;
     // Direction is always `Both` here: the SPEC frames neighborhood as
     // context hydration ("the relevant context around a seed"), which is the
@@ -116,7 +116,7 @@ pub fn run_neighborhood(ctx: &Context, args: &NeighborhoodArgs) -> CliResult {
 /// `dbmd graph orphans` — content files with no incoming AND no outgoing links
 /// (the curation worklist). A SWEEP; optionally scoped to one layer.
 pub fn run_orphans(ctx: &Context, args: &OrphansArgs) -> CliResult {
-    let store = Store::open(Path::new(&args.dir)).map_err(dbmd_core::Error::from)?;
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let layer = parse_layer(args.r#in.as_deref())?;
     let mut hits = graph::orphans(&store, layer).map_err(dbmd_core::Error::from)?;
     apply_limit(&mut hits, args.limit);

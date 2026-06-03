@@ -62,7 +62,7 @@ struct Match {
 /// three pieces are split out so the core is exercisable in-process against the
 /// corpus without spawning the binary or capturing stdout.
 pub fn run(ctx: &Context, args: &SearchArgs) -> CliResult {
-    let store = Store::open(Path::new(&args.dir)).map_err(dbmd_core::Error::from)?;
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let matches = collect_matches(&store, args)?;
     emit(ctx, &matches)
 }
@@ -106,7 +106,11 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
                     line: lineno,
                     text: line.trim_end_matches(['\n', '\r']).to_string(),
                 });
-                Ok(true)
+                // Stop scanning THIS file the moment the cap is reached rather
+                // than collecting every match in a huge file and truncating
+                // after — `Ok(false)` ends the current file's search; the
+                // `'outer` break below still stops the cross-file walk.
+                Ok(args.limit.is_none_or(|lim| matches.len() < lim))
             }),
         );
         if let Err(e) = scan {
@@ -276,10 +280,14 @@ fn content_files(store: &Store) -> Result<Vec<PathBuf>, CliError> {
             continue;
         }
         let walker = WalkBuilder::new(&dir)
+            // Match the core's `md_walker`: disable EVERY ignore source
+            // (`.gitignore`, parent ignores, `.ignore`, `.git/info/exclude`,
+            // global gitignore) and keep only the hidden-file skip. A store
+            // nested inside a repo whose `.gitignore` matches `*.md` must not
+            // silently hide content files from `search` when `validate` /
+            // `index` (which use `md_walker`) still see every file.
+            .standard_filters(false)
             .hidden(true)
-            .git_ignore(false)
-            .git_global(false)
-            .require_git(false)
             .build();
         for entry in walker {
             let entry = entry.map_err(|e| {

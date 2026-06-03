@@ -3,455 +3,673 @@
   "scope": "all",
   "store": "tests/corpora/corpus-b-edges",
   "summary": {
-    "errors": 25,
-    "warnings": 15,
+    "errors": 44,
     "info": 1,
-    "total": 41
+    "total": 59,
+    "warnings": 14
   },
   "issues": [
     {
-      "severity": "error",
       "code": "LOG_BAD_TIMESTAMP",
       "file": "log.md",
-      "line": 13,
       "key": null,
-      "message": "log entry header timestamp '2026-13-99 99:99' is unparseable",
-      "suggestion": "fix the header to '## [YYYY-MM-DD HH:MM] <kind> | <object>' with a valid time",
-      "related": []
+      "line": 13,
+      "message": "log entry header has an unparseable timestamp: \"## [2026-13-99 99:99] update | [[records/companies/northstar]]\"",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use `## [YYYY-MM-DD HH:MM] <kind> | <object>`"
     },
     {
-      "severity": "warning",
       "code": "LOG_UNKNOWN_KIND",
       "file": "log.md",
-      "line": 17,
       "key": null,
-      "message": "log entry kind 'frobnicate' is not a recognized kind",
-      "suggestion": "use a recognized kind (ingest/create/update/delete/rename/link/validate/index-rebuild/contradiction) or accept the custom kind",
-      "related": []
+      "line": 17,
+      "message": "log entry kind `frobnicate` is not recognized",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "use one of: ingest, create, update, delete, rename, link, validate, index-rebuild, contradiction"
     },
     {
-      "severity": "warning",
       "code": "LOG_OUT_OF_ORDER",
       "file": "log.md",
-      "line": 23,
       "key": null,
-      "message": "log entry '2026-05-02 08:00' precedes the previous entry '2026-05-03 11:00'; entries must be non-decreasing in time",
-      "suggestion": "reorder the entries by timestamp (a later agent pass re-sorts)",
-      "related": []
+      "line": 23,
+      "message": "log entry is older than the entry above it (possible rewrite)",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "append corrective entries; never reorder past ones"
     },
     {
-      "severity": "warning",
-      "code": "DUP_COMPANY_DOMAIN",
+      "code": "DUP_UNIQUE_KEY",
       "file": "records/companies/dup-domain-a.md",
-      "line": 8,
       "key": "domain",
-      "message": "two companies share domain 'globex.com'",
-      "suggestion": "merge the duplicates with dbmd rename, or cross-link with dbmd link",
+      "line": 8,
+      "message": "`company` unique key (domain) collides with 1 other record(s)",
       "related": [
         "records/companies/dup-domain-b.md"
-      ]
+      ],
+      "severity": "warning",
+      "suggestion": "merge with `dbmd rename`, or cross-link with `dbmd link`"
     },
     {
-      "severity": "error",
       "code": "INDEX_STALE_ENTRY",
       "file": "records/companies/index.md",
-      "line": 13,
       "key": null,
-      "message": "index lists 'records/companies/ghost-corp' which no longer exists",
-      "suggestion": "run dbmd index rebuild --folder records/companies to drop the stale entry",
+      "line": 13,
+      "message": "index entry `[[records/companies/ghost-corp]]` points at a missing file",
       "related": [
         "records/companies/ghost-corp.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
-      "severity": "error",
       "code": "SCHEMA_SHAPE_MISMATCH",
       "file": "records/contacts/bad-email-shape.md",
-      "line": 8,
       "key": "email",
-      "message": "contact.email value 'chris [at] vendor dot com' does not match shape 'email'",
-      "suggestion": "use a valid email address, e.g. chris@vendor.com",
-      "related": []
+      "line": 8,
+      "message": "`email` value \"chris [at] vendor dot com\" doesn't match shape Email",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use a `<local>@<domain>` address"
     },
     {
-      "severity": "error",
       "code": "DUP_ID",
       "file": "records/contacts/dup-id-one.md",
-      "line": 3,
       "key": "id",
-      "message": "id 'shared-id' is declared by more than one file",
-      "suggestion": "give each file a unique 'id' (or remove 'id' to derive it from the path)",
+      "line": 3,
+      "message": "id \"shared-id\" is declared by more than one file",
       "related": [
         "records/contacts/dup-id-two.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "give each file a unique `id` (or drop it to derive from the path)"
     },
     {
-      "severity": "warning",
-      "code": "DUP_CONTACT_EMAIL",
+      "code": "DUP_UNIQUE_KEY",
       "file": "records/contacts/duplicate-email-a.md",
-      "line": 8,
       "key": "email",
-      "message": "two contacts share email 'ops@northstar.io'",
-      "suggestion": "merge the duplicates with dbmd rename, or cross-link with dbmd link",
+      "line": 8,
+      "message": "`contact` unique key (email) collides with 1 other record(s)",
       "related": [
         "records/contacts/duplicate-email-b.md"
-      ]
+      ],
+      "severity": "warning",
+      "suggestion": "merge with `dbmd rename`, or cross-link with `dbmd link`"
     },
     {
-      "severity": "error",
-      "code": "INDEX_SUMMARY_MISMATCH",
-      "file": "records/contacts/index.md",
-      "line": 12,
-      "key": null,
-      "message": "index entry text for 'records/contacts/bad-email-shape' does not match the file's summary",
-      "suggestion": "run dbmd index rebuild --folder records/contacts to re-quote the summary",
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/contacts/index.jsonl",
+      "key": "company",
+      "line": null,
+      "message": "`index.jsonl` record for `records/contacts/bad-email-shape.md` is stale (company)",
       "related": [
         "records/contacts/bad-email-shape.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
-      "severity": "error",
-      "code": "INDEX_MISSING_ENTRY",
-      "file": "records/contacts/index.md",
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/contacts/index.jsonl",
+      "key": "company",
       "line": null,
-      "key": null,
-      "message": "file 'records/contacts/sarah-chen' exists but is not listed in records/contacts/index.md",
-      "suggestion": "run dbmd index rebuild --folder records/contacts to add the entry",
+      "message": "`index.jsonl` record for `records/contacts/dup-id-one.md` is stale (company)",
+      "related": [
+        "records/contacts/dup-id-one.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/contacts/index.jsonl",
+      "key": "company",
+      "line": null,
+      "message": "`index.jsonl` record for `records/contacts/dup-id-two.md` is stale (company)",
+      "related": [
+        "records/contacts/dup-id-two.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/contacts/index.jsonl",
+      "key": "company",
+      "line": null,
+      "message": "`index.jsonl` record for `records/contacts/duplicate-email-a.md` is stale (company)",
+      "related": [
+        "records/contacts/duplicate-email-a.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/contacts/index.jsonl",
+      "key": "company",
+      "line": null,
+      "message": "`index.jsonl` record for `records/contacts/duplicate-email-b.md` is stale (company)",
+      "related": [
+        "records/contacts/duplicate-email-b.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/contacts/index.jsonl",
+      "key": "company",
+      "line": null,
+      "message": "`index.jsonl` record for `records/contacts/sarah-chen.md` is stale (company)",
       "related": [
         "records/contacts/sarah-chen.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
+      "code": "INDEX_MISSING_ENTRY",
+      "file": "records/contacts/index.md",
+      "key": null,
+      "line": null,
+      "message": "file `records/contacts/sarah-chen.md` is not listed in its folder's `index.md`",
+      "related": [
+        "records/contacts/sarah-chen.md"
+      ],
       "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_SUMMARY_MISMATCH",
+      "file": "records/contacts/index.md",
+      "key": null,
+      "line": 12,
+      "message": "index entry for `records/contacts/bad-email-shape` text doesn't match the file's `summary`",
+      "related": [
+        "records/contacts/bad-email-shape.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
       "code": "SCHEMA_MISSING_REQUIRED",
       "file": "records/contacts/missing-company.md",
-      "line": 1,
       "key": "company",
-      "message": "contact schema requires field 'company' which is absent",
-      "suggestion": "add 'company: [[records/companies/<co>]]' to the frontmatter",
-      "related": []
+      "line": 1,
+      "message": "required field `company` is absent or empty",
+      "related": [],
+      "severity": "error",
+      "suggestion": "set `company` to a non-empty value"
     },
     {
-      "severity": "error",
       "code": "SCHEMA_LINK_PREFIX_MISMATCH",
       "file": "records/contacts/plain-company.md",
-      "line": 9,
       "key": "company",
-      "message": "contact.company is a plain string 'Acme Inc'; schema requires a wiki-link with prefix 'records/companies/'",
-      "suggestion": "replace with [[records/companies/acme]]",
-      "related": []
+      "line": 9,
+      "message": "`company` is a plain string \"Acme Inc\", expected a wiki-link under `records/companies/`",
+      "related": [],
+      "severity": "error",
+      "suggestion": "expected `link to records/companies/`; replace with [[records/companies/acme-inc]]"
     },
     {
-      "severity": "error",
       "code": "WIKI_LINK_SHORT_FORM",
       "file": "records/contacts/sarah-chen.md",
-      "line": 19,
       "key": null,
-      "message": "wiki-link '[[acme-co]]' is not a full store-relative path",
-      "suggestion": "replace with the full path, e.g. [[records/companies/acme]]",
-      "related": []
+      "line": 19,
+      "message": "wiki-link `[[acme-co]]` is not a full store-relative path",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use a full store-relative path, e.g. [[records/contacts/acme-co]]"
     },
     {
-      "severity": "warning",
       "code": "WIKI_LINK_HAS_EXTENSION",
       "file": "records/contacts/sarah-chen.md",
-      "line": 20,
       "key": null,
-      "message": "wiki-link '[[records/companies/northstar.md]]' carries a '.md' extension",
-      "suggestion": "drop the extension: [[records/companies/northstar]]",
-      "related": []
+      "line": 20,
+      "message": "wiki-link `[[records/companies/northstar.md]]` carries a `.md` extension",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "drop the extension: [[records/companies/northstar]]"
     },
     {
-      "severity": "warning",
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/decisions/index.jsonl",
+      "key": "affects",
+      "line": null,
+      "message": "`index.jsonl` record for `records/decisions/2026-q1-strategy.md` is stale (affects)",
+      "related": [
+        "records/decisions/2026-q1-strategy.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
       "code": "INDEX_WRONG_SCOPE",
       "file": "records/decisions/index.md",
-      "line": 3,
       "key": "scope",
-      "message": "index scope 'layer' does not match filesystem location (a type-folder)",
-      "suggestion": "set scope to 'type-folder' (or run dbmd index rebuild)",
-      "related": []
+      "line": 3,
+      "message": "index `scope: layer` doesn't match location (expected `type-folder`)",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "set `scope: type-folder`"
     },
     {
-      "severity": "warning",
-      "code": "DUP_EXPENSE_TUPLE",
+      "code": "DUP_UNIQUE_KEY",
       "file": "records/expenses/2026/05/2026-05-05-globex-a.md",
-      "line": 1,
       "key": null,
-      "message": "two expenses share (date, amount, vendor) = (2026-05-05, 240.00, records/companies/dup-domain-a)",
-      "suggestion": "likely a double-entry; merge or delete one with dbmd rename",
+      "line": 1,
+      "message": "`expense` unique key (date, amount, vendor) collides with 1 other record(s)",
       "related": [
         "records/expenses/2026/05/2026-05-05-globex-b.md"
-      ]
+      ],
+      "severity": "warning",
+      "suggestion": "merge with `dbmd rename`, or cross-link with `dbmd link`"
     },
     {
-      "severity": "error",
       "code": "SCHEMA_SHAPE_MISMATCH",
       "file": "records/expenses/2026/05/bad-date-shape.md",
-      "line": 7,
       "key": "date",
-      "message": "expense.date value 'May 7th, 2026' does not match shape 'date'",
-      "suggestion": "use an ISO-8601 date, e.g. 2026-05-07",
-      "related": []
+      "line": 7,
+      "message": "`date` value \"May 7th, 2026\" doesn't match shape Date",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use an ISO-8601 date, e.g. 2026-05-27"
     },
     {
-      "severity": "warning",
-      "code": "DUP_INVOICE_TUPLE",
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/expenses/index.jsonl",
+      "key": "vendor",
+      "line": null,
+      "message": "`index.jsonl` record for `records/expenses/2026/05/2026-05-05-globex-a.md` is stale (vendor)",
+      "related": [
+        "records/expenses/2026/05/2026-05-05-globex-a.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/expenses/index.jsonl",
+      "key": "vendor",
+      "line": null,
+      "message": "`index.jsonl` record for `records/expenses/2026/05/2026-05-05-globex-b.md` is stale (vendor)",
+      "related": [
+        "records/expenses/2026/05/2026-05-05-globex-b.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/expenses/index.jsonl",
+      "key": "vendor",
+      "line": null,
+      "message": "`index.jsonl` record for `records/expenses/2026/05/bad-date-shape.md` is stale (vendor)",
+      "related": [
+        "records/expenses/2026/05/bad-date-shape.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "DUP_UNIQUE_KEY",
       "file": "records/invoices/2026/04/2026-04-01-northstar-a.md",
-      "line": 1,
       "key": null,
-      "message": "two invoices share (vendor, date, amount) = (records/companies/northstar, 2026-04-01, 1200.00)",
-      "suggestion": "likely a re-entry; merge or delete one with dbmd rename",
+      "line": 1,
+      "message": "`invoice` unique key (vendor, date, amount) collides with 1 other record(s)",
       "related": [
         "records/invoices/2026/04/2026-04-01-northstar-b.md"
-      ]
+      ],
+      "severity": "warning",
+      "suggestion": "merge with `dbmd rename`, or cross-link with `dbmd link`"
     },
     {
-      "severity": "error",
       "code": "SCHEMA_ENUM_VIOLATION",
       "file": "records/invoices/2026/04/bad-status-enum.md",
-      "line": 10,
       "key": "status",
-      "message": "invoice.status 'pending' is not in enum [paid, unpaid, void]",
-      "suggestion": "set 'status' to one of: paid, unpaid, void",
-      "related": []
+      "line": 10,
+      "message": "`status` value \"pending\" not in enum [\"paid\", \"unpaid\", \"void\"]",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use one of: paid, unpaid, void"
     },
     {
-      "severity": "warning",
-      "code": "DUP_MEETING_TUPLE",
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/invoices/index.jsonl",
+      "key": "vendor",
+      "line": null,
+      "message": "`index.jsonl` record for `records/invoices/2026/04/2026-04-01-northstar-a.md` is stale (vendor)",
+      "related": [
+        "records/invoices/2026/04/2026-04-01-northstar-a.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/invoices/index.jsonl",
+      "key": "vendor",
+      "line": null,
+      "message": "`index.jsonl` record for `records/invoices/2026/04/2026-04-01-northstar-b.md` is stale (vendor)",
+      "related": [
+        "records/invoices/2026/04/2026-04-01-northstar-b.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/invoices/index.jsonl",
+      "key": "vendor",
+      "line": null,
+      "message": "`index.jsonl` record for `records/invoices/2026/04/bad-status-enum.md` is stale (vendor)",
+      "related": [
+        "records/invoices/2026/04/bad-status-enum.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "DUP_UNIQUE_KEY",
       "file": "records/meetings/2026/05/2026-05-22-sync-a.md",
-      "line": 1,
       "key": null,
-      "message": "two meetings share (date, attendees-set) = (2026-05-22, {records/contacts/duplicate-email-a, records/contacts/sarah-chen})",
-      "suggestion": "merge or delete one with dbmd rename",
+      "line": 1,
+      "message": "`meeting` unique key (date, attendees) collides with 1 other record(s)",
       "related": [
         "records/meetings/2026/05/2026-05-22-sync-b.md"
-      ]
+      ],
+      "severity": "warning",
+      "suggestion": "merge with `dbmd rename`, or cross-link with `dbmd link`"
     },
     {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/meetings/index.jsonl",
+      "key": "attendees",
+      "line": null,
+      "message": "`index.jsonl` record for `records/meetings/2026/05/2026-05-22-sync-a.md` is stale (attendees)",
+      "related": [
+        "records/meetings/2026/05/2026-05-22-sync-a.md"
+      ],
       "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/meetings/index.jsonl",
+      "key": "attendees",
+      "line": null,
+      "message": "`index.jsonl` record for `records/meetings/2026/05/2026-05-22-sync-b.md` is stale (attendees)",
+      "related": [
+        "records/meetings/2026/05/2026-05-22-sync-b.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
       "code": "INDEX_MISSING",
       "file": "records/misc",
-      "line": null,
       "key": null,
-      "message": "non-empty folder 'records/misc' has no index.md",
-      "suggestion": "run dbmd index rebuild --folder records/misc",
-      "related": []
+      "line": null,
+      "message": "non-empty folder `records/misc` has no index.md",
+      "related": [],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild --folder records/misc`"
     },
     {
-      "severity": "error",
       "code": "WIKI_LINK_AMBIGUOUS",
       "file": "records/misc/ambiguous-link.md",
-      "line": 19,
       "key": null,
-      "message": "short-form wiki-link '[[northstar]]' matches multiple files",
-      "suggestion": "use the full store-relative path to disambiguate",
+      "line": 19,
+      "message": "short-form wiki-link `[[northstar]]` matches multiple files",
       "related": [
         "records/companies/northstar.md",
         "wiki/companies/northstar.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "use the full store-relative path to disambiguate"
     },
     {
-      "severity": "error",
       "code": "WIKI_LINK_BROKEN",
       "file": "records/misc/broken-link.md",
-      "line": 19,
       "key": null,
-      "message": "wiki-link target 'records/contacts/ghost' does not exist",
-      "suggestion": "create the target or fix the path",
-      "related": []
+      "line": 19,
+      "message": "wiki-link target `records/contacts/ghost` doesn't exist",
+      "related": [],
+      "severity": "error",
+      "suggestion": "create `records/contacts/ghost.md`, or point the link at an existing file"
     },
     {
-      "severity": "error",
       "code": "FM_MALFORMED_YAML",
       "file": "records/misc/malformed-yaml.md",
-      "line": 1,
       "key": null,
-      "message": "frontmatter block is not valid YAML (unterminated flow sequence and quoted scalar)",
-      "suggestion": "fix the YAML: close the 'tags' sequence and terminate the 'name' string",
-      "related": []
+      "line": 1,
+      "message": "frontmatter block isn't valid YAML: did not find expected ',' or ']' at line 6 column 5, while parsing a flow sequence at line 5 column 7",
+      "related": [],
+      "severity": "error",
+      "suggestion": "repair the frontmatter YAML block, then rerun `dbmd validate`"
     },
     {
-      "severity": "error",
       "code": "FM_MISSING_TYPE",
       "file": "records/misc/no-type.md",
-      "line": 1,
       "key": "type",
-      "message": "content file has no 'type:' field",
-      "suggestion": "add a 'type:' field to the frontmatter (e.g. type: contact)",
-      "related": []
+      "line": 1,
+      "message": "content file has no `type:`",
+      "related": [],
+      "severity": "error",
+      "suggestion": "add a `type:` field (e.g. `type: contact`)"
     },
     {
-      "severity": "error",
       "code": "SUMMARY_MISSING",
       "file": "records/misc/summary-absent.md",
-      "line": 1,
       "key": "summary",
-      "message": "content file has no 'summary' field",
-      "suggestion": "run dbmd fm init records/misc/summary-absent.md to seed a default summary",
-      "related": []
+      "line": 1,
+      "message": "content file has no `summary`",
+      "related": [],
+      "severity": "error",
+      "suggestion": "run `dbmd fm init`"
     },
     {
-      "severity": "error",
       "code": "SUMMARY_EMPTY",
       "file": "records/misc/summary-blank.md",
-      "line": 6,
       "key": "summary",
-      "message": "'summary' is present but empty",
-      "suggestion": "set a one-line summary via dbmd fm set records/misc/summary-blank.md summary='...'",
-      "related": []
+      "line": 6,
+      "message": "`summary` is present but empty",
+      "related": [],
+      "severity": "error",
+      "suggestion": "write a one-line summary, or run `dbmd fm init`"
     },
     {
-      "severity": "error",
       "code": "SUMMARY_MULTILINE",
       "file": "records/misc/summary-multiline.md",
-      "line": 6,
       "key": "summary",
-      "message": "'summary' contains newlines; it must be a single line",
-      "suggestion": "rewrite 'summary' as one line (no block scalar)",
-      "related": []
+      "line": 6,
+      "message": "`summary` must be one line (contains a newline)",
+      "related": [],
+      "severity": "error",
+      "suggestion": "collapse the summary to a single line"
     },
     {
-      "severity": "warning",
       "code": "SUMMARY_TOO_LONG",
       "file": "records/misc/summary-overlong.md",
-      "line": 6,
       "key": "summary",
-      "message": "'summary' is 247 characters; the limit is 200",
-      "suggestion": "shorten 'summary' to <= 200 characters",
-      "related": []
+      "line": 6,
+      "message": "`summary` is 247 chars (> 200)",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "trim the summary to ≤ 200 chars"
     },
     {
-      "severity": "error",
       "code": "INDEX_JSONL_STALE",
       "file": "records/notes/index.jsonl",
-      "line": null,
       "key": "tags",
-      "message": "'index.jsonl' record for 'records/notes/malformed-tags.md' is stale (tags)",
-      "suggestion": "run 'dbmd index rebuild'",
+      "line": null,
+      "message": "`index.jsonl` record for `records/notes/malformed-tags.md` is stale (tags)",
       "related": [
         "records/notes/malformed-tags.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
-      "severity": "warning",
       "code": "TAGS_MALFORMED",
       "file": "records/notes/malformed-tags.md",
-      "line": 7,
       "key": "tags",
-      "message": "'tags' must be a flat YAML list of short scalar labels",
-      "suggestion": "use block form: one '- <tag>' per line",
-      "related": []
+      "line": 7,
+      "message": "`tags` must be a flat YAML list of short scalar labels",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "use block form: one `- <tag>` per line"
     },
     {
-      "severity": "error",
       "code": "INDEX_JSONL_MISSING",
       "file": "records/playbooks/index.jsonl",
-      "line": null,
       "key": null,
-      "message": "type-folder 'records/playbooks/' has no 'index.jsonl' twin",
-      "suggestion": "run 'dbmd index rebuild'",
-      "related": []
+      "line": null,
+      "message": "type-folder `records/playbooks/` has no `index.jsonl` twin",
+      "related": [],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
-      "severity": "error",
       "code": "INDEX_JSONL_STALE",
       "file": "records/processes/index.jsonl",
-      "line": null,
       "key": "summary",
-      "message": "'index.jsonl' record for 'records/processes/invoicing.md' is stale (summary)",
-      "suggestion": "run 'dbmd index rebuild'",
+      "line": null,
+      "message": "`index.jsonl` record for `records/processes/invoicing.md` is stale (summary)",
       "related": [
         "records/processes/invoicing.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
-      "severity": "info",
       "code": "POLICY_IGNORED_TYPE_PRESENT",
       "file": "records/scratch/throwaway.md",
-      "line": 2,
       "key": "type",
-      "message": "file has type 'test' which DB.md ## Policies → ### Ignored types lists",
-      "suggestion": "no action required; ignored-type files are ambient context, never synthesised",
+      "line": 2,
+      "message": "file has ignored type `test` (per DB.md ## Policies)",
       "related": [
         "DB.md"
-      ]
+      ],
+      "severity": "info",
+      "suggestion": "change the `type`, or remove it from DB.md `### Ignored types` if it should be managed"
     },
     {
-      "severity": "warning",
-      "code": "DUP_EMAIL_REINGEST",
+      "code": "DUP_UNIQUE_KEY",
       "file": "sources/emails/2026/05/2026-05-22-renewal-a.md",
-      "line": 1,
       "key": null,
-      "message": "two emails share (from, subject, date) = (elena.rodriguez@northstar.io, Renewal discussion - Northstar, 2026-05-22T09:14:00-07:00)",
-      "suggestion": "likely a re-ingest; delete the duplicate source",
+      "line": 1,
+      "message": "`email` unique key (from, subject, date) collides with 1 other record(s)",
       "related": [
         "sources/emails/2026/05/2026-05-22-renewal-b.md"
-      ]
+      ],
+      "severity": "warning",
+      "suggestion": "merge with `dbmd rename`, or cross-link with `dbmd link`"
     },
     {
-      "severity": "error",
       "code": "FM_BAD_TIMESTAMP",
       "file": "sources/emails/2026/05/bad-timestamp.md",
-      "line": 4,
       "key": "created",
-      "message": "'created' value 'not-a-real-timestamp' is not ISO-8601",
-      "suggestion": "set 'created' to an ISO-8601 timestamp (e.g. 2026-05-23T09:00:00-07:00)",
-      "related": []
+      "line": 4,
+      "message": "`created` is not ISO-8601: \"not-a-real-timestamp\"",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use RFC3339, e.g. 2026-05-27T08:00:00-07:00"
     },
     {
-      "severity": "error",
       "code": "INDEX_JSONL_DESYNC",
       "file": "sources/emails/index.jsonl",
-      "line": null,
       "key": null,
-      "message": "sources/emails/index.jsonl lists 2 entries but the folder has 3 files (missing 'sources/emails/2026/05/bad-timestamp')",
-      "suggestion": "run dbmd index rebuild --folder sources/emails to regenerate the complete jsonl",
+      "line": null,
+      "message": "file `sources/emails/2026/05/bad-timestamp.md` is missing from the complete `index.jsonl`",
       "related": [
         "sources/emails/2026/05/bad-timestamp.md"
-      ]
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
-      "severity": "warning",
-      "code": "LAYER_TYPE_MISMATCH",
-      "file": "wiki/contacts/misplaced-contact.md",
-      "line": 2,
-      "key": "type",
-      "message": "type 'contact' belongs in 'records/' but this file is under 'wiki/'",
-      "suggestion": "move the file under 'records/' (its canonical layer), or change its 'type:'",
-      "related": []
+      "code": "INDEX_JSONL_STALE",
+      "file": "wiki/companies/index.jsonl",
+      "key": "derived_from",
+      "line": null,
+      "message": "`index.jsonl` record for `wiki/companies/northstar.md` is stale (derived_from)",
+      "related": [
+        "wiki/companies/northstar.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
-      "severity": "warning",
+      "code": "INDEX_JSONL_STALE",
+      "file": "wiki/contacts/index.jsonl",
+      "key": "company",
+      "line": null,
+      "message": "`index.jsonl` record for `wiki/contacts/misplaced-contact.md` is stale (company)",
+      "related": [
+        "wiki/contacts/misplaced-contact.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
       "code": "INDEX_ORPHAN",
       "file": "wiki/people/index.md",
-      "line": null,
       "key": null,
-      "message": "index.md sits in empty / non-canonical folder 'wiki/people'",
-      "suggestion": "run dbmd index rebuild to delete the orphan index",
-      "related": []
+      "line": null,
+      "message": "`wiki/people/index.md` sits in an empty or non-canonical folder",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "remove it, or run `dbmd index rebuild`"
     },
     {
-      "severity": "warning",
       "code": "POLICY_IGNORED_TYPE_DERIVED",
       "file": "wiki/synthesis/derived-from-ignored.md",
-      "line": 9,
       "key": "derived_from",
-      "message": "wiki-page derives from 'records/scratch/throwaway' whose type 'test' is on the Ignored types list",
-      "suggestion": "remove the ignored-type source from derived_from, or delete this synthesis page",
+      "line": 9,
+      "message": "wiki-page derives from ignored-type record `records/scratch/throwaway` (type `test`)",
       "related": [
         "records/scratch/throwaway.md",
         "DB.md"
-      ]
+      ],
+      "severity": "warning",
+      "suggestion": "drop this `derived_from` link, or remove the target type from DB.md `### Ignored types`"
     },
     {
-      "severity": "error",
       "code": "WIKI_LINK_FLOW_FORM_LIST",
       "file": "wiki/synthesis/flow-form-list.md",
-      "line": 8,
       "key": "derived_from",
-      "message": "frontmatter list 'derived_from' uses flow form '[[[a]], [[b]]]' which YAML parses as a nested list",
-      "suggestion": "use the YAML block-sequence form, one '- [[path]]' per line",
-      "related": []
+      "line": 8,
+      "message": "`derived_from` uses inline flow form `[[[a]], [[b]]]`",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use YAML block-sequence form: one `- [[...]]` per line"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "wiki/synthesis/index.jsonl",
+      "key": "derived_from",
+      "line": null,
+      "message": "`index.jsonl` record for `wiki/synthesis/derived-from-ignored.md` is stale (derived_from)",
+      "related": [
+        "wiki/synthesis/derived-from-ignored.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "wiki/synthesis/index.jsonl",
+      "key": "derived_from",
+      "line": null,
+      "message": "`index.jsonl` record for `wiki/synthesis/flow-form-list.md` is stale (derived_from)",
+      "related": [
+        "wiki/synthesis/flow-form-list.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     }
   ]
 }

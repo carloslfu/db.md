@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::RenameArgs;
 use crate::cmd::write::{
     core_err, enforce_frozen, index_on_rename, index_on_write, open_store, policy_frozen_error,
-    to_store_relative,
+    require_store_relative,
 };
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
@@ -38,8 +38,8 @@ use crate::error::{CliError, CliResult, ExitCode};
 pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     let store = open_store(&args.dir)?;
 
-    let old_rel = to_store_relative(&store, &args.old);
-    let new_rel = to_store_relative(&store, &args.new);
+    let old_rel = require_store_relative(&store, &args.old)?;
+    let new_rel = require_store_relative(&store, &args.new)?;
     let old_abs = store.abs_path(&old_rel);
     let new_abs = store.abs_path(&new_rel);
 
@@ -196,10 +196,8 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), CliError> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("dbmd-rename");
-    let tmp = parent.join(format!(".{name}.tmp.{}", std::process::id()));
+    let (mut f, tmp) = create_temp_file(parent, name)?;
     {
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| CliError::runtime(format!("cannot write rewrite: {e}")))?;
         f.write_all(contents.as_bytes())
             .map_err(|e| CliError::runtime(format!("cannot write rewrite: {e}")))?;
         f.sync_all().ok();
@@ -208,7 +206,44 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), CliError> {
         let _ = std::fs::remove_file(&tmp);
         return Err(CliError::runtime(format!("cannot finalize rewrite: {e}")));
     }
+    sync_parent_dir(parent);
     Ok(())
+}
+
+fn create_temp_file(parent: &Path, name: &str) -> Result<(std::fs::File, PathBuf), CliError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    for _ in 0..128 {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{name}.tmp.{pid}.{nanos}.{seq}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(CliError::runtime(format!("cannot write rewrite: {e}"))),
+        }
+    }
+
+    Err(CliError::runtime(
+        "cannot write rewrite: could not allocate a unique temp file",
+    ))
+}
+
+fn sync_parent_dir(parent: &Path) {
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
 }
 
 /// True for a derived index artifact (`index.md` / `index.jsonl`). The catalog

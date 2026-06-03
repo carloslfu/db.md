@@ -36,7 +36,7 @@ pub fn run(ctx: &Context, args: &LinksArgs) -> CliResult {
 /// `NOT_A_STORE` exit. Goes through `dbmd_core::Error` so the exit code +
 /// machine code match every other store-walking subcommand.
 fn open_store(dir: &str) -> Result<Store, crate::error::CliError> {
-    Store::open(Path::new(dir)).map_err(|e| crate::error::CliError::from(dbmd_core::Error::from(e)))
+    Store::open_strict(Path::new(dir)).map_err(crate::error::CliError::from)
 }
 
 /// Map a store-walk error (failed ripgrep scan, I/O) to a CLI runtime error

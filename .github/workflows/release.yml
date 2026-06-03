@@ -87,8 +87,42 @@ jobs:
           echo "Resolved release version: $ver"
 
   # ── Build one tarball per target ────────────────────────────────────────
-  build:
+  preflight:
     needs: version
+    name: release preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Publishability
+        run: cargo package --workspace --locked
+
+      - name: cargo-deny (advisories + licenses + bans)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans
+
+  build:
+    needs: [version, preflight]
     name: build (${{ matrix.target_name }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -224,6 +258,7 @@ jobs:
   publish:
     needs: [version, build]
     runs-on: ubuntu-latest
+    if: ${{ github.ref_type == 'tag' }}
     permissions:
       contents: write       # create the GitHub Release + upload assets
       id-token: write        # OIDC, for the build-provenance attestation
@@ -296,8 +331,9 @@ jobs:
   # ── Publish the crates to crates.io (Trusted Publishing, manual-gated) ───
   publish-crates:
     name: Publish to crates.io
-    needs: [version, build]
+    needs: [version, publish]
     runs-on: ubuntu-latest
+    if: ${{ github.ref_type == 'tag' }}
     # The `crates-io` environment binds Trusted Publishing: crates.io only
     # accepts an OIDC publish from a job running in this environment. No
     # required reviewers are configured (solo maintainer), so a tag push
@@ -356,7 +392,7 @@ jobs:
     name: Update Homebrew tap
     needs: [version, publish]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
+    if: ${{ github.ref_type == 'tag' && !github.event.repository.fork }}
     steps:
       - uses: actions/checkout@v5
 

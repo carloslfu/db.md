@@ -223,7 +223,7 @@ fn now_fixed() -> DateTime<FixedOffset> {
 /// Open the store at `dir`, mapping a missing `DB.md` to the standard
 /// `NOT_A_STORE` CLI error.
 pub(crate) fn open_store(dir: &str) -> Result<Store, CliError> {
-    Store::open(Path::new(dir)).map_err(|e| dbmd_core::Error::from(e).into())
+    Store::open_strict(Path::new(dir)).map_err(CliError::from)
 }
 
 /// Lift any `dbmd-core` sub-error (`ParseError` / `StoreError` / `NotAStore`)

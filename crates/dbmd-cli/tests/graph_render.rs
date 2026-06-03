@@ -689,21 +689,9 @@ fn stats_json_counts_match_the_corpus_shape() {
     assert_eq!(top[0][0], "expense");
     assert_eq!(top[0][1], 490);
 
-    // The corpus uses only canonical content types, so `custom_types_present` is
-    // empty and the recognized set includes the headline types.
-    assert!(v["custom_types_present"].as_array().unwrap().is_empty());
-    let recognized: Vec<&str> = v["recognized_types_present"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t.as_str().unwrap())
-        .collect();
-    for t in ["contact", "company", "email", "expense", "wiki-page"] {
-        assert!(
-            recognized.contains(&t),
-            "{t} should be a recognized type present"
-        );
-    }
+    // `type_distribution` carries the per-type counts; no recognized/custom
+    // split exists any more (every type is the store's own).
+    assert_eq!(v["type_distribution"]["expense"], 490);
 }
 
 #[test]

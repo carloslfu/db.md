@@ -41,6 +41,7 @@ validated, never operated. Do not synthesise, do not repair.
 - role (string)
 - first_touch (date)
 - last_touch (date)
+- unique: email
 
 ### expense
 - date (required, date)
@@ -48,6 +49,7 @@ validated, never operated. Do not synthesise, do not repair.
 - currency (default USD)
 - category (string)
 - vendor (required, link to records/companies/)
+- unique: date, amount, vendor
 
 ### invoice
 - date (required, date)
@@ -55,15 +57,21 @@ validated, never operated. Do not synthesise, do not repair.
 - vendor (required, link to records/companies/)
 - status (required, enum: paid, unpaid, void)
 - paid_at (date)
+- unique: vendor, date, amount
 
 ### company
 - name (required, string)
 - domain (required, string)
 - industry (string)
 - relationship (enum: customer, vendor, partner, prospect)
+- unique: domain
 
 ### meeting
 - date (required, date)
 - attendees (required, link to records/contacts/)
 - location (string)
 - duration_min (int)
+- unique: date, attendees
+
+### email
+- unique: from, subject, date

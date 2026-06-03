@@ -16,7 +16,7 @@ use crate::error::CliResult;
 
 /// Run `dbmd stats`.
 pub fn run(ctx: &Context, args: &StatsArgs) -> CliResult {
-    let store = Store::open(Path::new(&args.dir)).map_err(dbmd_core::Error::from)?;
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let s = stats::compute(&store)?;
 
     if ctx.json {
@@ -44,15 +44,6 @@ fn emit_text(s: &Stats) {
         for (type_, count) in &s.top_types {
             println!("  {type_}: {count}");
         }
-    }
-    if !s.recognized_types_present.is_empty() {
-        println!(
-            "recognized types: {}",
-            s.recognized_types_present.join(", ")
-        );
-    }
-    if !s.custom_types_present.is_empty() {
-        println!("custom types: {}", s.custom_types_present.join(", "));
     }
 }
 
@@ -86,8 +77,6 @@ fn emit_json(s: &Stats) {
         "orphan_count": s.orphan_count,
         "broken_link_count": s.broken_link_count,
         "top_types": top_types,
-        "recognized_types_present": s.recognized_types_present,
-        "custom_types_present": s.custom_types_present,
     });
     println!("{}", serde_json::to_string(&out).expect("serialize stats"));
 }

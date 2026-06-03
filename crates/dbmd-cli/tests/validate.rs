@@ -185,12 +185,10 @@ fn clean_synthetic_store_text_summary_only() {
         "records/companies/acme.md",
         "---\ntype: company\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: Acme\nname: Acme\ndomain: acme.com\n---\n\n# Acme\n",
     );
-    // Log BOTH files as changed since the start of time so the working-set
-    // default actually INSPECTS them — without a log entry the changed set is
-    // empty and zero files are checked, which would make the clean assertion
-    // below pass vacuously for any content. The working-set scope does NOT run
-    // the `--all`-only index/log cross-file checks, so no index files are needed
-    // for a truly-clean result here.
+    // Log BOTH files as changed since the start of time so this test exercises
+    // the O(changed) working-set path rather than the no-log fallback. The
+    // working-set scope does NOT run the `--all`-only index/log cross-file
+    // checks, so no index files are needed for a truly-clean result here.
     write_file(
         tmp.path(),
         "log.md",
@@ -241,6 +239,33 @@ fn working_set_default_inspects_logged_files() {
     );
     assert_eq!(bad_ts[0]["file"], "records/contacts/sarah.md");
     assert_eq!(bad_ts[0]["severity"], "error");
+}
+
+#[test]
+fn working_set_default_falls_back_when_no_changes_are_logged() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_db_md(tmp.path());
+    write_file(
+        tmp.path(),
+        "records/notes/n.md",
+        "---\ntype: note\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: a note\n---\n\nSee [[records/contacts/ghost]].\n",
+    );
+
+    let (code, json) = run_validate_json(tmp.path(), false);
+    assert_eq!(
+        code, 6,
+        "default validate must not pass vacuously when no log entries exist"
+    );
+    assert_eq!(json["scope"], "working-set");
+    assert!(
+        json["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "WIKI_LINK_BROKEN" && i["file"] == "records/notes/n.md"),
+        "broken link should be found by the fallback content sweep: {}",
+        json["issues"]
+    );
 }
 
 #[test]

@@ -161,9 +161,30 @@ impl Store {
         false
     }
 
+    /// Open `path` as a db.md store and require `DB.md` to be readable and
+    /// parseable. Normal commands should enter through this strict gate so a
+    /// damaged config cannot silently disable schema or policy rules.
+    pub fn open_strict(path: &Path) -> crate::Result<Store> {
+        if !Store::is_db_md_store(path) {
+            return Err(NotAStore {
+                path: path.to_path_buf(),
+            }
+            .into());
+        }
+        let db_md = path.join("DB.md");
+        let text = std::fs::read_to_string(&db_md)?;
+        let config = parse_db_md(&text, &db_md)?;
+        Ok(Store {
+            root: path.to_path_buf(),
+            config,
+        })
+    }
+
     /// Open `path` as a db.md store: confirm the `DB.md` marker (else
-    /// [`NotAStore`]) and parse the `DB.md` config. Every store-walking
-    /// subcommand opens through here.
+    /// [`NotAStore`]) and parse the `DB.md` config when possible. This is the
+    /// lenient validation-oriented open path: a damaged `DB.md` still marks the
+    /// directory as a store so `dbmd validate` can report the config error as an
+    /// issue. Normal CLI commands should use [`Store::open_strict`] instead.
     pub fn open(path: &Path) -> Result<Store, NotAStore> {
         if !Store::is_db_md_store(path) {
             return Err(NotAStore {
@@ -1038,7 +1059,12 @@ fn json_value_matches(v: &serde_json::Value, value: &str) -> bool {
         serde_json::Value::Bool(b) => b.to_string() == value,
         serde_json::Value::Number(n) => n.to_string() == value,
         serde_json::Value::Array(items) => items.iter().any(|i| json_value_matches(i, value)),
-        serde_json::Value::Null => value.is_empty(),
+        // A present-but-null field never matches — consistent with the in-memory
+        // post-filter (`query::json_value_matches`, which the first `where`
+        // clause is NOT re-checked against, so the two must agree here or a
+        // `--where field=` query would return different rows than `--type X
+        // --where field=`).
+        serde_json::Value::Null => false,
         serde_json::Value::Object(_) => false,
     }
 }

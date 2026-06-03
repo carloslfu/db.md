@@ -817,9 +817,7 @@ fn read_frontmatter(abs: &Path) -> crate::Result<FileMeta> {
             // `id`, `status`, type-specific fields) goes to `fields`.
             "path" => {}
             _ => {
-                if let Ok(jv) = serde_json::to_value(&v) {
-                    fields.insert(key, jv);
-                }
+                fields.insert(key, yaml_to_json_value(&v));
             }
         }
     }
@@ -862,10 +860,52 @@ fn yaml_string_list(v: &serde_norway::Value) -> Vec<String> {
         serde_norway::Value::String(s) => vec![s.clone()],
         serde_norway::Value::Sequence(seq) => seq
             .iter()
-            .filter_map(|item| item.as_str().map(str::to_string))
+            .filter_map(yaml_string_or_wiki_link_literal)
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn yaml_string_or_wiki_link_literal(v: &serde_norway::Value) -> Option<String> {
+    v.as_str()
+        .map(str::to_string)
+        .or_else(|| unquoted_wiki_link_literal(v))
+}
+
+fn yaml_to_json_value(v: &serde_norway::Value) -> Value {
+    if let Some(link) = unquoted_wiki_link_literal(v) {
+        return Value::String(link);
+    }
+    match v {
+        serde_norway::Value::String(s) => Value::String(s.clone()),
+        serde_norway::Value::Bool(b) => Value::Bool(*b),
+        serde_norway::Value::Number(n) => {
+            serde_json::to_value(n).unwrap_or_else(|_| Value::String(n.to_string()))
+        }
+        serde_norway::Value::Sequence(seq) => {
+            Value::Array(seq.iter().map(yaml_to_json_value).collect())
+        }
+        serde_norway::Value::Mapping(_) | serde_norway::Value::Tagged(_) => {
+            serde_json::to_value(v).unwrap_or(Value::Null)
+        }
+        serde_norway::Value::Null => Value::Null,
+    }
+}
+
+fn unquoted_wiki_link_literal(v: &serde_norway::Value) -> Option<String> {
+    let serde_norway::Value::Sequence(outer) = v else {
+        return None;
+    };
+    if outer.len() != 1 {
+        return None;
+    }
+    let serde_norway::Value::Sequence(inner) = &outer[0] else {
+        return None;
+    };
+    let [serde_norway::Value::String(target)] = inner.as_slice() else {
+        return None;
+    };
+    Some(format!("[[{target}]]"))
 }
 
 /// Parse an RFC3339 timestamp scalar.
@@ -1417,7 +1457,7 @@ mod tests {
             "expense",
             Some("Lunch with vendor"),
             Some("2026-05-10T10:00:00Z"),
-            "created: 2026-05-10T09:00:00Z\nstatus: paid\namount: 42\ntags:\n  - food\nlinks:\n  - wiki/themes/spend\n",
+            "created: 2026-05-10T09:00:00Z\nstatus: paid\namount: 42\ncompany: [[records/companies/acme]]\nrelated:\n  - [[wiki/themes/spend]]\ntags:\n  - food\nlinks:\n  - wiki/themes/spend\n  - [[wiki/themes/renewal]]\n",
         );
         write_doc(
             &store,
@@ -1447,13 +1487,27 @@ mod tests {
         assert_eq!(r1.type_, "expense");
         assert_eq!(r1.summary, "Lunch with vendor");
         assert_eq!(r1.tags, vec!["food".to_string()]);
-        assert_eq!(r1.links, vec!["wiki/themes/spend".to_string()]);
+        assert_eq!(
+            r1.links,
+            vec![
+                "wiki/themes/spend".to_string(),
+                "[[wiki/themes/renewal]]".to_string()
+            ]
+        );
         assert_eq!(
             r1.created,
             Some(DateTime::parse_from_rfc3339("2026-05-10T09:00:00Z").unwrap())
         );
         assert_eq!(r1.fields.get("status"), Some(&Value::from("paid")));
         assert_eq!(r1.fields.get("amount"), Some(&Value::from(42)));
+        assert_eq!(
+            r1.fields.get("company"),
+            Some(&Value::from("[[records/companies/acme]]"))
+        );
+        assert_eq!(
+            r1.fields.get("related"),
+            Some(&serde_json::json!(["[[wiki/themes/spend]]"]))
+        );
         // Reserved keys never leak into `fields`.
         for reserved in [
             "path", "type", "summary", "tags", "links", "created", "updated",
@@ -1467,14 +1521,14 @@ mod tests {
         // Stable key order: declared fields first, then sorted extras.
         assert!(
             lines[1].starts_with(
-                r#"{"path":"records/expenses/2026/05/e1.md","type":"expense","summary":"Lunch with vendor","tags":["food"],"links":["wiki/themes/spend"],"created":"2026-05-10T09:00:00Z","updated":"2026-05-10T10:00:00Z","#
+                r#"{"path":"records/expenses/2026/05/e1.md","type":"expense","summary":"Lunch with vendor","tags":["food"],"links":["wiki/themes/spend","[[wiki/themes/renewal]]"],"created":"2026-05-10T09:00:00Z","updated":"2026-05-10T10:00:00Z","#
             ),
             "jsonl key order not stable:\n{}",
             lines[1]
         );
-        // The flattened extras come in BTreeMap (sorted) order: amount < status.
+        // The flattened extras come in BTreeMap (sorted) order.
         assert!(
-            lines[1].ends_with(r#""amount":42,"status":"paid"}"#),
+            lines[1].ends_with(r#""amount":42,"company":"[[records/companies/acme]]","related":["[[wiki/themes/spend]]"],"status":"paid"}"#),
             "extras must be sorted:\n{}",
             lines[1]
         );

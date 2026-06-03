@@ -463,12 +463,22 @@ fn normalize_frozen_path(p: &Path) -> String {
     no_dot.strip_suffix(".md").unwrap_or(no_dot).to_string()
 }
 
-/// A custom (or canonical-override) type schema parsed from a `DB.md`
-/// `### <type>` sub-section.
+/// A user-declared type schema parsed from a `DB.md` `### <type>` sub-section.
+/// The store's `## Schemas` is the **only** source of schema enforcement — the
+/// toolkit ships no built-in or implicit per-type schema (see SPEC § Schemas).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Schema {
     /// One [`FieldSpec`] per bulleted field line, in source order.
     pub fields: Vec<FieldSpec>,
+    /// `- unique: <field>[, <field> …]` directives — each inner vec is one
+    /// uniqueness constraint over the listed field(s) (compound when >1). Two
+    /// records of this type whose listed values collide warn as
+    /// `DUP_UNIQUE_KEY`.
+    pub unique_keys: Vec<Vec<String>>,
+    /// `- summary_template: <template>` directive — the `{field}` interpolation
+    /// pattern `dbmd fm init` / `dbmd write` use to compose a default `summary`
+    /// for this type. `None` falls back to the body's first paragraph.
+    pub summary_template: Option<String>,
 }
 
 /// One field declaration inside a [`Schema`]: `- <name> (<modifiers>)`.
@@ -603,11 +613,10 @@ pub fn write_file(path: &Path, frontmatter: &Frontmatter, body: &str) -> Result<
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("dbmd-write");
-    let tmp = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let (mut f, tmp) = create_temp_file(parent, file_name)?;
 
     // Scope the handle so it is flushed and closed before the rename.
     {
-        let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
         f.sync_all()?;
     }
@@ -616,7 +625,45 @@ pub fn write_file(path: &Path, frontmatter: &Frontmatter, body: &str) -> Result<
         let _ = std::fs::remove_file(&tmp);
         return Err(ParseError::Io(e));
     }
+    sync_parent_dir(parent);
     Ok(())
+}
+
+fn create_temp_file(parent: &Path, file_name: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    for _ in 0..128 {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{file_name}.tmp.{pid}.{nanos}.{seq}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique dbmd temp file",
+    ))
+}
+
+fn sync_parent_dir(parent: &Path) {
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
 }
 
 /// Extract every wiki-link from a body (and inline frontmatter), returning the
@@ -793,6 +840,7 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
     // still start with a valid `---` block (`type: db-md`); if it's missing we
     // surface MissingFrontmatter like any other file.
     let parsed = split_frontmatter(text, file)?;
+    let _frontmatter = Frontmatter::parse(&parsed.frontmatter_yaml, file)?;
     let sections = extract_sections(&parsed.body);
 
     let mut config = Config::default();
@@ -830,11 +878,21 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
                     ("schemas", _) => {
                         // The H3 heading text (as written) is the type name.
                         let type_name = section.heading.trim().to_string();
-                        let fields: Vec<FieldSpec> = bullet_lines(&section.body)
-                            .into_iter()
-                            .map(|b| parse_field_spec(&b))
-                            .collect();
-                        config.schemas.insert(type_name, Schema { fields });
+                        let mut schema = Schema::default();
+                        for b in bullet_lines(&section.body) {
+                            match parse_schema_bullet(&b) {
+                                SchemaBullet::Field(f) => schema.fields.push(f),
+                                SchemaBullet::Unique(k) if !k.is_empty() => {
+                                    schema.unique_keys.push(k)
+                                }
+                                SchemaBullet::SummaryTemplate(t) if !t.is_empty() => {
+                                    schema.summary_template = Some(t)
+                                }
+                                // Empty directive (`- unique:` with no fields) — ignore.
+                                SchemaBullet::Unique(_) | SchemaBullet::SummaryTemplate(_) => {}
+                            }
+                        }
+                        config.schemas.insert(type_name, schema);
                     }
                     _ => {}
                 }
@@ -844,6 +902,54 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
     }
 
     Ok(config)
+}
+
+/// One parsed bullet inside a `### <type>` schema block: an ordinary field, or a
+/// reserved directive (`unique:` / `summary_template:`). The names `unique` and
+/// `summary_template` are reserved and cannot be used as field names.
+#[derive(Debug)]
+enum SchemaBullet {
+    /// An ordinary `- <name> (<modifiers>)` field.
+    Field(FieldSpec),
+    /// `- unique: <field>[, <field> …]` — a (possibly compound) uniqueness key.
+    Unique(Vec<String>),
+    /// `- summary_template: <template>` — the default-`summary` pattern.
+    SummaryTemplate(String),
+}
+
+/// Classify one `## Schemas` bullet as a directive or a field. The directive
+/// forms are `- unique: a, b, …` and `- summary_template: …`; the keyword check
+/// guards against false positives — a field like `- status (enum: a, b)` has a
+/// `(` before any `:`, so its head isn't a bare reserved keyword and it parses
+/// as a [`FieldSpec`].
+fn parse_schema_bullet(bullet_line: &str) -> SchemaBullet {
+    let line = bullet_line.trim();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+        .or_else(|| line.strip_prefix('-'))
+        .unwrap_or(line)
+        .trim();
+
+    if let Some((head, rest)) = line.split_once(':') {
+        match head.trim().to_ascii_lowercase().as_str() {
+            "unique" => {
+                let fields = rest
+                    .split(',')
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty())
+                    .collect();
+                return SchemaBullet::Unique(fields);
+            }
+            "summary_template" => {
+                return SchemaBullet::SummaryTemplate(rest.trim().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    SchemaBullet::Field(parse_field_spec(bullet_line))
 }
 
 /// Parse a single `## Schemas` field-bullet line — `- <name> (<modifiers>)` —
@@ -2243,6 +2349,65 @@ mod tests {
         assert!(f.link_prefix.is_none());
         assert!(f.enum_values.is_none());
         assert!(f.unknown_modifiers.is_empty());
+    }
+
+    // ── parse_schema_bullet (directives) ─────────────────────────────────────
+
+    #[test]
+    fn schema_bullet_unique_single_field() {
+        match parse_schema_bullet("- unique: email") {
+            SchemaBullet::Unique(fields) => assert_eq!(fields, vec!["email".to_string()]),
+            other => panic!("expected Unique, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_bullet_unique_compound_trims_and_splits() {
+        match parse_schema_bullet("- unique: date, amount , vendor") {
+            SchemaBullet::Unique(fields) => assert_eq!(
+                fields,
+                vec![
+                    "date".to_string(),
+                    "amount".to_string(),
+                    "vendor".to_string()
+                ]
+            ),
+            other => panic!("expected Unique, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_bullet_summary_template_keeps_braces_and_inner_colons() {
+        match parse_schema_bullet("- summary_template: {role} at {company} (x: y)") {
+            SchemaBullet::SummaryTemplate(t) => assert_eq!(t, "{role} at {company} (x: y)"),
+            other => panic!("expected SummaryTemplate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_bullet_field_with_enum_modifier_is_not_a_directive() {
+        // A field whose modifiers contain a colon (`enum:`) parses as a field, not
+        // a directive — its head has a `(` before any `:`.
+        match parse_schema_bullet("- status (enum: open, closed)") {
+            SchemaBullet::Field(f) => {
+                assert_eq!(f.name, "status");
+                assert_eq!(
+                    f.enum_values,
+                    Some(vec!["open".to_string(), "closed".to_string()])
+                );
+            }
+            other => panic!("expected Field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_db_md_schema_captures_unique_and_summary_template() {
+        let db = "---\ntype: db-md\nscope: x\nowner: y\n---\n\n## Schemas\n\n### contact\n- email (required, email)\n- unique: email\n- summary_template: {role} at {company}\n";
+        let config = parse_db_md(db, Path::new("DB.md")).unwrap();
+        let s = config.schemas.get("contact").expect("contact schema");
+        assert_eq!(s.fields.len(), 1, "directives are not parsed as fields");
+        assert_eq!(s.unique_keys, vec![vec!["email".to_string()]]);
+        assert_eq!(s.summary_template.as_deref(), Some("{role} at {company}"));
     }
 
     // ── parse_db_md ──────────────────────────────────────────────────────────

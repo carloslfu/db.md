@@ -17,7 +17,7 @@ use crate::error::{CliError, CliResult, ExitCode};
 
 /// Run `dbmd tree`.
 pub fn run(ctx: &Context, args: &TreeArgs) -> CliResult {
-    let store = Store::open(Path::new(&args.dir)).map_err(dbmd_core::Error::from)?;
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let layer = parse_layer(args.layer.as_deref())?;
     let tree =
         render::tree(&store, layer, args.r#type.as_deref()).map_err(dbmd_core::Error::from)?;

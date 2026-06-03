@@ -19,6 +19,7 @@ use chrono::{DateTime, FixedOffset};
 use crate::cli::{IndexArgs, IndexCommand, IndexQueryArgs, IndexRebuildArgs, IndexShowArgs};
 use crate::cmd::fm::parse_layer;
 use crate::cmd::log::{into_cli, open_store, parse_flexible_timestamp};
+use crate::cmd::write::require_store_relative;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -50,7 +51,7 @@ pub fn run_rebuild(ctx: &Context, args: &IndexRebuildArgs) -> CliResult {
     // Resolve the rebuild scope. `--folder` is one type-folder; `--layer` is one
     // layer; neither is the whole store.
     let scope = if let Some(folder) = &args.folder {
-        RebuildScope::Folder(normalize_rel(Path::new(folder)))
+        RebuildScope::Folder(require_type_folder_scope(&store, folder)?)
     } else if let Some(layer) = &args.layer {
         RebuildScope::Layer(parse_layer(layer)?)
     } else {
@@ -59,13 +60,22 @@ pub fn run_rebuild(ctx: &Context, args: &IndexRebuildArgs) -> CliResult {
 
     if args.dry_run {
         let preview = render_dry_run(&store, &scope)?;
-        print!("{preview}");
+        if ctx.json {
+            let obj = serde_json::json!({
+                "dry_run": true,
+                "scope": scope.describe(),
+                "preview": preview,
+            });
+            println!("{obj}");
+        } else {
+            print!("{preview}");
+        }
         return Ok(());
     }
 
     match &scope {
         RebuildScope::Full => Index::rebuild_all(&store)?,
-        RebuildScope::Layer(layer) => Index::write_level(&store, &IndexLevel::Layer(*layer))?,
+        RebuildScope::Layer(layer) => rebuild_layer(&store, *layer)?,
         RebuildScope::Folder(folder) => {
             Index::write_level(&store, &IndexLevel::TypeFolder(folder.clone()))?
         }
@@ -83,19 +93,25 @@ pub fn run_rebuild(ctx: &Context, args: &IndexRebuildArgs) -> CliResult {
 /// `dbmd index show [<path>]` — print an `index.md` to stdout. Default is the
 /// root `index.md`; `<path>` scopes to a layer or type-folder. A missing index
 /// exits 1 with a stderr hint and an empty stdout (pipelines stay clean).
-pub fn run_show(_ctx: &Context, args: &IndexShowArgs) -> CliResult {
+pub fn run_show(ctx: &Context, args: &IndexShowArgs) -> CliResult {
     let store = open_store(&args.dir)?;
-    let index_md = match &args.path {
-        Some(p) => store
-            .root
-            .join(normalize_rel(Path::new(p)))
-            .join("index.md"),
-        None => store.root.join("index.md"),
+    let index_rel = match &args.path {
+        Some(p) => require_show_scope(&store, p)?.join("index.md"),
+        None => PathBuf::from("index.md"),
     };
+    let index_md = store.root.join(&index_rel);
 
     match std::fs::read_to_string(&index_md) {
         Ok(contents) => {
-            print!("{contents}");
+            if ctx.json {
+                let obj = serde_json::json!({
+                    "path": path_str(&index_rel),
+                    "contents": contents,
+                });
+                println!("{obj}");
+            } else {
+                print!("{contents}");
+            }
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -199,6 +215,14 @@ fn render_dry_run(store: &Store, scope: &RebuildScope) -> Result<String, CliErro
         }
     }
     Ok(out)
+}
+
+fn rebuild_layer(store: &Store, layer: Layer) -> Result<(), dbmd_core::Error> {
+    for tf in type_folders_in_layer(store, layer) {
+        Index::write_level(store, &IndexLevel::TypeFolder(tf))?;
+    }
+    Index::write_level(store, &IndexLevel::Layer(layer))?;
+    Ok(())
 }
 
 /// The immediate type-folders under a layer (one directory level below the layer
@@ -322,10 +346,49 @@ fn split_where(clause: &str) -> Result<(&str, &str), CliError> {
 
 // ── Path glue ────────────────────────────────────────────────────────────────
 
-/// Normalize a possibly-`./`-prefixed CLI path to a clean store-relative form.
-fn normalize_rel(p: &Path) -> PathBuf {
-    let s = path_str(p);
-    PathBuf::from(s.strip_prefix("./").unwrap_or(&s))
+/// Resolve `--folder` to exactly `<layer>/<type-folder>` under the store. This
+/// is a write scope, so parent traversal / absolute outside-store paths are
+/// rejected before core writes or removes `index.md` / `index.jsonl`.
+fn require_type_folder_scope(store: &Store, raw: &str) -> Result<PathBuf, CliError> {
+    let rel = require_store_relative(store, raw)?;
+    let comps = normal_components(&rel);
+    if comps.len() == 2 && Layer::from_dir_name(comps[0]).is_some() {
+        return Ok(rel);
+    }
+    Err(CliError::new(
+        ExitCode::Runtime,
+        "BAD_SCOPE",
+        format!("--folder expects <layer>/<type-folder>, got {raw:?}"),
+    )
+    .with_hint("example: --folder records/contacts"))
+}
+
+/// Resolve an `index show <path>` scope. Show is read-only, but it still must
+/// stay inside the store; accepted scopes are a layer (`records`) or a
+/// type-folder (`records/contacts`).
+fn require_show_scope(store: &Store, raw: &str) -> Result<PathBuf, CliError> {
+    let rel = require_store_relative(store, raw)?;
+    let comps = normal_components(&rel);
+    if matches!(comps.len(), 1 | 2)
+        && comps
+            .first()
+            .and_then(|c| Layer::from_dir_name(c))
+            .is_some()
+    {
+        return Ok(rel);
+    }
+    Err(CliError::new(
+        ExitCode::Runtime,
+        "BAD_SCOPE",
+        format!("index show path must be a layer or type-folder, got {raw:?}"),
+    )
+    .with_hint("examples: dbmd index show records; dbmd index show records/contacts"))
+}
+
+fn normal_components(path: &Path) -> Vec<&str> {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect()
 }
 
 /// Render a path with `/` separators for stable, platform-independent output.

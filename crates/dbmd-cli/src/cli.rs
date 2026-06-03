@@ -567,6 +567,11 @@ pub struct OutlineArgs {
     /// The file to outline.
     #[arg(value_name = "FILE")]
     pub file: String,
+
+    /// The store directory (defaults to the current directory). Consistent with
+    /// the other read commands so `outline` can target a store from elsewhere.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

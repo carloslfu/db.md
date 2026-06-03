@@ -410,6 +410,9 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
             if target.is_empty() || target == self_target {
                 continue;
             }
+            if resolve_existing(store, Path::new(&target)).is_none() {
+                continue;
+            }
             outgoing = true;
             linked_to.insert(PathBuf::from(target));
         }
@@ -497,9 +500,15 @@ pub fn rewrite_links_to(text: &str, old: &Path, new: &Path) -> String {
 /// rewrite can re-emit the display verbatim. The target/display character
 /// classes match [`wiki_link_re`] exactly, so the write side recognizes a link
 /// iff the read side does — the two never disagree on what a `[[…]]` is.
-fn rewrite_link_re() -> Regex {
-    Regex::new(r"\[\[([^\]\|\n]+?)(?:\|([^\]\n]*))?\]\]")
-        .expect("static wiki-link rewrite regex compiles")
+///
+/// Compiled once for the process via [`OnceLock`] — `rewrite_links_to` runs on
+/// the rename/link write path, so recompiling per call would be wasteful.
+fn rewrite_link_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\[\[([^\]\|\n]+?)(?:\|([^\]\n]*))?\]\]")
+            .expect("static wiki-link rewrite regex compiles")
+    })
 }
 
 /// Normalize a store-relative path into the canonical wiki-link target form:
@@ -517,11 +526,17 @@ fn normalize_target(path: &Path) -> String {
 }
 
 /// The wiki-link regex: `[[target]]` / `[[target|display]]`. Captures the raw
-/// target (group 1). Compiled once per call site; cheap.
-fn wiki_link_re() -> Regex {
+/// target (group 1). Compiled once for the process via [`OnceLock`] —
+/// `extract_link_targets` runs on the O(changed) loop path (backlinks /
+/// forwardlinks / neighborhood), so the compile must not repeat per call.
+fn wiki_link_re() -> &'static Regex {
     // target = anything up to the first `|` or `]`. display (optional) is
     // discarded. Matches across a single line/body slice.
-    Regex::new(r"\[\[([^\]\|\n]+?)(?:\|[^\]\n]*)?\]\]").expect("static wiki-link regex compiles")
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\[\[([^\]\|\n]+?)(?:\|[^\]\n]*)?\]\]")
+            .expect("static wiki-link regex compiles")
+    })
 }
 
 /// Extract every wiki-link target from a body, normalized to the canonical
@@ -1585,10 +1600,10 @@ mod tests {
     }
 
     #[test]
-    fn orphans_file_with_only_outgoing_is_not_orphan() {
+    fn orphans_file_with_only_broken_outgoing_link_is_orphan() {
         let fx = Fixture::new();
-        // `a` links out to a target that does NOT exist on disk. `a` still has
-        // an outgoing edge, so it is not an orphan (orphan = no edges at all).
+        // Broken targets are validation issues, not graph edges to another
+        // store file. A file whose only link points nowhere is still an orphan.
         fx.write(
             "wiki/people/a.md",
             "wiki-page",
@@ -1597,8 +1612,8 @@ mod tests {
         );
         let got = orphans(&fx.store, None).unwrap();
         assert!(
-            !paths(&got).contains(&"wiki/people/a.md".to_string()),
-            "outgoing-only is not an orphan: {got:?}"
+            paths(&got).contains(&"wiki/people/a.md".to_string()),
+            "broken outgoing links must not wire the graph: {got:?}"
         );
     }
 

@@ -182,32 +182,31 @@ fn validate_all_matches_expected_golden_issue_for_issue_and_exits_six() {
         "the per-code issue counts must match the golden exactly"
     );
 
-    // ── the layer-appropriate-type fixture fires exactly one warning ─────────
-    // A `type: contact` filed under `wiki/` (its canonical layer is `records/`)
-    // is valid-but-unusual → exactly one `LAYER_TYPE_MISMATCH` warning on that
-    // file, anchored to the `type:` line, and NOT an error (the placement is a
-    // convention nudge, not a hard block).
+    // ── v0.2 removed LAYER_TYPE_MISMATCH; the contact under wiki/ is now a
+    //    fully clean file the sweep must NOT flag (a false-positive catcher) ────
+    // The folder layout is convention, not enforcement — placement no longer
+    // warns. The `contact` under `wiki/contacts/` is schema-valid with resolving
+    // links, so it carries zero issues.
     let layer_issues: Vec<&serde_json::Value> = report["issues"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|i| i["code"] == "LAYER_TYPE_MISMATCH")
         .collect();
-    assert_eq!(
-        layer_issues.len(),
-        1,
-        "exactly one LAYER_TYPE_MISMATCH in the sweep: {layer_issues:#?}"
+    assert!(
+        layer_issues.is_empty(),
+        "LAYER_TYPE_MISMATCH was removed in v0.2; nothing emits it: {layer_issues:#?}"
     );
-    let li = layer_issues[0];
-    assert_eq!(
-        li["severity"], "warning",
-        "layer mismatch is a warning, not an error"
+    let misplaced_issues: Vec<&serde_json::Value> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["file"] == "wiki/contacts/misplaced-contact.md")
+        .collect();
+    assert!(
+        misplaced_issues.is_empty(),
+        "the contact under wiki/ is clean (schema + links valid) — no issue: {misplaced_issues:#?}"
     );
-    assert_eq!(
-        li["file"], "wiki/contacts/misplaced-contact.md",
-        "the misplaced contact under wiki/ is the fixture"
-    );
-    assert_eq!(li["key"], "type", "the issue is keyed on the `type` field");
 
     // ── every emitted issue carries the full contract shape ──────────────────
     for issue in report["issues"].as_array().unwrap() {
@@ -754,19 +753,18 @@ fn expected_validate_json_is_intent_derived_not_a_snapshot() {
          (uncovered: {true_uncovered:?})"
     );
 
-    // (c3) The four Block-1 validate checks (DB.md identity/structure +
-    //      layer-appropriate type) are REAL, not aspirational. The plan once
-    //      drifted to claim these checks "await a SPEC code"; they have since
-    //      landed (SPEC § Validation 40 → 44). This pins the substance that
-    //      claim got wrong: each of the four codes MUST be a row in the live
-    //      SPEC table AND seeded (mapped to a fixture) here — so a regression
-    //      that drops a code from SPEC, or stops seeding it, turns this red with
-    //      a code-named message rather than only nudging the aggregate counts.
+    // (c3) The three Block-1 DB.md identity/structure checks are REAL, not
+    //      aspirational. The plan once drifted to claim these checks "await a
+    //      SPEC code"; they have since landed (the live SPEC § Validation table
+    //      has 38 codes in v0.2). This pins the substance that claim got wrong:
+    //      each code MUST be a row in the live SPEC table AND seeded (mapped to a
+    //      fixture) here — so a regression that drops a code from SPEC, or stops
+    //      seeding it, turns this red with a code-named message rather than only
+    //      nudging the aggregate counts.
     for code in [
         "DB_MD_BAD_TYPE",
         "DB_MD_MISSING_FIELD",
         "DB_MD_UNKNOWN_SECTION",
-        "LAYER_TYPE_MISMATCH",
     ] {
         assert!(
             spec_codes.contains(code),
@@ -783,7 +781,7 @@ fn expected_validate_json_is_intent_derived_not_a_snapshot() {
     // (d) One designed breakage per fixture: the issues spread across MANY
     //     distinct fixture files (the breakage sites), not a handful — a clean
     //     one-issue-per-fixture structure a raw dump would not have. The golden
-    //     seeds 39 issues across well over a dozen distinct files.
+    //     seeds 40 issues across well over a dozen distinct files.
     let distinct_files: BTreeSet<&str> = golden["issues"]
         .as_array()
         .unwrap()

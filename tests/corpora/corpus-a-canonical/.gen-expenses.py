@@ -12,12 +12,13 @@ Intent (derived from SPEC.md, not from tool output):
         vendor (required, link to records/companies/).
   - Every `vendor` is a full-path wiki-link to an existing company
     record (one of the three vendor companies), so no WIKI_LINK_BROKEN.
-  - Every `(date, amount, vendor)` tuple is UNIQUE, so `dbmd validate
-    --all` reports no DUP_EXPENSE_TUPLE soft collision either — the
-    store is clean under both the working-set and the full sweep.
-  - Every record carries the deterministic default `summary`
-    (`<date> — <amount> <currency> — <vendor-leaf>`) exactly as
-    `dbmd-core::summary::compose_expense` would compose it — this is
+  - Every `(date, amount, vendor)` tuple is UNIQUE, and corpus-a's
+    `### expense` schema declares no `unique:` key, so `dbmd validate
+    --all` reports no `DUP_UNIQUE_KEY` collision — the store is clean
+    under both the working-set and the full sweep.
+  - Every record carries a hand-written `summary` in the
+    `<date> — <amount> <currency> — <vendor-leaf>` style (the shape the
+    pre-v0.2 built-in expense composer produced) — this is
     what a bulk-ingested ledger realistically looks like, and it lets
     the later index goldens be derived by the same rule.
 

@@ -62,8 +62,8 @@ O(store) and run off the interactive loop. See SPEC.md § Scale.
 
 ### Read
 - `dbmd search <query> [--type --in --where --linked-from --linked-to --updated-after --updated-before --created-after --created-before]` — embedded ripgrep over content + the frontmatter block; filters never parse the whole store
-- `dbmd fm get <file> <key>` / `dbmd fm query <key>=<value>` — `fm query` is ripgrep over frontmatter (the pre-write dedup primitive)
-- `dbmd graph backlinks|forwardlinks` — ripgrep scans (loop-fast); `orphans|sinks|clusters|neighborhood|path|cycles|broken|export` — whole-graph (SWEEP)
+- `dbmd fm get <file> <key>` / `dbmd fm query <key>=<value>` — `fm query` is sidecar-backed frontmatter filtering (the pre-write dedup primitive)
+- `dbmd graph backlinks|forwardlinks|neighborhood|orphans` — relationship retrieval; `orphans` is the SWEEP curation worklist
 - `dbmd tree [--layer --type]`
 - `dbmd outline <file>`
 - `dbmd stats` — store metrics (SWEEP)

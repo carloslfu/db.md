@@ -697,33 +697,63 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> crate::Result<()> {
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir)?;
 
-    // Unique temp name in the same directory (rename is atomic only within a
-    // filesystem; same dir guarantees that). The name must be unique even
-    // across threads of one process appending concurrently, so combine the pid
-    // with a process-wide monotonic counter — a wall-clock timestamp alone can
-    // collide and let one thread's rename pull another thread's temp out from
-    // under it.
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let pid = std::process::id();
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file_name = dest
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("log.md");
-    let tmp = dir.join(format!(".{}.{}.{}.tmp", file_name, pid, seq));
+    let (mut f, tmp) = create_temp_file(dir, file_name)?;
 
     {
-        let mut f = File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
     // rename over the destination; clean up the temp on failure.
     match fs::rename(&tmp, dest) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            sync_parent_dir(dir);
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e.into())
         }
+    }
+}
+
+fn create_temp_file(dir: &Path, file_name: &str) -> std::io::Result<(File, PathBuf)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    for _ in 0..128 {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{file_name}.{pid}.{nanos}.{seq}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique dbmd log temp file",
+    ))
+}
+
+fn sync_parent_dir(dir: &Path) {
+    if let Ok(parent) = File::open(dir) {
+        let _ = parent.sync_all();
     }
 }
 
@@ -815,7 +845,9 @@ where
     // double-emits.
     let mut buf: Vec<u8> = Vec::new();
     let mut start = len;
-    let mut emitted_abs: Vec<u64> = Vec::new();
+    // O(1) membership: a `Vec` + `.contains()` here is O(E^2) across a large
+    // single-month file (every header re-scanned against all prior emissions).
+    let mut emitted_abs: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut stop = false;
 
     while start > 0 && !stop {
@@ -851,13 +883,13 @@ where
 
             let entry_text = entry_text_at(&buf, start, abs, &headers, i);
             if let Some(entry) = parse_single_entry(&entry_text) {
-                emitted_abs.push(abs);
+                emitted_abs.insert(abs);
                 if take(entry) {
                     stop = true;
                     break;
                 }
             } else {
-                emitted_abs.push(abs);
+                emitted_abs.insert(abs);
             }
         }
     }
@@ -874,12 +906,12 @@ where
             }
             let entry_text = entry_text_at(&buf, start, abs, &headers, i);
             if let Some(entry) = parse_single_entry(&entry_text) {
-                emitted_abs.push(abs);
+                emitted_abs.insert(abs);
                 if take(entry) {
                     break;
                 }
             } else {
-                emitted_abs.push(abs);
+                emitted_abs.insert(abs);
             }
         }
     }

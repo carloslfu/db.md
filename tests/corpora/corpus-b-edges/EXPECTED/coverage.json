@@ -1,8 +1,11 @@
 {
-  "_comment": "Coverage map. Maps each SEEDED SPEC.md § Validation code to the EXPECTED fixture(s) that fire it. This IS a full-coverage guarantee: the SPEC table has 44 codes and this corpus now seeds all 44, so `uncovered_spec_codes` is empty and `all_spec_codes_covered` is true. The e2e_corpus_b.rs test `expected_validate_json_is_intent_derived_not_a_snapshot` asserts (1) coverage keys are a subset of the SPEC table (no invented codes), and (2) `uncovered_spec_codes` exactly equals SPEC-codes minus seeded-codes (both directions), so this file cannot drift out of sync with the SPEC table — if a future SPEC code is added without a seeding fixture, this file's bookkeeping forces CI to fail. The three DB_MD_* codes are seeded by the bad-db-md/ sub-store (a separate invocation, EXPECTED/bad-db-md.json — its DB.md violates the identity contract; the corpus-b root sweep never descends into it). LAYER_TYPE_MISMATCH is seeded by wiki/contacts/misplaced-contact.md in the main --all sweep. INDEX_JSONL_DESYNC is plan-mandated (db-md-rust-toolkit.md line 494) and also a SPEC table row; it is grouped under plan_extensions for provenance but counts as a seeded SPEC code in the coverage math.",
-  "spec_code_count": 44,
-  "all_spec_codes_covered": true,
-  "uncovered_spec_codes": [],
+  "_comment": "Coverage map. Maps each SEEDED SPEC.md § Validation code to the EXPECTED fixture(s) that fire it. The SPEC table has 40 codes (v0.2 plus the additive timestamp-missing codes); this corpus seeds 38 and explicitly leaves FM_MISSING_CREATED / FM_MISSING_UPDATED uncovered because the designed malformed files exercise bad timestamps and missing type/summary instead. The e2e_corpus_b.rs test asserts (1) coverage keys are a subset of the SPEC table (no invented codes) and (2) `uncovered_spec_codes` exactly equals SPEC-codes minus seeded-codes (both directions), so this file cannot drift out of sync with the SPEC table. The three DB_MD_* codes are seeded by the bad-db-md/ sub-store (EXPECTED/bad-db-md.json). DUP_UNIQUE_KEY is seeded by the six dup-pair fixtures via this store's DB.md `unique:` directives; v0.2 replaced the six type-specific DUP_* codes and LAYER_TYPE_MISMATCH with it. INDEX_JSONL_DESYNC is grouped under plan_extensions for provenance but counts as a seeded SPEC code in the coverage math.",
+  "spec_code_count": 40,
+  "all_spec_codes_covered": false,
+  "uncovered_spec_codes": [
+    "FM_MISSING_CREATED",
+    "FM_MISSING_UPDATED"
+  ],
   "coverage": {
     "DB_MD_BAD_TYPE": [
       "EXPECTED/bad-db-md.json"
@@ -13,25 +16,10 @@
     "DB_MD_UNKNOWN_SECTION": [
       "EXPECTED/bad-db-md.json"
     ],
-    "DUP_COMPANY_DOMAIN": [
-      "EXPECTED/validate.json"
-    ],
-    "DUP_CONTACT_EMAIL": [
-      "EXPECTED/validate.json"
-    ],
-    "DUP_EMAIL_REINGEST": [
-      "EXPECTED/validate.json"
-    ],
-    "DUP_EXPENSE_TUPLE": [
-      "EXPECTED/validate.json"
-    ],
     "DUP_ID": [
       "EXPECTED/validate.json"
     ],
-    "DUP_INVOICE_TUPLE": [
-      "EXPECTED/validate.json"
-    ],
-    "DUP_MEETING_TUPLE": [
+    "DUP_UNIQUE_KEY": [
       "EXPECTED/validate.json"
     ],
     "FM_BAD_TIMESTAMP": [
@@ -65,9 +53,6 @@
       "EXPECTED/validate.json"
     ],
     "INDEX_WRONG_SCOPE": [
-      "EXPECTED/validate.json"
-    ],
-    "LAYER_TYPE_MISMATCH": [
       "EXPECTED/validate.json"
     ],
     "LOG_BAD_TIMESTAMP": [

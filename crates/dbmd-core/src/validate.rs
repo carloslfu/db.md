@@ -29,12 +29,12 @@
 //! emitted issue vocabulary are the contract.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime};
 use serde_norway::Value;
 
-use crate::parser::{FieldSpec, Schema, Shape};
+use crate::parser::{Schema, Shape};
 use crate::store::Store;
 
 /// Severity of a validation [`Issue`]. Any [`Severity::Error`] fails validation
@@ -94,12 +94,14 @@ pub mod codes {
     pub const DB_MD_UNKNOWN_SECTION: &str = "DB_MD_UNKNOWN_SECTION";
     /// content file has no `type:`.
     pub const FM_MISSING_TYPE: &str = "FM_MISSING_TYPE";
+    /// content file has no `created:`.
+    pub const FM_MISSING_CREATED: &str = "FM_MISSING_CREATED";
+    /// content file has no `updated:`.
+    pub const FM_MISSING_UPDATED: &str = "FM_MISSING_UPDATED";
     /// frontmatter block isn't valid YAML.
     pub const FM_MALFORMED_YAML: &str = "FM_MALFORMED_YAML";
-    /// `created` / `updated` / a date field isn't ISO-8601.
+    /// `created` or `updated` isn't ISO-8601.
     pub const FM_BAD_TIMESTAMP: &str = "FM_BAD_TIMESTAMP";
-    /// a recognized `type:` sits in a layer other than its canonical one.
-    pub const LAYER_TYPE_MISMATCH: &str = "LAYER_TYPE_MISMATCH";
     /// content file has no `summary`.
     pub const SUMMARY_MISSING: &str = "SUMMARY_MISSING";
     /// `summary` present but empty.
@@ -120,18 +122,8 @@ pub mod codes {
     pub const WIKI_LINK_FLOW_FORM_LIST: &str = "WIKI_LINK_FLOW_FORM_LIST";
     /// two files declare the same explicit `id`.
     pub const DUP_ID: &str = "DUP_ID";
-    /// two `contact`s share `email`.
-    pub const DUP_CONTACT_EMAIL: &str = "DUP_CONTACT_EMAIL";
-    /// two `company`s share `domain`.
-    pub const DUP_COMPANY_DOMAIN: &str = "DUP_COMPANY_DOMAIN";
-    /// two `expense`s share `(date, amount, vendor)`.
-    pub const DUP_EXPENSE_TUPLE: &str = "DUP_EXPENSE_TUPLE";
-    /// two `invoice`s share `(vendor, date, amount)`.
-    pub const DUP_INVOICE_TUPLE: &str = "DUP_INVOICE_TUPLE";
-    /// two `email`s share `(from, subject, date)` (re-ingest).
-    pub const DUP_EMAIL_REINGEST: &str = "DUP_EMAIL_REINGEST";
-    /// two `meeting`s share `(date, sorted-attendees-set)`.
-    pub const DUP_MEETING_TUPLE: &str = "DUP_MEETING_TUPLE";
+    /// two records of a type collide on a `DB.md ## Schemas` `unique:` key.
+    pub const DUP_UNIQUE_KEY: &str = "DUP_UNIQUE_KEY";
     /// a `DB.md` schema requires a field that's absent.
     pub const SCHEMA_MISSING_REQUIRED: &str = "SCHEMA_MISSING_REQUIRED";
     /// a value doesn't match the schema's shape modifier.
@@ -199,9 +191,10 @@ const RECOGNIZED_LOG_KINDS: &[&str] = &[
 /// **Loop default.** Validate the working set: content files changed since
 /// `since` (default: the last `validate` entry in `log.md`), plus any file whose
 /// wiki-links target a changed/renamed/removed path. Per-file *checks* only —
-/// never a [`Store::walk`] / [`Store::walk_content_files`]-style parse-the-tree,
-/// and none of the cross-file global passes (entity-dedup, every-index sync,
-/// `log.md` ordering) that `--all` adds.
+/// none of the cross-file global passes (entity-dedup, every-index sync,
+/// `log.md` ordering) that `--all` adds. If the default call finds no logged
+/// changed objects, it falls back to a per-file content sweep so an externally
+/// edited or freshly copied store cannot pass vacuously.
 ///
 /// **Cost.** The changed set is read from `log.md` — O(changed): every
 /// `create`/`update`/`ingest`/`rename`/`delete`/`link` entry newer than the
@@ -231,6 +224,9 @@ pub fn validate_working_set(
 
     // 1. Changed objects, straight from the log (O(changed) — never a walk).
     let changed = changed_objects_since(store, cutoff);
+    if changed.is_empty() && since.is_none() {
+        return validate_content_sweep(store);
+    }
 
     // 2. Add every file with an incoming wiki-link to a changed/renamed/removed
     //    path (the linker may now be stale even though it didn't change). The
@@ -261,6 +257,16 @@ pub fn validate_working_set(
         // short-form target is reported as plain `WIKI_LINK_SHORT_FORM` and the
         // `--all` sweep does the ambiguity upgrade.
         check_content_file(store, rel, &abs, None, &mut issues);
+    }
+    issues.sort_by(issue_order);
+    Ok(issues)
+}
+
+fn validate_content_sweep(store: &Store) -> crate::Result<Vec<Issue>> {
+    let mut issues = Vec::new();
+    for rel in store.walk()? {
+        let abs = store.root.join(&rel);
+        check_content_file(store, &rel, &abs, None, &mut issues);
     }
     issues.sort_by(issue_order);
     Ok(issues)
@@ -299,8 +305,8 @@ pub fn validate_all(store: &Store) -> crate::Result<Vec<Issue>> {
         }
     }
 
-    // Cross-file: hard + soft entity-dedup collisions.
-    check_duplicates(&parsed, &mut issues);
+    // Cross-file: hard `id` + soft schema-declared `unique:` dedup collisions.
+    check_duplicates(store, &parsed, &mut issues);
 
     // Cross-file: hierarchical index.md + index.jsonl sync.
     check_indexes(store, &files, &mut issues);
@@ -398,7 +404,7 @@ fn check_content_file(
                 Some(1),
                 None,
                 "frontmatter is not a YAML mapping".into(),
-                None,
+                Some("repair the frontmatter YAML mapping, then rerun `dbmd validate`".into()),
                 vec![],
             );
             None
@@ -414,7 +420,7 @@ fn check_content_file(
                 Some(1),
                 None,
                 format!("frontmatter block isn't valid YAML: {e}"),
-                None,
+                Some("repair the frontmatter YAML block, then rerun `dbmd validate`".into()),
                 vec![],
             );
             None
@@ -460,45 +466,31 @@ fn check_frontmatter(
         );
     }
 
-    // ── layer-appropriate type ────────────────────────────────────────────────
-    // The recognized-type table (SPEC § Recognized types) gives each canonical
-    // content type a home layer. A recognized type sitting in a *different* layer
-    // (a `contact` under `sources/`, an `email` under `wiki/`) is valid-but-
-    // unusual — the folder layout is convention, not enforcement — so it warns,
-    // never blocks. Custom / unrecognized types carry no layer expectation; meta
-    // files (index/log) are not content files and are skipped via `is_content`.
-    if is_content {
-        if let Some(t) = &type_ {
-            if let (Some(expected), Some(actual)) = (canonical_layer_for_type(t), layer_of(rel)) {
-                if expected != actual {
-                    push(
-                        issues,
-                        Severity::Warning,
-                        codes::LAYER_TYPE_MISMATCH,
-                        rel,
-                        fm_key_line(fm_yaml, "type"),
-                        Some("type".into()),
-                        format!(
-                            "type `{t}` belongs in `{expected}/` but this file is under `{actual}/`"
-                        ),
-                        Some(format!(
-                            "move the file under `{expected}/` (its canonical layer), or change its `type:`"
-                        )),
-                        vec![],
-                    );
-                }
-            }
-        }
-    }
-
     // ── summary (universal on content files) ──────────────────────────────────
     if is_content {
         check_summary(rel, fm, fm_yaml, issues);
     }
 
-    // ── timestamps: created / updated + type-specific date fields ────────────
-    for key in ["created", "updated"] {
-        if let Some(v) = fm.get(key) {
+    // ── timestamps: created / updated ─────────────────────────────────────────
+    for (key, missing_code) in [
+        ("created", codes::FM_MISSING_CREATED),
+        ("updated", codes::FM_MISSING_UPDATED),
+    ] {
+        if is_content && !fm.contains_key(key) {
+            push(
+                issues,
+                Severity::Error,
+                missing_code,
+                rel,
+                fm_key_line_or_top(fm_yaml, key),
+                Some(key.into()),
+                format!("content file has no `{key}:` timestamp"),
+                Some(format!(
+                    "set `{key}` to an RFC3339 timestamp, e.g. 2026-05-27T08:00:00-07:00"
+                )),
+                vec![],
+            );
+        } else if let Some(v) = fm.get(key) {
             if let Some(s) = scalar_string(v) {
                 if !is_iso8601(&s) {
                     push(
@@ -516,41 +508,6 @@ fn check_frontmatter(
             }
         }
     }
-    // Type-specific date fields (the canonical date-shaped fields per type).
-    //
-    // Precedence: when an explicit `DB.md ## Schemas` block declares a date
-    // field with a `date` shape, the schema check OWNS that field — a bad value
-    // is `SCHEMA_SHAPE_MISMATCH` (the more specific rule), not the generic
-    // `FM_BAD_TIMESTAMP`. So `FM_BAD_TIMESTAMP` here covers only the universal
-    // `created`/`updated` (above) and the canonical date fields of types whose
-    // effective schema does NOT shape that field as a date. Skipping them avoids
-    // double-reporting one bad date under two codes.
-    if let Some(t) = &type_ {
-        let schema_date_fields = schema_shaped_date_fields(store, t);
-        for key in canonical_date_fields(t) {
-            if schema_date_fields.contains(*key) {
-                continue; // owned by the schema-shape check
-            }
-            if let Some(v) = fm.get(*key) {
-                if let Some(s) = scalar_string(v) {
-                    if !is_iso8601_date_or_datetime(&s) {
-                        push(
-                            issues,
-                            Severity::Error,
-                            codes::FM_BAD_TIMESTAMP,
-                            rel,
-                            fm_key_line(fm_yaml, key),
-                            Some((*key).into()),
-                            format!("`{key}` is not an ISO-8601 date: {s:?}"),
-                            Some("use an ISO-8601 date, e.g. 2026-05-27".into()),
-                            vec![],
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     // ── tags shape ────────────────────────────────────────────────────────────
     if let Some(tags) = fm.get("tags") {
         if !is_flat_scalar_list(tags) {
@@ -623,7 +580,10 @@ fn check_frontmatter(
                 fm_key_line(fm_yaml, "type"),
                 Some("type".into()),
                 format!("file has ignored type `{t}` (per DB.md ## Policies)"),
-                None,
+                Some(
+                    "change the `type`, or remove it from DB.md `### Ignored types` if it should be managed"
+                        .into(),
+                ),
                 // The policy source: `DB.md` declares the ignored type.
                 vec![PathBuf::from("DB.md")],
             );
@@ -647,7 +607,10 @@ fn check_frontmatter(
                         "wiki-page derives from ignored-type record `{}` (type `{}`)",
                         hit.target, hit.target_type
                     ),
-                    None,
+                    Some(
+                        "drop this `derived_from` link, or remove the target type from DB.md `### Ignored types`"
+                            .into(),
+                    ),
                     // The ignored-type source record, plus `DB.md` (the policy
                     // source that lists the ignored type).
                     vec![
@@ -659,7 +622,7 @@ fn check_frontmatter(
         }
     }
 
-    // ── schema enforcement: implicit canonical + explicit DB.md ## Schemas ───
+    // ── schema enforcement: DB.md ## Schemas (the only schema source) ─────────
     if let Some(t) = &type_ {
         if let Some(schema) = effective_schema(store, t) {
             check_schema(store, rel, fm, fm_yaml, &schema, issues);
@@ -848,8 +811,23 @@ fn check_wiki_link(
         );
     }
 
+    let Some(target_rel) = safe_md_target_rel(bare) else {
+        push(
+            issues,
+            Severity::Error,
+            codes::WIKI_LINK_BROKEN,
+            rel,
+            line,
+            key.map(str::to_string),
+            format!("wiki-link target `{bare}` is not a safe store-relative path"),
+            Some("use a full store-relative path under sources/, records/, or wiki/".into()),
+            vec![],
+        );
+        return;
+    };
+
     // Broken: target file doesn't exist (O(1) stat).
-    let target_abs = store.root.join(format!("{bare}.md"));
+    let target_abs = store.root.join(target_rel);
     if !target_abs.is_file() {
         push(
             issues,
@@ -859,80 +837,26 @@ fn check_wiki_link(
             line,
             key.map(str::to_string),
             format!("wiki-link target `{bare}` doesn't exist"),
-            None,
+            Some(format!(
+                "create `{bare}.md`, or point the link at an existing file"
+            )),
             vec![],
         );
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Schema enforcement (implicit canonical + explicit DB.md ## Schemas)
+//  Schema enforcement (user-declared DB.md ## Schemas — the only source)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The effective schema for a type: an explicit `DB.md ## Schemas` block wins;
-/// otherwise the implicit canonical schema (the `(link)` etc. annotations from
-/// SPEC's recognized-types table). `None` for unknown types with no schema.
+/// The effective schema for a type: the store's explicit `DB.md ## Schemas`
+/// block, or `None`. This is the **only** source of schema enforcement — the
+/// toolkit ships no implicit or built-in per-type schema (SPEC § Schemas). A
+/// store that wants its `contact` / `expense` / etc. fields enforced declares
+/// them in `## Schemas`; the example schema pack in SPEC § Example types is a
+/// copy-in starting point.
 fn effective_schema(store: &Store, type_: &str) -> Option<Schema> {
-    if let Some(s) = store.config.schemas.get(type_) {
-        return Some(s.clone());
-    }
-    implicit_canonical_schema(type_)
-}
-
-/// The set of field names the type's effective schema declares with a `date`
-/// shape. These are owned by the schema-shape check (`SCHEMA_SHAPE_MISMATCH`),
-/// so the generic `FM_BAD_TIMESTAMP` date-field pass skips them — see precedence
-/// rule #2 in `corpus-b-edges/EXPECTED/README.md`. Empty when the type has no
-/// schema or no date-shaped field.
-fn schema_shaped_date_fields(store: &Store, type_: &str) -> BTreeSet<String> {
-    effective_schema(store, type_)
-        .map(|s| {
-            s.fields
-                .iter()
-                .filter(|f| matches!(f.shape, Some(Shape::Date)))
-                .map(|f| f.name.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The implicit canonical schema for a recognized type — exactly the fields the
-/// SPEC's recognized-types table marks `(link → <prefix>/)`, and no others.
-/// These are validated exactly like explicit `link to` fields. Returns `None`
-/// for types with no canonical link-shaped field.
-///
-/// The marked set (SPEC § Recognized types table): `contact.company`,
-/// `expense.vendor`, `expense.contact`, `meeting.expense`, `invoice.vendor`.
-/// This match arm and that table must stay in lockstep — if you add or remove a
-/// field here, change the table's `(link)` annotations too.
-///
-/// `wiki-page.derived_from` is intentionally absent: its links may target either
-/// `records/` or `sources/`, so it has no single canonical prefix to enforce
-/// (see SPEC § Reading rules). An operator who wants a prefix on it declares an
-/// explicit `### wiki-page` schema in `DB.md ## Schemas`.
-fn implicit_canonical_schema(type_: &str) -> Option<Schema> {
-    // We model each marked field as a `link to <prefix>/` FieldSpec so it hits
-    // the same code path as explicit schemas (SCHEMA_LINK_PREFIX_MISMATCH).
-    let link_field = |name: &str, prefix: &str| FieldSpec {
-        name: name.to_string(),
-        required: false,
-        shape: None,
-        link_prefix: Some(PathBuf::from(prefix)),
-        default: None,
-        enum_values: None,
-        unknown_modifiers: vec![],
-    };
-    let fields: Vec<FieldSpec> = match type_ {
-        "contact" => vec![link_field("company", "records/companies/")],
-        "expense" => vec![
-            link_field("vendor", "records/companies/"),
-            link_field("contact", "records/contacts/"),
-        ],
-        "meeting" => vec![link_field("expense", "records/expenses/")],
-        "invoice" => vec![link_field("vendor", "records/companies/")],
-        _ => return None,
-    };
-    Some(Schema { fields })
+    store.config.schemas.get(type_).cloned()
 }
 
 /// Validate a file's frontmatter against a schema's [`FieldSpec`]s.
@@ -1064,6 +988,20 @@ fn check_schema_link(
     }
 
     for link in links {
+        if link.target.ends_with(".md") {
+            let bare = link.target.trim_end_matches(".md");
+            push(
+                issues,
+                Severity::Warning,
+                codes::WIKI_LINK_HAS_EXTENSION,
+                rel,
+                Some(link.line),
+                Some(field.to_string()),
+                format!("wiki-link `[[{}]]` carries a `.md` extension", link.target),
+                Some(format!("drop the extension: [[{bare}]]")),
+                vec![],
+            );
+        }
         let bare = link.target.trim_end_matches(".md");
         if !path_under_prefix(bare, prefix_str) {
             let leaf = bare.rsplit('/').next().unwrap_or(bare);
@@ -1079,9 +1017,25 @@ fn check_schema_link(
                 vec![],
             );
         } else {
+            let Some(target_rel) = safe_md_target_rel(bare) else {
+                push(
+                    issues,
+                    Severity::Error,
+                    codes::WIKI_LINK_BROKEN,
+                    rel,
+                    line,
+                    Some(field.to_string()),
+                    format!("wiki-link target `{bare}` is not a safe store-relative path"),
+                    Some(
+                        "use a full store-relative path under sources/, records/, or wiki/".into(),
+                    ),
+                    vec![],
+                );
+                continue;
+            };
             // Correct prefix — still surface a broken target so the agent sees
             // one consistent vocabulary.
-            let target_abs = store.root.join(format!("{bare}.md"));
+            let target_abs = store.root.join(target_rel);
             if !target_abs.is_file() {
                 push(
                     issues,
@@ -1091,7 +1045,9 @@ fn check_schema_link(
                     line,
                     Some(field.to_string()),
                     format!("wiki-link target `{bare}` doesn't exist"),
-                    None,
+                    Some(format!(
+                        "create `{bare}.md`, or point the link at an existing file"
+                    )),
                     vec![],
                 );
             }
@@ -1137,16 +1093,21 @@ fn check_schema_shape(
 //  Cross-file: entity-dedup collisions (validate_all only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Hard `DUP_ID` + the six soft `DUP_*` entity-dedup collisions.
+/// Hard `DUP_ID` + the soft, schema-declared `DUP_UNIQUE_KEY` collisions.
+///
+/// `DUP_ID` is universal (two files with the same explicit `id`).
+/// `DUP_UNIQUE_KEY` is driven entirely by the store's `DB.md ## Schemas`: each
+/// `- unique: <field>[, <field> …]` directive on a `### <type>` declares a
+/// uniqueness constraint, and two records of that type whose declared values
+/// collide warn. No type carries a built-in dedup key — the store opts in.
 ///
 /// **Reporting precedence (rule #1 in `corpus-b-edges/EXPECTED/README.md`):** a
 /// collision group of N files yields exactly ONE issue, not N. Its `file` is the
 /// lexicographically smallest store-relative path in the group (a total order →
-/// deterministic); `related` is the rest, sorted. A single-field collision
-/// (`id`/`email`/`domain`) anchors to that field's line on the reported file and
-/// carries it as `key`; a multi-field tuple collision anchors to line 1 with a
-/// null key.
-fn check_duplicates(parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Issue>) {
+/// deterministic); `related` is the rest, sorted. A single-field key anchors to
+/// that field's line on the reported file and carries it as `key`; a multi-field
+/// key anchors to line 1 with a null key.
+fn check_duplicates(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Issue>) {
     // Path → frontmatter YAML, for resolving the anchor field's line on the
     // reported (smallest-path) member.
     let fm_yaml_of: HashMap<&PathBuf, &str> = parsed
@@ -1183,130 +1144,35 @@ fn check_duplicates(parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Issue>) {
         }
     }
 
-    // ── Soft, type-aware tuple dedup (all → warning). ────────────────────────
-    // Build (type → field-tuple → files) maps.
-    let field = |p: &Parsed, k: &str| -> Option<String> {
-        p.fm.as_ref()
-            .and_then(|m| m.get(k))
-            .and_then(scalar_string)
-            .map(|s| s.trim().to_lowercase())
-    };
-    // A field that may be a wiki-link (e.g. `vendor`): prefer its bare link
-    // target (handles the unquoted YAML-sequence form), else a scalar string.
-    let link_or_scalar = |p: &Parsed, k: &str| -> Option<String> {
-        if let Some(link) = frontmatter_links_for_key(&p.fm_yaml, k, 2)
-            .into_iter()
-            .next()
-        {
-            return Some(link.target.trim_end_matches(".md").to_lowercase());
+    // ── DUP_UNIQUE_KEY (warning): schema-declared `unique:` collisions. ───────
+    // Every constraint comes from the store's `## Schemas`; a type with no
+    // `unique:` directive is never dedup-checked. Iteration over the BTreeMap is
+    // key-ordered, so emitted issues are deterministic across runs.
+    for (type_name, schema) in &store.config.schemas {
+        for key_fields in &schema.unique_keys {
+            soft_dup(parsed, issues, type_name, key_fields, &fm_yaml_of);
         }
-        field(p, k)
-    };
-
-    // contact.email — single-field collision, anchors to the `email` line.
-    soft_dup(
-        parsed,
-        issues,
-        "contact",
-        codes::DUP_CONTACT_EMAIL,
-        Some("email"),
-        &fm_yaml_of,
-        |p| field(p, "email").map(|e| vec![e]),
-    );
-    // company.domain — single-field collision, anchors to the `domain` line.
-    soft_dup(
-        parsed,
-        issues,
-        "company",
-        codes::DUP_COMPANY_DOMAIN,
-        Some("domain"),
-        &fm_yaml_of,
-        |p| field(p, "domain").map(|d| vec![d]),
-    );
-    // expense (date, amount, vendor) — tuple, anchors to line 1.
-    soft_dup(
-        parsed,
-        issues,
-        "expense",
-        codes::DUP_EXPENSE_TUPLE,
-        None,
-        &fm_yaml_of,
-        |p| {
-            Some(vec![
-                field(p, "date")?,
-                field(p, "amount")?,
-                link_or_scalar(p, "vendor")?,
-            ])
-        },
-    );
-    // invoice (vendor, date, amount) — tuple, anchors to line 1.
-    soft_dup(
-        parsed,
-        issues,
-        "invoice",
-        codes::DUP_INVOICE_TUPLE,
-        None,
-        &fm_yaml_of,
-        |p| {
-            Some(vec![
-                link_or_scalar(p, "vendor")?,
-                field(p, "date")?,
-                field(p, "amount")?,
-            ])
-        },
-    );
-    // email (from, subject, date) — tuple, anchors to line 1.
-    soft_dup(
-        parsed,
-        issues,
-        "email",
-        codes::DUP_EMAIL_REINGEST,
-        None,
-        &fm_yaml_of,
-        |p| {
-            Some(vec![
-                field(p, "from")?,
-                field(p, "subject")?,
-                field(p, "date")?,
-            ])
-        },
-    );
-    // meeting (date, sorted-attendees-set) — tuple, anchors to line 1.
-    soft_dup(
-        parsed,
-        issues,
-        "meeting",
-        codes::DUP_MEETING_TUPLE,
-        None,
-        &fm_yaml_of,
-        |p| {
-            let date = field(p, "date")?;
-            let attendees = meeting_attendees_key(p)?;
-            Some(vec![date, attendees])
-        },
-    );
+    }
 }
 
-/// Emit ONE soft-dedup warning per group of ≥2 files of `type_` that share the
-/// tuple `key_of` returns. Files for which `key_of` is `None` (missing a field)
-/// are skipped — an incomplete tuple is never a collision.
+/// Emit ONE `DUP_UNIQUE_KEY` warning per group of ≥2 files of `type_` whose
+/// declared `key_fields` render to the same token tuple. Files missing any key
+/// field are skipped — an incomplete key is never a collision.
 ///
 /// Per reporting rule #1 the issue is keyed on the lexicographically smallest
-/// store-relative path; `related` is the rest. `anchor_field` is `Some(name)`
-/// for a single-field collision (`email`/`domain`) — the issue then anchors to
-/// that field's line on the reported file and carries it as `key`; `None` for a
-/// multi-field tuple, which anchors to line 1 with a null key. `fm_yaml_of`
-/// resolves the field line on the reported member.
-#[allow(clippy::too_many_arguments)]
+/// store-relative path; `related` is the rest. A single-field key anchors to
+/// that field's line on the reported file and carries it as `key`; a multi-field
+/// key anchors to line 1 with a null key. `fm_yaml_of` resolves the field line.
 fn soft_dup(
     parsed: &[(PathBuf, Parsed)],
     issues: &mut Vec<Issue>,
     type_: &str,
-    code: &'static str,
-    anchor_field: Option<&str>,
+    key_fields: &[String],
     fm_yaml_of: &HashMap<&PathBuf, &str>,
-    key_of: impl Fn(&Parsed) -> Option<Vec<String>>,
 ) {
+    if key_fields.is_empty() {
+        return;
+    }
     let mut groups: HashMap<Vec<String>, Vec<PathBuf>> = HashMap::new();
     for (rel, p) in parsed {
         let is_type =
@@ -1318,37 +1184,102 @@ fn soft_dup(
         if !is_type {
             continue;
         }
-        if let Some(key) = key_of(p) {
+        if let Some(key) = dedup_key(p, key_fields) {
             groups.entry(key).or_default().push(rel.clone());
         }
     }
-    for files in groups.values() {
-        if files.len() > 1 {
-            let (reported, related) = canonical_and_related(files);
-            // Single-field collisions anchor to the field's line + carry the key;
-            // tuple collisions anchor to line 1 with a null key.
-            let (line, key) = match anchor_field {
-                Some(f) => (
-                    fm_yaml_of.get(&reported).and_then(|y| fm_key_line(y, f)),
-                    Some(f.to_string()),
-                ),
-                None => (Some(1), None),
-            };
-            push(
-                issues,
-                Severity::Warning,
-                code,
-                &reported,
-                line,
-                key,
-                format!(
-                    "{type_} record shares its dedup key with {} other record(s)",
-                    related.len()
-                ),
-                Some("merge with `dbmd rename`, or cross-link with `dbmd link`".into()),
-                related,
-            );
+    // HashMap iteration is nondeterministic; sort by reported member so the
+    // emitted issue order is stable across runs.
+    let mut collisions: Vec<(PathBuf, Vec<PathBuf>)> = groups
+        .values()
+        .filter(|files| files.len() > 1)
+        .map(|files| canonical_and_related(files))
+        .collect();
+    collisions.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let fields_disp = key_fields.join(", ");
+    for (reported, related) in collisions {
+        // Single-field keys anchor to the field's line + carry the key; multi-
+        // field keys anchor to line 1 with a null key.
+        let (line, key) = if key_fields.len() == 1 {
+            (
+                fm_yaml_of
+                    .get(&reported)
+                    .and_then(|y| fm_key_line(y, &key_fields[0])),
+                Some(key_fields[0].clone()),
+            )
+        } else {
+            (Some(1), None)
+        };
+        let n = related.len();
+        push(
+            issues,
+            Severity::Warning,
+            codes::DUP_UNIQUE_KEY,
+            &reported,
+            line,
+            key,
+            format!("`{type_}` unique key ({fields_disp}) collides with {n} other record(s)"),
+            Some("merge with `dbmd rename`, or cross-link with `dbmd link`".into()),
+            related,
+        );
+    }
+}
+
+/// Render a type's `unique:` key for one file: each field's dedup token in
+/// order, or `None` if any field is absent/empty (an incomplete key never
+/// collides).
+fn dedup_key(p: &Parsed, key_fields: &[String]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(key_fields.len());
+    for f in key_fields {
+        out.push(dedup_token(p, f)?);
+    }
+    Some(out)
+}
+
+/// One field's normalized dedup token, or `None` when absent/empty. Wiki-link
+/// values (single or block-sequence list) reduce to their lower-cased target
+/// path(s); a list collapses to a sorted, de-duplicated set so item order never
+/// matters. Plain scalars (and YAML scalar lists) lower-case and trim.
+fn dedup_token(p: &Parsed, field: &str) -> Option<String> {
+    // Wiki-links first — read from the raw frontmatter text so the unquoted
+    // `field: [[...]]` (a YAML nested-sequence, not a string) is handled.
+    let links = frontmatter_links_for_key(&p.fm_yaml, field, 2);
+    if !links.is_empty() {
+        let set: BTreeSet<String> = links
+            .into_iter()
+            .map(|l| l.target.trim_end_matches(".md").to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        return if set.is_empty() {
+            None
+        } else {
+            Some(set.into_iter().collect::<Vec<_>>().join(","))
+        };
+    }
+    match p.fm.as_ref()?.get(field) {
+        Some(Value::Sequence(items)) => {
+            let set: BTreeSet<String> = items
+                .iter()
+                .filter_map(scalar_string)
+                .map(|s| s.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if set.is_empty() {
+                None
+            } else {
+                Some(set.into_iter().collect::<Vec<_>>().join(","))
+            }
         }
+        Some(v) => {
+            let s = scalar_string(v)?.trim().to_lowercase();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        None => None,
     }
 }
 
@@ -1536,7 +1467,21 @@ fn check_type_folder_index_md(
     // Stale entries + summary mismatch.
     for entry in &entries {
         let bare = entry.target.trim_end_matches(".md");
-        let target_abs = store.root.join(format!("{bare}.md"));
+        let Some(target_rel) = safe_md_target_rel(bare) else {
+            push(
+                issues,
+                Severity::Error,
+                codes::INDEX_STALE_ENTRY,
+                index_rel,
+                Some(entry.line),
+                None,
+                format!("index entry `[[{bare}]]` is not a safe store-relative path"),
+                Some("run `dbmd index rebuild`".into()),
+                vec![],
+            );
+            continue;
+        };
+        let target_abs = store.root.join(target_rel);
         if !target_abs.is_file() {
             push(
                 issues,
@@ -1641,6 +1586,20 @@ fn check_type_folder_index_jsonl(
             }
         };
         if let Some(path) = rec.get("path").and_then(|v| v.as_str()) {
+            if !is_safe_store_relative_path(Path::new(path)) {
+                push(
+                    issues,
+                    Severity::Error,
+                    codes::INDEX_JSONL_DESYNC,
+                    jsonl_rel,
+                    Some((i + 1) as u32),
+                    None,
+                    format!("`index.jsonl` record path `{path}` is not a safe store-relative path"),
+                    Some("run `dbmd index rebuild`".into()),
+                    vec![],
+                );
+                continue;
+            }
             records.insert(PathBuf::from(path), rec);
         }
     }
@@ -1855,7 +1814,7 @@ fn check_log(store: &Store, issues: &mut Vec<Issue>) {
                         Some(line_no),
                         None,
                         format!("log entry kind `{kind}` is not recognized"),
-                        None,
+                        Some(format!("use one of: {}", RECOGNIZED_LOG_KINDS.join(", "))),
                         vec![],
                     );
                 }
@@ -2094,31 +2053,6 @@ fn not_a_store_issue(store: &Store) -> Issue {
         message: format!("{} has no DB.md; not a db.md store", store.root.display()),
         suggestion: Some("create a `DB.md` at the store root".into()),
         related: vec![],
-    }
-}
-
-/// The canonical home layer of a **recognized** content type, per SPEC §
-/// Recognized types (the `Layer` column). `None` for custom / unrecognized
-/// types (which carry no layer expectation and are never flagged) and for the
-/// meta types `db-md` / `index` / `log` (which are not content files). This is
-/// the single source the `LAYER_TYPE_MISMATCH` check consults.
-fn canonical_layer_for_type(type_: &str) -> Option<&'static str> {
-    match type_ {
-        "email" | "transcript" | "pdf-source" => Some("sources"),
-        "contact" | "company" | "expense" | "meeting" | "decision" | "invoice" => Some("records"),
-        "wiki-page" => Some("wiki"),
-        _ => None,
-    }
-}
-
-/// The layer a store-relative path lives under — its first path component, when
-/// that component is one of the three canonical layers. `None` otherwise.
-fn layer_of(rel: &Path) -> Option<&'static str> {
-    match rel.iter().next().and_then(|s| s.to_str()) {
-        Some("sources") => Some("sources"),
-        Some("records") => Some("records"),
-        Some("wiki") => Some("wiki"),
-        _ => None,
     }
 }
 
@@ -2426,6 +2360,29 @@ fn is_full_store_path(bare: &str) -> bool {
     let first = parts.next().unwrap_or("");
     let has_rest = parts.next().map(|r| !r.is_empty()).unwrap_or(false);
     matches!(first, "sources" | "records" | "wiki") && has_rest
+}
+
+/// True if a path contains only normal relative components. Validator inputs
+/// come from user-authored markdown/JSON sidecars; never let absolute paths,
+/// platform prefixes, or `..` turn a validation probe into a filesystem escape.
+fn is_safe_store_relative_path(path: &Path) -> bool {
+    let mut saw_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => saw_component = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    saw_component
+}
+
+fn safe_md_target_rel(bare: &str) -> Option<PathBuf> {
+    let path = Path::new(bare);
+    if !is_safe_store_relative_path(path) {
+        return None;
+    }
+    Some(PathBuf::from(format!("{bare}.md")))
 }
 
 /// True if a bare target path is under `prefix` (both `.md`-stripped).
@@ -2758,7 +2715,7 @@ where
 /// Resolve the `type` of a wiki-link target file (bare, no `.md`), or `None`.
 fn link_target_type(store: &Store, target: &str) -> Option<String> {
     let bare = target.trim_end_matches(".md");
-    let abs = store.root.join(format!("{bare}.md"));
+    let abs = store.root.join(safe_md_target_rel(bare)?);
     let text = std::fs::read_to_string(&abs).ok()?;
     let (yaml, _, _) = split_frontmatter(&text)?;
     let value: Value = serde_norway::from_str(&yaml).ok()?;
@@ -2767,39 +2724,6 @@ fn link_target_type(store: &Store, target: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// The canonical date-shaped fields for a recognized type (validated as
-/// ISO-8601 dates, in addition to `created`/`updated`).
-fn canonical_date_fields(type_: &str) -> &'static [&'static str] {
-    match type_ {
-        "email" => &["date"],
-        "transcript" => &["recorded_at"],
-        "pdf-source" => &["received_at"],
-        "contact" => &["first_touch", "last_touch"],
-        "expense" => &["date"],
-        "meeting" => &["date"],
-        "invoice" => &["date", "paid_at"],
-        _ => &[],
-    }
-}
-
-/// The meeting dedup key: `date` is handled by the caller; this returns the
-/// sorted attendee set joined into a stable string. Attendees are wiki-links
-/// (block-sequence), extracted from the raw frontmatter text so the unquoted
-/// form is handled. `None` if no attendees.
-fn meeting_attendees_key(p: &Parsed) -> Option<String> {
-    let mut set = BTreeSet::new();
-    for link in frontmatter_links_for_key(&p.fm_yaml, "attendees", 2) {
-        let norm = link.target.trim_end_matches(".md").to_lowercase();
-        if !norm.is_empty() {
-            set.insert(norm);
-        }
-    }
-    if set.is_empty() {
-        return None;
-    }
-    Some(set.into_iter().collect::<Vec<_>>().join(","))
 }
 
 // ── Shape validators ─────────────────────────────────────────────────────────
@@ -2985,7 +2909,7 @@ fn issue_order(a: &Issue, b: &Issue) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::Config;
+    use crate::parser::{Config, FieldSpec};
     use std::fs;
     use tempfile::TempDir;
 
@@ -3245,118 +3169,6 @@ mod tests {
         assert_eq!(count(&issues, codes::DB_MD_MISSING_FIELD), 2);
     }
 
-    // ── layer-appropriate type ──────────────────────────────────────────────────
-
-    /// A `contact` (records-layer type) under `sources/` → `LAYER_TYPE_MISMATCH`
-    /// (warning), keyed on `type`. The check must compare the type's canonical
-    /// layer against the file's actual layer.
-    #[test]
-    fn contact_under_sources_is_layer_mismatch() {
-        let fx = Fixture::new();
-        fx.write(
-            "sources/misc/c.md",
-            &valid_contact("a contact in the wrong layer"),
-        );
-        let issues = fx.store_all();
-        let i = find(&issues, codes::LAYER_TYPE_MISMATCH);
-        assert!(!i.is_error(), "layer mismatch is a warning, not an error");
-        assert_eq!(i.severity, Severity::Warning);
-        assert_eq!(i.file, PathBuf::from("sources/misc/c.md"));
-        assert_eq!(i.key.as_deref(), Some("type"));
-        assert!(
-            i.message.contains("records") && i.message.contains("sources"),
-            "message names both the expected and actual layer: {}",
-            i.message
-        );
-    }
-
-    /// An `email` (sources-layer type) under `wiki/` → `LAYER_TYPE_MISMATCH`.
-    #[test]
-    fn email_under_wiki_is_layer_mismatch() {
-        let fx = Fixture::new();
-        fx.write(
-            "wiki/notes/e.md",
-            "---\ntype: email\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: misfiled email\n---\n\n# E\n",
-        );
-        let issues = fx.store_all();
-        let i = find(&issues, codes::LAYER_TYPE_MISMATCH);
-        assert_eq!(i.file, PathBuf::from("wiki/notes/e.md"));
-    }
-
-    /// A `contact` under `records/` (its canonical layer) → NO layer issue.
-    /// Pins the no-false-positive half: a correctly-placed recognized type is
-    /// silent, so a bug that flagged every typed file would fail here.
-    #[test]
-    fn contact_under_records_is_not_flagged() {
-        let fx = Fixture::new();
-        fx.write("records/contacts/a.md", &valid_contact("correctly placed"));
-        let issues = fx.store_all();
-        assert!(
-            !has(&issues, codes::LAYER_TYPE_MISMATCH),
-            "a contact under records/ is correctly placed: {issues:#?}"
-        );
-    }
-
-    /// A CUSTOM (unrecognized) type carries no layer expectation → never flagged,
-    /// in any layer. Guards against treating "no canonical layer" as a mismatch.
-    #[test]
-    fn custom_type_has_no_layer_expectation() {
-        let fx = Fixture::new();
-        fx.write(
-            "wiki/notes/p.md",
-            "---\ntype: proposal\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: a custom-typed note\n---\n\n# P\n",
-        );
-        let issues = fx.store_all();
-        assert!(
-            !has(&issues, codes::LAYER_TYPE_MISMATCH),
-            "a custom type is ambient context with no layer rule: {issues:#?}"
-        );
-    }
-
-    /// `wiki-page` is the wiki-layer type → silent under `wiki/`, flagged under
-    /// `records/`. Covers the third layer of the mapping in both directions.
-    #[test]
-    fn wiki_page_layer_rule_both_directions() {
-        let fx = Fixture::new();
-        fx.write(
-            "wiki/topics/ok.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: properly placed synthesis\n---\n\n# OK\n",
-        );
-        fx.write(
-            "records/topics/bad.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: synthesis misfiled into records\n---\n\n# BAD\n",
-        );
-        let issues = fx.store_all();
-        let hits: Vec<&Issue> = issues
-            .iter()
-            .filter(|i| i.code == codes::LAYER_TYPE_MISMATCH)
-            .collect();
-        assert_eq!(hits.len(), 1, "only the misplaced one fires: {hits:#?}");
-        assert_eq!(hits[0].file, PathBuf::from("records/topics/bad.md"));
-    }
-
-    /// The layer check is a per-file check, so it must also fire in the
-    /// O(changed) working-set scope (not only `--all`) — for a file the log
-    /// names as changed. A bug that placed it solely in the sweep would fail
-    /// here. (The working set is log-driven, so the file must have a log entry.)
-    #[test]
-    fn layer_mismatch_fires_in_working_set_scope() {
-        let fx = Fixture::new();
-        fx.write(
-            "sources/misc/c.md",
-            &valid_contact("wrong layer, working set"),
-        );
-        fx.write(
-            "log.md",
-            "---\ntype: log\n---\n\n## [2026-05-22 10:00] create | sources/misc/c\nadded\n",
-        );
-        let issues = validate_working_set(&fx.store(), None).unwrap();
-        assert!(
-            has(&issues, codes::LAYER_TYPE_MISMATCH),
-            "the per-file layer check runs in the working-set scope too: {issues:#?}"
-        );
-    }
-
     // ── frontmatter ─────────────────────────────────────────────────────────
 
     #[test]
@@ -3369,6 +3181,39 @@ mod tests {
         let issues = fx.store_all();
         assert!(has(&issues, codes::FM_MISSING_TYPE));
         assert!(find(&issues, codes::FM_MISSING_TYPE).is_error());
+    }
+
+    #[test]
+    fn missing_universal_timestamps_are_errors_on_content_files() {
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/a.md",
+            "---\ntype: contact\nsummary: x\nname: A\n---\n\n# A\n",
+        );
+        let issues = fx.store_all();
+
+        let missing_created = find(&issues, codes::FM_MISSING_CREATED);
+        assert_eq!(missing_created.key.as_deref(), Some("created"));
+        assert!(missing_created.is_error());
+
+        let missing_updated = find(&issues, codes::FM_MISSING_UPDATED);
+        assert_eq!(missing_updated.key.as_deref(), Some("updated"));
+        assert!(missing_updated.is_error());
+    }
+
+    #[test]
+    fn meta_files_do_not_require_universal_timestamps() {
+        let fx = Fixture::new();
+        let issues = fx.store_all();
+
+        assert!(
+            !has(&issues, codes::FM_MISSING_CREATED),
+            "DB.md/log/index meta files must not require content timestamps: {issues:#?}"
+        );
+        assert!(
+            !has(&issues, codes::FM_MISSING_UPDATED),
+            "DB.md/log/index meta files must not require content timestamps: {issues:#?}"
+        );
     }
 
     #[test]
@@ -3401,7 +3246,9 @@ mod tests {
             "---\ntype: contact\n  bad: : : :\n: : nope\n---\n\nbody\n",
         );
         let issues = fx.store_all();
-        assert!(has(&issues, codes::FM_MALFORMED_YAML));
+        let issue = find(&issues, codes::FM_MALFORMED_YAML);
+        assert!(issue.is_error());
+        assert!(issue.suggestion.as_deref().is_some_and(|s| !s.is_empty()));
         // When YAML doesn't parse we don't *also* claim the summary is missing;
         // the agent fixes the YAML first.
         assert!(
@@ -3591,6 +3438,19 @@ mod tests {
         let issue = find(&issues, codes::WIKI_LINK_BROKEN);
         assert!(issue.is_error());
         assert!(issue.message.contains("records/contacts/ghost"));
+        assert!(issue.suggestion.as_deref().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn traversal_full_path_wiki_link_is_rejected_before_probe() {
+        let fx = Fixture::new();
+        let mut body = valid_contact("links with traversal");
+        body.push_str("\nSee [[records/contacts/../../ghost]].\n");
+        fx.write("wiki/people/a.md", &body);
+        let issues = fx.store_all();
+        let issue = find(&issues, codes::WIKI_LINK_BROKEN);
+        assert!(issue.message.contains("not a safe store-relative path"));
+        assert!(issue.suggestion.as_deref().is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
@@ -3713,11 +3573,23 @@ mod tests {
     }
 
     #[test]
-    fn short_form_canonical_link_field_is_prefix_mismatch() {
-        // A short-form value in a *canonical* link field (`contact.company`) is
-        // a SCHEMA_LINK_PREFIX_MISMATCH (the target isn't under the prefix), not
-        // a bare SHORT_FORM — the schema path owns that field's vocabulary.
-        let fx = Fixture::new();
+    fn short_form_in_declared_link_field_is_prefix_mismatch_not_double_reported() {
+        // A short-form value in a *declared* link field (a `### contact` schema
+        // with `company link to records/companies/`) is SCHEMA_LINK_PREFIX_MISMATCH
+        // (the target isn't under the prefix), and must NOT also be reported as a
+        // bare WIKI_LINK_SHORT_FORM — the schema path owns that field once.
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "contact".into(),
+            Schema {
+                fields: vec![FieldSpec {
+                    name: "company".into(),
+                    link_prefix: Some(PathBuf::from("records/companies")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
         fx.write(
             "records/contacts/a.md",
             "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\ncompany: \"[[northstar]]\"\n---\n\n# A\n",
@@ -3735,58 +3607,41 @@ mod tests {
         );
     }
 
-    // ── schema: implicit canonical link fields ───────────────────────────────
-
     #[test]
-    fn contact_company_plain_string_is_link_prefix_mismatch() {
-        let fx = Fixture::new();
-        fx.write(
-            "records/contacts/a.md",
-            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: Sarah\ncompany: \"Acme Co\"\n---\n\n# Sarah\n",
+    fn schema_link_field_with_md_extension_still_warns() {
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "contact".into(),
+            Schema {
+                fields: vec![FieldSpec {
+                    name: "company".into(),
+                    link_prefix: Some(PathBuf::from("records/companies")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
         );
-        let issues = fx.store_all();
-        let issue = find(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH);
-        assert!(issue.is_error());
-        assert_eq!(issue.key.as_deref(), Some("company"));
-        let sugg = issue.suggestion.as_deref().unwrap();
-        assert!(
-            sugg.contains("records/companies/"),
-            "suggestion should name the prefix: {sugg}"
-        );
-    }
-
-    #[test]
-    fn contact_company_wrong_prefix_is_link_prefix_mismatch() {
-        let fx = Fixture::new();
-        // Points under records/people/ but the canonical prefix is companies/.
-        fx.write(
-            "records/people/acme.md",
-            &valid_contact("acme as a person? wrong"),
-        );
-        fx.write(
-            "records/contacts/a.md",
-            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: Sarah\ncompany: \"[[records/people/acme]]\"\n---\n\n# Sarah\n",
-        );
-        let issues = fx.store_all();
-        let issue = find(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH);
-        assert_eq!(issue.key.as_deref(), Some("company"));
-    }
-
-    #[test]
-    fn contact_company_correct_link_passes_schema() {
-        let fx = Fixture::new();
         fx.write(
             "records/companies/acme.md",
-            "---\ntype: company\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: a company\nname: Acme\n---\n\n# Acme\n",
+            "---\ntype: company\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: Acme\nname: Acme\n---\n\n# Acme\n",
         );
         fx.write(
             "records/contacts/a.md",
-            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: Sarah\ncompany: \"[[records/companies/acme]]\"\n---\n\n# Sarah\n",
+            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\ncompany: \"[[records/companies/acme.md]]\"\n---\n\n# A\n",
         );
         let issues = fx.store_all();
+        let issue = issues
+            .iter()
+            .find(|i| {
+                i.code == codes::WIKI_LINK_HAS_EXTENSION && i.key.as_deref() == Some("company")
+            })
+            .unwrap_or_else(|| panic!("schema link extension warning missing: {issues:#?}"));
+        assert_eq!(issue.severity, Severity::Warning);
         assert!(
-            !has(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH),
-            "{issues:#?}"
+            !issues
+                .iter()
+                .any(|i| i.code == codes::WIKI_LINK_BROKEN && i.key.as_deref() == Some("company")),
+            "extensionless existence check should still find acme.md: {issues:#?}"
         );
     }
 
@@ -3817,6 +3672,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                ..Default::default()
             };
             fx.config.schemas.insert("contact".into(), schema);
             fx
@@ -3852,9 +3708,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_schema_overrides_implicit_canonical() {
-        // An explicit `contact` schema with NO company link field means a plain
-        // `company` string is fine (the implicit canonical link is overridden).
+    fn schema_without_link_field_allows_plain_value() {
+        // A `contact` schema with no `company` link field means a plain `company`
+        // string is fine — schema enforcement is exactly what the store declares,
+        // nothing implicit.
         let mut fx = Fixture::new();
         fx.config.schemas.insert(
             "contact".into(),
@@ -3864,6 +3721,7 @@ mod tests {
                     required: true,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         fx.write(
@@ -3873,8 +3731,38 @@ mod tests {
         let issues = fx.store_all();
         assert!(
             !has(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH),
-            "explicit schema with no company link should override the implicit canonical one: {issues:#?}"
+            "no declared link field for `company` → a plain value is fine: {issues:#?}"
         );
+    }
+
+    #[test]
+    fn schema_link_field_plain_value_is_prefix_mismatch() {
+        // The surviving link-enforcement path: a declared `link to <prefix>/`
+        // field with a plain-string value is SCHEMA_LINK_PREFIX_MISMATCH.
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "contact".into(),
+            Schema {
+                fields: vec![FieldSpec {
+                    name: "company".into(),
+                    link_prefix: Some(PathBuf::from("records/companies")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        fx.write(
+            "records/contacts/a.md",
+            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: Sarah\ncompany: \"Acme Co\"\n---\n\n# Sarah\n",
+        );
+        let issues = fx.store_all();
+        let issue = find(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH);
+        assert_eq!(issue.key.as_deref(), Some("company"));
+        assert!(issue
+            .suggestion
+            .as_deref()
+            .unwrap()
+            .contains("records/companies/"));
     }
 
     #[test]
@@ -3900,6 +3788,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                ..Default::default()
             },
         );
         // `USD 100` is the corpus-realistic shape (an `expense.currency`-style
@@ -3988,6 +3877,7 @@ mod tests {
         let issue = find(&issues, codes::POLICY_IGNORED_TYPE_PRESENT);
         assert_eq!(issue.severity, Severity::Info);
         assert!(!issue.is_error());
+        assert!(issue.suggestion.as_deref().is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
@@ -4006,6 +3896,7 @@ mod tests {
         let issue = find(&issues, codes::POLICY_IGNORED_TYPE_DERIVED);
         assert_eq!(issue.severity, Severity::Warning);
         assert_eq!(issue.key.as_deref(), Some("derived_from"));
+        assert!(issue.suggestion.as_deref().is_some_and(|s| !s.is_empty()));
     }
 
     /// The shared `derived_from_ignored_type` entry point — the single
@@ -4130,8 +4021,16 @@ mod tests {
     }
 
     #[test]
-    fn dup_contact_email_is_warning() {
-        let fx = Fixture::new();
+    fn dup_unique_key_single_field_is_warning() {
+        let mut fx = Fixture::new();
+        // contact declares `- unique: email`.
+        fx.config.schemas.insert(
+            "contact".into(),
+            Schema {
+                unique_keys: vec![vec!["email".into()]],
+                ..Default::default()
+            },
+        );
         for (f, name) in [("a", "A"), ("b", "B")] {
             fx.write(
                 &format!("records/contacts/{f}.md"),
@@ -4140,9 +4039,9 @@ mod tests {
         }
         let issues = fx.store_all();
         // One issue per group (rule #1), keyed on the smallest path, anchored to
-        // the `email` field.
-        assert_eq!(count(&issues, codes::DUP_CONTACT_EMAIL), 1);
-        let dup = find(&issues, codes::DUP_CONTACT_EMAIL);
+        // the single `email` field.
+        assert_eq!(count(&issues, codes::DUP_UNIQUE_KEY), 1);
+        let dup = find(&issues, codes::DUP_UNIQUE_KEY);
         assert_eq!(dup.severity, Severity::Warning);
         assert_eq!(dup.file, PathBuf::from("records/contacts/a.md"));
         assert_eq!(dup.key.as_deref(), Some("email"));
@@ -4150,8 +4049,16 @@ mod tests {
     }
 
     #[test]
-    fn dup_expense_tuple_and_clean_when_one_field_differs() {
-        let fx = Fixture::new();
+    fn dup_unique_key_compound_and_clean_when_one_field_differs() {
+        let mut fx = Fixture::new();
+        // expense declares `- unique: date, amount, vendor` (a compound key).
+        fx.config.schemas.insert(
+            "expense".into(),
+            Schema {
+                unique_keys: vec![vec!["date".into(), "amount".into(), "vendor".into()]],
+                ..Default::default()
+            },
+        );
         fx.write("records/companies/acme.md", "---\ntype: company\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: c\nname: Acme\n---\n# A\n");
         let exp = |f: &str, amount: &str| {
             format!(
@@ -4165,24 +4072,36 @@ mod tests {
         // One issue for the e1+e2 group (rule #1), keyed on the smallest path
         // (e1) with e2 in `related`; e3 differs on amount and never appears.
         assert_eq!(
-            count(&issues, codes::DUP_EXPENSE_TUPLE),
+            count(&issues, codes::DUP_UNIQUE_KEY),
             1,
             "only e1+e2 collide, one issue: {issues:#?}"
         );
-        let dup = find(&issues, codes::DUP_EXPENSE_TUPLE);
+        let dup = find(&issues, codes::DUP_UNIQUE_KEY);
         assert_eq!(dup.file, PathBuf::from("records/expenses/e1.md"));
-        assert_eq!(dup.line, Some(1), "tuple collision anchors to line 1");
+        assert_eq!(
+            dup.line,
+            Some(1),
+            "compound-key collision anchors to line 1"
+        );
         assert_eq!(dup.related, vec![PathBuf::from("records/expenses/e2.md")]);
         assert!(
-            !issues.iter().any(|i| i.code == codes::DUP_EXPENSE_TUPLE
+            !issues.iter().any(|i| i.code == codes::DUP_UNIQUE_KEY
                 && i.related.contains(&PathBuf::from("records/expenses/e3.md"))),
             "e3 differs on amount and must not collide: {issues:#?}"
         );
     }
 
     #[test]
-    fn dup_meeting_tuple_is_attendee_set_order_independent() {
-        let fx = Fixture::new();
+    fn dup_unique_key_list_field_is_order_independent() {
+        let mut fx = Fixture::new();
+        // meeting declares `- unique: date, attendees`; the list field is a set.
+        fx.config.schemas.insert(
+            "meeting".into(),
+            Schema {
+                unique_keys: vec![vec!["date".into(), "attendees".into()]],
+                ..Default::default()
+            },
+        );
         fx.write("records/contacts/a.md", &valid_contact("a"));
         fx.write("records/contacts/b.md", &valid_contact("b"));
         let m = |f: &str, order: &str| {
@@ -4198,14 +4117,14 @@ mod tests {
         fx.write("records/meetings/m1.md", &m("m1", "ab"));
         fx.write("records/meetings/m2.md", &m("m2", "ba"));
         let issues = fx.store_all();
-        // One issue per group (rule #1): the attendee SET is order-independent,
-        // so m1 (ab) and m2 (ba) collide → a single issue on the smaller path.
+        // The attendee SET is order-independent, so m1 (ab) and m2 (ba) collide
+        // → a single issue on the smaller path.
         assert_eq!(
-            count(&issues, codes::DUP_MEETING_TUPLE),
+            count(&issues, codes::DUP_UNIQUE_KEY),
             1,
             "same date + same attendee set (any order) collide as one issue: {issues:#?}"
         );
-        let dup = find(&issues, codes::DUP_MEETING_TUPLE);
+        let dup = find(&issues, codes::DUP_UNIQUE_KEY);
         assert_eq!(dup.file, PathBuf::from("records/meetings/m1.md"));
         assert_eq!(dup.related, vec![PathBuf::from("records/meetings/m2.md")]);
     }
@@ -4271,6 +4190,28 @@ mod tests {
             "{}",
             missing.message
         );
+    }
+
+    #[test]
+    fn index_md_entry_with_traversal_path_is_stale_not_probe() {
+        let fx = Fixture::new();
+        fx.write("records/contacts/a.md", &valid_contact("a"));
+        fx.write("index.md", "---\ntype: index\nscope: root\n---\n\n## Records\n- [[records/contacts/index|C]] (1 files)\n");
+        fx.write(
+            "records/index.md",
+            "---\ntype: index\nscope: layer\nfolder: records\n---\n# r\n",
+        );
+        fx.write(
+            "records/contacts/index.md",
+            "---\ntype: index\nscope: type-folder\nfolder: records/contacts\n---\n\n- [[records/contacts/../../ghost]] — unsafe\n",
+        );
+        fx.write(
+            "records/contacts/index.jsonl",
+            "{\"path\":\"records/contacts/a.md\",\"type\":\"contact\",\"summary\":\"a\"}\n",
+        );
+        let issues = fx.store_all();
+        let stale = find(&issues, codes::INDEX_STALE_ENTRY);
+        assert!(stale.message.contains("not a safe store-relative path"));
     }
 
     #[test]
@@ -4379,6 +4320,31 @@ mod tests {
             issues
                 .iter()
                 .any(|i| i.code == codes::INDEX_JSONL_DESYNC && i.message.contains("ghost.md")),
+            "{issues:#?}"
+        );
+    }
+
+    #[test]
+    fn index_jsonl_record_with_traversal_path_is_desync_not_probe() {
+        let fx = Fixture::new();
+        fx.write("records/contacts/a.md", &valid_contact("a"));
+        fx.write("index.md", "---\ntype: index\nscope: root\n---\n\n## Records\n- [[records/contacts/index|C]] (1 files)\n");
+        fx.write(
+            "records/index.md",
+            "---\ntype: index\nscope: layer\nfolder: records\n---\n# r\n",
+        );
+        fx.write(
+            "records/contacts/index.md",
+            "---\ntype: index\nscope: type-folder\nfolder: records/contacts\n---\n\n- [[records/contacts/a]] — a\n",
+        );
+        fx.write(
+            "records/contacts/index.jsonl",
+            "{\"path\":\"records/contacts/a.md\",\"type\":\"contact\",\"summary\":\"a\"}\n{\"path\":\"records/contacts/../../ghost.md\",\"type\":\"contact\",\"summary\":\"x\"}\n",
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues.iter().any(|i| i.code == codes::INDEX_JSONL_DESYNC
+                && i.message.contains("not a safe store-relative path")),
             "{issues:#?}"
         );
     }
@@ -4603,6 +4569,10 @@ mod tests {
         let unknown = find(&issues, codes::LOG_UNKNOWN_KIND);
         assert_eq!(unknown.severity, Severity::Warning);
         assert!(unknown.message.contains("frobnicate"));
+        assert!(unknown
+            .suggestion
+            .as_deref()
+            .is_some_and(|s| s.contains("create")));
         let bad = find(&issues, codes::LOG_BAD_TIMESTAMP);
         assert!(bad.is_error());
     }
@@ -4853,168 +4823,6 @@ mod tests {
                     || i.key.as_deref() == Some("budget")),
             "unknown fields are ambient context: {issues:#?}"
         );
-    }
-
-    // ── implicit canonical schema across the four link-bearing types ──────────
-
-    #[test]
-    fn expense_vendor_plain_string_is_link_prefix_mismatch() {
-        // Exercises the `expense` branch of the implicit canonical schema.
-        let fx = Fixture::new();
-        fx.write(
-            "records/expenses/e.md",
-            "---\ntype: expense\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: an expense\ndate: 2026-05-01\namount: 100\nvendor: \"Acme Co\"\n---\n\n# E\n",
-        );
-        let issues = fx.store_all();
-        let issue = find(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH);
-        assert_eq!(issue.key.as_deref(), Some("vendor"));
-        assert!(issue
-            .suggestion
-            .as_deref()
-            .unwrap()
-            .contains("records/companies/"));
-    }
-
-    #[test]
-    fn invoice_vendor_correct_unquoted_link_passes() {
-        // The unquoted canonical link form must satisfy the implicit schema.
-        let fx = Fixture::new();
-        fx.write(
-            "records/companies/acme.md",
-            "---\ntype: company\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: a company\nname: Acme\n---\n\n# Acme\n",
-        );
-        fx.write(
-            "records/invoices/i.md",
-            "---\ntype: invoice\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: an invoice\ndate: 2026-05-01\namount: 100\nvendor: [[records/companies/acme]]\n---\n\n# I\n",
-        );
-        let issues = fx.store_all();
-        assert!(
-            !has(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH),
-            "a correct unquoted vendor link must pass: {issues:#?}"
-        );
-        assert!(!has(&issues, codes::WIKI_LINK_BROKEN), "{issues:#?}");
-    }
-
-    #[test]
-    fn implicit_canonical_schema_matches_spec_link_set_exactly() {
-        // Lockstep guard: the implicit canonical schema must enforce EXACTLY the
-        // fields the SPEC recognized-types table marks `(link → <prefix>/)`, and
-        // no others. This pins both directions of the prior code↔SPEC drift:
-        //   * the four record fields the table now marks are enforced with their
-        //     stated prefixes, and
-        //   * types/fields the table does NOT mark (notably wiki-page, whose
-        //     `derived_from` spans records/ AND sources/) carry NO implicit
-        //     link schema.
-        // If you change either side, change the SPEC § Recognized types table to
-        // match — they are one source of truth.
-        let prefix_of = |type_: &str, field: &str| -> Option<String> {
-            implicit_canonical_schema(type_)?
-                .fields
-                .into_iter()
-                .find(|f| f.name == field)
-                .and_then(|f| f.link_prefix)
-                .map(|p| p.to_string_lossy().into_owned())
-        };
-
-        // The complete enforced set, field-for-field with its prefix.
-        let expected: &[(&str, &str, &str)] = &[
-            ("contact", "company", "records/companies/"),
-            ("expense", "vendor", "records/companies/"),
-            ("expense", "contact", "records/contacts/"),
-            ("meeting", "expense", "records/expenses/"),
-            ("invoice", "vendor", "records/companies/"),
-        ];
-        for (type_, field, prefix) in expected {
-            assert_eq!(
-                prefix_of(type_, field).as_deref(),
-                Some(*prefix),
-                "{type_}.{field} must be an implicit link to {prefix}"
-            );
-        }
-
-        // The total number of implicit link fields across all types is exactly
-        // the size of the expected set — no extra, unmarked field has crept in.
-        let total: usize = ["contact", "expense", "meeting", "invoice"]
-            .iter()
-            .filter_map(|t| implicit_canonical_schema(t))
-            .map(|s| s.fields.len())
-            .sum();
-        assert_eq!(total, expected.len(), "no unmarked field may be enforced");
-
-        // wiki-page is NOT in the table's `(link)` set: it must have no implicit
-        // schema at all (derived_from is left to ordinary wiki-link validation).
-        assert!(
-            implicit_canonical_schema("wiki-page").is_none(),
-            "wiki-page.derived_from has no single canonical prefix; it must not be implicit-schema enforced"
-        );
-        // A type with no marked link field at all also returns None.
-        assert!(implicit_canonical_schema("company").is_none());
-        assert!(implicit_canonical_schema("decision").is_none());
-    }
-
-    #[test]
-    fn wiki_page_derived_from_plain_string_is_not_prefix_mismatch() {
-        // The user-visible half of the finding, running the other way: a
-        // `wiki-page` written per the SPEC table (derived_from spans records/
-        // AND sources/) must NOT raise SCHEMA_LINK_PREFIX_MISMATCH, because the
-        // implicit schema deliberately omits the field. A plain-string value is
-        // therefore not a hard schema error.
-        let fx = Fixture::new();
-        fx.write(
-            "wiki/themes/t.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: a theme\ntopic: renewals\nderived_from: \"some notes\"\n---\n\n# T\n",
-        );
-        let issues = fx.store_all();
-        assert!(
-            !has(&issues, codes::SCHEMA_LINK_PREFIX_MISMATCH),
-            "wiki-page.derived_from is not implicit-schema enforced: {issues:#?}"
-        );
-    }
-
-    #[test]
-    fn expense_contact_and_meeting_expense_enforce_their_prefixes() {
-        // The two implicit link fields not previously exercised end-to-end:
-        // expense.contact (→ records/contacts/) and meeting.expense
-        // (→ records/expenses/). A plain string in each is a prefix mismatch
-        // naming the correct prefix.
-        let fx = Fixture::new();
-        fx.write(
-            "records/expenses/e.md",
-            "---\ntype: expense\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: an expense\ndate: 2026-05-01\namount: 100\nvendor: [[records/companies/acme]]\ncontact: \"Jane Doe\"\n---\n\n# E\n",
-        );
-        fx.write(
-            "records/meetings/m.md",
-            "---\ntype: meeting\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: a meeting\ndate: 2026-05-01\nexpense: \"2026-05 lunch\"\n---\n\n# M\n",
-        );
-        let issues = fx.store_all();
-
-        let contact_issue = issues.iter().find(|i| {
-            i.code == codes::SCHEMA_LINK_PREFIX_MISMATCH
-                && i.file == *"records/expenses/e.md"
-                && i.key.as_deref() == Some("contact")
-        });
-        let contact_issue = contact_issue.unwrap_or_else(|| {
-            panic!("expense.contact plain string must be a prefix mismatch: {issues:#?}")
-        });
-        assert!(contact_issue
-            .suggestion
-            .as_deref()
-            .unwrap()
-            .contains("records/contacts/"));
-
-        let expense_issue = issues.iter().find(|i| {
-            i.code == codes::SCHEMA_LINK_PREFIX_MISMATCH
-                && i.file == *"records/meetings/m.md"
-                && i.key.as_deref() == Some("expense")
-        });
-        let expense_issue = expense_issue.unwrap_or_else(|| {
-            panic!("meeting.expense plain string must be a prefix mismatch: {issues:#?}")
-        });
-        assert!(expense_issue
-            .suggestion
-            .as_deref()
-            .unwrap()
-            .contains("records/expenses/"));
     }
 
     // ── find_links_to prefix-collision safety (working set) ───────────────────

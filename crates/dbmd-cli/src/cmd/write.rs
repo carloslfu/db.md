@@ -18,7 +18,8 @@
 //! a new module) respects the wired module tree — `write`/`link`/`rename` are
 //! already declared in `cmd/mod.rs`.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use dbmd_core::{summary, Frontmatter, Store};
 
@@ -59,6 +60,7 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     // `--type` is authoritative for the type (it is the required flag); set it
     // after `--fm` so a stray `--fm type=…` can never disagree with it.
     set_fm(&mut fm, "type", &args.r#type)?;
+    apply_schema_defaults(&store, &args.r#type, &mut fm)?;
 
     // ── body (optional) ──────────────────────────────────────────────────────
     let body = match &args.body_file {
@@ -124,10 +126,7 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
 /// `NOT_A_STORE` exit. The single store-open gate every writer in this group
 /// goes through.
 pub(crate) fn open_store(dir: &str) -> Result<Store, CliError> {
-    // `Store::open` yields `NotAStore`; route it through `dbmd_core::Error`
-    // (which has the `#[from] NotAStore` arm) so the CLI's single
-    // `From<dbmd_core::Error>` conversion maps it to the `NOT_A_STORE` exit.
-    Store::open(Path::new(dir)).map_err(|e| CliError::from(dbmd_core::Error::from(e)))
+    Store::open_strict(Path::new(dir)).map_err(CliError::from)
 }
 
 /// Normalize a caller-supplied path argument to a clean store-relative path.
@@ -153,12 +152,23 @@ pub(crate) fn to_store_relative(store: &Store, raw: &str) -> PathBuf {
     }
     let p = Path::new(raw);
     let rel = if p.is_absolute() {
-        store.rel_path(p).unwrap_or_else(|| p.to_path_buf())
+        store_relative_for_missing_absolute(store, p).unwrap_or_else(|| p.to_path_buf())
     } else {
         // Drop a single leading `./`.
         p.strip_prefix("./").unwrap_or(p).to_path_buf()
     };
     PathBuf::from(path_to_unix(&rel))
+}
+
+/// Normalize a caller-supplied write path and require it to remain inside the
+/// opened store. This is the hard boundary every mutating surface should use:
+/// absolute paths are accepted only when they resolve under the store root, and
+/// raw `..` / root / platform-prefix components are rejected before any disk
+/// write, move, or index maintenance can run.
+pub(crate) fn require_store_relative(store: &Store, raw: &str) -> Result<PathBuf, CliError> {
+    let rel = to_store_relative(store, raw);
+    ensure_safe_store_relative(&rel, raw)?;
+    Ok(rel)
 }
 
 /// Resolve `target` to a store-relative path by canonicalizing **both** it and
@@ -177,6 +187,62 @@ pub(crate) fn canonical_store_relative(store: &Store, target: &Path) -> Option<P
     let canonical_root = std::fs::canonicalize(&store.root).unwrap_or_else(|_| store.root.clone());
     let rel = canonical_target.strip_prefix(&canonical_root).ok()?;
     Some(PathBuf::from(path_to_unix(rel)))
+}
+
+/// Like [`canonical_store_relative`], but for an absolute path whose leaf may
+/// not exist yet (e.g. a `rename` destination). It canonicalizes the nearest
+/// existing ancestor and then appends the missing tail lexically. If that
+/// ancestor is outside the store, the path is rejected by returning `None`.
+fn store_relative_for_missing_absolute(store: &Store, target: &Path) -> Option<PathBuf> {
+    if !target.is_absolute() {
+        return None;
+    }
+
+    let canonical_root = std::fs::canonicalize(&store.root).ok()?;
+    let mut cursor = target;
+    let mut missing_tail: Vec<OsString> = Vec::new();
+
+    while !cursor.exists() {
+        missing_tail.push(cursor.file_name()?.to_os_string());
+        cursor = cursor.parent()?;
+    }
+
+    let canonical_existing = std::fs::canonicalize(cursor).ok()?;
+    let base = canonical_existing.strip_prefix(&canonical_root).ok()?;
+    let mut rel = PathBuf::from(path_to_unix(base));
+    for part in missing_tail.iter().rev() {
+        rel.push(part);
+    }
+    Some(PathBuf::from(path_to_unix(&rel)))
+}
+
+/// Reject paths that cannot be a safe store-relative key. `Path::join` treats
+/// absolute children as replacements, and `..` can escape after a later
+/// filesystem operation, so only normal relative components are accepted.
+fn ensure_safe_store_relative(rel: &Path, raw: &str) -> Result<(), CliError> {
+    let mut saw_component = false;
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) => saw_component = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(path_outside_store_error(raw));
+            }
+        }
+    }
+    if !saw_component {
+        return Err(path_outside_store_error(raw));
+    }
+    Ok(())
+}
+
+fn path_outside_store_error(raw: &str) -> CliError {
+    CliError::new(
+        ExitCode::Runtime,
+        "PATH_OUTSIDE_STORE",
+        format!("path `{raw}` is not inside the db.md store"),
+    )
+    .with_hint("use a store-relative path, or an absolute path that resolves under the store root")
 }
 
 /// Enforce the `DB.md` `### Frozen pages` policy: refuse a write to a frozen
@@ -240,7 +306,7 @@ fn resolve_write_path(
     fm: &Frontmatter,
     raw_path: &str,
 ) -> Result<PathBuf, CliError> {
-    let rel = to_store_relative(store, raw_path);
+    let rel = require_store_relative(store, raw_path)?;
     // The filename is the last component; the folder is rebuilt below, so we hand
     // the sharder just the name. This is what lets the agent write
     // `dbmd write emails/e1.md --type email` (or even `e1.md`) and get the
@@ -435,6 +501,50 @@ pub(crate) fn core_err<E: Into<dbmd_core::Error>>(e: E) -> CliError {
 /// [`CliError`]. Used wherever a writer seeds or overrides frontmatter.
 fn set_fm(fm: &mut Frontmatter, key: &str, value: &str) -> Result<(), CliError> {
     fm.set(key, value).map_err(core_err)
+}
+
+/// Apply `DB.md ## Schemas` `default <value>` modifiers for `type_`, filling
+/// only absent fields. Explicit `--fm` values and existing/imported
+/// frontmatter always win over schema defaults.
+pub(crate) fn apply_schema_defaults(
+    store: &Store,
+    type_: &str,
+    fm: &mut Frontmatter,
+) -> Result<(), CliError> {
+    let Some(schema) = store.config.schemas.get(type_) else {
+        return Ok(());
+    };
+    for spec in &schema.fields {
+        let Some(default) = &spec.default else {
+            continue;
+        };
+        if fm.get(&spec.name).is_some() {
+            continue;
+        }
+        apply_default_value(fm, &spec.name, default)?;
+    }
+    Ok(())
+}
+
+fn apply_default_value(
+    fm: &mut Frontmatter,
+    key: &str,
+    value: &serde_norway::Value,
+) -> Result<(), CliError> {
+    match key {
+        "type" | "id" | "created" | "updated" | "summary" | "status" | "tags" => {
+            let Some(s) = value.as_str() else {
+                return Err(CliError::runtime(format!(
+                    "schema default for `{key}` must be a scalar string"
+                )));
+            };
+            set_fm(fm, key, s)
+        }
+        _ => {
+            fm.extra.insert(key.to_string(), value.clone());
+            Ok(())
+        }
+    }
 }
 
 /// Render a path with `/` separators on every OS so output + comparisons are

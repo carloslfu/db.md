@@ -11,14 +11,14 @@
 
 # Debug build of the whole workspace -> target/debug/dbmd
 build:
-	cargo build --workspace
+	cargo build --workspace --locked
 
 # Optimized build (LTO, stripped) -> target/release/dbmd
 release:
-	cargo build --workspace --release
+	cargo build --workspace --release --locked
 
 test:
-	cargo test --workspace
+	cargo test --workspace --locked
 
 fmt:
 	cargo fmt --all
@@ -27,7 +27,7 @@ fmt-check:
 	cargo fmt --all --check
 
 lint:
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Publishability guard. Packages every crate from its TARBALL (the form
 # `cargo publish` ships) so an include_str!/include_bytes! path that escapes

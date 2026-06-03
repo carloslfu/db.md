@@ -25,6 +25,37 @@ Two things version independently:
   (`--target claude-code|codex` to force one). The skill body points at `dbmd
   spec` as the single source of truth — it never inlines the SPEC, so it cannot
   drift from it.
+- Validation now emits `FM_MISSING_CREATED` and `FM_MISSING_UPDATED` when a
+  content file omits the universal timestamps.
+
+#### Changed
+
+- `dbmd validate` falls back to a per-file content sweep when the default
+  working-set has no logged changed objects, avoiding vacuous clean reports on
+  fresh stores or externally edited stores with no `log.md` entry.
+- `dbmd index show --json` and `dbmd index rebuild --dry-run --json` now emit
+  machine-parseable envelopes instead of ignoring global JSON mode.
+
+#### Fixed
+
+- Mutating CLI paths (`write`, `link`, `rename`, `fm`, and scoped `index`
+  operations) now reject absolute/traversal paths outside the opened store.
+- Core write paths use exclusive, same-directory temp files before atomic
+  rename, closing predictable-temp clobber races.
+- Normal CLI commands fail closed on unreadable or malformed `DB.md` instead of
+  silently using a default config.
+- `fm init` can initialize raw markdown files that were externally dropped into
+  the store.
+- Schema `default <value>` modifiers are applied by `write` and `fm init`
+  without overwriting explicit fields.
+- Schema-declared `link to` fields now still warn on `.md` wiki-link targets.
+- `index rebuild --layer <layer>` repairs child type-folder `index.jsonl`
+  artifacts before rendering the layer rollup.
+- Summary templates and `index.jsonl` projection normalize unquoted wiki-link
+  YAML shapes consistently.
+- `graph orphans` counts only links to existing store files as graph edges.
+- Skill install/uninstall refuses to overwrite or remove unmanaged agent
+  instruction files.
 
 ### Format — v0.2 (breaking: the type model is now generic)
 
@@ -53,7 +84,7 @@ link, or the type-specific dedup) must declare those rules explicitly in
 - Seven validation codes: `LAYER_TYPE_MISMATCH` and the six type-specific
   collisions (`DUP_CONTACT_EMAIL`, `DUP_COMPANY_DOMAIN`, `DUP_EXPENSE_TUPLE`,
   `DUP_INVOICE_TUPLE`, `DUP_EMAIL_REINGEST`, `DUP_MEETING_TUPLE`) — superseded by
-  the schema-driven `DUP_UNIQUE_KEY`. The live SPEC table now has 38 codes.
+  the schema-driven `DUP_UNIQUE_KEY`. The live SPEC table now has 40 codes.
 - The hard-coded per-type `summary` composers, and the `dbmd stats`
   recognized-vs-custom type split (every type is now the store's own).
 

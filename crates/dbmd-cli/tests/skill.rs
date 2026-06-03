@@ -37,7 +37,10 @@ fn installs_claude_code_skill_with_frontmatter() {
     let skill = home.path().join(".claude/skills/db-md/SKILL.md");
     let body = std::fs::read_to_string(&skill).expect("SKILL.md written");
     // The frontmatter Claude Code reads to discover + trigger the skill.
-    assert!(body.starts_with("---\n"), "skill opens with YAML frontmatter");
+    assert!(
+        body.starts_with("---\n"),
+        "skill opens with YAML frontmatter"
+    );
     assert!(body.contains("name: db-md"));
     assert!(body.contains("description:"));
     // The body is a pointer at the single source of truth, not an inlined SPEC.
@@ -56,6 +59,25 @@ fn installs_codex_skill_at_the_documented_bootstrap_path() {
     let skill = home.path().join(".codex/instructions/db-md.md");
     let body = std::fs::read_to_string(&skill).expect("codex skill written");
     assert!(body.contains("dbmd spec"));
+}
+
+#[test]
+fn install_refuses_to_overwrite_unmanaged_codex_instructions() {
+    let home = tempfile::TempDir::new().unwrap();
+    let skill = home.path().join(".codex/instructions/db-md.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&skill, "custom user instructions\n").unwrap();
+
+    dbmd_home(home.path())
+        .args(["install-skill", "--target", "codex"])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert_eq!(
+        std::fs::read_to_string(&skill).unwrap(),
+        "custom user instructions\n"
+    );
 }
 
 #[test]
@@ -79,7 +101,10 @@ fn autodetect_prefers_claude_code_when_present() {
         .args(["--json", "install-skill"])
         .assert()
         .success();
-    assert_eq!(stdout_json(&out)["target"], serde_json::json!("claude-code"));
+    assert_eq!(
+        stdout_json(&out)["target"],
+        serde_json::json!("claude-code")
+    );
 }
 
 #[test]
@@ -108,7 +133,10 @@ fn uninstall_removes_then_noops() {
         .args(["--json", "uninstall-skill", "--target", "claude-code"])
         .assert()
         .success();
-    assert_eq!(stdout_json(&out)["action"], serde_json::json!("uninstalled"));
+    assert_eq!(
+        stdout_json(&out)["action"],
+        serde_json::json!("uninstalled")
+    );
     assert!(!skill.exists());
 
     // A second uninstall is a clean no-op, not an error.
@@ -117,6 +145,47 @@ fn uninstall_removes_then_noops() {
         .assert()
         .success();
     assert_eq!(stdout_json(&out)["action"], serde_json::json!("noop"));
+}
+
+#[test]
+fn uninstall_refuses_to_remove_unmanaged_codex_instructions() {
+    let home = tempfile::TempDir::new().unwrap();
+    let skill = home.path().join(".codex/instructions/db-md.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&skill, "custom user instructions\n").unwrap();
+
+    dbmd_home(home.path())
+        .args(["uninstall-skill", "--target", "codex"])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert_eq!(
+        std::fs::read_to_string(&skill).unwrap(),
+        "custom user instructions\n"
+    );
+}
+
+#[test]
+fn uninstall_claude_code_removes_only_the_managed_skill_file() {
+    let home = tempfile::TempDir::new().unwrap();
+    dbmd_home(home.path())
+        .args(["install-skill", "--target", "claude-code"])
+        .assert()
+        .success();
+
+    let dir = home.path().join(".claude/skills/db-md");
+    let skill = dir.join("SKILL.md");
+    let sibling = dir.join("notes.md");
+    std::fs::write(&sibling, "keep me\n").unwrap();
+
+    dbmd_home(home.path())
+        .args(["uninstall-skill", "--target", "claude-code"])
+        .assert()
+        .success();
+
+    assert!(!skill.exists());
+    assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "keep me\n");
 }
 
 #[test]

@@ -56,7 +56,10 @@ by hand — the release flow is the tag.
 
 - Every new source file gets `SPDX-License-Identifier: Apache-2.0`.
 - User-facing changes get a `## [Unreleased]` entry in `CHANGELOG.md`.
-- Any new validation code must be added to `SPEC.md § Validation` AND seeded in
-  `tests/corpora/corpus-b-edges` in the same change.
+- Any change to the validation-code vocabulary (adding OR removing a code) must
+  update `SPEC.md § Validation`, the `codes` module, the
+  `tests/corpora/corpus-b-edges` seeding fixtures, and `EXPECTED/coverage.json`
+  in the same change — the corpus-b coverage test enforces SPEC↔fixture parity
+  both directions, so a half-done change turns CI red.
 - Wiki-links in stores are full store-relative paths; short form is a validation
   error.

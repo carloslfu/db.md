@@ -3,8 +3,8 @@
 Extraction fixtures for `dbmd extract` (plan Block 3 / Block 7 eval). Each
 binary document under `sources/docs/` has a known-good `.txt` sibling used to
 diff extractor output. The fixtures live under `sources/docs/` (not a flat
-folder) so they exercise the real store path: `sources/docs/` is where the
-`pdf-source` type is canonically filed (SPEC § Recognized types).
+folder) so they exercise the real store path: `sources/docs/` is where a
+`pdf-source` (in the example domain) is filed (SPEC § Example types).
 
 This corpus is **not** a valid db.md store on its own — there is no `DB.md`,
 no `index.md`, no frontmatter on the fixtures. It is a bag of raw documents

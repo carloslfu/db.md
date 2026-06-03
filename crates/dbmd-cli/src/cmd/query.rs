@@ -83,7 +83,7 @@ fn split_where(clause: &str) -> Result<(&str, &str), CliError> {
 
 /// Open the `--dir` as a db.md store, mapping a missing `DB.md` to `NOT_A_STORE`.
 fn open_store(dir: &str) -> Result<Store, CliError> {
-    Store::open(Path::new(dir)).map_err(|e| CliError::from(dbmd_core::Error::from(e)))
+    Store::open_strict(Path::new(dir)).map_err(CliError::from)
 }
 
 /// Map a sidecar-read error to a CLI runtime error through the canonical

@@ -116,9 +116,9 @@ version = 2
 ignore = []
 
 # ---------------------------------------------------------------------------
-# Sources: warn (not deny) on crates from outside crates.io, so the
-# intra-workspace path dep (dbmd-cli -> dbmd-core) does not fail. Tighten to
-# "deny" if a git or unknown-registry dependency is ever introduced.
+# Sources: deny crates from outside crates.io. Workspace path dependencies are
+# first-party and do not trip this gate; external git or unknown-registry deps
+# must be reviewed before they can enter the graph.
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"

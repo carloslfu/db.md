@@ -21,10 +21,10 @@ independent source of truth the tool is measured against.
 diffing. The runner should compare as a **set** of issue objects (order
 independent) OR sort the tool output the same way before diffing.
 
-## Coverage — all 44 SPEC § Validation codes are seeded
+## Coverage — all 38 SPEC § Validation codes are seeded
 
-The SPEC § Validation table defines **44** codes. This corpus seeds
-**all 44** (the seeding table below has 44 rows). One of those 44,
+The SPEC § Validation table defines **38** codes (v0.2). This corpus
+seeds **all 38** (the seeding table below has 38 rows). One of those 38,
 `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md line
 494) and is grouped under `plan_extensions` in `coverage.json` for
 provenance — it still counts as a seeded SPEC code. `coverage.json`
@@ -35,14 +35,14 @@ SPEC-minus-mapped from the live SPEC table and `coverage.json`, and fails
 CI unless `uncovered_spec_codes` equals that gap exactly (both
 directions) and `all_spec_codes_covered` agrees. So if a future SPEC code
 is added without a seeding fixture — or a fixture is removed — the
-bookkeeping forces CI red. 39 distinct codes fire in the `--all` sweep
-across 41 issue objects (`SCHEMA_SHAPE_MISMATCH` appears twice — email
-shape + date shape) in `validate.json` (the 39th is
-`LAYER_TYPE_MISMATCH`, seeded by the misplaced contact under `wiki/`);
-the three `DB_MD_*` identity-contract codes are a separate invocation on
-the `bad-db-md/` sub-store (`bad-db-md.json`); `NOT_A_STORE` is a
-separate invocation (`not-a-store.json`); `POLICY_FROZEN_PAGE` is
-write-time (`policy-refusal/`).
+bookkeeping forces CI red. 33 distinct codes fire in the `--all` sweep
+across 40 issue objects (`SCHEMA_SHAPE_MISMATCH` twice — email + date
+shape; `INDEX_JSONL_STALE` twice; `DUP_UNIQUE_KEY` six times — one per
+dup-pair fixture) in `validate.json`; the three `DB_MD_*`
+identity-contract codes are a separate invocation on the `bad-db-md/`
+sub-store (`bad-db-md.json`); `NOT_A_STORE` is a separate invocation
+(`not-a-store.json`); `POLICY_FROZEN_PAGE` is write-time
+(`policy-refusal/`).
 
 | Code | Severity | Seeded by | Issue site |
 |------|----------|-----------|------------|
@@ -53,7 +53,6 @@ write-time (`policy-refusal/`).
 | `FM_MISSING_TYPE` | error | `records/misc/no-type.md` | no `type:` key (line 1) |
 | `FM_MALFORMED_YAML` | error | `records/misc/malformed-yaml.md` | unparseable block (line 1) |
 | `FM_BAD_TIMESTAMP` | error | `sources/emails/2026/05/bad-timestamp.md` | `created` line 4 |
-| `LAYER_TYPE_MISMATCH` | warning | `wiki/contacts/misplaced-contact.md` | `type: contact` under `wiki/` (line 2) |
 | `SUMMARY_MISSING` | error | `records/misc/summary-absent.md` | no `summary` key (line 1) |
 | `SUMMARY_EMPTY` | error | `records/misc/summary-blank.md` | `summary` line 6 |
 | `SUMMARY_MULTILINE` | error | `records/misc/summary-multiline.md` | `summary` line 6 |
@@ -64,12 +63,7 @@ write-time (`policy-refusal/`).
 | `WIKI_LINK_AMBIGUOUS` | error | `records/misc/ambiguous-link.md` | `[[northstar]]` line 19 |
 | `WIKI_LINK_FLOW_FORM_LIST` | error | `wiki/synthesis/flow-form-list.md` | `derived_from` line 8 |
 | `DUP_ID` | error | `records/contacts/dup-id-{one,two}.md` | `id` line 3 |
-| `DUP_CONTACT_EMAIL` | warning | `records/contacts/duplicate-email-{a,b}.md` | `email` line 8 |
-| `DUP_COMPANY_DOMAIN` | warning | `records/companies/dup-domain-{a,b}.md` | `domain` line 8 |
-| `DUP_EXPENSE_TUPLE` | warning | `records/expenses/2026/05/2026-05-05-globex-{a,b}.md` | tuple |
-| `DUP_INVOICE_TUPLE` | warning | `records/invoices/2026/04/2026-04-01-northstar-{a,b}.md` | tuple |
-| `DUP_EMAIL_REINGEST` | warning | `sources/emails/2026/05/2026-05-22-renewal-{a,b}.md` | tuple |
-| `DUP_MEETING_TUPLE` | warning | `records/meetings/2026/05/2026-05-22-sync-{a,b}.md` | tuple |
+| `DUP_UNIQUE_KEY` | warning (×6) | `contacts/duplicate-email-{a,b}` (`unique: email`), `companies/dup-domain-{a,b}` (`domain`), `expenses/…/2026-05-05-globex-{a,b}` (`date, amount, vendor`), `invoices/…/2026-04-01-northstar-{a,b}` (`vendor, date, amount`), `emails/…/2026-05-22-renewal-{a,b}` (`from, subject, date`), `meetings/…/2026-05-22-sync-{a,b}` (`date, attendees`) | one per `unique:` key in DB.md § Schemas; single-field → field line, compound → line 1 |
 | `SCHEMA_MISSING_REQUIRED` | error | `records/contacts/missing-company.md` | absent `company` |
 | `SCHEMA_SHAPE_MISMATCH` | error (×2) | `records/contacts/bad-email-shape.md` (`email` line 8) + `records/expenses/2026/05/bad-date-shape.md` (`date` line 7) | two fixtures: email shape + date shape |
 | `SCHEMA_LINK_PREFIX_MISMATCH` | error | `records/contacts/plain-company.md` | `company` line 9 |
@@ -187,22 +181,26 @@ contract with the validator; the validator should implement them.
     `--all` sweep checks only `<root>/DB.md` (clean) and walks
     `sources/`/`records/`/`wiki/` under the root, so it never descends
     into `bad-db-md/` — exactly the isolation `not-a-store/` relies on.
-11. **`LAYER_TYPE_MISMATCH` fires on a placement, not a defect.** The
-    `wiki/contacts/misplaced-contact.md` fixture is a fully valid
-    `contact` (schema satisfied, summary + timestamps valid, its one
-    wiki-link resolves) whose ONLY anomaly is its layer: a `contact`
-    belongs under `records/`, so sitting under `wiki/` is the single
-    warning it fires. Its type-folder gets a complete, matching
-    `index.md` + `index.jsonl` so no `INDEX_*` co-fires; layer/root
-    index completeness is unchecked (rule #6), so `wiki/index.md` need
-    not list it.
+11. **`DUP_UNIQUE_KEY` is schema-declared, not built in.** Each dup-pair
+    fixture collides only because this store's `DB.md ## Schemas` gives its
+    type a `unique:` key (`contact: email`, `company: domain`,
+    `expense: date, amount, vendor`, `invoice: vendor, date, amount`,
+    `email: from, subject, date`, `meeting: date, attendees`). A
+    single-field key anchors to that field's line and carries it as `key`;
+    a compound key anchors to line 1 with a null `key`. The
+    `wiki/contacts/misplaced-contact.md` fixture — a fully valid `contact`
+    that v0.1 flagged only for its `wiki/` placement — is now a pure clean
+    file (the layout is convention, not enforcement) and fires nothing; it
+    stays as a false-positive catcher with a complete, matching
+    `index.md` + `index.jsonl` so no `INDEX_*` fires.
 
 ## What MUST be true (the invariants, restated)
 
-- `dbmd validate --all --json <store>` emits **exactly** the 41 issues
-  in `validate.json` (39 distinct codes; `SCHEMA_SHAPE_MISMATCH` twice)
-  — no more (no spurious issues on the deliberately clean link targets
-  and clean indexes), no fewer.
+- `dbmd validate --all --json <store>` emits **exactly** the 40 issues
+  in `validate.json` (33 distinct codes; `SCHEMA_SHAPE_MISMATCH` twice,
+  `INDEX_JSONL_STALE` twice, `DUP_UNIQUE_KEY` six times) — no more (no
+  spurious issues on the deliberately clean link targets and clean
+  indexes), no fewer.
 - Exit code is **non-zero** (there are 25 errors).
 - Every `error` blocks; `warning`/`info` do not change the exit code on
   their own — but here errors dominate, so exit is non-zero regardless.
@@ -212,6 +210,6 @@ contract with the validator; the validator should implement them.
 - The clean files exist precisely to catch false positives:
   `records/companies/northstar.md`, `wiki/companies/northstar.md`,
   `records/decisions/2026-q1-strategy.md`, `wiki/contacts/misplaced-contact.md`
-  (its links + schema are clean — only the layer warns), every clean
+  (fully clean — schema + links valid, placement no longer warns), every clean
   type-folder `index.md`/`index.jsonl`, and the first two well-formed
   `log.md` entries must produce **no** other issue.

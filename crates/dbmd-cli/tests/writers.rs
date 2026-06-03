@@ -125,7 +125,12 @@ fn fm_value(file_text: &str, key: &str) -> String {
 
 #[test]
 fn write_flat_contact_composes_summary_and_prints_resolved_path() {
-    let store = Store::new();
+    // The store declares a `summary_template` for `contact`; `write` composes the
+    // default summary from it (v0.2 has no built-in per-type composer — the
+    // template is the store's to declare).
+    let store = Store::with_db_md(
+        "---\ntype: db-md\nscope: company\nowner: T\n---\n\n## Schemas\n\n### contact\n- summary_template: {role}\n",
+    );
     let out = store.run(&[
         "write",
         "records/contacts/sarah.md",
@@ -137,12 +142,40 @@ fn write_flat_contact_composes_summary_and_prints_resolved_path() {
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     // Flat type: path is used as-is, printed back.
     assert_eq!(out.stdout.trim(), "records/contacts/sarah.md");
-    // The file exists with a composed summary derived from `role`.
+    // The file exists with a composed summary derived from `role` via the template.
     let written = std::fs::read_to_string(store.abs("records/contacts/sarah.md")).unwrap();
     assert!(written.contains("type: contact"), "{written}");
     assert!(written.contains("summary: VP Sales"), "{written}");
     assert!(written.contains("created:"), "{written}");
     assert!(written.contains("updated:"), "{written}");
+}
+
+#[test]
+fn write_applies_schema_defaults_without_overwriting_explicit_fields() {
+    let store = Store::with_db_md(
+        "---\ntype: db-md\nscope: company\nowner: T\n---\n\n## Schemas\n\n### expense\n- currency (default USD)\n- status (default draft)\n",
+    );
+
+    let out = store.run(&[
+        "write",
+        "records/expenses/e1.md",
+        "--type",
+        "expense",
+        "--summary",
+        "Office chairs",
+        "--fm",
+        "date=2026-05-22",
+        "--fm",
+        "status=approved",
+    ]);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+
+    let written = std::fs::read_to_string(store.abs("records/expenses/2026/05/e1.md")).unwrap();
+    assert!(written.contains("currency: USD"), "{written}");
+    assert!(
+        written.contains("status: approved"),
+        "explicit --fm must win over schema default:\n{written}"
+    );
 }
 
 #[test]
@@ -191,6 +224,10 @@ fn write_source_email_auto_shards_by_date_and_prints_sharded_path() {
         "anything/e1.md", // the folder part is ignored; shard_path_for rebuilds it
         "--type",
         "email",
+        // v0.2: no built-in per-type composer, so a summary-less record needs an
+        // explicit one. This test is about date-sharding, not summary composition.
+        "--summary",
+        "a@x.com to b@y.com re Renewal",
         "--fm",
         "date=2026-05-22",
         "--fm",
@@ -366,6 +403,47 @@ fn write_refuses_when_not_a_store() {
     assert_eq!(out.status.code(), Some(3), "NOT_A_STORE is exit 3");
     let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert_eq!(v["error"]["code"], "NOT_A_STORE");
+}
+
+#[test]
+fn write_refuses_malformed_db_md_instead_of_using_default_config() {
+    let store =
+        Store::with_db_md("---\ntype: db-md\n  bad: : : :\n: : nope\n---\n\n# Broken config\n");
+    let out = store.run(&[
+        "--json",
+        "write",
+        "records/contacts/sarah.md",
+        "--type",
+        "contact",
+        "--summary",
+        "Sarah",
+    ]);
+
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.error_json()["error"]["code"], "PARSE_ERROR");
+    assert!(!store.abs("records/contacts/sarah.md").exists());
+}
+
+#[test]
+fn write_refuses_paths_outside_the_store() {
+    let store = Store::new();
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("outside.md");
+    let out = store.run(&[
+        "--json",
+        "write",
+        outside.to_str().unwrap(),
+        "--type",
+        "contact",
+        "--summary",
+        "outside",
+    ]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.error_json()["error"]["code"], "PATH_OUTSIDE_STORE");
+    assert!(
+        !outside.exists(),
+        "a refused outside-store write must not create the requested file"
+    );
 }
 
 // ── write: COLLISION REFUSAL (assert no write happened) ────────────────────────
@@ -626,6 +704,54 @@ fn link_rejects_short_form_target() {
 }
 
 #[test]
+fn link_refuses_paths_outside_the_store() {
+    let store = Store::new();
+    store.seed(
+        "records/companies/acme.md",
+        "---\ntype: company\nsummary: y\n---\n# Acme\n",
+    );
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("outside.md");
+    let outside_body = "---\ntype: note\nsummary: outside\n---\n# Outside\n";
+    std::fs::write(&outside, outside_body).unwrap();
+
+    let out = store.run(&[
+        "--json",
+        "link",
+        outside.to_str().unwrap(),
+        "records/companies/acme",
+    ]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.error_json()["error"]["code"], "PATH_OUTSIDE_STORE");
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        outside_body,
+        "a refused outside-store link must not mutate the outside file"
+    );
+}
+
+#[test]
+fn link_refuses_traversal_target() {
+    let store = Store::new();
+    let original = "---\ntype: contact\nsummary: x\n---\n# Sarah\n";
+    store.seed("records/contacts/sarah.md", original);
+
+    let out = store.run(&[
+        "--json",
+        "link",
+        "records/contacts/sarah.md",
+        "records/../companies/acme",
+    ]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.error_json()["error"]["code"], "PATH_OUTSIDE_STORE");
+    assert_eq!(
+        std::fs::read_to_string(store.abs("records/contacts/sarah.md")).unwrap(),
+        original,
+        "a refused traversal target must not append a malformed link"
+    );
+}
+
+#[test]
 fn link_refuses_frozen_from_file() {
     let store = Store::with_db_md(
         "---\ntype: db-md\n---\n\n# S\n\n## Policies\n\n### Frozen pages\n- records/decisions/d.md\n",
@@ -780,6 +906,34 @@ fn rename_refuses_when_destination_exists() {
     assert_eq!(
         std::fs::read_to_string(store.abs("records/contacts/b.md")).unwrap(),
         dest
+    );
+}
+
+#[test]
+fn rename_refuses_paths_outside_the_store() {
+    let store = Store::new();
+    store.seed(
+        "records/contacts/a.md",
+        "---\ntype: contact\nsummary: x\n---\n# A\n",
+    );
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("moved.md");
+
+    let out = store.run(&[
+        "--json",
+        "rename",
+        "records/contacts/a.md",
+        outside.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.error_json()["error"]["code"], "PATH_OUTSIDE_STORE");
+    assert!(
+        store.abs("records/contacts/a.md").exists(),
+        "source must survive a refused outside-store rename"
+    );
+    assert!(
+        !outside.exists(),
+        "a refused outside-store rename must not create the destination"
     );
 }
 

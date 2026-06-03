@@ -16,9 +16,9 @@ use crate::error::CliResult;
 
 /// Run `dbmd outline`.
 pub fn run(ctx: &Context, args: &OutlineArgs) -> CliResult {
-    // No `--dir` on this command: the store is the current directory, and the
-    // file is resolved store-relative (or absolute) by `render::outline`.
-    let store = Store::open(Path::new(".")).map_err(dbmd_core::Error::from)?;
+    // The store is `--dir` (default `.`); the file is then resolved
+    // store-relative (or absolute) by `render::outline`.
+    let store = Store::open_strict(Path::new(&args.dir))?;
     let outline = render::outline(&store, Path::new(&args.file)).map_err(dbmd_core::Error::from)?;
 
     if ctx.json {

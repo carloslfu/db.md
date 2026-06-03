@@ -18,7 +18,7 @@ use serde_norway::Value as YamlValue;
 
 use crate::cli::{FmArgs, FmCommand, FmGetArgs, FmInitArgs, FmQueryArgs, FmSetArgs};
 use crate::cmd::log::{into_cli, open_store};
-use crate::cmd::write::canonical_store_relative;
+use crate::cmd::write::{apply_schema_defaults, require_store_relative};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -68,16 +68,16 @@ pub fn run_get(ctx: &Context, args: &FmGetArgs) -> CliResult {
 pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     let (key, value) = split_assignment(&args.assignment)?;
 
-    let file = Path::new(&args.file);
     let store = open_store(".")?;
-    let rel = store_relative(&store, file);
+    let rel = require_store_relative(&store, &args.file)?;
+    let file = store.abs_path(&rel);
 
     // Frozen-page policy: refuse before any mutation.
     enforce_not_frozen(&store, &rel)?;
 
-    let (mut fm, body) = into_cli(parser::read_file(file))?;
+    let (mut fm, body) = into_cli(parser::read_file(&file))?;
     into_cli(fm.set(key, value))?;
-    into_cli(parser::write_file(file, &fm, &body))?;
+    into_cli(parser::write_file(&file, &fm, &body))?;
 
     // Write-through: re-derive the record from the now-updated file and re-sort
     // the type-folder index. Non-fatal if it can't run (the file is the source
@@ -132,13 +132,13 @@ pub fn run_query(ctx: &Context, args: &FmQueryArgs) -> CliResult {
 /// `summary` (overridable with `--summary`), then fold the file into its index
 /// write-through. Refuses on a `DB.md` frozen page before mutating.
 pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
-    let file = Path::new(&args.file);
     let store = open_store(".")?;
-    let rel = store_relative(&store, file);
+    let rel = require_store_relative(&store, &args.file)?;
+    let file = store.abs_path(&rel);
 
     enforce_not_frozen(&store, &rel)?;
 
-    let (mut fm, body) = into_cli(parser::read_file(file))?;
+    let (mut fm, body) = read_or_seed_raw_body(&file)?;
 
     // Type: an explicit frontmatter `type` wins; otherwise infer from the
     // type-folder path segment. A file with neither is an error (init can't
@@ -175,6 +175,7 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
     if fm.updated.is_none() {
         fm.updated = Some(now);
     }
+    apply_schema_defaults(&store, &type_, &mut fm)?;
 
     // Summary: an explicit `--summary` wins; otherwise compose the deterministic
     // default for this type and write it to `summary:`. An already-present
@@ -186,7 +187,7 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
         fm.summary = Some(composed);
     }
 
-    into_cli(parser::write_file(file, &fm, &body))?;
+    into_cli(parser::write_file(&file, &fm, &body))?;
     let index_ok = Index::on_write(&store, &rel).is_ok();
 
     if ctx.json {
@@ -209,6 +210,17 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
 }
 
 // ── Shared glue ──────────────────────────────────────────────────────────────
+
+fn read_or_seed_raw_body(file: &Path) -> Result<(parser::Frontmatter, String), CliError> {
+    match parser::read_file(file) {
+        Ok(parsed) => Ok(parsed),
+        Err(dbmd_core::ParseError::MissingFrontmatter { .. }) => {
+            let body = std::fs::read_to_string(file).map_err(CliError::from)?;
+            Ok((parser::Frontmatter::default(), body))
+        }
+        Err(e) => Err(CliError::from(dbmd_core::Error::from(e))),
+    }
+}
 
 /// Split a `key=value` assignment at the first `=`. The value may itself contain
 /// `=` (e.g. a query string); only the first separator splits. An empty key is
@@ -245,29 +257,6 @@ fn enforce_not_frozen(store: &Store, rel: &Path) -> Result<(), CliError> {
         .into());
     }
     Ok(())
-}
-
-/// Resolve a CLI-supplied file path to its store-relative form. A path already
-/// under the store root is rebased; anything else (e.g. an absolute path outside
-/// the store, or a bare relative path when the store is the CWD) is used as
-/// given — the frozen-page check and index write-through both key off this.
-///
-/// Routes through the shared, canonicalizing [`canonical_store_relative`] first
-/// so an **absolute** `<file>` resolves to the same store-relative key as the
-/// equivalent relative one. `fm set`/`fm init` always open the store at the CWD
-/// (`store.root` is the literal `.`), so without this a bare
-/// `strip_prefix(&store.root)` of an absolute path fails and the frozen-page
-/// gate is skipped — the same single-normalization gap the write surfaces had.
-fn store_relative(store: &Store, file: &Path) -> std::path::PathBuf {
-    if let Some(rel) = canonical_store_relative(store, file) {
-        return rel;
-    }
-    if let Ok(rel) = file.strip_prefix(&store.root) {
-        return rel.to_path_buf();
-    }
-    // Strip a leading `./` for a clean store-relative key.
-    let s = path_str(file);
-    Path::new(s.strip_prefix("./").unwrap_or(&s)).to_path_buf()
 }
 
 /// Parse a `--in <layer>` value into a [`Layer`], or a usage error.

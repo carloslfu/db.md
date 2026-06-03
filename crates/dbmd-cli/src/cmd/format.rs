@@ -51,11 +51,14 @@ pub fn run(ctx: &Context, args: &FormatArgs) -> CliResult {
             .with_hint(format!("could not write `{}`", args.file))
     })?;
 
-    // Report whether the canonical form differed from what was on disk. Re-read
-    // is cheap and lets the agent branch on "did anything change" without a
-    // separate diff.
-    let reformatted = std::fs::read_to_string(file).map_err(CliError::from)?;
-    let changed = reformatted != original;
+    // Report whether the canonical form differed from what was on disk —
+    // computed in-memory from the same pieces the writer just emitted, NOT a
+    // re-read. The atomic write already succeeded, so a transient re-read
+    // failure (or a concurrent delete) must not turn a successful format into
+    // an error exit; reconstructing the bytes also avoids re-reading what we
+    // just wrote. This mirrors `parser::write_file`'s composition exactly.
+    let canonical = format!("---\n{}---\n{}", frontmatter.to_yaml(), body);
+    let changed = canonical != original;
 
     if ctx.json {
         let obj = serde_json::json!({
@@ -85,12 +88,12 @@ fn locate_store(file: &Path) -> Result<Store, CliError> {
     let mut dir: Option<&Path> = Some(start.as_path());
     while let Some(d) = dir {
         if Store::is_db_md_store(d) {
-            return Store::open(d).map_err(|e| CliError::from(dbmd_core::Error::from(e)));
+            return Store::open_strict(d).map_err(CliError::from);
         }
         dir = d.parent();
     }
     // No ancestor is a store: surface NOT_A_STORE against the file's directory.
-    Store::open(&start).map_err(|e| CliError::from(dbmd_core::Error::from(e)))
+    Store::open_strict(&start).map_err(CliError::from)
 }
 
 /// The file's store-relative path. Canonicalizes the file and strips the store

@@ -90,7 +90,7 @@ fn map_extract_error(err: ExtractError) -> CliError {
             err.to_string(),
         )
         .with_hint(
-            "supported document types: .pdf, .docx, .xlsx, .epub, .html (detected by extension)",
+            "supported document types: .pdf, .docx, .xlsx/.xlsm/.xlsb/.ods, .epub, .html/.htm/.xhtml (detected by extension)",
         ),
         // Encrypted/locked document — clean refusal, not a crash.
         ExtractError::Encrypted(_) => CliError::new(ExitCode::Runtime, err.code(), err.to_string())

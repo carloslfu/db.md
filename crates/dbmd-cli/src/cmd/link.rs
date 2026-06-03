@@ -15,7 +15,9 @@ use std::path::Path;
 use dbmd_core::Store;
 
 use crate::cli::LinkArgs;
-use crate::cmd::write::{core_err, enforce_frozen, index_on_write, open_store, to_store_relative};
+use crate::cmd::write::{
+    core_err, enforce_frozen, index_on_write, open_store, require_store_relative,
+};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -30,7 +32,7 @@ const LAYER_DIRS: [&str; 3] = ["sources", "records", "wiki"];
 pub fn run(ctx: &Context, args: &LinkArgs) -> CliResult {
     let store = open_store(&args.dir)?;
 
-    let from_rel = to_store_relative(&store, &args.from);
+    let from_rel = require_store_relative(&store, &args.from)?;
     let from_abs = store.abs_path(&from_rel);
     if !from_abs.exists() {
         return Err(missing_from_error(&from_rel));
@@ -79,7 +81,7 @@ fn append_wiki_link(abs: &Path, target: &str) -> Result<(), CliError> {
 /// with a layer dir) so `link` never writes an edge `dbmd validate` would flag
 /// `WIKI_LINK_SHORT_FORM`.
 fn canonical_link_target(store: &Store, raw: &str) -> Result<String, CliError> {
-    let rel = to_store_relative(store, raw);
+    let rel = require_store_relative(store, raw)?;
     let unix = path_to_unix(&rel);
     let bare = unix.strip_suffix(".md").unwrap_or(&unix).to_string();
 

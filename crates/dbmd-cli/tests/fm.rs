@@ -12,7 +12,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::{copy_store_to_temp, corpus_a, corpus_b, dbmd};
+use common::{copy_store_to_temp, corpus_a, corpus_b, dbmd, write_db_md, write_file};
 
 // ── fm get ─────────────────────────────────────────────────────────────────────
 
@@ -207,6 +207,43 @@ fn set_refuses_a_frozen_page_passed_as_absolute_path() {
 }
 
 #[test]
+fn set_refuses_a_file_outside_the_store() {
+    let tmp = tempfile::TempDir::new().expect("store tempdir");
+    let store = tmp.path();
+    write_db_md(store);
+
+    let outside_dir = tempfile::TempDir::new().expect("outside tempdir");
+    let outside = write_file(
+        outside_dir.path(),
+        "outside.md",
+        "---\ntype: note\nsummary: outside\n---\n# Outside\n",
+    );
+    let before = std::fs::read_to_string(&outside).unwrap();
+
+    let out = dbmd()
+        .current_dir(store)
+        .args([
+            "--json",
+            "fm",
+            "set",
+            outside.to_str().unwrap(),
+            "status=draft",
+        ])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).expect("json error on stderr");
+    assert_eq!(v["error"]["code"], serde_json::json!("PATH_OUTSIDE_STORE"));
+
+    let after = std::fs::read_to_string(&outside).unwrap();
+    assert_eq!(
+        before, after,
+        "fm set must not mutate a markdown file outside the opened store"
+    );
+}
+
+#[test]
 fn set_refuses_an_extensionless_frozen_entry() {
     // Regression for the divergent-frozen-policy finding: `fm set` historically
     // used a byte-exact `PathBuf` equality against `config.frozen_pages`, which
@@ -358,11 +395,12 @@ fn init_infers_type_seeds_timestamps_and_composes_summary() {
     // Timestamps seeded.
     assert!(file.contains("created:"), "created seeded:\n{file}");
     assert!(file.contains("updated:"), "updated seeded:\n{file}");
-    // Deterministic default summary composed (resolves the company link to its
-    // name); the contact composer is `<role> at <company-name>`.
+    // No `summary_template` is declared for `contact` in this store, so the
+    // default summary is the body's first non-heading paragraph (v0.2 dropped
+    // the built-in per-type composers; a store opts into a template).
     assert!(
-        file.contains("summary: VP Finance at Northstar Logistics"),
-        "default summary composed + company resolved:\n{file}"
+        file.contains("summary: New finance contact."),
+        "default summary is the body's first paragraph:\n{file}"
     );
 
     // Folded into the type-folder index write-through (both artifacts).
@@ -372,6 +410,31 @@ fn init_infers_type_seeds_timestamps_and_composes_summary() {
     assert!(
         md.contains("records/contacts/tom-vega"),
         "new file in index.md"
+    );
+}
+
+#[test]
+fn init_adds_frontmatter_to_raw_markdown_import() {
+    let (_tmp, store) = copy_store_to_temp(&corpus_a());
+    let raw = "# Tom Vega\n\nNew finance contact.\n";
+    common::write_file(&store, "records/contacts/tom-raw.md", raw);
+
+    dbmd()
+        .current_dir(&store)
+        .args(["fm", "init", "records/contacts/tom-raw.md"])
+        .assert()
+        .success();
+
+    let file = std::fs::read_to_string(store.join("records/contacts/tom-raw.md")).unwrap();
+    assert!(file.starts_with("---\n"), "frontmatter added:\n{file}");
+    assert!(file.contains("type: contact"), "type inferred:\n{file}");
+    assert!(
+        file.contains("summary: New finance contact."),
+        "summary composed:\n{file}"
+    );
+    assert!(
+        file.ends_with(raw),
+        "raw markdown body must be preserved after inserted frontmatter:\n{file}"
     );
 }
 
@@ -400,6 +463,35 @@ fn init_honors_explicit_summary_override() {
     assert!(
         file.contains("summary: Hand-written override summary"),
         "explicit --summary wins over the composed default:\n{file}"
+    );
+}
+
+#[test]
+fn init_applies_schema_defaults_without_overwriting_existing_fields() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let store = tmp.path();
+    common::write_file(
+        store,
+        "DB.md",
+        "---\ntype: db-md\nscope: company\nowner: T\n---\n\n## Schemas\n\n### contact\n- status (default active)\n- role (default Unknown)\n",
+    );
+    common::write_file(
+        store,
+        "records/contacts/nina-ray.md",
+        "---\nname: Nina Ray\nstatus: archived\n---\n\n# Nina Ray\n\nAnalyst.\n",
+    );
+
+    dbmd()
+        .current_dir(store)
+        .args(["fm", "init", "records/contacts/nina-ray.md"])
+        .assert()
+        .success();
+
+    let file = std::fs::read_to_string(store.join("records/contacts/nina-ray.md")).unwrap();
+    assert!(file.contains("role: Unknown"), "default applied:\n{file}");
+    assert!(
+        file.contains("status: archived"),
+        "existing frontmatter must win over schema default:\n{file}"
     );
 }
 
@@ -457,6 +549,37 @@ fn init_refuses_a_frozen_page_passed_as_absolute_path() {
     assert_eq!(
         before, after,
         "init must not touch a frozen page addressed by absolute path"
+    );
+}
+
+#[test]
+fn init_refuses_a_file_outside_the_store() {
+    let tmp = tempfile::TempDir::new().expect("store tempdir");
+    let store = tmp.path();
+    write_db_md(store);
+
+    let outside_dir = tempfile::TempDir::new().expect("outside tempdir");
+    let outside = write_file(
+        outside_dir.path(),
+        "outside.md",
+        "---\nname: Outside\n---\n\n# Outside\n\nBody.\n",
+    );
+    let before = std::fs::read_to_string(&outside).unwrap();
+
+    let out = dbmd()
+        .current_dir(store)
+        .args(["--json", "fm", "init", outside.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).expect("json error on stderr");
+    assert_eq!(v["error"]["code"], serde_json::json!("PATH_OUTSIDE_STORE"));
+
+    let after = std::fs::read_to_string(&outside).unwrap();
+    assert_eq!(
+        before, after,
+        "fm init must not rewrite frontmatter outside the opened store"
     );
 }
 

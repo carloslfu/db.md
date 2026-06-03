@@ -1,4 +1,4 @@
-# db.md — v0.1
+# db.md — v0.2
 
 `db.md` is **the open database, in plain files**. Records are markdown
 files with YAML frontmatter. Relationships are wiki-links. The database
@@ -23,10 +23,14 @@ open and intentionally simple.
 
 ## Status
 
-**Spec version:** `v0.1` (this document is the tagged release).
+**Spec version:** `v0.2`. **v0.2 made the type model generic:** schema
+enforcement is now solely the store's own `DB.md ## Schemas` — the
+toolkit ships no built-in or implicit per-type schema, and the example
+types (`contact`, `expense`, …) are illustrative, not normative. See the
+[CHANGELOG](CHANGELOG.md) for the v0.1 → v0.2 migration.
 **Stable:** the three-folder layout, the `DB.md` config file, and the
-universal frontmatter contract are stable. The recognized-type
-vocabulary is additive only.
+universal frontmatter contract are stable. From v0.2 on, the validation
+vocabulary is additive.
 **Tooling:** Apache-2.0 Rust `dbmd` CLI (one binary, subcommands for
 read / write / validate / extract ops, zero LLM dependencies). The
 agent runtime is BYO (Claude Code, Codex, or any harness).
@@ -127,12 +131,13 @@ tags: [tag1, tag2]    # optional; categorical labels
 ---
 ```
 
-Type-specific fields layer on top — see [Recognized types](#recognized-types)
-for the canonical vocabulary.
+Type-specific fields layer on top. A store declares any it wants enforced
+in `DB.md ## Schemas`; see [Example types](#example-types) for illustrative
+patterns to copy.
 
 **Content files** = everything under `sources/`, `records/`, `wiki/`. **Meta files** = `DB.md`, `index.md`, `log.md` (these have their own contracts; they do not need `summary`, `created`, or `updated`).
 
-**The `summary` field is canonical and required on every content file.** It is the **single source of truth** for what the file is about. Every hierarchical `index.md` reads this field directly to populate its catalog entries — no extraction rules, no recomputation. The agent writes a thoughtful summary when creating files (the curator's judgment), `dbmd fm init` writes a deterministic default if the agent doesn't (composed from other frontmatter fields per type), and the agent can always override via `dbmd fm set <file> summary='...'`.
+**The `summary` field is canonical and required on every content file.** It is the **single source of truth** for what the file is about. Every hierarchical `index.md` reads this field directly to populate its catalog entries — no extraction rules, no recomputation. The agent writes a thoughtful summary when creating files (the curator's judgment), `dbmd fm init` writes a deterministic default if the agent doesn't (the type's `summary_template` from `DB.md ## Schemas`, or the file's first paragraph), and the agent can always override via `dbmd fm set <file> summary='...'`.
 
 **`summary` rules:**
 - Required on every content file.
@@ -159,11 +164,14 @@ for the canonical vocabulary.
 - Unknown fields pass through. Tools that don't recognize a field
   treat it as ambient context.
 
-## Recognized types
+## Example types
 
-The canonical vocabulary the spec ships at v0.1. **Custom types are
-valid** — the manager / curator treats unknown types as ambient
-context.
+db.md has **no built-in type vocabulary.** `type` is a free-form label;
+every type is the store's own. The table below is an **illustrative
+example domain** (a company / CRM brain) — copy what fits into your
+`DB.md ## Schemas`, ignore the rest, invent your own. The only structural
+types the toolkit knows are the three meta files (`db-md`, `index`,
+`log`); every content type is yours.
 
 **Every content type (everything below except `db-md`, `index`, `log`) requires `summary` in frontmatter** — see the [universal frontmatter contract](#the-universal-frontmatter-contract). The "Type-specific fields" column lists fields *in addition to* the universal contract (`type`, `id`, `created`, `updated`, `summary`, `status`, `tags`).
 
@@ -185,31 +193,24 @@ context.
 
 **Reading rules:**
 
-- Custom types pass through. A reader that doesn't recognize `type:
-  proposal` reads the file as ambient context.
+- Every type passes through. The toolkit recognizes no type specially; a
+  reader that doesn't know `type: proposal` (or `type: contact`) reads the
+  file as ambient context.
 - The folder layout is convention, not enforcement. A `type: contact`
   in `sources/foo/` is valid (though unusual).
 - A single entity (e.g. a person) can have both a `records/contacts/`
   data row AND a `wiki/people/` narrative page. The record is the
   atomic fact; the wiki page is the synthesis that cross-references
   it.
-- Custom types **also require `summary`** — the field is universal across
-  content files regardless of whether the spec recognizes the type.
-- **Canonical types carry implicit schemas.** Every field marked
-  `(link → <prefix>/)` in the table above — `contact.company`,
-  `expense.vendor`, `expense.contact`, `meeting.expense`, and
-  `invoice.vendor` — is validated like any `DB.md ## Schemas` link
-  field: a plain string where a wiki-link under the named prefix is
-  expected is a `SCHEMA_LINK_PREFIX_MISMATCH` error. The implicit
-  schema enforces **exactly** the fields the table marks `(link)` and
-  no others. An explicit `### <type>` block in `DB.md ## Schemas`
-  overrides the implicit schema for that type.
-- **`wiki-page.derived_from` is deliberately not implicit-schema
-  enforced.** Its links may point into *either* `records/` or
-  `sources/`, so it has no single canonical prefix; it is left to
-  ordinary wiki-link validation (broken targets still reported)
-  rather than the single-prefix link check. To pin a prefix on it,
-  declare an explicit `### wiki-page` schema in `DB.md ## Schemas`.
+- Every content type requires `summary` — the field is universal across
+  content files, whatever the `type`.
+- **No type carries a built-in schema.** Field requirements, shapes, link
+  prefixes, and uniqueness are enforced *only* where the store's
+  `DB.md ## Schemas` declares them (see [The `DB.md` file](#the-dbmd-file)).
+  An example type above becomes enforced the moment you copy its schema
+  into `## Schemas` — and not before. So a field like `contact.company` is
+  a plain label until a `### contact` schema declares it
+  `link to records/companies/`.
 
 **Worked example — a `contact` record (note `summary` in frontmatter):**
 
@@ -236,21 +237,16 @@ status: active
 
 The `summary` field is what `records/contacts/index.md` prints next to `[[records/contacts/sarah-chen]]`. It's the agent's judgment captured in data — not recomputed by tooling.
 
-**Deterministic defaults per type** (what `dbmd fm init` writes when the agent doesn't override):
-
-| `type`       | Default `summary` template                                 |
-|--------------|------------------------------------------------------------|
-| `contact`    | `<role> at <company-name> (last_touch: <date>)`            |
-| `company`    | `<relationship>; <industry>`                               |
-| `expense`    | `<date> — <amount> <currency> — <vendor>`                  |
-| `meeting`    | `<date> — <first 3 attendees> (+N more)` when `N>0`        |
-| `decision`   | `<decided_by>: <title-or-first-heading>`                   |
-| `invoice`    | `<vendor> — <amount> — <status>`                           |
-| `email`      | `<from> → <to> — <subject>`                                |
-| `transcript` | `<recorded_at> — <attendees>`                              |
-| `pdf-source` | `<doc_type> from <received_from>`                          |
-| `wiki-page`  | `<topic>` or the file's first non-heading paragraph        |
-| (custom)     | first non-heading paragraph, truncated to ≤200 chars       |
+**Deterministic default `summary`** (what `dbmd fm init` / `dbmd write`
+write when the agent doesn't): the type's `summary_template` from
+`DB.md ## Schemas` if one is declared, else the file's first non-heading
+paragraph, truncated to ≤200 chars. A `summary_template` interpolates
+`{field}` placeholders from frontmatter — so a `### contact` schema with
+`summary_template: {role} at {company} (last_touch: {last_touch})`
+reproduces a contact's default line, now as the store's own declaration
+rather than a built-in. A `{field}` that is a wiki-link renders its
+display-or-leaf text; a list field renders comma-joined; an absent field
+renders empty.
 
 The agent can always overwrite the default with `dbmd fm set <file> summary='<better>'`. The tool generates a deterministic floor; the agent provides the ceiling.
 
@@ -346,23 +342,27 @@ the canonical collision modes:
   resolver is introduced and matches multiple files, it's a hard
   error.
 
-**Soft collisions (warnings; type-aware entity-dedup signals):**
-- Two `contact` records with the same `email`.
-- Two `company` records with the same `domain`.
-- Two `expense` records with the same `(date, amount, vendor)` tuple.
-- Two `invoice` records with the same `(vendor, date, amount)`.
-- Two `email` source files with the same `(from, subject, date)`
-  (likely re-ingest).
-- Two `meeting` records with the same `(date, attendees-set)`.
+**Soft collisions (warnings; schema-declared uniqueness):**
+- Two records of a type that share a `DB.md ## Schemas` `unique:` key.
+  A `unique:` directive names one or more fields (a compound key when
+  more than one); records of that type whose combined values match
+  collide. A list-valued key field collapses to a sorted set, so order
+  never matters (e.g. a meeting's attendee set).
+
+No type carries a built-in dedup key — the store opts in, per type. A
+`### contact` schema with `unique: email` warns on two contacts sharing
+an email; `### expense` with `unique: date, amount, vendor` warns on a
+re-entered expense; `### meeting` with `unique: date, attendees` warns on
+the same meeting logged twice regardless of attendee order.
 
 Soft collisions don't fail validation; they emit warnings the agent
 reads (machine-parseable via `dbmd validate --json`) and decides
 how to resolve — usually by `dbmd rename` to merge or `dbmd link` to
 cross-reference. The toolkit detects; the agent decides.
 
-Each collision maps to a structured issue code (`DUP_ID`,
-`DUP_CONTACT_EMAIL`, `DUP_COMPANY_DOMAIN`, ...); see
-[Validation](#validation) for the complete code vocabulary.
+Each collision maps to a structured issue code (`DUP_ID` for the
+universal `id` field, `DUP_UNIQUE_KEY` for a schema-declared `unique:`
+key); see [Validation](#validation) for the complete code vocabulary.
 
 A reader that doesn't speak wiki-links treats them as text — no
 breakage.
@@ -423,6 +423,8 @@ wiki pages from sources tagged `transient`.
 - role (string)
 - first_touch (date)
 - last_touch (date)
+- unique: email
+- summary_template: {role} at {company} (last_touch: {last_touch})
 
 ### expense
 - date (required, date)
@@ -431,6 +433,7 @@ wiki pages from sources tagged `transient`.
 - category (string)
 - vendor (link to records/companies/)
 - receipt (link to sources/)
+- unique: date, amount, vendor
 ```
 
 **Canonical sections (all optional):**
@@ -447,16 +450,18 @@ wiki pages from sources tagged `transient`.
   - **`### Ignored types`** — type list the curator never
     synthesizes (still readable as ambient context, but no
     derived wiki pages, no new records).
-- **`## Schemas`** — custom type definitions or overrides of the
-  canonical types. Parseable and enforced by `dbmd validate`.
+- **`## Schemas`** — the store's type definitions. This is the **only**
+  source of schema enforcement; the toolkit ships no built-in or implicit
+  per-type schema. Parseable and enforced by `dbmd validate`.
 
-  Each schema is a `### <type>` heading followed by one field per
-  bulleted line in the form `- <field-name> (<modifiers>)`. One
-  field per line; modifiers are comma-separated inside parens.
-  Bullets without parens declare a free-form optional field of any
-  shape.
+  Each schema is a `### <type>` heading followed by field and directive
+  bullets. A **field** is `- <field-name> (<modifiers>)` (one per line;
+  modifiers comma-separated inside parens; a bullet without parens is a
+  free-form optional field of any shape). A **directive** is
+  `- <keyword>: <value>` with a reserved keyword; `unique` and
+  `summary_template` are reserved and can't be used as field names.
 
-  **Recognized modifiers:**
+  **Recognized field modifiers:**
   - `required` — field must be present and non-empty.
   - Shape modifiers: `string`, `int`, `bool`, `date`, `email`,
     `currency`, `url`. Validate enforces the shape (date is
@@ -471,15 +476,24 @@ wiki pages from sources tagged `transient`.
   - `enum: <v1>, <v2>, ...` — value must be one of the listed
     options.
 
-  Unknown modifiers are ignored (read as ambient context, no
-  error). Custom schemas override the canonical recognized-type
-  rules for the named `### <type>`; canonical types not named in
-  `## Schemas` use spec defaults.
+  **Directives:**
+  - `unique: <field>[, <field> ...]` — a uniqueness constraint over the
+    listed field(s) (compound when more than one). Two records of this
+    type whose values collide warn as `DUP_UNIQUE_KEY`. Repeat the
+    directive for independent constraints. A wiki-link field compares by
+    target; a list field compares as a sorted set.
+  - `summary_template: <template>` — the `{field}`-interpolation pattern
+    `dbmd fm init` / `dbmd write` use to compose this type's default
+    `summary` (see [Example types](#example-types)).
+
+  Unknown modifiers are ignored (read as ambient context, no error). A
+  type with no `### <type>` block is unconstrained — any frontmatter is
+  valid for it.
 
   `dbmd validate` emits structured `Issue`s (codes
   `SCHEMA_MISSING_REQUIRED`, `SCHEMA_SHAPE_MISMATCH`,
-  `SCHEMA_LINK_PREFIX_MISMATCH`, `SCHEMA_ENUM_VIOLATION`) so the
-  agent can read and remediate them via `--json`.
+  `SCHEMA_LINK_PREFIX_MISMATCH`, `SCHEMA_ENUM_VIOLATION`,
+  `DUP_UNIQUE_KEY`) so the agent can read and remediate them via `--json`.
 
 Absence of a section = use canonical defaults. The `DB.md` file is the
 single point of configuration; there is no separate `rules/` folder.
@@ -636,7 +650,7 @@ PASS — 0 errors, 2 warnings (unknown type `proposal` in records/proposals/x.md
 - Append-only. The curator never rewrites past entries; if a finding is wrong, append a corrective entry below it.
 - Parseable with `grep "^## \[" log.md | tail -5` or any similar pipeline (or `dbmd log tail`).
 - **Rotation.** `log.md` is the active timeline; `dbmd log` automatically rolls older months into `log/<YYYY-MM>.md` on append. The full history is the archives plus the active file — one timeline, paginated so the active file (and every read of it) stays small no matter how old the store gets. `dbmd log tail` / `dbmd log since` reverse-read from the active file and cross into archives only when the requested range does.
-- **Concurrent-clone merges.** A single-writer store (one agent, one clone — the v0.1 contract; see [Writers and readers](#writers-and-readers)) never has a merge. When two git clones of a store both append (multi-machine sync, a shared repo), git's line merge conflicts on the shared end-of-file region. Resolution is the agent's: a curator with this SPEC in context semantically merges — keep both entries, order by timestamp. For merges where no agent is in the loop (a human, CI), set `log.md merge=union` in `.gitattributes`: because every entry is timestamped, the union driver keeps both sides (never drops one) and a later agent pass reorders. The derived `index.md` needs no merge logic at all — on conflict, regenerate it with `dbmd index rebuild`.
+- **Concurrent-clone merges.** A single-writer store (one agent, one clone — the v0.2 contract; see [Writers and readers](#writers-and-readers)) never has a merge. When two git clones of a store both append (multi-machine sync, a shared repo), git's line merge conflicts on the shared end-of-file region. Resolution is the agent's: a curator with this SPEC in context semantically merges — keep both entries, order by timestamp. For merges where no agent is in the loop (a human, CI), set `log.md merge=union` in `.gitattributes`: because every entry is timestamped, the union driver keeps both sides (never drops one) and a later agent pass reorders. The derived `index.md` needs no merge logic at all — on conflict, regenerate it with `dbmd index rebuild`.
 
 ## The curator contract
 
@@ -827,9 +841,13 @@ partner in a collision).
 content files changed since the last `validate` entry in `log.md` (or
 since `--since <ts>`), plus any file linking to a changed, renamed, or
 removed path. This keeps the post-write check O(changed), flat in
-store size. `dbmd validate --all` walks the entire store — every link,
-every index, and the entity-dedup collisions (`DUP_*`), which the
-working-set pass leaves to the pre-write checks and to `--all`. Both
+store size. If the default call has no logged changed objects to
+inspect (fresh store, missing log, or external edits not recorded in
+`log.md`), it falls back to a per-file content sweep so validation
+never passes vacuously. `dbmd validate --all` walks the entire store —
+every link, every index, and the entity-dedup collisions (`DUP_*`),
+which the working-set pass leaves to the pre-write checks and to
+`--all`. Both
 modes emit the same issue vocabulary below.
 
 **Canonical issue codes** (the complete vocabulary the agent will
@@ -842,9 +860,10 @@ see; grouped by category):
 | `DB_MD_MISSING_FIELD` | error | the store's `DB.md` frontmatter lacks `scope` or `owner` |
 | `DB_MD_UNKNOWN_SECTION` | warning | `DB.md` has an `##` section other than `Agent instructions` / `Policies` / `Schemas` |
 | `FM_MISSING_TYPE` | error | content file has no `type:` |
+| `FM_MISSING_CREATED` | error | content file has no `created:` timestamp — run `dbmd fm init` or set RFC3339 manually |
+| `FM_MISSING_UPDATED` | error | content file has no `updated:` timestamp — run `dbmd fm init` or set RFC3339 manually |
 | `FM_MALFORMED_YAML` | error | frontmatter block isn't valid YAML |
-| `FM_BAD_TIMESTAMP` | error | `created` / `updated` / date field isn't ISO-8601 |
-| `LAYER_TYPE_MISMATCH` | warning | a recognized `type:` sits in a layer other than its canonical one (e.g. `contact` under `sources/`) |
+| `FM_BAD_TIMESTAMP` | error | `created` or `updated` isn't ISO-8601 |
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |
 | `SUMMARY_EMPTY` | error | `summary` present but empty |
 | `SUMMARY_MULTILINE` | error | `summary` contains newlines |
@@ -855,12 +874,7 @@ see; grouped by category):
 | `WIKI_LINK_HAS_EXTENSION` | warning | target carries `.md` — drop it |
 | `WIKI_LINK_FLOW_FORM_LIST` | error | frontmatter list uses `[[[a]], [[b]]]` — use block form |
 | `DUP_ID` | error | two files declare the same `id` |
-| `DUP_CONTACT_EMAIL` | warning | two `contact`s share `email` |
-| `DUP_COMPANY_DOMAIN` | warning | two `company`s share `domain` |
-| `DUP_EXPENSE_TUPLE` | warning | two `expense`s share `(date, amount, vendor)` |
-| `DUP_INVOICE_TUPLE` | warning | two `invoice`s share `(vendor, date, amount)` |
-| `DUP_EMAIL_REINGEST` | warning | two `email`s share `(from, subject, date)` |
-| `DUP_MEETING_TUPLE` | warning | two `meeting`s share `(date, attendees-set)` |
+| `DUP_UNIQUE_KEY` | warning | two records of a type share a `DB.md ## Schemas` `unique:` key |
 | `SCHEMA_MISSING_REQUIRED` | error | `DB.md` schema requires a field that's absent |
 | `SCHEMA_SHAPE_MISMATCH` | error | value doesn't match the schema's shape modifier |
 | `SCHEMA_LINK_PREFIX_MISMATCH` | error | `link to <prefix>/` field has a plain or wrong-prefix value |
@@ -882,8 +896,10 @@ see; grouped by category):
 | `INDEX_JSONL_STALE` | error | an `index.jsonl` record's fields don't match the file's frontmatter |
 | `TAGS_MALFORMED` | warning | `tags` isn't a flat YAML list of short scalar labels |
 
-The vocabulary is additive across spec versions (new codes layer on;
-existing codes keep their meaning). Errors block; the agent resolves
+v0.2 reworked the type-driven codes — it dropped the six type-specific
+`DUP_*` collisions and `LAYER_TYPE_MISMATCH`, and added the generic
+`DUP_UNIQUE_KEY`. From v0.2 on the vocabulary is additive (new codes layer
+on; existing codes keep their meaning). Errors block; the agent resolves
 warnings and info at its discretion — usually via `dbmd rename`,
 `dbmd link`, `dbmd fm set`, or `dbmd index rebuild`.
 
@@ -900,18 +916,6 @@ parser ignores it, so it does not corrupt the config, but it signals
 the operator wrote a section the toolkit will never read). Recognized
 `###` sub-headings inside `Policies` / `Schemas` (e.g. `Frozen pages`,
 `Ignored types`, a `### <type>` schema block) are not flagged.
-
-**Layer-appropriate types.** The recognized-type table assigns each
-canonical content type a home layer (`email`/`transcript`/`pdf-source`
-→ `sources/`; `contact`/`company`/`expense`/`meeting`/`decision`/
-`invoice` → `records/`; `wiki-page` → `wiki/`). A file whose recognized
-`type:` sits in a *different* layer (a `type: contact` under
-`sources/`, a `type: email` under `wiki/`) gets `LAYER_TYPE_MISMATCH`
-(warning, not error): the folder layout is convention, not enforcement,
-so the placement is valid-but-unusual and worth a curator's eye, not a
-hard block. Custom / unrecognized types carry no layer expectation and
-are never flagged; meta types (`db-md`, `index`, `log`) have their own
-contracts and are exempt.
 
 ## Why files
 
@@ -975,13 +979,13 @@ are on disk and findable by `dbmd search` (ripgrep doesn't need the
 catalog), but not yet listed in `index.md`. The agent reconciles a
 bulk drop once, not file-by-file in the loop.
 
-**Single-agent-per-store is the v0.1 contract.** db.md does not
+**Single-agent-per-store is the v0.2 contract.** db.md does not
 coordinate multiple curator agents writing to the same store
 concurrently. The operator runs one curator at a time. If multiple
 agents need to operate, give each its own store (and link the
 stores externally) or serialize via the operator's own tooling.
 Multi-agent coordination — locks, leases, conflict resolution —
-is out of scope at v0.1.
+is out of scope at v0.2.
 
 ## Scale
 
@@ -1093,7 +1097,7 @@ misses synonyms — but the agent driving `dbmd` is a language model, so
 search. `dbmd` stays a dumb lexical tool and computes nothing; the model
 is the semantic layer — and a frontier model is a *richer* semantic model
 than any embedding index. This is the whole semantic story: no vectors to
-compute or store, now or ever, and nothing needed beyond the v0.1 toolkit.
+compute or store, now or ever, and nothing needed beyond the v0.2 toolkit.
 (A maintained keyword index makes this a sublinear fast path at scale —
 see the [Roadmap](#roadmap) — but it is a *lexical* index, never a vector
 index; db.md adds no embeddings and no ANN.)
@@ -1105,7 +1109,7 @@ layer, at company scale and beyond.
 
 ## Roadmap
 
-v0.1 is deliberately the simplest thing that already works at company
+v0.2 is deliberately the simplest thing that already works at company
 scale: plain files, YAML frontmatter, wiki-links, embedded ripgrep.
 No daemon, no engine, no magic — and it carries a store to the low
 millions of files. That is the floor, not the ceiling.
@@ -1119,7 +1123,7 @@ files" contract or the format you read today:
   - **Separated** — plain markdown files on disk (Obsidian-compatible,
     git-diffable, maximal interop) plus an adjacent index sidecar
     holding the compiled view: typed frontmatter, wiki-link edges,
-    content hash, summary. **v0.1 already ships the nascent form — the
+    content hash, summary. **v0.2 already ships the nascent form — the
     per-type-folder `index.jsonl`;** the roadmap deepens it (body
     keywords, richer fields) and makes its reads sublinear. The files
     are literally the source of truth; the sidecar makes reads
@@ -1197,7 +1201,7 @@ dbmd spec > /path/to/harness/system-prompt-fragment       # generic
 Step 2's exact form depends on the harness; every harness with a
 system-prompt mechanism works. After step 2 the agent carries the
 canonical SPEC in context for every session — knows the format,
-the recognized types, the curator contract, the session lifecycle,
+the example types, the curator contract, the session lifecycle,
 and how to operate stores via `dbmd` subcommands. Per-store
 overrides come from `DB.md` on every operation.
 
@@ -1217,10 +1221,12 @@ prompt interactively.
 
 ## Versioning
 
-The spec is versioned with the repo tag (`v0.1`, `v0.2`, ...). Old
-versions stay readable forever — additive changes only. New types
-and new fields layer on top; tools that don't recognize them
-ignore them.
+The spec is versioned with the repo tag (`v0.1`, `v0.2`, ...). v0.2
+generalized the type model (schema enforcement is solely the store's
+`## Schemas`; the example types are illustrative) and reworked the
+type-driven validation codes. From v0.2 on, changes are additive: old
+stores stay readable forever, new fields and new codes layer on top, and
+tools that don't recognize them ignore them.
 
 ## License
 

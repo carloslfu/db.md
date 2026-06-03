@@ -24,6 +24,8 @@ use crate::cli::{SkillArgs, SkillTarget};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
+const MANAGED_MARKER: &str = "dbmd-managed-skill:v1";
+
 /// Run `dbmd install-skill`: create the skill directory (if needed) and write
 /// the skill file for the resolved target.
 pub fn install(ctx: &Context, args: &SkillArgs) -> CliResult {
@@ -36,6 +38,7 @@ pub fn install(ctx: &Context, args: &SkillArgs) -> CliResult {
         SkillTarget::ClaudeCode => CLAUDE_CODE_SKILL,
         SkillTarget::Codex => CODEX_SKILL,
     };
+    ensure_installable(&file)?;
     std::fs::write(&file, body).map_err(|e| io_err("writing skill", &file, e))?;
     emit(ctx, target, &file, "installed");
     Ok(())
@@ -52,16 +55,48 @@ pub fn uninstall(ctx: &Context, args: &SkillArgs) -> CliResult {
         emit(ctx, target, &file, "noop");
         return Ok(());
     }
-    // Remove only what this command owns: the whole `db-md/` skill dir for
-    // Claude Code, or just the single file for Codex (whose `instructions/` dir
-    // is shared with other tools' files).
+    ensure_managed(&file, "uninstall")?;
+
+    // Remove only what this command owns: the managed skill file. For Claude
+    // Code, also remove the `db-md/` skill dir only if it becomes empty; user
+    // siblings in that directory are left untouched.
     let removed = match target {
-        SkillTarget::ClaudeCode => std::fs::remove_dir_all(&dir),
+        SkillTarget::ClaudeCode => {
+            std::fs::remove_file(&file).and_then(|()| match std::fs::remove_dir(&dir) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+                Err(e) => Err(e),
+            })
+        }
         SkillTarget::Codex => std::fs::remove_file(&file),
     };
     removed.map_err(|e| io_err("removing skill", &file, e))?;
     emit(ctx, target, &file, "uninstalled");
     Ok(())
+}
+
+fn ensure_installable(file: &Path) -> CliResult {
+    if !file.exists() {
+        return Ok(());
+    }
+    ensure_managed(file, "install")
+}
+
+fn ensure_managed(file: &Path, action: &str) -> CliResult {
+    let body = std::fs::read_to_string(file).map_err(|e| io_err("reading skill", file, e))?;
+    if body.contains(MANAGED_MARKER) {
+        return Ok(());
+    }
+    Err(CliError::new(
+        ExitCode::Collision,
+        "SKILL_NOT_MANAGED",
+        format!(
+            "refusing to {action} unmanaged db.md skill file at {}",
+            file.display()
+        ),
+    )
+    .with_hint("move the file aside, or remove it yourself if it is not managed by dbmd"))
 }
 
 /// Resolve the target: an explicit `--target` wins; otherwise autodetect by
@@ -159,6 +194,8 @@ name: db-md
 description: Operate a db.md store — the open database in plain files — with the `dbmd` CLI. Use when reading, writing, searching, validating, or curating a folder that has a DB.md at its root. Run `dbmd spec` for the full contract.
 ---
 
+<!-- dbmd-managed-skill:v1 -->
+
 # db.md (the `dbmd` CLI)
 
 You have the `dbmd` binary on PATH. It operates a **db.md store**: a database
@@ -223,7 +260,9 @@ not a copy — when in doubt, run `dbmd spec` and read the store's `DB.md`.
 /// frontmatter (Codex consumes plain instructions files at startup). The path
 /// matches db.md's existing `dbmd spec >> ~/.codex/instructions/db-md.md`
 /// bootstrap convention.
-const CODEX_SKILL: &str = r##"# db.md (the `dbmd` CLI)
+const CODEX_SKILL: &str = r##"<!-- dbmd-managed-skill:v1 -->
+
+# db.md (the `dbmd` CLI)
 
 You have the `dbmd` binary on PATH. It operates a **db.md store**: a database
 that is a plain directory — `sources/` (raw evidence), `records/` (atomic typed

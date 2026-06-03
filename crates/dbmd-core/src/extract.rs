@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
 use serde::Serialize;
@@ -159,7 +160,7 @@ impl Format {
 pub enum ExtractError {
     /// The file extension is missing or not one of the supported document
     /// formats. Carries the offending extension (or `""` when absent).
-    #[error("unsupported document format: {0:?} (supported: pdf, docx, xlsx, epub, html)")]
+    #[error("unsupported document format: {0:?} (supported: pdf, docx, xlsx/xlsm/xlsb/ods, epub, html/htm/xhtml)")]
     UnsupportedFormat(String),
 
     /// The document is encrypted/password-protected and could not be opened
@@ -296,26 +297,46 @@ pub fn normalize_text(raw: &str) -> String {
 /// cannot be opened is mapped to [`ExtractError::Encrypted`] rather than a raw
 /// parse error so the caller can branch on it. Metadata carries the page count
 /// when the document tree exposes it.
+///
+/// `pdf-extract`/`lopdf` `panic!` internally on some malformed-but-openable
+/// PDFs (e.g. an out-of-set base `/Encoding` name), so both parser calls are
+/// wrapped in [`std::panic::catch_unwind`]: an internal abort is contained and
+/// surfaced as [`ExtractError::Parse`], upholding this module's "never panics"
+/// contract on untrusted `sources/` input.
 fn extract_pdf(path: &Path) -> Result<Extracted> {
     // Read the bytes ourselves so a missing/unreadable file is a clean
     // `ExtractError::Io` (via `?`) before we hand anything to the PDF parser.
     let bytes = std::fs::read(path)?;
 
-    let text = match pdf_extract::extract_text_from_mem(&bytes) {
+    let text = match guard_pdf_panic(|| pdf_extract::extract_text_from_mem(&bytes))? {
         Ok(t) => t,
         Err(e) => return Err(classify_pdf_error(e)),
     };
 
     let mut out = Extracted::new(text, Format::Pdf);
 
-    // Page count is cheap and useful; derive it from the parsed document. A
-    // failure here is non-fatal — the text already succeeded.
-    if let Ok(doc) = pdf_extract::Document::load_mem(&bytes) {
-        let pages = doc.get_pages().len() as u64;
-        out.put_num("pages", pages);
+    // Page count is best-effort; derive it from the parsed document. A parse
+    // failure OR an internal panic here is non-fatal — the text already
+    // succeeded — so a contained panic (outer `Err`) and a load failure (inner
+    // `Err`) are both silently skipped.
+    if let Ok(Ok(doc)) = guard_pdf_panic(|| pdf_extract::Document::load_mem(&bytes)) {
+        out.put_num("pages", doc.get_pages().len() as u64);
     }
 
     Ok(out)
+}
+
+/// Run a panic-prone `pdf-extract`/`lopdf` call, converting an internal unwind
+/// into a typed [`ExtractError::Parse`] tagged `pdf` so the module's "never
+/// panics" contract holds on adversarial PDFs. `AssertUnwindSafe` is sound: the
+/// closure borrows only `&[u8]`, and on a caught unwind we discard any partial
+/// state and return an owned error. The default panic hook still writes the
+/// panic line to stderr — library code must not mutate the process-global hook.
+fn guard_pdf_panic<T>(f: impl FnOnce() -> T) -> Result<T> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|_| ExtractError::Parse {
+        format: "pdf",
+        message: "pdf parser aborted on malformed input".to_string(),
+    })
 }
 
 /// Map a `pdf-extract` error onto the right [`ExtractError`] variant.
@@ -797,25 +818,54 @@ fn open_zip<R: Read + std::io::Seek>(
     })
 }
 
-/// Read a single zip entry to a UTF-8 string. A missing entry or a read failure
-/// is a typed [`ExtractError::Parse`]; invalid UTF-8 is lossily decoded (OOXML /
-/// XHTML are declared UTF-8, but we never panic on a stray byte).
+/// Cap on a single decompressed zip entry. docx/epub members are XML text — a
+/// member that inflates past this ceiling is a decompression bomb or corruption,
+/// not real evidence. `sources/` is untrusted input, so bound the read rather
+/// than let `read_to_end` follow a hostile DEFLATE stream until OOM.
+const MAX_ZIP_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read a single zip entry to a UTF-8 string, bounded by [`MAX_ZIP_ENTRY_BYTES`]
+/// so a zip-bomb member cannot exhaust memory. A missing entry, an over-cap
+/// entry, or a read failure is a typed [`ExtractError::Parse`]; invalid UTF-8 is
+/// lossily decoded (OOXML / XHTML are declared UTF-8, but we never panic on a
+/// stray byte).
 fn read_zip_entry<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
     format: &'static str,
 ) -> Result<String> {
-    let mut entry = archive.by_name(name).map_err(|e| ExtractError::Parse {
+    let entry = archive.by_name(name).map_err(|e| ExtractError::Parse {
         format,
         message: format!("missing zip entry {name:?}: {e}"),
     })?;
+    // Reject up front when the central directory declares an over-cap size...
+    let declared = entry.size();
+    if declared > MAX_ZIP_ENTRY_BYTES {
+        return Err(ExtractError::Parse {
+            format,
+            message: format!(
+                "zip entry {name:?} declares {declared} bytes, over the {MAX_ZIP_ENTRY_BYTES}-byte cap"
+            ),
+        });
+    }
+    // ...and bound the actual decompressed read so a lying header (a bomb that
+    // understates its uncompressed size) still cannot allocate past the cap.
     let mut bytes = Vec::new();
     entry
+        .take(MAX_ZIP_ENTRY_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| ExtractError::Parse {
             format,
             message: format!("reading {name:?}: {e}"),
         })?;
+    if bytes.len() as u64 > MAX_ZIP_ENTRY_BYTES {
+        return Err(ExtractError::Parse {
+            format,
+            message: format!(
+                "zip entry {name:?} exceeds the {MAX_ZIP_ENTRY_BYTES}-byte cap (decompression bomb?)"
+            ),
+        });
+    }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -960,6 +1010,21 @@ mod tests {
             "expected Encrypted, got {err:?}"
         );
         assert_eq!(err.code(), "DOCUMENT_ENCRYPTED");
+    }
+
+    #[test]
+    fn guard_pdf_panic_contains_unwind_as_parse_error() {
+        // The "never panics" contract: an internal pdf-extract/lopdf panic must
+        // surface as a typed ExtractError::Parse, not abort the process. (cargo
+        // captures the unwind's stderr line for a passing test.)
+        let contained: Result<()> = guard_pdf_panic(|| panic!("simulated pdf-extract abort"));
+        assert!(
+            matches!(contained, Err(ExtractError::Parse { format: "pdf", .. })),
+            "panic must be contained as a pdf Parse error, got {contained:?}"
+        );
+        // The success path is transparent — the value passes straight through.
+        let ok: Result<u32> = guard_pdf_panic(|| 42);
+        assert_eq!(ok.unwrap(), 42);
     }
 
     #[test]

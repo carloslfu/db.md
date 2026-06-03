@@ -6,7 +6,7 @@
 //! analytics — low agent value, and a human who wants graph metrics opens the
 //! store in Obsidian, so we never build the full graph just for stats.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -31,31 +31,7 @@ pub struct Stats {
     pub broken_link_count: usize,
     /// Top types by count, descending (ties broken by type name ascending).
     pub top_types: Vec<(String, usize)>,
-    /// Recognized canonical types that appear in the store.
-    pub recognized_types_present: Vec<String>,
-    /// Custom (non-canonical) types that appear in the store.
-    pub custom_types_present: Vec<String>,
 }
-
-/// The canonical **content** type vocabulary from SPEC.md § Recognized types.
-///
-/// Excludes the three meta types (`db-md`, `index`, `log`) — those mark config
-/// and catalog files, not content. A `type:` value not in this set is "custom"
-/// for schema-coverage purposes (still valid; the agent treats it as ambient
-/// context). Kept here, derived from the SPEC table, because no shared
-/// canonical-type constant exists elsewhere in the crate yet.
-const RECOGNIZED_CONTENT_TYPES: &[&str] = &[
-    "email",
-    "transcript",
-    "pdf-source",
-    "contact",
-    "company",
-    "expense",
-    "meeting",
-    "decision",
-    "invoice",
-    "wiki-page",
-];
 
 /// How many entries [`Stats::top_types`] holds.
 const TOP_TYPES_LIMIT: usize = 10;
@@ -162,9 +138,6 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
     }
 
     stats.top_types = top_types(&stats.type_distribution, TOP_TYPES_LIMIT);
-    let (recognized, custom) = split_schema_coverage(&stats.type_distribution);
-    stats.recognized_types_present = recognized;
-    stats.custom_types_present = custom;
 
     Ok(stats)
 }
@@ -311,23 +284,6 @@ fn top_types(dist: &BTreeMap<String, usize>, limit: usize) -> Vec<(String, usize
     pairs
 }
 
-/// Partition the present types into (recognized canonical content types,
-/// custom types). Both lists are sorted ascending and deduped.
-fn split_schema_coverage(dist: &BTreeMap<String, usize>) -> (Vec<String>, Vec<String>) {
-    let canonical: BTreeSet<&str> = RECOGNIZED_CONTENT_TYPES.iter().copied().collect();
-    let mut recognized = Vec::new();
-    let mut custom = Vec::new();
-    // BTreeMap keys are already sorted ascending.
-    for type_ in dist.keys() {
-        if canonical.contains(type_.as_str()) {
-            recognized.push(type_.clone());
-        } else {
-            custom.push(type_.clone());
-        }
-    }
-    (recognized, custom)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,8 +329,6 @@ mod tests {
         assert_eq!(s.orphan_count, 0);
         assert_eq!(s.broken_link_count, 0);
         assert!(s.top_types.is_empty());
-        assert!(s.recognized_types_present.is_empty());
-        assert!(s.custom_types_present.is_empty());
     }
 
     #[test]
@@ -516,47 +470,6 @@ mod tests {
             12,
             "distribution keeps all types"
         );
-    }
-
-    #[test]
-    fn schema_coverage_splits_recognized_from_custom() {
-        let (_d, store) = temp_store();
-        write_rel(&store, "records/contacts/c.md", &doc("contact", "c")); // recognized
-        write_rel(&store, "sources/emails/e.md", &doc("email", "e")); // recognized
-        write_rel(&store, "wiki/people/p.md", &doc("wiki-page", "p")); // recognized
-        write_rel(&store, "records/proposals/x.md", &doc("proposal", "x")); // custom
-        write_rel(&store, "records/widgets/w.md", &doc("widget", "w")); // custom
-
-        let s = compute(&store).expect("compute");
-        assert_eq!(
-            s.recognized_types_present,
-            vec![
-                "contact".to_string(),
-                "email".to_string(),
-                "wiki-page".to_string()
-            ],
-            "recognized canonical content types, sorted ascending"
-        );
-        assert_eq!(
-            s.custom_types_present,
-            vec!["proposal".to_string(), "widget".to_string()],
-            "non-canonical types land in custom, sorted ascending"
-        );
-    }
-
-    #[test]
-    fn meta_types_are_not_recognized_content_types() {
-        // A stray file declaring a meta type (`index`/`log`/`db-md`) as its
-        // type must be treated as custom for schema coverage — those are meta,
-        // not content, types. (Such a file is unusual but stats must not lie.)
-        let (_d, store) = temp_store();
-        write_rel(&store, "wiki/synthesis/weird.md", &doc("log", "weird"));
-        let s = compute(&store).expect("compute");
-        assert!(
-            s.recognized_types_present.is_empty(),
-            "`log` is a meta type, not a recognized content type"
-        );
-        assert_eq!(s.custom_types_present, vec!["log".to_string()]);
     }
 
     #[test]

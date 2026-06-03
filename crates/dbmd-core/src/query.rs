@@ -10,6 +10,7 @@
 //! Backs `dbmd search --type/--where`, `dbmd fm query`, `dbmd index query`, and
 //! `dbmd graph backlinks --type/--in`.
 
+use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
 
 use crate::index::IndexRecord;
@@ -187,10 +188,13 @@ fn record_matches_where(record: &IndexRecord, key: &str, value: &str) -> bool {
         // `urgent` is one of the file's tags.
         "tags" => record.tags.iter().any(|t| t == value),
         "links" => record.links.iter().any(|l| l == value),
-        // Timestamps compare on their canonical RFC3339 string form so a query
-        // can pin an exact `created` / `updated`.
-        "created" => record.created.map(|t| t.to_rfc3339()).as_deref() == Some(value),
-        "updated" => record.updated.map(|t| t.to_rfc3339()).as_deref() == Some(value),
+        // Timestamps compare as instants (both sides parsed as RFC3339) so a
+        // `Z`-form query matches a `+00:00`-form stored value and vice versa.
+        // A plain string compare of `to_rfc3339()` would disagree with the
+        // `Store::find_by_where_in` sidecar pre-filter — which this in-memory
+        // pass re-runs over — and silently drop real matches.
+        "created" => timestamp_value_matches(record.created, value),
+        "updated" => timestamp_value_matches(record.updated, value),
         _ => record
             .fields
             .get(key)
@@ -208,7 +212,7 @@ fn record_matches_where(record: &IndexRecord, key: &str, value: &str) -> bool {
 /// - a bool matches `"true"` / `"false"`;
 /// - an array matches when **any** element matches (so a list-valued custom
 ///   field behaves like `tags` — membership, not whole-list equality);
-/// - `null` never matches.
+/// - `null` never matches (a present-but-null field is treated as no value).
 fn json_value_matches(value: &Value, target: &str) -> bool {
     match value {
         Value::String(s) => s == target,
@@ -218,6 +222,18 @@ fn json_value_matches(value: &Value, target: &str) -> bool {
         Value::Null => false,
         // Objects have no scalar form a `key=value` predicate can match.
         Value::Object(_) => false,
+    }
+}
+
+/// Match a stored instant against a `key=value` predicate by parsing `value` as
+/// RFC3339 and comparing instants. A plain string compare of `to_rfc3339()`
+/// (which always emits the numeric `+00:00` offset, never `Z`) would reject a
+/// `…Z` query against the identical moment, and disagree with the sidecar
+/// pre-filter [`Store::find_by_where_in`], silently dropping real matches.
+fn timestamp_value_matches(stored: Option<DateTime<FixedOffset>>, value: &str) -> bool {
+    match (stored, DateTime::parse_from_rfc3339(value)) {
+        (Some(stored), Ok(queried)) => stored == queried,
+        _ => false,
     }
 }
 
@@ -801,6 +817,51 @@ mod tests {
             &r,
             "updated",
             "2026-05-29T12:00:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn record_matches_where_timestamp_z_and_offset_spellings_are_equal() {
+        // Regression: the in-memory filter compared `to_rfc3339()` (always the
+        // `+00:00` form) to the raw predicate string, so a `Z`-spelled query of
+        // the identical instant silently failed — and disagreed with the
+        // `Store::find_by_where_in` sidecar pre-filter (instant-based),
+        // dropping real matches. Both spellings must compare equal now.
+        let mut stored_z = rec("records/meetings/m.md", "meeting", &[]);
+        stored_z.created =
+            Some(chrono::DateTime::parse_from_rfc3339("2026-05-29T12:00:00Z").unwrap());
+        assert!(record_matches_where(
+            &stored_z,
+            "created",
+            "2026-05-29T12:00:00Z"
+        ));
+        assert!(record_matches_where(
+            &stored_z,
+            "created",
+            "2026-05-29T12:00:00+00:00"
+        ));
+
+        // Stored as `+00:00`, queried as `Z` — this is the spelling pair that
+        // failed before the fix.
+        let mut stored_offset = rec("records/meetings/n.md", "meeting", &[]);
+        stored_offset.created =
+            Some(chrono::DateTime::parse_from_rfc3339("2026-05-29T12:00:00+00:00").unwrap());
+        assert!(record_matches_where(
+            &stored_offset,
+            "created",
+            "2026-05-29T12:00:00Z"
+        ));
+
+        // A different instant still does not match; an unparseable value is false.
+        assert!(!record_matches_where(
+            &stored_z,
+            "created",
+            "2026-05-29T13:00:00Z"
+        ));
+        assert!(!record_matches_where(
+            &stored_z,
+            "created",
+            "not-a-timestamp"
         ));
     }
 

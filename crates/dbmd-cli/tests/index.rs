@@ -13,7 +13,7 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use common::{copy_store_to_temp, corpus_a, dbmd};
+use common::{copy_store_to_temp, corpus_a, dbmd, write_db_md, write_file};
 
 // ── rebuild ────────────────────────────────────────────────────────────────────
 
@@ -72,6 +72,30 @@ fn rebuild_full_is_byte_identical_to_the_committed_corpus() {
     assert_eq!(
         artifacts, committed_artifacts,
         "rebuild must produce exactly the committed artifact set (no orphans/extras)"
+    );
+}
+
+#[test]
+fn rebuild_layer_repairs_type_folder_artifacts() {
+    let (_tmp, store) = copy_store_to_temp(&corpus_a());
+    let jsonl = store.join("records/contacts/index.jsonl");
+    std::fs::remove_file(&jsonl).unwrap();
+    assert!(!jsonl.exists(), "precondition: sidecar was removed");
+
+    dbmd()
+        .current_dir(&store)
+        .args(["index", "rebuild", "--layer", "records"])
+        .assert()
+        .success();
+
+    assert!(
+        jsonl.exists(),
+        "`index rebuild --layer records` must repair child type-folder sidecars"
+    );
+    let restored = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(
+        restored.contains("records/contacts/sarah-chen.md"),
+        "restored sidecar should contain contact records: {restored}"
     );
 }
 
@@ -305,6 +329,48 @@ fn rebuild_scoped_to_a_folder_matches_committed() {
 }
 
 #[test]
+fn rebuild_folder_refuses_paths_outside_the_store() {
+    let tmp = tempfile::TempDir::new().expect("store tempdir");
+    let store = tmp.path();
+    write_db_md(store);
+
+    let outside = tempfile::TempDir::new().expect("outside tempdir");
+    let outside_folder = outside.path().join("records").join("contacts");
+    std::fs::create_dir_all(&outside_folder).unwrap();
+
+    let out = dbmd()
+        .current_dir(store)
+        .args([
+            "--json",
+            "index",
+            "rebuild",
+            "--folder",
+            outside_folder.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).expect("json error on stderr");
+    assert_eq!(v["error"]["code"], serde_json::json!("PATH_OUTSIDE_STORE"));
+    assert!(
+        !outside_folder.join("index.md").exists() && !outside_folder.join("index.jsonl").exists(),
+        "a refused folder rebuild must not create outside-store index artifacts"
+    );
+}
+
+#[test]
+fn rebuild_folder_rejects_traversal_scope() {
+    let (_tmp, store) = copy_store_to_temp(&corpus_a());
+    dbmd()
+        .current_dir(&store)
+        .args(["index", "rebuild", "--folder", "records/../contacts"])
+        .assert()
+        .failure()
+        .code(1);
+}
+
+#[test]
 fn rebuild_dry_run_previews_without_writing() {
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
 
@@ -340,6 +406,38 @@ fn rebuild_dry_run_previews_without_writing() {
     let after = std::fs::read(&target).unwrap();
     assert_eq!(after, b"STALE PLACEHOLDER\n", "dry-run must not write");
     assert_ne!(after, before);
+}
+
+#[test]
+fn rebuild_dry_run_json_wraps_preview_without_writing() {
+    let (_tmp, store) = copy_store_to_temp(&corpus_a());
+    let target = store.join("records/contacts/index.md");
+    std::fs::write(&target, "STALE PLACEHOLDER\n").unwrap();
+
+    let out = dbmd()
+        .current_dir(&store)
+        .args([
+            "--json",
+            "index",
+            "rebuild",
+            "--dry-run",
+            "--folder",
+            "records/contacts",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["scope"], "folder records/contacts");
+    assert!(v["preview"]
+        .as_str()
+        .unwrap()
+        .contains("--- records/contacts/index.md ---"));
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "STALE PLACEHOLDER\n"
+    );
 }
 
 #[test]
@@ -389,6 +487,52 @@ fn show_scoped_prints_a_type_folder_index() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains("folder: wiki/people"));
     assert!(stdout.contains("[[wiki/people/sarah-chen]]"));
+}
+
+#[test]
+fn show_json_wraps_path_and_contents() {
+    let out = dbmd()
+        .args(["--json", "index", "show", "wiki/people"])
+        .arg("--dir")
+        .arg(corpus_a())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["path"], "wiki/people/index.md");
+    assert!(v["contents"]
+        .as_str()
+        .unwrap()
+        .contains("folder: wiki/people"));
+}
+
+#[test]
+fn show_refuses_paths_outside_the_store() {
+    let tmp = tempfile::TempDir::new().expect("store tempdir");
+    let store = tmp.path();
+    write_db_md(store);
+
+    let outside = tempfile::TempDir::new().expect("outside tempdir");
+    let outside_index = write_file(
+        outside.path(),
+        "records/contacts/index.md",
+        "OUTSIDE INDEX\n",
+    );
+    let outside_scope = outside_index.parent().unwrap();
+
+    let out = dbmd()
+        .current_dir(store)
+        .args(["--json", "index", "show", outside_scope.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).expect("json error on stderr");
+    assert_eq!(v["error"]["code"], serde_json::json!("PATH_OUTSIDE_STORE"));
+    assert!(
+        out.get_output().stdout.is_empty(),
+        "outside index content must not be printed"
+    );
 }
 
 #[test]
