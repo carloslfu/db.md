@@ -514,9 +514,9 @@ fn yaml_scalar_string(value: &serde_norway::Value) -> Option<String> {
         return Some(s.to_string());
     }
     match value {
-        serde_norway::Value::Null | serde_norway::Value::Mapping(_) | serde_norway::Value::Sequence(_) => {
-            None
-        }
+        serde_norway::Value::Null
+        | serde_norway::Value::Mapping(_)
+        | serde_norway::Value::Sequence(_) => None,
         other => serde_norway::to_string(other)
             .ok()
             .map(|s| s.trim().to_string()),

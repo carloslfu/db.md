@@ -1427,8 +1427,10 @@ mod tests {
 
     fn fm_with_extra(key: &str, value: &str) -> Frontmatter {
         let mut fm = Frontmatter::default();
-        fm.extra
-            .insert(key.to_string(), serde_norway::Value::String(value.to_string()));
+        fm.extra.insert(
+            key.to_string(),
+            serde_norway::Value::String(value.to_string()),
+        );
         fm
     }
 
@@ -1491,8 +1493,10 @@ mod tests {
         let dir = empty_store();
         let store = open(&dir);
         let mut fm = fm_with_created("2020-01-01T00:00:00Z");
-        fm.extra
-            .insert("date".into(), serde_norway::Value::String("2026-05-22".into()));
+        fm.extra.insert(
+            "date".into(),
+            serde_norway::Value::String("2026-05-22".into()),
+        );
         let p = store.shard_path_for("expense", &fm, "x").unwrap();
         // The primary `date` (2026/05), not `created` (2020/01), drives the shard.
         assert_eq!(p, PathBuf::from("records/expenses/2026/05/x.md"));
