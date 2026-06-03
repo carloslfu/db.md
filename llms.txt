@@ -1,0 +1,62 @@
+# db.md
+
+> The open database, in plain files. Records are markdown files with YAML
+> frontmatter; relationships are wiki-links; the database is the directory.
+> Built for agents: a database a harness reads, writes, links, and curates
+> directly through the `dbmd` CLI. No daemon, no server, no embeddings.
+
+This file is the agent-readable entry point, in the spirit of llms.txt.
+**The installer is text:** if you are an AI agent, you install and integrate
+db.md yourself by reading the steps below and acting on them — it is plain
+text by design. The smart model is the installer; there is no per-harness
+machinery to depend on.
+
+## 1. Install the binary (one ~5MB binary, no toolchain)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
+```
+
+Alternatives, same checksummed binary: `brew install carloslfu/tap/dbmd`, or
+`cargo install dbmd-cli` (if you have the Rust toolchain).
+
+## 2. Load the contract (the single source of truth)
+
+```sh
+dbmd spec
+```
+
+`dbmd spec` prints the canonical SPEC: the format, the curator contract, the
+session lifecycle, the validation codes, and the full subcommand surface. Read
+it once per session. An agent that has read it can operate any db.md store
+immediately; per-store overrides come from the store's own `DB.md`.
+
+## 3. Integrate into your agent (optional — for persistence)
+
+`dbmd spec` is enough on its own. To make your agent reach for db.md
+automatically on every future session, save a skill where your harness reads
+skills — the open Agent Skills format (a `db-md/SKILL.md` folder with
+`name`/`description` frontmatter whose body is a thin pointer that runs
+`dbmd spec`):
+
+- Claude Code → `~/.claude/skills/db-md/SKILL.md`
+- Codex → `~/.codex/skills/db-md/SKILL.md`
+- Any other harness → its own skills directory, or load `dbmd spec` into the
+  system prompt.
+
+`dbmd install-skill` does this for Claude Code and Codex — convenience over the
+step above, not the mechanism and not required.
+
+## 4. Operate
+
+Read with `dbmd search` / `dbmd query` / `dbmd graph`; write with `dbmd write` /
+`dbmd fm set` / `dbmd link`; validate with `dbmd validate`; record with
+`dbmd log`. Every command takes `--json`. Read the store's `DB.md` (identity,
+policies, schemas) before writing.
+
+## Links
+
+- SPEC (the contract): run `dbmd spec`, or https://github.com/carloslfu/db.md/blob/main/SPEC.md
+- Toolkit reference: https://github.com/carloslfu/db.md/blob/main/TOOLS.md
+- README: https://github.com/carloslfu/db.md/blob/main/README.md
+- Source + releases: https://github.com/carloslfu/db.md

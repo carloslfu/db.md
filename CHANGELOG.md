@@ -12,6 +12,18 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Docs
+
+- **Repo-root `llms.txt`** — an agent-readable entry point at the top of the
+  repo, in the [llms.txt](https://llmstxt.org) spirit: the installer is text. An
+  agent (or a human) can read one plain file to learn what db.md is and how to
+  operate a store, no binary required.
+- **Docs reframed around the text path.** `dbmd install-skill` is now presented
+  as optional convenience — a persistent drop of the cross-agent skill — over the
+  text path (read `llms.txt`, or run `dbmd spec`), not the only way in. `dbmd
+  spec` stays the single source of truth: every other surface points at it and
+  never inlines the SPEC, so nothing can drift.
+
 ### Fixed
 
 - Preserved the declared Rust 1.85 MSRV by keeping the direct `zip` dependency
