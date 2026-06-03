@@ -33,7 +33,10 @@ dbmd search "(revenue|sales|ARR)" --in records
 dbmd graph backlinks db/records/contacts/sarah.md
 dbmd validate db/
 
-# load the canonical spec into an agent's system prompt
+# teach a local coding agent dbmd once (Claude Code / Codex)
+dbmd install-skill
+
+# or load the canonical spec into any harness's system prompt, per session
 dbmd spec
 ```
 

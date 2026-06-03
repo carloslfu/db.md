@@ -6,11 +6,63 @@ All notable changes to db.md are documented here. The format follows
 
 Two things version independently:
 
-- **The format** (`SPEC.md`) — stable at **v0.1**.
+- **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
   `Cargo.toml`, currently **v0.2.4**.
 
 ## [Unreleased]
+
+### Toolkit
+
+#### Added
+
+- **`dbmd install-skill`** — install a coding-agent skill that teaches Claude
+  Code (`~/.claude/skills/db-md/SKILL.md`) or Codex
+  (`~/.codex/instructions/db-md.md`) to operate a db.md store with `dbmd`. The
+  persistent sibling of `dbmd spec`: where `spec` loads the contract for one
+  session, `install-skill` drops a skill the agent keeps across sessions.
+  Autodetects the target (`--target claude-code|codex` to force one),
+  `--uninstall` removes it. The skill body points at `dbmd spec` as the single
+  source of truth — it never inlines the SPEC, so it cannot drift from it.
+
+### Format — v0.2 (breaking: the type model is now generic)
+
+The spec no longer ships a built-in type vocabulary. `type` is a free-form
+label, and schema enforcement comes solely from the store's own
+`DB.md ## Schemas`. The `contact` / `expense` / … types are now illustrative
+**examples**, not normative. **Migration:** a store that relied on the old
+implicit schemas (e.g. `contact.company` enforced as a `records/companies/`
+link, or the type-specific dedup) must declare those rules explicitly in
+`## Schemas` — copy the example schema pack from SPEC § Example types.
+
+#### Added
+
+- **`unique:` schema directive** — declare a uniqueness constraint over one or
+  more fields (`- unique: email` / `- unique: date, amount, vendor`);
+  collisions warn as the new generic `DUP_UNIQUE_KEY` code. Wiki-link fields
+  compare by target; list fields compare as a sorted set.
+- **`summary_template:` schema directive** — a `{field}`-interpolation pattern
+  for a type's default `summary` (e.g. `summary_template: {role} at {company}`),
+  replacing the old built-in per-type composers.
+
+#### Removed
+
+- The implicit / built-in per-type schemas — no type carries an enforced schema
+  unless `## Schemas` declares it.
+- Seven validation codes: `LAYER_TYPE_MISMATCH` and the six type-specific
+  collisions (`DUP_CONTACT_EMAIL`, `DUP_COMPANY_DOMAIN`, `DUP_EXPENSE_TUPLE`,
+  `DUP_INVOICE_TUPLE`, `DUP_EMAIL_REINGEST`, `DUP_MEETING_TUPLE`) — superseded by
+  the schema-driven `DUP_UNIQUE_KEY`. The live SPEC table now has 38 codes.
+- The hard-coded per-type `summary` composers, and the `dbmd stats`
+  recognized-vs-custom type split (every type is now the store's own).
+
+#### Changed
+
+- Folder placement is no longer enforced by type (`LAYER_TYPE_MISMATCH` is
+  gone); the three-layer layout stays a convention.
+
+Toolkit impact: this is a breaking 0.x change — recommend bumping the crate to
+**0.3.0** at release.
 
 ## [0.2.4] — 2026-06-01
 

@@ -24,6 +24,7 @@ pub mod fm;
 pub mod format;
 pub mod graph;
 pub mod index;
+pub mod install_skill;
 pub mod link;
 pub mod links;
 pub mod log;

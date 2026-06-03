@@ -151,6 +151,12 @@ pub enum Command {
     /// installation point: `dbmd spec` loads the standard into an agent's
     /// system prompt.
     Spec(SpecArgs),
+
+    /// Install a coding-agent skill that teaches a local agent (Claude Code or
+    /// Codex) to operate a db.md store with `dbmd`. The persistent sibling of
+    /// `dbmd spec`: where `spec` loads the contract for one session,
+    /// `install-skill` drops a skill the agent keeps across every session.
+    InstallSkill(InstallSkillArgs),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -809,4 +815,44 @@ pub struct SpecArgs {
     /// `DBMD_SPEC` env var).
     #[arg(long, value_name = "PATH")]
     pub spec: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// install-skill
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which coding agent `dbmd install-skill` targets. As a clap `ValueEnum`, the
+/// `--target` value is validated by clap itself (kebab-cased to `claude-code` /
+/// `codex`), so a bad value is the usual arg-parse error (exit `2`) and the body
+/// never hand-validates a string. Mirrors how `--color` uses `ColorChoice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SkillTarget {
+    /// Anthropic Claude Code → `~/.claude/skills/db-md/SKILL.md`.
+    ClaudeCode,
+    /// OpenAI Codex → `~/.codex/instructions/db-md.md`.
+    Codex,
+}
+
+impl SkillTarget {
+    /// The canonical CLI spelling — matches the `--target` value, the install
+    /// path segment, and the `target` field in `--json` output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillTarget::ClaudeCode => "claude-code",
+            SkillTarget::Codex => "codex",
+        }
+    }
+}
+
+/// `dbmd install-skill` — drop a persistent agent skill that teaches `dbmd`.
+#[derive(Debug, Args)]
+pub struct InstallSkillArgs {
+    /// Which agent to install for. Default: autodetect — Claude Code when
+    /// `~/.claude` exists, else Codex when `~/.codex` exists, else Claude Code.
+    #[arg(long, value_enum, value_name = "TARGET")]
+    pub target: Option<SkillTarget>,
+
+    /// Remove the skill this command installed instead of installing it.
+    #[arg(long)]
+    pub uninstall: bool,
 }

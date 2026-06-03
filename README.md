@@ -4,15 +4,19 @@
 
 `db.md` is a database where records are markdown files with YAML
 frontmatter, relationships are wiki-links, and the index is whatever
-you choose to build on top. The database is the directory. The
-schema is the frontmatter. Simple and open.
+you build on top. The database is the directory; the schema is the
+frontmatter.
 
-One directory, three layers, one config file. Raw evidence lives in
+One file at the root, **`DB.md`**, says how the store behaves — its
+identity, the agent's instructions, the policies, the schemas. A
+capable agent reads `DB.md` and curates the files directly. That file
+is the center of it; the rest is plain data the agent operates.
+
+One directory, three layers, one config file: raw evidence in
 `sources/`, atomic typed data in `records/`, curator-synthesized
-narrative in `wiki/`. Identity, agent instructions, policies, and
-schemas all live in a single `DB.md` file at the root. An agent
-runtime you bring (Claude Code, Codex, or your own) plays the curator
-role, guided by the [SPEC](SPEC.md) and the store's `DB.md`.
+narrative in `wiki/` — all governed by `DB.md`. Bring any agent
+runtime (Claude Code, Codex, or your own); it plays the curator role,
+guided by the [SPEC](SPEC.md) and the store's `DB.md`.
 
 ```
 db/
@@ -39,22 +43,30 @@ dbmd links records/contacts/sarah-chen    # who links to this record?
 dbmd index rebuild db                     # regenerate the index hierarchy
 ```
 
-Point any agent runtime at the store. The [SPEC](SPEC.md) becomes its contract:
+**Point your coding agent at the store.** Install the skill once — it teaches Claude Code or Codex how to drive `dbmd`:
+
+```bash
+dbmd install-skill                        # ~/.claude/skills/db-md or ~/.codex/instructions
+```
+
+Or load the contract per session, for any harness:
 
 ```bash
 claude --append-system "$(dbmd spec)"     # Claude Code, Codex, or any runtime
 ```
 
-The format is at **v0.1**, tagged [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1); changes are additive only.
+The format is at **v0.2**: schema enforcement is solely the store's own `DB.md ## Schemas`, and the example types (`contact`, `expense`, …) are illustrative, not normative (v0.1 was the first tagged release, [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1)). From v0.2 on, changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
 ## The curator is your agent
 
 db.md ships **no LLM runtime and no API keys**. "Curator" is a role
-any agent runtime plays: Claude Code, Codex, or your own. The agent
-reads the [SPEC](SPEC.md) (`dbmd spec`), follows the curator contract, and
-operates the store through `dbmd` subcommands. The toolkit is
-deterministic file/data plumbing; the agent does the reasoning. See
-[SPEC.md](SPEC.md) § The curator contract and § The agent session.
+any agent runtime plays: Claude Code, Codex, or your own. Run `dbmd
+install-skill` to teach Claude Code or Codex the toolkit once; any
+other harness loads the contract per session with `dbmd spec`. The
+agent then follows the curator contract and operates the store through
+`dbmd` subcommands. The toolkit is deterministic file/data plumbing;
+the agent does the reasoning. See [SPEC.md](SPEC.md) § The curator
+contract and § The agent session.
 
 ## Why files
 
@@ -152,7 +164,7 @@ bootstrap pattern.
 
 ```
 db.md/
-├── SPEC.md             # format spec + curator contract + validation codes (v0.1)
+├── SPEC.md             # format spec + curator contract + validation codes (v0.2)
 ├── README.md
 ├── TOOLS.md            # toolkit reference (subcommand surface, install, bootstrap)
 ├── Cargo.toml          # Rust workspace

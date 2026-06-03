@@ -49,6 +49,9 @@ O(store) and run off the interactive loop. See SPEC.md § Scale.
 ### Open
 - `dbmd spec` — print the bundled canonical SPEC (the installation
   point: install `dbmd`, run `dbmd spec` to read the standard)
+- `dbmd install-skill` — install a persistent Claude Code / Codex skill
+  that teaches the agent `dbmd` (the install-once sibling of `dbmd
+  spec`; `--target claude-code|codex`, `--uninstall`)
 - `dbmd fm get DB.md <key>` — read store identity
 
 ### Warm up
@@ -127,20 +130,23 @@ attestations (`gh attestation verify <tarball> --repo carloslfu/db.md`).
 # 1 — install (prebuilt binary; or `cargo install dbmd-cli` with Rust)
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
-# 2 — load the SPEC into the harness's system prompt
+# 2 — teach a local coding agent once (persistent skill)
+dbmd install-skill                               # Claude Code or Codex (autodetected)
+
+# …or load the SPEC into any harness's system prompt, per session
 claude --append-system "$(dbmd spec)"            # Claude Code
 dbmd spec >> ~/.codex/instructions/db-md.md      # Codex
 dbmd spec > /path/to/harness/system-prompt       # generic
 ```
 
-After step 2 the agent carries the canonical SPEC for every
-session — the format, recognized types, curator contract, session
+Either way, the agent carries the canonical SPEC for every
+session — the format, example types, curator contract, session
 lifecycle, the full subcommand surface, and the validation issue-code
 vocabulary. Per-store overrides come from `DB.md` on every operation.
 
 ## Status
 
-The format (SPEC.md) is stable at v0.1. The single-binary all-Rust
+The format (SPEC.md) is at v0.2. The single-binary all-Rust
 `dbmd` described here is the active build target — treat this
 document as the toolkit contract the binary implements. The
 workspace is `crates/dbmd-core` (library) + `crates/dbmd-cli`
