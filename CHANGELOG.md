@@ -8,9 +8,11 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.2.4**.
+  `Cargo.toml`, currently **v0.3.0**.
 
 ## [Unreleased]
+
+## [0.3.0] — 2026-06-03
 
 ### Toolkit
 
@@ -93,8 +95,8 @@ link, or the type-specific dedup) must declare those rules explicitly in
 - Folder placement is no longer enforced by type (`LAYER_TYPE_MISMATCH` is
   gone); the three-layer layout stays a convention.
 
-Toolkit impact: this is a breaking 0.x change — recommend bumping the crate to
-**0.3.0** at release.
+Toolkit impact: this is a breaking 0.x change; the crate is bumped to **0.3.0**
+for this release.
 
 ## [0.2.4] — 2026-06-01
 
