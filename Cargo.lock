@@ -199,7 +199,7 @@ dependencies = [
  "log",
  "quick-xml 0.39.4",
  "serde",
- "zip 7.2.0",
+ "zip",
 ]
 
 [[package]]
@@ -417,7 +417,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "walkdir",
- "zip 8.6.0",
+ "zip",
 ]
 
 [[package]]
@@ -1952,20 +1952,6 @@ name = "zip"
 version = "7.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "typed-path",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "crc32fast",
  "flate2",

@@ -12,6 +12,11 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved the declared Rust 1.85 MSRV by keeping the direct `zip` dependency
+  on the 7.2 line; `zip` 8.x now requires Rust 1.88.
+
 ## [0.3.1] — 2026-06-03
 
 A world-class hardening pass — a deep adversarial audit of every core module

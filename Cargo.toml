@@ -47,7 +47,8 @@ quick-xml = "0.40"        # docx/epub OOXML + XHTML parse (MIT)
 # DEFLATE backend it keeps pulls in `flate2` → `zlib-rs` (Zlib) + `zopfli`
 # (Apache-2.0); both are permissive and recorded in THIRD_PARTY_NOTICES (the
 # Zlib obligation is why `Zlib` is on the allowlist).
-zip = { version = "8", default-features = false, features = ["deflate"] }
+# Keep this on 7.x while the workspace MSRV is Rust 1.85; zip 8.x requires 1.88.
+zip = { version = "7.2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 insta = "1"
 assert_cmd = "2"
