@@ -1164,6 +1164,12 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Atomic (rename-based) write for the **derived** catalog (`index.md` /
+/// `index.jsonl`). Deliberately NOT `fsync`-durable like [`crate::fsx`]: the
+/// index is rebuildable (`dbmd index rebuild`) and this is the O(changed)
+/// write-through path, so a per-write `fsync` would be cost without benefit — a
+/// crash-lost catalog write is recovered by a rebuild, not data loss. (Primary
+/// data — content records, `log.md` — uses the durable `crate::fsx` path.)
 fn write_atomic(path: &Path, contents: String) -> crate::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

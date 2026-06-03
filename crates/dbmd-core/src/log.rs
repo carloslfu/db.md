@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, TimeZone};
@@ -204,7 +204,7 @@ impl Log {
                 }
                 body.push_str(&entry.render());
                 let full = compose_active(&header, &body);
-                write_atomic(&active, full.as_bytes())?;
+                crate::fsx::write_atomic(&active, full.as_bytes())?;
                 return Ok(());
             }
 
@@ -214,7 +214,7 @@ impl Log {
                 full.push('\n');
             }
             full.push_str(&entry.render());
-            write_atomic(&active, full.as_bytes())?;
+            crate::fsx::write_atomic(&active, full.as_bytes())?;
             Ok(())
         } else {
             // Fresh log: frontmatter + the single entry.
@@ -223,7 +223,7 @@ impl Log {
             }
             let body = entry.render();
             let full = compose_active(LOG_FRONTMATTER, &body);
-            write_atomic(&active, full.as_bytes())?;
+            crate::fsx::write_atomic(&active, full.as_bytes())?;
             Ok(())
         }
     }
@@ -679,82 +679,15 @@ fn append_to_archive(path: &Path, entries: &[LogEntry]) -> crate::Result<()> {
             full.push('\n');
         }
         full.push_str(&body);
-        write_atomic(path, full.as_bytes())?;
+        crate::fsx::write_atomic(path, full.as_bytes())?;
     } else {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let full = compose_active(LOG_FRONTMATTER, &body);
-        write_atomic(path, full.as_bytes())?;
+        crate::fsx::write_atomic(path, full.as_bytes())?;
     }
     Ok(())
-}
-
-/// Atomic write: write to a temp file in the same directory, fsync, then
-/// rename over the destination — so a concurrent reader never sees a
-/// half-written file. Mirrors the parser's write path.
-fn write_atomic(dest: &Path, bytes: &[u8]) -> crate::Result<()> {
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir)?;
-
-    let file_name = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("log.md");
-    let (mut f, tmp) = create_temp_file(dir, file_name)?;
-
-    {
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    // rename over the destination; clean up the temp on failure.
-    match fs::rename(&tmp, dest) {
-        Ok(()) => {
-            sync_parent_dir(dir);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e.into())
-        }
-    }
-}
-
-fn create_temp_file(dir: &Path, file_name: &str) -> std::io::Result<(File, PathBuf)> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    for _ in 0..128 {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!(".{file_name}.{pid}.{nanos}.{seq}.tmp"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => return Ok((file, tmp)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique dbmd log temp file",
-    ))
-}
-
-fn sync_parent_dir(dir: &Path) {
-    if let Ok(parent) = File::open(dir) {
-        let _ = parent.sync_all();
-    }
 }
 
 /// Every `log/<YYYY-MM>.md` archive, sorted **newest month first**.

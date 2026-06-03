@@ -49,9 +49,11 @@ O(store) and run off the interactive loop. See SPEC.md § Scale.
 ### Open
 - `dbmd spec` — print the bundled canonical SPEC (the installation
   point: install `dbmd`, run `dbmd spec` to read the standard)
-- `dbmd install-skill` — install a persistent Claude Code / Codex skill
-  that teaches the agent `dbmd` (the install-once sibling of `dbmd
-  spec`; `--target claude-code|codex`)
+- `dbmd install-skill` — install the cross-agent [Agent Skill](https://agentskills.io)
+  that teaches a local agent `dbmd` (the install-once sibling of `dbmd
+  spec`). One file, the open `SKILL.md` format, dropped into each agent's
+  skills dir (`~/.claude/skills/db-md`, `~/.codex/skills/db-md`); points
+  every detected agent by default, `--target claude-code|codex` narrows
 - `dbmd uninstall-skill` — remove the skill `install-skill` wrote
   (`--target` to pick the agent)
 - `dbmd fm get DB.md <key>` — read store identity
@@ -132,19 +134,26 @@ attestations (`gh attestation verify <tarball> --repo carloslfu/db.md`).
 # 1 — install (prebuilt binary; or `cargo install dbmd-cli` with Rust)
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
-# 2 — teach a local coding agent once (persistent skill)
-dbmd install-skill                               # Claude Code or Codex (autodetected)
+# 2 — point your agent. Two delivery forms of the ONE contract:
 
-# …or load the SPEC into any harness's system prompt, per session
-claude --append-system "$(dbmd spec)"            # Claude Code
-dbmd spec >> ~/.codex/instructions/db-md.md      # Codex
+#   a) persistent skill — open Agent Skills format, every future session.
+#      One command points every agent on the machine:
+dbmd install-skill                               # ~/.claude/skills/db-md, ~/.codex/skills/db-md
+
+#   b) any other harness — load the SPEC into its system prompt, per session:
+claude --append-system "$(dbmd spec)"            # Claude Code (per-session alternative)
 dbmd spec > /path/to/harness/system-prompt       # generic
 ```
 
-Either way, the agent carries the canonical SPEC for every
-session — the format, example types, curator contract, session
-lifecycle, the full subcommand surface, and the validation issue-code
-vocabulary. Per-store overrides come from `DB.md` on every operation.
+There is one source of truth — `dbmd spec`, which prints the SPEC. The
+installed skill is a thin pointer that runs `dbmd spec` (never an inlined
+copy, so it cannot drift). Claude Code and Codex both speak the open
+`SKILL.md` format, so `install-skill` is the install-once path for them; any
+harness with a system-prompt hook can carry `dbmd spec` directly. Either way
+the agent carries the canonical SPEC for every session — the format, example
+types, curator contract, session lifecycle, the full subcommand surface, and
+the validation issue-code vocabulary. Per-store overrides come from `DB.md`
+on every operation.
 
 ## Status
 

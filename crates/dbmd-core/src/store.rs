@@ -284,13 +284,18 @@ impl Store {
     /// or when `DB.md ## Schemas` declares `shard: by-date`. False for
     /// dedup-bounded entity types (`contact`/`company`/`decision`) and `wiki/`.
     pub fn type_shards(&self, type_: &str) -> bool {
-        // Built-in classification. Sharding is a property of the *type*:
+        // A `DB.md ## Schemas` `### <type>` block with a `shard:` directive is
+        // authoritative — it is the v0.2 generic-model way to declare sharding,
+        // so it overrides the built-in default below (in either direction).
+        if let Some(shard) = self.config.schemas.get(type_).and_then(|s| s.shard) {
+            return shard;
+        }
+        // Built-in default for the example types. Sharding is a property of the
+        // *type*:
         //  - source types carry a primary date field and shard;
         //  - event record types track business volume and shard;
         //  - dedup-bounded entity types and curation-bounded wiki stay flat.
-        // NOTE: the SPEC's `DB.md ## Schemas` `shard: by-date` override has no
-        // representation in the frozen `Schema`/`FieldSpec` types (no shard
-        // flag), so it cannot be consulted here yet — see the store findings.
+        // Any type can override this via a `shard:` directive (above).
         matches!(
             type_,
             // source types
@@ -1447,6 +1452,54 @@ mod tests {
         ] {
             assert!(!store.type_shards(t), "{t} should stay flat");
         }
+    }
+
+    #[test]
+    fn type_shards_respects_schema_directive_both_directions() {
+        use crate::parser::{Config, Schema};
+        let dir = empty_store();
+        let mut store = open(&dir);
+        let mut config = Config::default();
+        // A CUSTOM type (not in the built-in list) opts into date-sharding —
+        // without the schema override `type_shards` would return false for it.
+        config.schemas.insert(
+            "shipment".to_string(),
+            Schema {
+                shard: Some(true),
+                ..Schema::default()
+            },
+        );
+        // A BUILT-IN event type opts OUT (flat) — the override wins over the
+        // built-in default.
+        config.schemas.insert(
+            "expense".to_string(),
+            Schema {
+                shard: Some(false),
+                ..Schema::default()
+            },
+        );
+        // A schema with no `shard:` directive leaves the built-in default intact.
+        config
+            .schemas
+            .insert("meeting".to_string(), Schema::default());
+        store.config = config;
+
+        assert!(
+            store.type_shards("shipment"),
+            "custom type with `shard: by-date` must shard"
+        );
+        assert!(
+            !store.type_shards("expense"),
+            "built-in event type with `shard: flat` must go flat"
+        );
+        assert!(
+            store.type_shards("meeting"),
+            "schema without a `shard:` directive keeps the built-in default"
+        );
+        assert!(
+            !store.type_shards("contact"),
+            "unconfigured entity type stays flat"
+        );
     }
 
     // ── shard_path_for ───────────────────────────────────────────────────────

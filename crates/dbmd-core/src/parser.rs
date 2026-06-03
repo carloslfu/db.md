@@ -479,6 +479,15 @@ pub struct Schema {
     /// pattern `dbmd fm init` / `dbmd write` use to compose a default `summary`
     /// for this type. `None` falls back to the body's first paragraph.
     pub summary_template: Option<String>,
+    /// `- shard: by-date | flat` directive — whether records of this type are
+    /// date-sharded on disk (`records/<type>/<YYYY>/<MM>/…`) or kept flat.
+    /// `None` = no directive declared, so the store's built-in default for the
+    /// type applies ([`crate::store::Store::type_shards`]); `Some(true)` forces
+    /// date-sharding (e.g. a custom event type the toolkit has no built-in for);
+    /// `Some(false)` forces flat. This is the v0.2 generic-model way to declare
+    /// sharding — the toolkit ships no implicit per-type behavior beyond the
+    /// example-type defaults.
+    pub shard: Option<bool>,
 }
 
 /// One field declaration inside a [`Schema`]: `- <name> (<modifiers>)`.
@@ -593,8 +602,6 @@ pub fn read_file(path: &Path) -> Result<(Frontmatter, String), ParseError> {
 /// temp-file-rename so a reader never sees a half-written file. Preserves the
 /// operator-edited body exactly as given.
 pub fn write_file(path: &Path, frontmatter: &Frontmatter, body: &str) -> Result<(), ParseError> {
-    use std::io::Write;
-
     let yaml = frontmatter.to_yaml();
     // `to_yaml` already terminates each block with a newline. Compose the file
     // as: opening fence, frontmatter YAML, closing fence, then body verbatim.
@@ -604,66 +611,11 @@ pub fn write_file(path: &Path, frontmatter: &Frontmatter, body: &str) -> Result<
     contents.push_str("---\n");
     contents.push_str(body);
 
-    // Atomic write: write to a sibling temp file in the same directory, then
-    // rename over the target. Same-dir rename is atomic on a single
-    // filesystem, so a concurrent reader never sees a half-written file.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("dbmd-write");
-    let (mut f, tmp) = create_temp_file(parent, file_name)?;
-
-    // Scope the handle so it is flushed and closed before the rename.
-    {
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
-    }
-    // On failure, clean up the temp file rather than leaking it.
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(ParseError::Io(e));
-    }
-    sync_parent_dir(parent);
+    // One durable, atomic write for all primary data (see `crate::fsx`):
+    // temp-file + fsync + rename + parent-fsync. Content records are primary
+    // data, so they get the durable path (unlike the rebuildable index).
+    crate::fsx::write_atomic(path, contents.as_bytes())?;
     Ok(())
-}
-
-fn create_temp_file(parent: &Path, file_name: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    for _ in 0..128 {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(".{file_name}.tmp.{pid}.{nanos}.{seq}"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => return Ok((file, tmp)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique dbmd temp file",
-    ))
-}
-
-fn sync_parent_dir(parent: &Path) {
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
 }
 
 /// Extract every wiki-link from a body (and inline frontmatter), returning the
@@ -888,8 +840,12 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
                                 SchemaBullet::SummaryTemplate(t) if !t.is_empty() => {
                                     schema.summary_template = Some(t)
                                 }
-                                // Empty directive (`- unique:` with no fields) — ignore.
-                                SchemaBullet::Unique(_) | SchemaBullet::SummaryTemplate(_) => {}
+                                SchemaBullet::Shard(Some(b)) => schema.shard = Some(b),
+                                // Empty `unique:`/`summary_template:`, or a `shard:`
+                                // with an unrecognized value — ignored.
+                                SchemaBullet::Unique(_)
+                                | SchemaBullet::SummaryTemplate(_)
+                                | SchemaBullet::Shard(None) => {}
                             }
                         }
                         config.schemas.insert(type_name, schema);
@@ -905,8 +861,9 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
 }
 
 /// One parsed bullet inside a `### <type>` schema block: an ordinary field, or a
-/// reserved directive (`unique:` / `summary_template:`). The names `unique` and
-/// `summary_template` are reserved and cannot be used as field names.
+/// reserved directive (`unique:` / `summary_template:` / `shard:`). The names
+/// `unique`, `summary_template`, and `shard` are reserved and cannot be used as
+/// field names.
 #[derive(Debug)]
 enum SchemaBullet {
     /// An ordinary `- <name> (<modifiers>)` field.
@@ -915,6 +872,9 @@ enum SchemaBullet {
     Unique(Vec<String>),
     /// `- summary_template: <template>` — the default-`summary` pattern.
     SummaryTemplate(String),
+    /// `- shard: by-date | flat` — date-shard records of this type, or keep them
+    /// flat. `None` = an unrecognized value, ignored like an unknown modifier.
+    Shard(Option<bool>),
 }
 
 /// Classify one `## Schemas` bullet as a directive or a field. The directive
@@ -944,6 +904,16 @@ fn parse_schema_bullet(bullet_line: &str) -> SchemaBullet {
             }
             "summary_template" => {
                 return SchemaBullet::SummaryTemplate(rest.trim().to_string());
+            }
+            "shard" => {
+                // `by-date` (synonyms: date/sharded/true) enables date-sharding;
+                // `flat` (none/false) forces flat; anything else is ignored.
+                let v = match rest.trim().to_ascii_lowercase().as_str() {
+                    "by-date" | "date" | "sharded" | "true" => Some(true),
+                    "flat" | "none" | "false" => Some(false),
+                    _ => None,
+                };
+                return SchemaBullet::Shard(v);
             }
             _ => {}
         }
@@ -2408,6 +2378,43 @@ mod tests {
         assert_eq!(s.fields.len(), 1, "directives are not parsed as fields");
         assert_eq!(s.unique_keys, vec![vec!["email".to_string()]]);
         assert_eq!(s.summary_template.as_deref(), Some("{role} at {company}"));
+    }
+
+    #[test]
+    fn schema_bullet_shard_directive_parses_values() {
+        assert!(matches!(
+            parse_schema_bullet("- shard: by-date"),
+            SchemaBullet::Shard(Some(true))
+        ));
+        assert!(matches!(
+            parse_schema_bullet("- shard: flat"),
+            SchemaBullet::Shard(Some(false))
+        ));
+        // An unrecognized value is ignored (None), like an unknown modifier.
+        assert!(matches!(
+            parse_schema_bullet("- shard: weekly"),
+            SchemaBullet::Shard(None)
+        ));
+        // A field whose name has a `(` before any `:` is still a field — the same
+        // guard that keeps `- status (enum: a, b)` a field, not a directive.
+        assert!(matches!(
+            parse_schema_bullet("- shardiness (string)"),
+            SchemaBullet::Field(_)
+        ));
+    }
+
+    #[test]
+    fn parse_db_md_schema_captures_shard_directive() {
+        let db = "---\ntype: db-md\nscope: x\nowner: y\n---\n\n## Schemas\n\n### shipment\n- carrier (string)\n- shard: by-date\n\n### contact\n- shard: flat\n";
+        let config = parse_db_md(db, Path::new("DB.md")).unwrap();
+        let shipment = config.schemas.get("shipment").expect("shipment schema");
+        assert_eq!(shipment.shard, Some(true));
+        assert_eq!(
+            shipment.fields.len(),
+            1,
+            "`shard:` is a directive, not a field"
+        );
+        assert_eq!(config.schemas.get("contact").unwrap().shard, Some(false));
     }
 
     // ── parse_db_md ──────────────────────────────────────────────────────────

@@ -43,17 +43,19 @@ dbmd links records/contacts/sarah-chen    # who links to this record?
 dbmd index rebuild db                     # regenerate the index hierarchy
 ```
 
-**Point your coding agent at the store.** Install the skill once — it teaches Claude Code or Codex how to drive `dbmd`:
+**Point your coding agent at the store — install the skill once.** It teaches Claude Code and Codex to drive `dbmd`, in the open [Agent Skills](https://agentskills.io) format, discovered on every future session. One command points every agent on the machine:
 
 ```bash
-dbmd install-skill                        # ~/.claude/skills/db-md or ~/.codex/instructions
+dbmd install-skill                        # ~/.claude/skills/db-md, ~/.codex/skills/db-md
 ```
 
-Or load the contract per session, for any harness:
+Any other harness loads the same contract into its system prompt, per session:
 
 ```bash
-claude --append-system "$(dbmd spec)"     # Claude Code, Codex, or any runtime
+claude --append-system "$(dbmd spec)"     # any runtime with a system-prompt hook
 ```
+
+The skill is a thin pointer that runs `dbmd spec` — the single source of truth — so it never drifts from the standard.
 
 The format is at **v0.2**: schema enforcement is solely the store's own `DB.md ## Schemas`, and the example types (`contact`, `expense`, …) are illustrative, not normative (v0.1 was the first tagged release, [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1)). From v0.2 on, changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
@@ -167,6 +169,7 @@ db.md/
 ├── SPEC.md             # format spec + curator contract + validation codes (v0.2)
 ├── README.md
 ├── TOOLS.md            # toolkit reference (subcommand surface, install, bootstrap)
+├── skills/db-md/       # the canonical Agent Skill (SKILL.md) that `dbmd install-skill` ships
 ├── Cargo.toml          # Rust workspace
 ├── crates/
 │   ├── dbmd-core/      # library: parser, store, graph, validate, stats, query, index, log
@@ -213,6 +216,20 @@ The question under every alternative is the same, asked on two axes: what sits b
 | Karpathy's LLM Wiki | nothing: plain markdown the model reads (db.md's lineage) | the model curve, directly on the files (db.md's lineage) |
 
 Vector RAG is the approach db.md bets most directly against: db.md computes, stores, and searches no vector, ever. Where RAG engineers retrieval over embeddings of your data, db.md keeps the data as files and lets the frontier model read them, with semantic recall coming from the agent expanding the query over plain lexical search, not a separate embedding model.
+
+The memory products built on that approach, by name, and what each stands for:
+
+| Memory tool | What it stands for | What sits between you and your data |
+|---|---|---|
+| **Mem0** | managed memory: an LLM extracts facts, embeds them, and retrieves by similarity (keyword and entity matching added in 2026) | a vector-and-graph service you call; your memories kept as embeddings you cannot read, recall capped by a separate, smaller retrieval model and re-paid on every query |
+| **Letta / MemGPT** | self-editing agent memory; it asked whether a filesystem is all you need and answered files plus embeddings | an embedding index built automatically over your files; db.md is that same filesystem thesis with the vectors removed |
+| **Zep / Graphiti** | temporal memory built as a derived knowledge graph | a hosted graph and its API, a derived structure built from your data and kept in step with it |
+| **Cognee** | an extract-cognify-load pipeline into a graph-and-vector store | one more derived store to build and keep in sync with your files |
+| **db.md** | the data is the files; the agent is the query engine; no vector, ever | nothing: it rides the frontier model directly on the files you own |
+
+The mechanism is the whole argument. An embedding has no notion of when a fact was true or whether it was later superseded; a dated file does. db.md answers time and knowledge-update questions by filtering frontmatter, not by hoping a vector lands nearby. The clearest proof that this is the right cut is that Mem0's own 2026 rewrite went append-only and bolted keyword and entity matching onto its vectors, moving onto the ground db.md already stands on. db.md is that endpoint, without the vector tax.
+
+Every tool here ships a memory system you adopt: a service, an engine, an index you rent and maintain. db.md ships a convention you own: plain files the frontier model reads and writes directly. The memory layer was always a database with the data hidden; db.md is the same job with the data left in the open.
 
 For the genuinely hard remainder (high write concurrency, ACID, sub-millisecond reads, billions-row aggregates), a real database still backs db.md. That is the roadmap, not the claim for today.
 

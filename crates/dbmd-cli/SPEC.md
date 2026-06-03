@@ -458,8 +458,9 @@ wiki pages from sources tagged `transient`.
   bullets. A **field** is `- <field-name> (<modifiers>)` (one per line;
   modifiers comma-separated inside parens; a bullet without parens is a
   free-form optional field of any shape). A **directive** is
-  `- <keyword>: <value>` with a reserved keyword; `unique` and
-  `summary_template` are reserved and can't be used as field names.
+  `- <keyword>: <value>` with a reserved keyword; `unique`,
+  `summary_template`, and `shard` are reserved and can't be used as field
+  names.
 
   **Recognized field modifiers:**
   - `required` — field must be present and non-empty.
@@ -485,6 +486,12 @@ wiki pages from sources tagged `transient`.
   - `summary_template: <template>` — the `{field}`-interpolation pattern
     `dbmd fm init` / `dbmd write` use to compose this type's default
     `summary` (see [Example types](#example-types)).
+  - `shard: by-date | flat` — whether records of this type are date-sharded
+    on disk (`records/<type>/<YYYY>/<MM>/…`, keyed off the type's primary
+    date field) or kept flat. This is the generic-model way to declare
+    sharding: it overrides the toolkit's built-in default for the type, so a
+    custom event type opts into sharding with `shard: by-date`, and any type
+    can force flat with `shard: flat`. An unrecognized value is ignored.
 
   Unknown modifiers are ignored (read as ambient context, no error). A
   type with no `### <type>` block is unconstrained — any frontmatter is
@@ -661,8 +668,9 @@ user's choice. **db.md ships no LLM runtime and no API keys.**
 
 **The agent acting as curator:**
 
-1. **Knows the SPEC** (this document, loaded into the harness's
-   system prompt via `dbmd spec` at bootstrap — see
+1. **Knows the SPEC** (this document — carried by the harness from
+   bootstrap, whether as an installed skill the agent discovers or
+   piped into the system prompt via `dbmd spec`; see
    [Tooling](#tooling)). The SPEC is the canonical behavior
    contract; the agent doesn't re-read it per session.
 2. **Reads the store's `DB.md`** on every session — frontmatter for
@@ -725,9 +733,15 @@ user's choice. **db.md ships no LLM runtime and no API keys.**
 - Edit `DB.md`. That's operator-owned.
 - Rewrite past `log.md` entries. The log is append-only; corrections
   go on the end.
-- Use any tool other than `dbmd` for store operations. All file/data
-  ops go through `dbmd` subcommands; the harness can do anything else
-  it wants outside the store.
+- Bypass the contract by editing the store out from under it —
+  hand-patching frontmatter, indexes, the log, or wiki-links in ways
+  that break the invariants this document defines. Drive store
+  operations through a conforming db.md tool: `dbmd` is the reference
+  implementation, and its subcommands are the canonical verbs this
+  contract is written against. (`dbmd` is replaceable, not mandatory —
+  anyone can build a db.md-aware tool; the contract is the format and
+  these invariants, not the binary.) The harness can do anything it
+  wants outside the store.
 
 ### Pre-write checks
 
@@ -779,10 +793,11 @@ write-through (see [Scale](#scale)).
 Every session against a db.md store follows the same shape. The
 toolkit doesn't enforce it; the contract lives here.
 
-1. **Open** — the harness already has `dbmd spec` in its system
-   prompt from bootstrap (see [Tooling](#tooling)); if it doesn't,
-   `dbmd spec` and load it now. Read the store's `DB.md` for
-   identity, agent instructions, policies, and schemas.
+1. **Open** — the harness already carries the SPEC from bootstrap
+   (an installed skill, or `dbmd spec` in the system prompt; see
+   [Tooling](#tooling)); if it doesn't, run `dbmd spec` and load it
+   now. Read the store's `DB.md` for identity, agent instructions,
+   policies, and schemas.
 2. **Warm up** — `dbmd log tail 20` to learn what was done lately;
    `dbmd log since <last-session-time>` for a precise diff.
 3. **Operate** — read with `dbmd search` / `dbmd fm query` /
@@ -841,9 +856,13 @@ partner in a collision).
 content files changed since the last `validate` entry in `log.md` (or
 since `--since <ts>`), plus any file linking to a changed, renamed, or
 removed path. This keeps the post-write check O(changed), flat in
-store size. `dbmd validate --all` walks the entire store — every link,
-every index, and the entity-dedup collisions (`DUP_*`), which the
-working-set pass leaves to the pre-write checks and to `--all`. Both
+store size. If the default call has no logged changed objects to
+inspect (fresh store, missing log, or external edits not recorded in
+`log.md`), it falls back to a per-file content sweep so validation
+never passes vacuously. `dbmd validate --all` walks the entire store —
+every link, every index, and the entity-dedup collisions (`DUP_*`),
+which the working-set pass leaves to the pre-write checks and to
+`--all`. Both
 modes emit the same issue vocabulary below.
 
 **Canonical issue codes** (the complete vocabulary the agent will
@@ -856,6 +875,8 @@ see; grouped by category):
 | `DB_MD_MISSING_FIELD` | error | the store's `DB.md` frontmatter lacks `scope` or `owner` |
 | `DB_MD_UNKNOWN_SECTION` | warning | `DB.md` has an `##` section other than `Agent instructions` / `Policies` / `Schemas` |
 | `FM_MISSING_TYPE` | error | content file has no `type:` |
+| `FM_MISSING_CREATED` | error | content file has no `created:` timestamp — run `dbmd fm init` or set RFC3339 manually |
+| `FM_MISSING_UPDATED` | error | content file has no `updated:` timestamp — run `dbmd fm init` or set RFC3339 manually |
 | `FM_MALFORMED_YAML` | error | frontmatter block isn't valid YAML |
 | `FM_BAD_TIMESTAMP` | error | `created` or `updated` isn't ISO-8601 |
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |
@@ -1180,23 +1201,31 @@ calls anywhere in the binary. The agent runtime — Claude Code,
 Codex, or any harness — is BYO and calls `dbmd` for file/data
 operations. See `TOOLS.md` for the full toolkit reference.
 
-**Agent bootstrap (two lines, any harness):**
+**Agent bootstrap (install the binary, point your agent):**
 
 ```bash
-# 1 — install the binary (one Rust binary, ~5MB, MIT/Apache)
-cargo install dbmd-cli
+# 1 — install the binary (~5MB, prebuilt, no toolchain; or cargo with Rust)
+curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
-# 2 — load the SPEC into the harness's system prompt
-claude --append-system "$(dbmd spec)"                     # Claude Code
-dbmd spec >> ~/.codex/instructions/db-md.md               # Codex
+# 2 — point your agent at db.md. Two delivery forms of the ONE contract:
+
+#   a) persistent skill — the open Agent Skills format, discovered on every
+#      future session. One command points every agent on the machine:
+dbmd install-skill                                        # ~/.claude/skills/db-md, ~/.codex/skills/db-md
+
+#   b) any other harness — load the SPEC into its system prompt, per session:
+claude --append-system "$(dbmd spec)"                     # Claude Code (per-session alternative)
 dbmd spec > /path/to/harness/system-prompt-fragment       # generic
 ```
 
-Step 2's exact form depends on the harness; every harness with a
-system-prompt mechanism works. After step 2 the agent carries the
-canonical SPEC in context for every session — knows the format,
-the example types, the curator contract, the session lifecycle,
-and how to operate stores via `dbmd` subcommands. Per-store
+There is one source of truth — `dbmd spec`, which prints this SPEC. The
+installed skill is a thin pointer that runs `dbmd spec`; it never inlines
+the SPEC, so it cannot drift. Pick the form your harness wants: Claude Code
+and Codex both speak the [Agent Skills](https://agentskills.io) format, so
+`dbmd install-skill` is the install-once path for them; any harness with a
+system-prompt mechanism can carry `dbmd spec` directly. Either way the agent
+knows the format, the example types, the curator contract, the session
+lifecycle, and how to operate stores via `dbmd` subcommands; per-store
 overrides come from `DB.md` on every operation.
 
 **Subcommand map** (grouped by session phase; full reference in

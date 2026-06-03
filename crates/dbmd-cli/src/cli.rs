@@ -152,10 +152,11 @@ pub enum Command {
     /// system prompt.
     Spec(SpecArgs),
 
-    /// Install a coding-agent skill that teaches a local agent (Claude Code or
-    /// Codex) to operate a db.md store with `dbmd`. The persistent sibling of
-    /// `dbmd spec`: where `spec` loads the contract for one session,
-    /// `install-skill` drops a skill the agent keeps across every session.
+    /// Install the cross-agent Agent Skill that teaches a local coding agent
+    /// (Claude Code, Codex) to operate a db.md store with `dbmd`. The persistent
+    /// sibling of `dbmd spec`: where `spec` loads the contract for one session,
+    /// `install-skill` drops a skill the agent discovers on every future
+    /// session. With no `--target`, points every agent on the machine at once.
     InstallSkill(SkillArgs),
 
     /// Remove the coding-agent skill that `install-skill` wrote — the reverse of
@@ -839,7 +840,8 @@ pub struct SpecArgs {
 pub enum SkillTarget {
     /// Anthropic Claude Code → `~/.claude/skills/db-md/SKILL.md`.
     ClaudeCode,
-    /// OpenAI Codex → `~/.codex/instructions/db-md.md`.
+    /// OpenAI Codex → `~/.codex/skills/db-md/SKILL.md` (the open Agent Skills
+    /// layout, same shape as Claude Code).
     Codex,
 }
 
@@ -858,8 +860,10 @@ impl SkillTarget {
 /// the same per-agent skill location, so they take the same `--target`.
 #[derive(Debug, Args)]
 pub struct SkillArgs {
-    /// Which agent to act on. Default: autodetect — Claude Code when
-    /// `~/.claude` exists, else Codex when `~/.codex` exists, else Claude Code.
+    /// Which agent to act on. Default: every detected agent — both Claude Code
+    /// (`~/.claude`) and Codex (`~/.codex`) when present, so one command points
+    /// every agent on the machine. Falls back to Claude Code when neither is
+    /// found. Pass `--target` to narrow to a single agent.
     #[arg(long, value_enum, value_name = "TARGET")]
     pub target: Option<SkillTarget>,
 }

@@ -188,62 +188,13 @@ fn emit_result(
     }
 }
 
-/// Atomic write: temp file in the same dir, then rename over the target.
+/// Atomic, durable write of a rewritten content file — delegates to the one
+/// core primitive (`dbmd_core::write_atomic`: temp + fsync + rename +
+/// parent-fsync). A rewritten linker is primary data, so it uses the durable
+/// path, same as the original `dbmd write`.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), CliError> {
-    use std::io::Write;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("dbmd-rename");
-    let (mut f, tmp) = create_temp_file(parent, name)?;
-    {
-        f.write_all(contents.as_bytes())
-            .map_err(|e| CliError::runtime(format!("cannot write rewrite: {e}")))?;
-        f.sync_all().ok();
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(CliError::runtime(format!("cannot finalize rewrite: {e}")));
-    }
-    sync_parent_dir(parent);
-    Ok(())
-}
-
-fn create_temp_file(parent: &Path, name: &str) -> Result<(std::fs::File, PathBuf), CliError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    for _ in 0..128 {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(".{name}.tmp.{pid}.{nanos}.{seq}"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => return Ok((file, tmp)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(CliError::runtime(format!("cannot write rewrite: {e}"))),
-        }
-    }
-
-    Err(CliError::runtime(
-        "cannot write rewrite: could not allocate a unique temp file",
-    ))
-}
-
-fn sync_parent_dir(parent: &Path) {
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    dbmd_core::write_atomic(path, contents.as_bytes())
+        .map_err(|e| CliError::runtime(format!("cannot finalize rewrite: {e}")))
 }
 
 /// True for a derived index artifact (`index.md` / `index.jsonl`). The catalog

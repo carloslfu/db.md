@@ -18,15 +18,19 @@ Two things version independently:
 
 #### Added
 
-- **`dbmd install-skill`** / **`dbmd uninstall-skill`** — install (or remove) a
-  coding-agent skill that teaches Claude Code (`~/.claude/skills/db-md/SKILL.md`)
-  or Codex (`~/.codex/instructions/db-md.md`) to operate a db.md store with
-  `dbmd`. The persistent sibling of `dbmd spec`: where `spec` loads the contract
-  for one session, `install-skill` drops a skill the agent keeps across sessions,
-  and `uninstall-skill` removes exactly what it wrote. Autodetects the target
-  (`--target claude-code|codex` to force one). The skill body points at `dbmd
-  spec` as the single source of truth — it never inlines the SPEC, so it cannot
-  drift from it.
+- **`dbmd install-skill`** / **`dbmd uninstall-skill`** — install (or remove) the
+  cross-agent [Agent Skill](https://agentskills.io) that teaches a local coding
+  agent to operate a db.md store with `dbmd`. One source, every agent: the skill
+  is authored once at `skills/db-md/SKILL.md`, embedded in the binary, and dropped
+  into each agent's skills dir in the open `SKILL.md` format — Claude Code
+  (`~/.claude/skills/db-md/SKILL.md`) and Codex (`~/.codex/skills/db-md/SKILL.md`),
+  the same file, frontmatter and all. With no `--target` it points every detected
+  agent in one command (`--target claude-code|codex` narrows to one). The
+  persistent sibling of `dbmd spec`: where `spec` loads the contract for one
+  session, `install-skill` drops a skill the agent discovers on every future
+  session, and `uninstall-skill` removes exactly what it wrote (preserving any
+  user-created siblings). The skill body is a thin pointer that runs `dbmd spec`,
+  the single source of truth — it never inlines the SPEC, so it cannot drift.
 - Validation now emits `FM_MISSING_CREATED` and `FM_MISSING_UPDATED` when a
   content file omits the universal timestamps.
 
