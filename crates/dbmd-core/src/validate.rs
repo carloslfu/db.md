@@ -3608,14 +3608,13 @@ mod tests {
         let issues = fx.store_all();
         assert!(
             issues.iter().any(|i| i.code == codes::WIKI_LINK_SHORT_FORM
-                && i.file == *"wiki/people/short.md"
+                && i.file == Path::new("wiki/people/short.md")
                 && i.key.as_deref() == Some("related")),
             "unquoted short-form frontmatter link must be caught: {issues:#?}"
         );
         assert!(
-            issues
-                .iter()
-                .any(|i| i.code == codes::WIKI_LINK_BROKEN && i.file == *"wiki/people/broken.md"),
+            issues.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN
+                && i.file == Path::new("wiki/people/broken.md")),
             "unquoted full-path frontmatter link to a missing file must be caught: {issues:#?}"
         );
     }
@@ -3856,7 +3855,8 @@ mod tests {
         let bad_shape: Vec<_> = issues
             .iter()
             .filter(|i| {
-                i.code == codes::SCHEMA_SHAPE_MISMATCH && i.file == *"records/widgets/bad.md"
+                i.code == codes::SCHEMA_SHAPE_MISMATCH
+                    && i.file == Path::new("records/widgets/bad.md")
             })
             .map(|i| i.key.clone().unwrap_or_default())
             .collect();
@@ -3867,10 +3867,8 @@ mod tests {
             "inf must be rejected as currency: {issues:#?}"
         );
         assert!(
-            !issues
-                .iter()
-                .any(|i| i.code == codes::SCHEMA_SHAPE_MISMATCH
-                    && i.file == *"records/widgets/ok.md"),
+            !issues.iter().any(|i| i.code == codes::SCHEMA_SHAPE_MISMATCH
+                && i.file == Path::new("records/widgets/ok.md")),
             "valid shapes (incl. `USD 1,234.50`) must not fire: {issues:#?}"
         );
     }
@@ -4737,15 +4735,14 @@ mod tests {
         );
         let issues = validate_working_set(&fx.store(), None).unwrap();
         assert!(
-            issues.iter().any(
-                |i| i.code == codes::FM_BAD_TIMESTAMP && i.file == *"records/contacts/dirty.md"
-            ),
+            issues.iter().any(|i| i.code == codes::FM_BAD_TIMESTAMP
+                && i.file == Path::new("records/contacts/dirty.md")),
             "{issues:#?}"
         );
         assert!(
             !issues
                 .iter()
-                .any(|i| i.file == *"records/contacts/unlogged.md"),
+                .any(|i| i.file == Path::new("records/contacts/unlogged.md")),
             "unlogged file must not be in the working set: {issues:#?}"
         );
     }
@@ -4766,9 +4763,8 @@ mod tests {
         );
         let issues = validate_working_set(&fx.store(), None).unwrap();
         assert!(
-            issues
-                .iter()
-                .any(|i| i.code == codes::WIKI_LINK_BROKEN && i.file == *"wiki/people/linker.md"),
+            issues.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN
+                && i.file == Path::new("wiki/people/linker.md")),
             "incoming linker to a removed path must be validated: {issues:#?}"
         );
     }
@@ -4796,11 +4792,15 @@ mod tests {
         let since = DateTime::parse_from_rfc3339("2026-05-22T00:00:00+00:00").unwrap();
         let issues = validate_working_set(&fx.store(), Some(since)).unwrap();
         assert!(
-            issues.iter().any(|i| i.file == *"records/contacts/new.md"),
+            issues
+                .iter()
+                .any(|i| i.file == Path::new("records/contacts/new.md")),
             "{issues:#?}"
         );
         assert!(
-            !issues.iter().any(|i| i.file == *"records/contacts/old.md"),
+            !issues
+                .iter()
+                .any(|i| i.file == Path::new("records/contacts/old.md")),
             "old change is before the cutoff: {issues:#?}"
         );
     }
@@ -4830,13 +4830,13 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|i| i.file == *"records/contacts/after.md"),
+                .any(|i| i.file == Path::new("records/contacts/after.md")),
             "{issues:#?}"
         );
         assert!(
             !issues
                 .iter()
-                .any(|i| i.file == *"records/contacts/before.md"),
+                .any(|i| i.file == Path::new("records/contacts/before.md")),
             "change before the last validate entry is outside the default window: {issues:#?}"
         );
     }
@@ -4938,7 +4938,7 @@ mod tests {
         assert!(
             !issues
                 .iter()
-                .any(|i| i.file == *"wiki/people/only-sarah-chen.md"),
+                .any(|i| i.file == Path::new("wiki/people/only-sarah-chen.md")),
             "a prefix-sharing link must not pull a file into the working set: {issues:#?}"
         );
     }
@@ -4968,9 +4968,10 @@ mod tests {
         );
         let issues = validate_working_set(&fx.store(), None).unwrap();
         assert!(
-            issues.iter().any(
-                |i| i.file == *"records/contacts/index.md" && i.code == codes::WIKI_LINK_BROKEN
-            ),
+            issues
+                .iter()
+                .any(|i| i.file == Path::new("records/contacts/index.md")
+                    && i.code == codes::WIKI_LINK_BROKEN),
             "the catalog `index.md` linking to the deleted target must be pulled \
              into the working set and flagged WIKI_LINK_BROKEN (proves the scan \
              uses embedded-ripgrep `Store::find_links_to`, not the index-skipping \
@@ -5011,15 +5012,15 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|i| i.file == *"wiki/people/refers-sarah.md"
+                .any(|i| i.file == Path::new("wiki/people/refers-sarah.md")
                     && i.code == codes::WIKI_LINK_BROKEN),
             "linker to the FIRST deleted target must be pulled in and flagged: {issues:#?}"
         );
         assert!(
-            issues
-                .iter()
-                .any(|i| i.file == *"records/meetings/2026/05/kickoff.md"
-                    && i.code == codes::WIKI_LINK_BROKEN),
+            issues.iter().any(
+                |i| i.file == Path::new("records/meetings/2026/05/kickoff.md")
+                    && i.code == codes::WIKI_LINK_BROKEN
+            ),
             "linker to the SECOND deleted target (typed-field edge) must also be \
              pulled in and flagged — proves the scan covers the whole changed set, \
              not just one object: {issues:#?}"

@@ -560,7 +560,7 @@ mod tests {
             .layers
             .iter()
             .flat_map(|l| &l.type_folders)
-            .filter(|tf| tf.path == *"sources/emails")
+            .filter(|tf| tf.path == Path::new("sources/emails"))
             .collect();
 
         assert_eq!(

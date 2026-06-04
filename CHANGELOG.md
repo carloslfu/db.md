@@ -8,9 +8,11 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.1**.
+  `Cargo.toml`, currently **v0.3.2**.
 
 ## [Unreleased]
+
+## [0.3.2] — 2026-06-04
 
 ### Removed
 
@@ -36,8 +38,11 @@ Two things version independently:
 
 ### Fixed
 
-- Preserved the declared Rust 1.85 MSRV by keeping the direct `zip` dependency
-  on the 7.2 line; `zip` 8.x now requires Rust 1.88.
+- Preserved the declared Rust 1.85 MSRV, end to end. The direct `zip` dependency
+  stays on the 7.2 line (`zip` 8.x now requires Rust 1.88), and the test suite
+  again compiles on 1.85 — a handful of `PathBuf == *"…"` comparisons needed
+  `PartialEq<str> for PathBuf`, which std only added after 1.85, so they now use
+  `Path::new(…)`. Verified with a real `cargo +1.85 build` and `test`.
 
 ## [0.3.1] — 2026-06-03
 

@@ -34,7 +34,7 @@ name = "dbmd"
 path = "src/main.rs"
 
 [dependencies]
-dbmd-core = { path = "../dbmd-core", version = "0.3.1" }
+dbmd-core = { path = "../dbmd-core", version = "0.3.2" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
