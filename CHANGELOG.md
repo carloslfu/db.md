@@ -12,6 +12,18 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Docs
+
+- **Corrected store creation: the agent writes `DB.md`; there is no `dbmd init`.**
+  The SPEC, README, and CLI README documented `dbmd fm init DB.md` as the way to
+  initialize a store, but that command refuses on a directory with no `DB.md`
+  (chicken-and-egg), and store creation is agent/operator-authored **by design**,
+  not a tool command. Replaced the bogus one-liner with the real method (write a
+  `DB.md` with `type: db-md` + `scope` + `owner`) and stated the thin-tool
+  principle explicitly: `dbmd` plumbs (validate / index / query / link) and never
+  scaffolds what a capable agent authors. Also documented that `scope`/`owner`
+  are required (enforced by `dbmd validate --all`), which the SPEC understated.
+
 ## [0.3.2] — 2026-06-04
 
 ### Removed

@@ -15,7 +15,10 @@ so there are no external tools to install or license.
 - **All Rust.** Built for velocity the way ripgrep is.
 - **Zero AI dependencies.** No provider SDKs, no API keys, no model
   calls. `dbmd` is deterministic file/data plumbing; the agent
-  reasons, `dbmd` executes.
+  reasons, `dbmd` executes. It never scaffolds, templates, or
+  generates what a capable agent authors itself — there is no `dbmd
+  init`, no wizards: you write `DB.md` and summaries; `dbmd` validates,
+  indexes, queries, and links.
 - **MIT/Apache only.** No GPL, no AGPL anywhere in the binary.
 - **One install.** ~5MB, cross-platform (darwin / linux ×
   x86_64 / arm64).

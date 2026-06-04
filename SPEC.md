@@ -384,12 +384,26 @@ differentiates the file from the standard name `db.md`.
 store-walking `dbmd` subcommand (`validate`, `search`, `graph`,
 `fm query`, `index rebuild`, `stats`, ...) exits non-zero with
 structured error code `NOT_A_STORE` rather than guessing.
-Initializing a fresh store is one composed command:
-`mkdir -p mystore/{sources,records,wiki} && dbmd fm init mystore/DB.md`.
+**Creating a store is the agent's job, not a tool command.** `DB.md` is
+operator/agent-authored — you write it. There is deliberately **no `dbmd
+init`**, no scaffold, no template: `dbmd` is plumbing (it validates, indexes,
+queries, links), and a capable agent authors what a tool would otherwise
+generate. To make a fresh store, create the folders and write a `DB.md`:
 
-The file carries identity in frontmatter and optional per-store
-overrides in sections. Required: frontmatter with `type: db-md`.
-Optional: any of the standard sections below.
+```bash
+mkdir -p mystore/{sources,records,wiki}
+# then write mystore/DB.md yourself — minimally:
+#   ---
+#   type: db-md
+#   scope: company        # company | personal | research | <custom>
+#   owner: <name>
+#   ---
+```
+
+The file carries identity in frontmatter and optional per-store overrides in
+sections. **Required frontmatter: `type: db-md`, `scope`, and `owner`** — a
+store missing `scope` or `owner` fails `dbmd validate` with
+`DB_MD_MISSING_FIELD`. Optional: any of the standard sections below.
 
 ```markdown
 ---

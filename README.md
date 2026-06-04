@@ -34,8 +34,9 @@ db/
 # install the toolkit (one prebuilt binary, ~5MB, no toolchain)
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
-# create a store
-mkdir -p db/{sources,records,wiki} && dbmd fm init db/DB.md
+# create a store — you write DB.md (the agent authors it; there is no `dbmd init`)
+mkdir -p db/{sources,records,wiki}
+printf -- '---\ntype: db-md\nscope: personal\nowner: me\n---\n' > db/DB.md
 
 dbmd validate db                          # frontmatter + link + schema check
 dbmd search "renewal" --in records        # search across the store
