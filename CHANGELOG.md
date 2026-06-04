@@ -8,12 +8,18 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.2**.
+  `Cargo.toml`, currently **v0.3.3**.
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-06-04
+
 ### Docs
 
+- **Explicit agent flow in every surface.** The skill, the SPEC
+  (§ "How an agent uses db.md"), and `llms.txt` now open with the four-move
+  path — discover → `dbmd spec` → `DB.md` → operate — so the path is
+  unmistakable the moment an agent reads any of them.
 - **Corrected store creation: the agent writes `DB.md`; there is no `dbmd init`.**
   The SPEC, README, and CLI README documented `dbmd fm init DB.md` as the way to
   initialize a store, but that command refuses on a directory with no `DB.md`
