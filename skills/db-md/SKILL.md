@@ -15,15 +15,21 @@ that is a plain directory — raw evidence in `sources/`, atomic typed data in
 `DB.md` at the root. `dbmd` is deterministic file/data plumbing; **you are the
 curator** — the reasoning, synthesis, and judgment are yours.
 
-**Before anything else: load the contract once per session.**
+## How to use db.md — four moves, in order
+
+1. **You're here.** This skill fired because a db.md store is in play (a `DB.md`
+   at a folder root). The skill is only the doorway — it carries no contract.
+2. **Contract.** Run `dbmd spec` once this session. It prints the canonical SPEC
+   — format, curator role, session lifecycle, validation codes, every command —
+   the single source of truth. This skill points at it; don't guess from memory.
+3. **Store config.** Read this store's own `DB.md` (`dbmd fm get DB.md scope`,
+   then its `## Agent instructions` / `## Policies` / `## Schemas`). It overrides
+   the defaults — read it before you write.
+4. **Operate.** Drive `dbmd` (cheat sheet below); `--json` on everything.
 
 ```
-dbmd spec            # prints the canonical SPEC — the single source of truth
+dbmd spec            # step 2 — the contract, the single source of truth
 ```
-
-`dbmd spec` is authoritative; this skill is only a pointer to it. Then read the
-store's own `DB.md` for its identity, policies, and schemas — `DB.md` overrides
-defaults, so read it before you write.
 
 ## Cheat sheet (grouped by session phase)
 

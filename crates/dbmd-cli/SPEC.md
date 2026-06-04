@@ -103,16 +103,21 @@ A db.md store composes three data models in one directory:
 The pattern: *sources are evidence; records are facts; wiki is
 understanding.* Same store, three composed models.
 
-### Where the agent reads what
+### How an agent uses db.md — four moves, in order
 
-1. **`dbmd spec`** prints the canonical spec (this document, bundled
-   into the binary). The agent reads it once at startup to understand
-   the format and the curator contract.
-2. **`DB.md`** at the store root: identity (frontmatter) + per-store
-   overrides (sections: agent instructions, policies, schemas). The
-   agent reads it on every operation on this store.
-3. The store itself: `sources/`, `records/`, `wiki/`. The agent
-   operates here via `dbmd` subcommands.
+1. **Discover.** A skill-aware harness (Claude Code, Codex) surfaces the db.md
+   skill by its description, or a human/manager points the agent at the store.
+   The skill is only the doorway — it carries no contract of its own.
+2. **Contract.** `dbmd spec` prints this document (bundled into the binary): the
+   format, the curator contract, the session lifecycle, the validation codes,
+   and the full subcommand surface. The agent reads it once per session — this
+   is the single source of truth.
+3. **Store config.** `DB.md` at the store root: identity (frontmatter) +
+   per-store overrides (`## Agent instructions`, `## Policies`, `## Schemas`).
+   Read on every operation on this store; it overrides the defaults, so read it
+   before writing.
+4. **Operate.** The store itself — `sources/`, `records/`, `wiki/` — driven via
+   `dbmd` subcommands. See [The agent session](#the-agent-session) for the loop.
 
 ## The universal frontmatter contract
 

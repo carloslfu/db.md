@@ -11,6 +11,10 @@ db.md yourself by reading the steps below and acting on them — it is plain
 text by design. The smart model is the installer; there is no per-harness
 machinery to depend on.
 
+**The agent's path, four moves:** discover db.md → run `dbmd spec` for the
+contract → read the store's `DB.md` → operate with `dbmd`. The steps below get
+you the binary; `dbmd spec` is the single source of truth from there.
+
 ## 1. Install the binary (one ~5MB binary, no toolchain)
 
 ```sh
