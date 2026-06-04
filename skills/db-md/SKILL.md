@@ -5,7 +5,7 @@ version: 0.2.0
 license: Apache-2.0
 ---
 
-<!-- dbmd-managed-skill:v1 — written by `dbmd install-skill`; edit the source at skills/db-md/SKILL.md in the db.md repo, not this copy. -->
+<!-- The canonical db.md Agent Skill (source of truth: skills/db-md/SKILL.md in the db.md repo). To use it, place a copy where your harness reads skills, e.g. ~/.claude/skills/db-md/ or ~/.codex/skills/db-md/. The body points at "dbmd spec", so it never copies the SPEC and cannot drift. -->
 
 # db.md (the `dbmd` CLI)
 

@@ -51,13 +51,7 @@ Load the contract once per session — `dbmd spec` is the single source of truth
 claude --append-system "$(dbmd spec)"     # any runtime with a system-prompt hook
 ```
 
-To persist that across sessions, save a skill where your harness reads skills, in the open [Agent Skills](https://agentskills.io) format ([`skills/db-md/SKILL.md`](skills/db-md/SKILL.md), with `name`/`description` frontmatter): Claude Code reads `~/.claude/skills/db-md/`, Codex reads `~/.codex/skills/db-md/`; any other harness uses its own skills dir or loads `dbmd spec` into its system prompt. As an **optional convenience**, one command does that persist step for Claude Code + Codex — it is sugar, not the mechanism and not required:
-
-```bash
-dbmd install-skill                        # ~/.claude/skills/db-md, ~/.codex/skills/db-md
-```
-
-The skill body just points at `dbmd spec` — the single source of truth — and never copies the SPEC, so it cannot drift from the standard.
+To persist that across sessions, place a skill where your harness reads skills, in the open [Agent Skills](https://agentskills.io) format — the canonical file ships in the repo at [`skills/db-md/SKILL.md`](skills/db-md/SKILL.md) (a `name`/`description` frontmatter pointer that runs `dbmd spec`): Claude Code reads `~/.claude/skills/db-md/`, Codex reads `~/.codex/skills/db-md/`; any other harness uses its own skills dir or loads `dbmd spec` into its system prompt. Placing it is generic file work — copy the file, use your harness's own skill installer (Codex's `skill-installer`, a Claude Code plugin), or just tell your agent to set itself up. db.md ships **no per-harness install command**; the installer is text and the model does the rest. The skill never copies the SPEC (it points at `dbmd spec`), so it cannot drift.
 
 The format is at **v0.2**: schema enforcement is solely the store's own `DB.md ## Schemas`, and the example types (`contact`, `expense`, …) are illustrative, not normative (v0.1 was the first tagged release, [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1)). From v0.2 on, changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
@@ -68,9 +62,10 @@ any agent runtime plays: Claude Code, Codex, or your own. The agent
 loads the contract with `dbmd spec` — the single source of truth, read
 once per session — then follows the curator contract and operates the
 store through `dbmd` subcommands. Persisting that across sessions is a
-skill in the open Agent Skills format; `dbmd install-skill` is an
-optional convenience that writes it for Claude Code + Codex, not a
-requirement. The toolkit is deterministic file/data plumbing; the
+skill in the open Agent Skills format (`skills/db-md/SKILL.md` in the
+repo) — placed by copying the file, the harness's own skill installer,
+or the agent itself; db.md ships no per-harness install command. The
+toolkit is deterministic file/data plumbing; the
 agent does the reasoning. See [SPEC.md](SPEC.md) § The curator
 contract and § The agent session.
 
@@ -173,7 +168,7 @@ db.md/
 ├── SPEC.md             # format spec + curator contract + validation codes (v0.2)
 ├── README.md
 ├── TOOLS.md            # toolkit reference (subcommand surface, install, bootstrap)
-├── skills/db-md/       # the canonical Agent Skill (SKILL.md) that `dbmd install-skill` ships
+├── skills/db-md/       # the canonical Agent Skill (SKILL.md) — the distributable agents/harnesses install
 ├── Cargo.toml          # Rust workspace
 ├── crates/
 │   ├── dbmd-core/      # library: parser, store, graph, validate, stats, query, index, log

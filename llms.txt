@@ -34,18 +34,19 @@ immediately; per-store overrides come from the store's own `DB.md`.
 ## 3. Integrate into your agent (optional — for persistence)
 
 `dbmd spec` is enough on its own. To make your agent reach for db.md
-automatically on every future session, save a skill where your harness reads
+automatically on every future session, place a skill where your harness reads
 skills — the open Agent Skills format (a `db-md/SKILL.md` folder with
 `name`/`description` frontmatter whose body is a thin pointer that runs
-`dbmd spec`):
+`dbmd spec`). The canonical skill file ships in the repo at `skills/db-md/SKILL.md`:
 
 - Claude Code → `~/.claude/skills/db-md/SKILL.md`
 - Codex → `~/.codex/skills/db-md/SKILL.md`
 - Any other harness → its own skills directory, or load `dbmd spec` into the
   system prompt.
 
-`dbmd install-skill` does this for Claude Code and Codex — convenience over the
-step above, not the mechanism and not required.
+Placing it is generic file work: copy the file, use your harness's own skill
+installer, or just tell your agent to set itself up. db.md ships no per-harness
+install command — the installer is text and the model does the rest.
 
 ## 4. Operate
 

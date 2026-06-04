@@ -12,17 +12,27 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Removed
+
+- **`dbmd install-skill` / `dbmd uninstall-skill`.** The installer is text:
+  `dbmd spec` + the repo-root `llms.txt` are the contract, and the open-format
+  skill ships in the repo at `skills/db-md/SKILL.md`. Placing that skill is
+  generic file work — copy it, use your harness's own skill installer (Codex's
+  `skill-installer`, a Claude Code plugin), or tell your agent to. db.md no
+  longer ships per-harness install code: it was the one thing coupled to harness
+  internals (and the thing that broke when Codex moved its skills directory). The
+  mechanism is generic text plus a capable model — nothing to maintain or drift.
+
 ### Docs
 
 - **Repo-root `llms.txt`** — an agent-readable entry point at the top of the
   repo, in the [llms.txt](https://llmstxt.org) spirit: the installer is text. An
-  agent (or a human) can read one plain file to learn what db.md is and how to
-  operate a store, no binary required.
-- **Docs reframed around the text path.** `dbmd install-skill` is now presented
-  as optional convenience — a persistent drop of the cross-agent skill — over the
-  text path (read `llms.txt`, or run `dbmd spec`), not the only way in. `dbmd
-  spec` stays the single source of truth: every other surface points at it and
-  never inlines the SPEC, so nothing can drift.
+  agent (or a human) reads one plain file to learn what db.md is and how to
+  install, integrate, and operate a store.
+- **Docs reframed around the text path.** README, TOOLS.md, SPEC.md, and
+  `llms.txt` present one model: `dbmd spec` is the single source of truth;
+  persistence is a skill *file* you place (or your agent / harness installer
+  places), not a `dbmd` command. Nothing inlines the SPEC, so nothing drifts.
 
 ### Fixed
 

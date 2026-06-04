@@ -32,7 +32,6 @@ pub mod query;
 pub mod rename;
 pub mod search;
 pub mod sections;
-pub mod skill;
 pub mod spec;
 pub mod stats;
 pub mod tree;

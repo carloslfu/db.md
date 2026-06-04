@@ -33,12 +33,14 @@ dbmd search "(revenue|sales|ARR)" --in records
 dbmd graph backlinks db/records/contacts/sarah.md
 dbmd validate db/
 
-# teach a local coding agent dbmd once (Claude Code / Codex)
-dbmd install-skill
-
-# or load the canonical spec into any harness's system prompt, per session
+# load the canonical contract — the single source of truth, read once per session
 dbmd spec
 ```
+
+To persist the contract across sessions, drop the open-format skill
+`skills/db-md/SKILL.md` where your harness reads skills (copy it, use your
+harness's own skill installer, or tell your agent) — there is no `dbmd`
+install command; the installer is text.
 
 Every subcommand supports `--json` and `--help`; none prompt
 interactively.

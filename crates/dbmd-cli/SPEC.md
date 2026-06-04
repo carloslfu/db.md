@@ -1219,22 +1219,23 @@ session lifecycle, the validation codes, and the full subcommand surface. An
 agent that has read it can operate any db.md store immediately; per-store
 overrides come from the store's `DB.md` on every operation.
 
-**Make it persistent (optional — not required; not the mechanism).** To have
-your agent reach for db.md automatically on every future session, save a skill
-where your harness reads
+**Make it persistent (optional).** To have your agent reach for db.md
+automatically on every future session, place a skill where your harness reads
 skills — the open [Agent Skills](https://agentskills.io) format (a
 `db-md/SKILL.md` folder with `name`/`description` frontmatter whose body is a
-thin pointer that runs `dbmd spec`):
+thin pointer that runs `dbmd spec`). The canonical skill file ships in the repo
+at `skills/db-md/SKILL.md`:
 
 - Claude Code → `~/.claude/skills/db-md/SKILL.md`
 - Codex → `~/.codex/skills/db-md/SKILL.md`
 - Any other harness → its own skills directory, or load `dbmd spec` into the
   system prompt.
 
-`dbmd install-skill` does this for Claude Code and Codex — convenience over the
-steps above, not the mechanism and not required. The mechanism is generic text
-and a capable model; there is no per-harness machinery to depend on. The skill
-never copies the SPEC (it points at `dbmd spec`), so it cannot drift.
+Placing it is generic file work, not a db.md command: copy the file, use your
+harness's own skill installer (Codex's `skill-installer`, a Claude Code plugin),
+or just tell your agent to set itself up from this contract. db.md ships no
+per-harness installer — the mechanism is generic text and a capable model. The
+skill never copies the SPEC (it points at `dbmd spec`), so it cannot drift.
 
 **Subcommand map** (grouped by session phase; full reference in
 `TOOLS.md`). Every subcommand supports `--json` and `--help`; none

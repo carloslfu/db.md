@@ -82,8 +82,6 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Link(args) => cmd::link::run(ctx, args),
         Command::Rename(args) => cmd::rename::run(ctx, args),
         Command::Spec(args) => cmd::spec::run(ctx, args),
-        Command::InstallSkill(args) => cmd::skill::install(ctx, args),
-        Command::UninstallSkill(args) => cmd::skill::uninstall(ctx, args),
     }
 }
 

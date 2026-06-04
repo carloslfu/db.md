@@ -151,17 +151,6 @@ pub enum Command {
     /// installation point: `dbmd spec` loads the standard into an agent's
     /// system prompt.
     Spec(SpecArgs),
-
-    /// Install the cross-agent Agent Skill that teaches a local coding agent
-    /// (Claude Code, Codex) to operate a db.md store with `dbmd`. The persistent
-    /// sibling of `dbmd spec`: where `spec` loads the contract for one session,
-    /// `install-skill` drops a skill the agent discovers on every future
-    /// session. With no `--target`, points every agent on the machine at once.
-    InstallSkill(SkillArgs),
-
-    /// Remove the coding-agent skill that `install-skill` wrote — the reverse of
-    /// `install-skill`, scoped to only what it installed.
-    UninstallSkill(SkillArgs),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -827,43 +816,6 @@ pub struct SpecArgs {
     pub spec: Option<String>,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// install-skill / uninstall-skill
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Which coding agent the `install-skill` / `uninstall-skill` commands act on.
-/// As a clap `ValueEnum`, the `--target` value is validated by clap itself
-/// (kebab-cased to `claude-code` / `codex`), so a bad value is the usual
-/// arg-parse error (exit `2`) and the body never hand-validates a string.
-/// Mirrors how `--color` uses `ColorChoice`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SkillTarget {
-    /// Anthropic Claude Code → `~/.claude/skills/db-md/SKILL.md`.
-    ClaudeCode,
-    /// OpenAI Codex → `~/.codex/skills/db-md/SKILL.md` (the open Agent Skills
-    /// layout, same shape as Claude Code).
-    Codex,
-}
-
-impl SkillTarget {
-    /// The canonical CLI spelling — matches the `--target` value, the install
-    /// path segment, and the `target` field in `--json` output.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SkillTarget::ClaudeCode => "claude-code",
-            SkillTarget::Codex => "codex",
-        }
-    }
-}
-
-/// Shared args for `dbmd install-skill` and `dbmd uninstall-skill` — both act on
-/// the same per-agent skill location, so they take the same `--target`.
-#[derive(Debug, Args)]
-pub struct SkillArgs {
-    /// Which agent to act on. Default: every detected agent — both Claude Code
-    /// (`~/.claude`) and Codex (`~/.codex`) when present, so one command points
-    /// every agent on the machine. Falls back to Claude Code when neither is
-    /// found. Pass `--target` to narrow to a single agent.
-    #[arg(long, value_enum, value_name = "TARGET")]
-    pub target: Option<SkillTarget>,
-}
+// (install-skill / uninstall-skill removed: the installer is text — `dbmd spec`
+// + the repo-root `llms.txt` + the distributable `skills/db-md/SKILL.md`. Agents
+// and harness skill-installers place the skill; dbmd ships no per-harness code.)

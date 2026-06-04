@@ -9,16 +9,14 @@
 
 .PHONY: build release test fmt fmt-check lint publish-check sync clean
 
-# Single source of truth: the repo-root SPEC.md and skills/ are authoritative.
-# The `dbmd` binary embeds them via include_str!, but cargo package requires the
-# embedded path to stay INSIDE the crate — so we mirror them into crates/dbmd-cli
-# and embed the mirror. `make sync` regenerates the mirror; the
-# `bundled_assets_match_repo_root` test fails if anyone edits a root source and
-# forgets to re-sync. Edit the root files, never the mirrors.
+# Single source of truth: the repo-root SPEC.md is authoritative. `dbmd spec`
+# embeds it via include_str!, but cargo package requires the embedded path to
+# stay INSIDE the crate — so we mirror it into crates/dbmd-cli and embed the
+# mirror. `make sync` regenerates it; the `bundled_spec_matches_repo_root` test
+# fails if SPEC.md is edited without re-syncing. Edit SPEC.md, never the mirror.
+# (skills/db-md/SKILL.md is a distributable artifact, not embedded in the binary.)
 sync:
 	cp SPEC.md crates/dbmd-cli/SPEC.md
-	mkdir -p crates/dbmd-cli/skills/db-md
-	cp skills/db-md/SKILL.md crates/dbmd-cli/skills/db-md/SKILL.md
 
 # Debug build of the whole workspace -> target/debug/dbmd
 build: sync
