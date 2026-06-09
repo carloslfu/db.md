@@ -2,29 +2,35 @@
 
 **The database was a workaround for computers that couldn't read. They can now.**
 
-Your database is a folder of plain text files. No server, no tables, no query
-language. Every record is one markdown file you can open, read, and edit by
-hand, and the links between records are written into the text itself. The folder
-is the database.
+**Your database is a folder of plain text files.** No server, no tables, no
+query language. Every record is one markdown file you can open, read, and edit
+by hand. The links between records are written into the text itself.
+
+The folder is the database.
 
 For fifty years that would have been a toy. You needed a server, because the
 data would not fit in memory. You needed a schema up front, and a query
-language, because software could not read plain writing or find anything in the
-pile. Every one of those reasons just expired. A capable agent reads the files,
-writes them, links them, and finds anything in them by plain meaning.
+language, because software could not read plain writing or find anything in
+the pile.
 
-The agent is the engine, and here is the bet that makes this a database and not
-just a folder: it gets sharper every time the model behind it improves. A SQL
-store queries exactly as well in ten years as the day you installed it. A db.md
-store gets smarter on the model curve, with nothing to migrate and nothing to
-rebuild.
+**Every one of those reasons just expired.** A capable agent reads the files,
+writes them, links them, and finds anything in them by plain meaning. The
+agent is the engine.
 
-So a database stops being software you run and becomes data you own: text on
-disk that a person reads easily, a model reads better than anything else, and
-that outlasts every tool that ever touches it. It is not small. Millions of
-records live on plain files with no vector database. And it replaces a whole
-class of software: the products that were only ever a database with a screen on
-top.
+And the engine is the bet. **A db.md store gets sharper every time the model
+behind it improves.** A SQL database queries exactly as well in ten years as
+the day you installed it. Your files ride the model curve, with nothing to
+migrate and nothing to rebuild.
+
+So the database stops being software you run and becomes **data you own.**
+Text on disk that a person reads easily, a model reads better than anything
+else, and that outlasts every tool that ever touches it.
+
+It is not small. **Millions of records live on plain files**, with no vector
+database anywhere.
+
+And it replaces a whole class of software: **the products that were only ever
+a database with a screen on top.**
 
 Here is a record. It is a file:
 
@@ -56,9 +62,9 @@ than any row in any table. That is the whole format.
 
 Most software a company pays for is a database with a screen bolted on: a CRM,
 an ops tracker, a contract register, the internal tool every company rebuilds,
-the SaaS product that is just a table behind a login. db.md replaces the
-database and the screen at once. The records are the files, the agent answers the
-questions, and the view gets built the moment you ask for one.
+the SaaS product that is just a table behind a login. **db.md replaces the
+database and the screen at once.** The records are the files, the agent answers
+the questions, and the view gets built the moment you ask for one.
 
 This is built for company scale. A full email history, hundreds of thousands of
 records and sometimes millions, lives on plain files and stays fast with
@@ -100,8 +106,8 @@ v0.2, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
 Every other way to store data puts something between you and it. Ask two
 questions of each one: what sits in the middle, and what does it ride on as
-models improve. db.md puts nothing in the middle, and it rides on the model
-itself. Everything else rides on machinery you maintain, and machinery only
+models improve. **db.md puts nothing in the middle, and it rides on the model
+itself.** Everything else rides on machinery you maintain, and machinery only
 improves when you do the work.
 
 | Approach | What sits between you and your data | What it rides on |
@@ -113,14 +119,16 @@ improves when you do the work.
 | Knowledge-graph memory | a derived graph beside your files, queried through an API, stale until the next rebuild | a better model too, but spent rebuilding a graph that drifts from your files, not the files themselves |
 | Karpathy's LLM Wiki | nothing. Plain markdown the model reads. This is db.md's lineage | the model curve, directly on the files. Also db.md's lineage |
 
-The fight db.md picks most directly is with vector RAG. db.md computes, stores,
-and searches no vector, ever. RAG engineers a retrieval pipeline over
+The fight db.md picks most directly is with vector RAG. **db.md computes,
+stores, and searches no vector, ever.** RAG engineers a retrieval pipeline over
 embeddings of your data; db.md keeps the data as files and lets the model read
 them, with semantic recall coming from the agent widening its own search in
-plain language. An embedding cannot tell you when a fact was true or whether
-something later replaced it. A dated file can. The clearest sign this is the
-right cut: Mem0's 2026 rewrite went append-only and bolted keyword and entity
-matching onto its vectors, moving onto ground db.md already stood on.
+plain language.
+
+An embedding cannot tell you when a fact was true or whether something later
+replaced it. A dated file can. The clearest sign this is the right cut: Mem0's
+2026 rewrite went append-only and bolted keyword and entity matching onto its
+vectors, moving onto ground db.md already stood on.
 
 ## Why files
 
@@ -173,14 +181,17 @@ Every command speaks `--json`, so anything you build on top reads it cleanly.
 db.md ships no model and no API keys. The curator is whatever agent you already
 use: Claude Code, Codex, or your own. The whole flow is four moves. It discovers
 db.md, runs `dbmd spec` for the contract, reads the store's `DB.md`, then
-operates with `dbmd`. The binary is deterministic plumbing. The agent does the
-thinking. You are never locked to a model, because the model is the one part you
-bring and the one part that keeps improving.
+operates with `dbmd`.
 
-The installer is text. Hand an agent the repo's [llms.txt](llms.txt) and it sets
-itself up by reading it and running the commands. To make your agent reach for
-db.md on every session, place a skill where it reads skills, in the open
-[Agent Skills](https://agentskills.io) format. The canonical file ships at
+The binary is deterministic plumbing. The agent does the thinking. You are
+never locked to a model, because the model is the one part you bring and the
+one part that keeps improving.
+
+The installer is text. Hand an agent the repo's [llms.txt](llms.txt) and it
+sets itself up by reading it and running the commands.
+
+To make your agent reach for db.md on every session, place a skill where it
+reads skills, in the open [Agent Skills](https://agentskills.io) format. The canonical file ships at
 [`skills/db-md/SKILL.md`](skills/db-md/SKILL.md), and its body just points at
 `dbmd spec`, so it cannot drift. There is no install command for this, on
 purpose. Copy the file, use your agent's own skill installer, or tell the agent
@@ -198,7 +209,7 @@ subcommands for read, write, validate, extract, graph, index, and log work.
   `pdfgrep`, no AGPL `rga`.
 - **Zero AI dependencies.** No provider SDKs, no API keys, no model calls in
   the binary. The agent runtime is yours.
-- **A library, not just a CLI.** All the logic lives in `dbmd-core`. Run `cargo
+- **A library underneath.** All the logic lives in `dbmd-core`. Run `cargo
   add dbmd-core` to build your own db.md-aware tool.
 
 See [TOOLS.md](TOOLS.md) for the full command surface and the agent bootstrap.
@@ -246,7 +257,7 @@ db.md is an open standard, and it stands on its own. A plain markdown vault
 becomes a db.md store, with no platform and no account required: Obsidian
 users, a researcher running a topic wiki, an agentic computer keeping a company
 brain, any agent runtime with a folder of markdown. The [spec](SPEC.md) is the
-contract. The runtime is replaceable. The files outlast both.
+contract. The runtime is replaceable. **The files outlast both.**
 
 ## License
 
