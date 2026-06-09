@@ -245,7 +245,7 @@ jobs:
           }
 
       - name: Upload target artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tarball-${{ matrix.target_name }}
           path: |
@@ -267,7 +267,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download all target artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: tarball-*
           path: incoming
@@ -310,7 +310,7 @@ jobs:
       # softprops/gh-release is the standard immutable-asset path; assets get
       # stable download URLs the install script's GitHub fallback reads.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: dbmd v${{ needs.version.outputs.version }}
@@ -320,11 +320,29 @@ jobs:
             release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz
             release/${{ needs.version.outputs.version }}/SHA256SUMS
 
-      - name: Attest build provenance for the release tarballs
-        # Signed SLSA provenance. Anyone can verify a downloaded tarball was
-        # built by this CI from this source:
-        #   gh attestation verify <tarball> --repo carloslfu/db.md
-        uses: actions/attest-build-provenance@v2
+      # Signed SLSA provenance. Anyone can verify a downloaded tarball was
+      # built by this CI from this source:
+      #   gh attestation verify <tarball> --repo carloslfu/db.md
+      # Sigstore's Rekor transparency log intermittently 404s on the
+      # read-after-write ("error fetching tlog entry"), which once cost three
+      # release attempts. Retry up to 3x; the last attempt is the hard gate, so
+      # every release still ships attested.
+      - name: Attest build provenance (attempt 1)
+        id: attest1
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
+      - name: Attest build provenance (attempt 2)
+        id: attest2
+        if: steps.attest1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
+      - name: Attest build provenance (attempt 3, final)
+        if: steps.attest1.outcome == 'failure' && steps.attest2.outcome == 'failure'
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
 
@@ -355,7 +373,7 @@ jobs:
       # token at runtime. No token is stored in the repo or in CI.
       - name: Authenticate to crates.io via OIDC (Trusted Publishing, no token)
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@v1.0.4
       - name: Publish dbmd-core then dbmd-cli (skip versions already on crates.io)
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
