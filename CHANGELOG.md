@@ -8,9 +8,54 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.4**.
+  `Cargo.toml`, currently **v0.3.5**.
 
 ## [Unreleased]
+
+## [0.3.5] — 2026-06-09
+
+A correctness-and-robustness release. An adversarial multi-agent review of the
+toolkit surfaced 27 confirmed defects (7 high, 11 medium, 9 low); all are fixed
+here, each guarded by a regression test that reconstructs the trigger and fails
+against the prior code. No behavior changes outside the named bugs.
+
+### Fixed
+
+- **`dbmd format` silently deleted universal frontmatter fields.** A
+  `type`/`id`/`summary`/`status` written as a bare YAML scalar that parses as a
+  number, bool, or null (e.g. `id: 100`, `summary: 2026`, `status: 0`) was
+  dropped on parse and erased on the next `format`, while `validate` reported
+  the file clean. The parser now coerces these to their string form the way
+  `validate`/`store`/`index` already do, so all surfaces agree and the field
+  round-trips.
+- **`validate --all` false-failed on a clean store.** Any `summary` containing
+  ` · ` (a middle dot) tripped a spurious `INDEX_SUMMARY_MISMATCH` (exit 6); the
+  index-entry summary is now matched against the renderer's real, double-spaced
+  `  ·  #tag` suffix instead of the first ` · `.
+- **Log month-rotation could duplicate entries.** A crash or I/O error between
+  the archive write and the active-file trim, followed by the natural retry,
+  permanently duplicated the prior month's entries. Rotation is now
+  crash/retry-idempotent.
+- **`dbmd extract` could be OOM-killed by a crafted spreadsheet.** A small
+  `.xlsx`/`.ods`/`.xlsb` declaring a huge sheet range forced an unbounded dense
+  allocation. The spreadsheet adapter now bounds it, returning a typed error on
+  untrusted `sources/` input.
+- **`--type` queries dropped records in non-canonical type-folders;** **`graph
+  backlinks --type` under-reported;** **structured `search` aborted on a single
+  stale sidecar entry;** **`rename` left a half-applied state on partial
+  failure** (now rolls back). Plus medium/low fixes across working-set and
+  post-rotation validation, the `graph neighborhood` traversal bound, write
+  TOCTOU, `write_atomic` temp-file cleanup, summary truncation on UTF-8
+  boundaries, and several CLI flag-placement / exit-code / help-text mismatches.
+
+### Changed
+
+- **Cross-module consistency.** A leading UTF-8 BOM is now tolerated uniformly
+  by the parser, validator, and graph frontmatter readers (previously only some
+  accepted it); `dbmd search` decodes matched lines lossily so a single invalid
+  UTF-8 byte can no longer abort a scan; and `dbmd graph neighborhood` routes
+  `--limit` (default 200) into the bounded traversal rather than only truncating
+  the printed result.
 
 ## [0.3.4] — 2026-06-09
 
