@@ -86,10 +86,10 @@ impl Query {
         // remember which predicates that reader has already satisfied so the
         // in-memory pass doesn't re-test them.
         let (candidates, type_done, where_done) = if let Some(type_) = &self.type_ {
-            // `find_by_type` reads the type's canonical sidecar (or, when that
-            // folder isn't indexed yet, the sidecars of just that type's layer —
-            // never the whole store); every record it returns already has the
-            // right `type`.
+            // `find_by_type` reads the sidecars of just that type's layer —
+            // never the whole store — and filters by `type`, so the result is
+            // complete across every folder the type is filed under within its
+            // layer; every record it returns already has the right `type`.
             (store.find_by_type(type_)?, true, 0)
         } else if let Some((key, value)) = self.wheres.first() {
             // No type to scope on: let the first `where` clause pick the

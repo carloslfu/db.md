@@ -19,6 +19,7 @@
 //! already declared in `cmd/mod.rs`.
 
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::path::{Component, Path, PathBuf};
 
 use dbmd_core::{summary, Frontmatter, Store};
@@ -69,8 +70,14 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     };
 
     // ── summary: explicit wins; else compose a deterministic default ─────────
+    // An explicit `--summary` is the agent's ceiling: collapse it to a single
+    // line (the `SUMMARY_MULTILINE` contract) but DO NOT truncate it — that
+    // matches `dbmd fm set` (which preserves the value verbatim) and lets the
+    // validator surface an over-long value as a `SUMMARY_TOO_LONG` warning
+    // rather than silently dropping the agent's trailing content. Only the
+    // composed deterministic floor is capped at `MAX_SUMMARY_LEN`.
     let summary_text = match &args.summary {
-        Some(s) => summary::normalize(s),
+        Some(s) => summary::collapse_whitespace(s),
         None => summary::compose_default(&store, &args.r#type, &fm, &body)?,
     };
     if is_content_type(&args.r#type) && summary_text.trim().is_empty() {
@@ -99,12 +106,31 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     enforce_frozen(&store, &resolved)?;
 
     // ── collision refusal (after the frozen-page gate) ───────────────────────
-    if abs.exists() {
-        return Err(collision_error(&store, &resolved));
-    }
+    // ATOMIC claim, not a TOCTOU pre-check. A bare `abs.exists()` test is racy:
+    // `write_file` finishes with an UNCONDITIONAL `fs::rename` over the
+    // destination (`fsx::write_atomic`), so two sanctioned concurrent writers
+    // (the spec allows many writers to `records/` via `dbmd write` + scripts)
+    // could both observe `exists()==false` and the second would silently
+    // clobber the first's primary content. Instead, atomically claim the path
+    // with `create_new` (which the OS resolves atomically against any other
+    // creator): the winner holds an empty sentinel that its own `write_atomic`
+    // rename replaces; every loser — concurrent creator OR an already-existing
+    // file — gets `AlreadyExists` and the structured `PATH_COLLISION` refusal.
+    claim_new_path(&abs).map_err(|kind| match kind {
+        ClaimError::Exists => collision_error(&store, &resolved),
+        ClaimError::Io(e) => {
+            CliError::runtime(format!("cannot create `{resolved_disp}`: {e}"))
+        }
+    })?;
 
     // ── write, then maintain the catalog write-through ───────────────────────
-    dbmd_core::parser::write_file(&abs, &fm, &body).map_err(core_err)?;
+    // If the real write fails after we claimed the path, remove the empty
+    // sentinel so a retry does not see a spurious `PATH_COLLISION` on a
+    // zero-byte stub (pre-fix, a failed write left nothing behind).
+    if let Err(e) = dbmd_core::parser::write_file(&abs, &fm, &body) {
+        let _ = std::fs::remove_file(&abs);
+        return Err(core_err(e));
+    }
     let index_warning = index_on_write(&store, &resolved);
     let policy_warning = ignored_type_derivation_warning(&store, &args.r#type, &fm);
 
@@ -377,6 +403,36 @@ fn collision_error(store: &Store, resolved: &Path) -> CliError {
     // it whether this is the same entity.
     CliError::new(ExitCode::Collision, "PATH_COLLISION", message)
         .with_hint("update the existing file (dbmd fm set), or write to a disambiguated path")
+}
+
+/// Why claiming a fresh write path failed.
+enum ClaimError {
+    /// The destination already exists (a prior file or a concurrent creator who
+    /// won the atomic create) → a `PATH_COLLISION` refusal.
+    Exists,
+    /// A genuine I/O error (permission, ENOSPC creating the parent, …).
+    Io(std::io::Error),
+}
+
+/// Atomically claim `abs` as a brand-new write target, closing the collision
+/// TOCTOU. `OpenOptions::create_new` is resolved atomically by the OS against
+/// every other creator, so exactly one of N racing `dbmd write`s for the same
+/// resolved path wins; the rest (and any pre-existing file) get
+/// [`ClaimError::Exists`]. The winner leaves an empty sentinel that its own
+/// `parser::write_file` (temp-file + `rename`) immediately replaces with the
+/// real content, so the claim adds no observable intermediate state on success.
+///
+/// The parent directory is created first (mirroring `fsx::write_atomic`, which
+/// also `create_dir_all`s) so the claim works for a fresh type-folder.
+fn claim_new_path(abs: &Path) -> Result<(), ClaimError> {
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(ClaimError::Io)?;
+    }
+    match OpenOptions::new().write(true).create_new(true).open(abs) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(ClaimError::Exists),
+        Err(e) => Err(ClaimError::Io(e)),
+    }
 }
 
 /// The refusal for a content file that has no usable summary (exit `1`). A

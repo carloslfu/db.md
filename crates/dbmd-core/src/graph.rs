@@ -32,12 +32,15 @@
 //!   canonical bare targets (its relationship view), where the lower-level
 //!   [`Store::find_links_to`] returns every `.md` the text appears in.
 //! - **Scoped** (`--type` / `--in`): the candidate set is enumerated from the
-//!   relevant type-folder `index.jsonl` sidecars — one sequential read per
-//!   type-folder (via [`crate::query::Query`], which sits on
-//!   [`Store::read_type_index`]) — and each candidate is confirmed by a
-//!   single-file parse. That is what makes `--type` / `--in` an *I/O* scope, not
-//!   just a result filter: a typed/layer-scoped `backlinks` reads only the
-//!   relevant folder(s)' sidecars and parses only those files.
+//!   relevant layer's `index.jsonl` sidecars — the sidecars of the one layer the
+//!   `--type` belongs to (via [`Store::sidecar_records`]), filtered to that type
+//!   — and each candidate is confirmed by a single-file parse. That is what makes
+//!   `--type` / `--in` an *I/O* scope, not just a result filter: a typed/layer-scoped
+//!   `backlinks` reads only the relevant layer's sidecars (O(entities-in-layer))
+//!   and parses only those files. A type's records can span several folders within
+//!   its layer (`wiki-page` under any `wiki/<topic>/`), so the read is layer-wide,
+//!   not a single canonical folder — otherwise off-canonical-folder linkers would
+//!   be silently dropped.
 //!
 //! **Why the scoped path confirms by parsing the candidate, not by trusting the
 //! sidecar's `links` field.** A sidecar record's `links` is the file's
@@ -61,8 +64,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 
 use crate::index::IndexRecord;
-use crate::query::Query;
-use crate::store::{Layer, Store, StoreError};
+use crate::store::{layer_for_type, Layer, Store, StoreError};
 
 /// Which edge directions a traversal follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,12 +132,14 @@ pub fn backlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreError>
 ///   it keeps the unscoped call inside the loop budget (the old per-candidate
 ///   confirm-read re-opened every file in the store → O(store)).
 /// - **Scoped** (`types` and/or `layer` set): the candidate set — the files that
-///   *might* link to `path` — is read from the relevant type-folder
-///   `index.jsonl` sidecars, so the call touches only the named folder(s):
-///   O(folder), the sanctioned loop cost. Each candidate is then confirmed by a
-///   single-file parse. When `types` lists several types, every named type's
-///   folder is read and the candidate sets unioned; a `layer` further restricts
-///   the candidate paths to that layer.
+///   *might* link to `path` — is read from the relevant layer's `index.jsonl`
+///   sidecars, so the call touches only the named layer(s): O(entities-in-layer),
+///   the sanctioned loop cost. Each candidate is then confirmed by a single-file
+///   parse. When `types` lists several types, the sidecars of each type's layer
+///   are read and the candidate sets unioned (filtered to the type), so a type
+///   whose records span multiple folders within its layer (e.g. `wiki-page` under
+///   any `wiki/<topic>/`) is fully covered; a `layer` further restricts the
+///   candidate paths to that layer.
 ///
 /// **Correctness (one edge set, both paths).** An incoming edge to X is exactly:
 /// some file whose [`forwardlinks`] contains X — a wiki-link in the body or in
@@ -243,13 +247,26 @@ pub fn forwardlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreErr
 /// The candidate set for an incoming-edge scan: the sidecar records that could
 /// link to the target, read from the type-folder `index.jsonl` sidecars (never
 /// a content-tree walk). `types`/`layer` narrow *which* sidecars are read — the
-/// I/O scope that keeps a typed/layer backlinks O(folder).
+/// I/O scope that keeps a typed/layer backlinks O(entities-in-layer).
 ///
-/// - `types` non-empty: read each type's folder sidecar (via [`Query`], which
-///   sits on [`Store::read_type_index`]), optionally layer-scoped, and union the
-///   records by path (a file appears once even if two type reads surface it).
+/// - `types` non-empty: for each type, read **the whole layer** the type belongs
+///   to ([`layer_for_type`] → [`Store::sidecar_records`]) and keep the records of
+///   that `type`, unioned by path across the requested types. A `layer` filter,
+///   when given, intersects with the type's own layer (a type lives in exactly
+///   one layer, so a mismatched `--in` simply yields no candidates).
 /// - `types` empty: every sidecar record under `layer` (or store-wide when
 ///   `None`) via [`Store::sidecar_records`].
+///
+/// **Why the whole layer, not just the type's canonical folder.** A `type` can
+/// legitimately span several folders within one layer — `wiki-page` is the
+/// canonical case (SPEC files it under `wiki/<topic>/` for an *arbitrary* topic:
+/// `wiki/topics/`, `wiki/people/`, `wiki/projects/`, …). Reading only the
+/// single canonical-guess folder (`wiki/topics/`) would silently drop every
+/// wiki-page filed elsewhere in the layer, so a scoped `backlinks --type
+/// wiki-page` would under-report dependents the moment that canonical folder
+/// exists — breaking the docstring's promise that the scoped edge set equals the
+/// unscoped one. Reading the type's full layer subtree and filtering by `type`
+/// is complete and still O(entities-in-layer), the sanctioned loop scope.
 fn candidate_records(
     store: &Store,
     types: &[String],
@@ -261,12 +278,21 @@ fn candidate_records(
     let mut by_path: std::collections::BTreeMap<PathBuf, IndexRecord> =
         std::collections::BTreeMap::new();
     for type_ in types {
-        let mut q = Query::new().with_type(type_);
-        if let Some(layer) = layer {
-            q = q.with_layer(layer);
+        // A type lives in exactly one layer; read that whole layer's sidecars so
+        // a record filed under a non-canonical folder of the same type (e.g. a
+        // `wiki-page` under `wiki/people/` rather than `wiki/topics/`) is still a
+        // candidate. An explicit `--in` layer that disagrees with the type's
+        // layer can never match the type, so skip the read entirely.
+        let type_layer = layer_for_type(type_);
+        if let Some(scope) = layer {
+            if scope != type_layer {
+                continue;
+            }
         }
-        for rec in q.execute(store)? {
-            by_path.insert(rec.path.clone(), rec);
+        for rec in store.sidecar_records(Some(type_layer))? {
+            if rec.type_ == *type_ {
+                by_path.insert(rec.path.clone(), rec);
+            }
         }
     }
     Ok(by_path.into_values().collect())
@@ -300,12 +326,45 @@ fn file_links_to(store: &Store, rel: &Path, target: &str) -> Result<bool, StoreE
 ///   filtering to `meeting`. (An empty `types` slice imposes no filter.)
 /// - Each node records the lowest hop count at which it is first reached (BFS
 ///   order); the seed is never included as a node.
+///
+/// Unbounded traversal: delegates to [`neighborhood_capped`] with no node cap, so
+/// it expands every reachable node within `hops`. For a densely-interlinked store
+/// this is one full-store backlinks scan **per reached node** (O(visited × store))
+/// — prefer [`neighborhood_capped`] with a `max_nodes` cap to bound that work.
 pub fn neighborhood(
     store: &Store,
     seed: &Path,
     hops: u32,
     types: &[String],
     direction: Direction,
+) -> Result<ContextSlice, StoreError> {
+    neighborhood_capped(store, seed, hops, types, direction, None)
+}
+
+/// [`neighborhood`] with a hard cap on how many nodes the BFS **traverses**.
+///
+/// `max_nodes` bounds the *traversal*, not just the result: each node the BFS
+/// expands triggers a per-node incoming-edge scan (an unscoped [`backlinks`] is a
+/// full-store ripgrep pass), so an uncapped neighborhood of a hub node costs
+/// O(visited × store). A post-hoc `.take(n)` on the returned nodes caps the
+/// *output* but not that work — the scans still run for every reached node. This
+/// cap stops discovering (and therefore stops scanning) once `max_nodes` distinct
+/// non-seed nodes have entered the BFS, so the expensive per-node scans are bounded
+/// to at most `max_nodes` of them. `None` is unbounded (the [`neighborhood`]
+/// behavior).
+///
+/// The cap is applied at *discovery* in BFS order, so the kept nodes are exactly
+/// the first `max_nodes` reached (closest-first by hop), and each still records its
+/// true minimum hop distance. Type-filtered (off-type) nodes count against the cap
+/// because the BFS must still traverse *through* them to reach deeper on-type
+/// nodes — the scan cost is paid when a node is expanded, on- or off-type alike.
+pub fn neighborhood_capped(
+    store: &Store,
+    seed: &Path,
+    hops: u32,
+    types: &[String],
+    direction: Direction,
+    max_nodes: Option<usize>,
 ) -> Result<ContextSlice, StoreError> {
     let seed_rel = PathBuf::from(normalize_target(seed));
     let type_filter: HashSet<&str> = types.iter().map(|s| s.as_str()).collect();
@@ -320,11 +379,21 @@ pub fn neighborhood(
     let mut frontier: VecDeque<PathBuf> = VecDeque::new();
     frontier.push_back(seed_rel.clone());
 
+    // Count of distinct non-seed nodes admitted to the BFS. Once it hits
+    // `max_nodes` we stop discovering new nodes, which stops enqueuing them, which
+    // stops the per-node full-store backlinks scan they would have triggered — the
+    // cap bounds the *traversal cost*, not only the printed result.
+    let mut admitted = 0usize;
+    let cap_reached = |admitted: usize| max_nodes.is_some_and(|cap| admitted >= cap);
+
     let mut hop = 0u32;
-    while hop < hops && !frontier.is_empty() {
+    while hop < hops && !frontier.is_empty() && !cap_reached(admitted) {
         hop += 1;
         let level_size = frontier.len();
         for _ in 0..level_size {
+            if cap_reached(admitted) {
+                break;
+            }
             let current = frontier.pop_front().expect("frontier non-empty");
 
             // Collect this node's edges in the requested direction(s). Each
@@ -342,9 +411,13 @@ pub fn neighborhood(
             }
 
             for (neighbor, dir) in edges {
+                if cap_reached(admitted) {
+                    break;
+                }
                 if !discovered.insert(neighbor.clone()) {
                     continue;
                 }
+                admitted += 1;
                 let (summary, type_) = read_summary_and_type(store, &neighbor);
                 let include = type_filter.is_empty()
                     || type_
@@ -681,6 +754,8 @@ fn read_summary_and_type(store: &Store, rel: &Path) -> (String, Option<String>) 
 /// `None` if the text has no leading frontmatter block. Local mirror of the
 /// parser's split so the graph module stays self-contained.
 fn frontmatter_block(text: &str) -> Option<&str> {
+    // Tolerate a single leading UTF-8 BOM, matching parser/store/index/validate.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;
@@ -1391,6 +1466,68 @@ mod tests {
         assert_eq!(paths(&records_only), vec!["records/meetings/m1"]);
     }
 
+    #[test]
+    fn backlinks_scoped_type_spans_all_topic_folders_in_its_layer() {
+        // REGRESSION (finding #12): a `type` can legitimately span several folders
+        // within one layer — `wiki-page` is filed under `wiki/<topic>/` for an
+        // arbitrary topic (SPEC). The scoped candidate set must read the whole
+        // `wiki/` layer and filter by type, NOT just the canonical-guess folder
+        // `wiki/topics/`. Before the fix, `find_by_type("wiki-page")` read ONLY
+        // `wiki/topics/index.jsonl` whenever that sidecar existed, silently
+        // dropping every wiki-page linker filed under any other topic folder — so
+        // `backlinks --type wiki-page` under-reported dependents (a wrong
+        // blast-radius check) the moment a `wiki/topics/` page also existed.
+        //
+        // The trigger needs BOTH: a populated `wiki/topics/` (so its canonical
+        // sidecar exists) AND a wiki-page elsewhere in the layer that links the
+        // target. The earlier
+        // `backlinks_scoped_candidates_come_from_the_sidecar_not_a_tree_walk` test
+        // masks this bug precisely because its fixture has no `wiki/topics/`.
+        let fx = Fixture::new();
+        fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
+        // A wiki-page in the CANONICAL topic folder, NOT linking the target — its
+        // only purpose is to make `wiki/topics/index.jsonl` exist on disk.
+        fx.write(
+            "wiki/topics/glossary.md",
+            "wiki-page",
+            "Glossary",
+            "No link to sarah here.",
+        );
+        // A wiki-page in a NON-canonical topic folder that DOES link the target.
+        fx.write(
+            "wiki/people/sarah.md",
+            "wiki-page",
+            "Sarah bio",
+            "Profile of [[records/contacts/sarah]].",
+        );
+        fx.reindex(); // builds wiki/topics/index.jsonl AND wiki/people/index.jsonl
+
+        // Scoped to `wiki-page`: the off-canonical linker MUST be found. Pre-fix,
+        // the candidate set was only `wiki/topics/`'s sidecar, so this was empty.
+        let scoped = backlinks_filtered(
+            &fx.store,
+            &fx.p("records/contacts/sarah.md"),
+            &["wiki-page".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            paths(&scoped),
+            vec!["wiki/people/sarah"],
+            "a wiki-page filed outside wiki/topics/ must still be a scoped backlink"
+        );
+
+        // Cross-check: the unscoped path (ripgrep tree scan) finds the same single
+        // linker, proving the scoped result is now complete — not over- or
+        // under-counting — and that the data was real all along.
+        let unscoped = backlinks(&fx.store, &fx.p("records/contacts/sarah.md")).unwrap();
+        assert_eq!(
+            paths(&unscoped),
+            vec!["wiki/people/sarah"],
+            "scoped and unscoped backlinks must agree on the edge set"
+        );
+    }
+
     // ── neighborhood ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1556,6 +1693,127 @@ mod tests {
         assert_eq!(slice.nodes[0].path, fx.p("records/meetings/m1"));
         assert_eq!(slice.nodes[0].type_.as_deref(), Some("meeting"));
         assert_eq!(slice.nodes[0].hops, 2);
+    }
+
+    #[test]
+    fn neighborhood_capped_bounds_traversal_not_just_output() {
+        // REGRESSION (finding #16): `neighborhood` expands every reached node, and
+        // each incoming-edge expansion is a full-store scan, so the per-node cost
+        // is O(visited × store). The CLI's `--limit` was applied post-hoc as a
+        // `.take(n)` on the RESULT, which caps printed nodes but NOT the traversal
+        // — the scans still fire for every reachable node. `neighborhood_capped`
+        // bounds the traversal itself: once `max_nodes` distinct nodes are
+        // admitted, the BFS stops discovering (and therefore stops scanning).
+        //
+        // Structure proving traversal — not just output — is bounded:
+        //   seed -> a, b, c   (hop 1, discovered in sorted order: a, b, c)
+        //   a    -> deep      (hop 2, reachable ONLY by expanding `a`)
+        // Cap at 2: admit `a` and `b`, stop before `c` and before any hop-2
+        // expansion. `deep` is therefore unreachable. A post-hoc `.take(2)` would
+        // have traversed the whole graph (reaching `deep`) and only then truncated
+        // — so the absence of `deep` is observable proof the traversal stopped.
+        let fx = Fixture::new();
+        fx.write(
+            "wiki/n/seed.md",
+            "wiki-page",
+            "Seed",
+            "[[wiki/n/a]] [[wiki/n/b]] [[wiki/n/c]]",
+        );
+        fx.write("wiki/n/a.md", "wiki-page", "A", "[[wiki/n/deep]]");
+        fx.write("wiki/n/b.md", "wiki-page", "B", "");
+        fx.write("wiki/n/c.md", "wiki-page", "C", "");
+        fx.write("wiki/n/deep.md", "wiki-page", "Deep", "");
+
+        // Uncapped over 3 hops: all four reachable nodes appear (a, b, c at hop 1,
+        // deep at hop 2) — the full set the cap is measured against.
+        let full =
+            neighborhood(&fx.store, &fx.p("wiki/n/seed.md"), 3, &[], Direction::Outgoing).unwrap();
+        assert_eq!(
+            paths(&full.nodes.iter().map(|n| n.path.clone()).collect::<Vec<_>>()),
+            vec!["wiki/n/a", "wiki/n/b", "wiki/n/c", "wiki/n/deep"],
+            "uncapped traversal reaches every node within the hop budget"
+        );
+
+        // Capped at 2 over the SAME hop budget: exactly the first two hop-1 nodes,
+        // and crucially NOT `deep` — the cap halted the BFS before any node was
+        // expanded into hop 2, so the deep node was never traversed to.
+        let capped = neighborhood_capped(
+            &fx.store,
+            &fx.p("wiki/n/seed.md"),
+            3,
+            &[],
+            Direction::Outgoing,
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(
+            paths(
+                &capped
+                    .nodes
+                    .iter()
+                    .map(|n| n.path.clone())
+                    .collect::<Vec<_>>()
+            ),
+            vec!["wiki/n/a", "wiki/n/b"],
+            "the cap bounds traversal: only the first 2 nodes are reached, and the \
+             hop-2 `deep` node (reachable only by expanding a capped-out node) is \
+             never traversed"
+        );
+
+        // `max_nodes = None` is exactly the unbounded `neighborhood` behavior.
+        let uncapped = neighborhood_capped(
+            &fx.store,
+            &fx.p("wiki/n/seed.md"),
+            3,
+            &[],
+            Direction::Outgoing,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            uncapped.nodes.len(),
+            full.nodes.len(),
+            "None cap matches the unbounded neighborhood result"
+        );
+    }
+
+    #[test]
+    fn neighborhood_capped_both_direction_caps_the_node_count() {
+        // The CLI always passes `Direction::Both` (the per-node backlinks scan is
+        // the expensive path the cap exists to bound). The cap gates discovery in
+        // any direction, so a hub linked from many nodes is still bounded.
+        let fx = Fixture::new();
+        fx.write("wiki/h/hub.md", "wiki-page", "Hub", "");
+        for n in ["a", "b", "c", "d", "e"] {
+            fx.write(
+                &format!("wiki/h/{n}.md"),
+                "wiki-page",
+                n,
+                "[[wiki/h/hub]]",
+            );
+        }
+        fx.reindex();
+
+        let capped = neighborhood_capped(
+            &fx.store,
+            &fx.p("wiki/h/hub.md"),
+            1,
+            &[],
+            Direction::Both,
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(
+            capped.nodes.len(),
+            3,
+            "Both-direction neighborhood is bounded to the node cap"
+        );
+
+        // Without the cap the same call returns all five backlinking nodes,
+        // proving the cap (not the data) limited the set.
+        let uncapped =
+            neighborhood(&fx.store, &fx.p("wiki/h/hub.md"), 1, &[], Direction::Both).unwrap();
+        assert_eq!(uncapped.nodes.len(), 5);
     }
 
     #[test]
@@ -1725,5 +1983,19 @@ mod tests {
     fn frontmatter_block_none_without_leading_fence() {
         let text = "no frontmatter here\n";
         assert_eq!(frontmatter_block(text), None);
+    }
+
+    #[test]
+    fn frontmatter_block_tolerates_leading_bom() {
+        // Regression (finding #19 cross-module): a UTF-8 BOM before the opening
+        // fence must not hide the frontmatter from the graph layer — otherwise a
+        // BOM-prefixed file the catalog indexes contributes no backlinks/edges.
+        // Pre-fix the `---\n` strip failed on the BOM and returned None.
+        let text = "\u{feff}---\ntype: contact\nsummary: hi\n---\nbody here\n";
+        assert_eq!(
+            frontmatter_block(text),
+            Some("type: contact\nsummary: hi\n"),
+            "a leading BOM must not hide frontmatter from the graph layer"
+        );
     }
 }

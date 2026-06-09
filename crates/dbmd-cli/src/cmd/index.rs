@@ -195,12 +195,14 @@ fn render_dry_run(store: &Store, scope: &RebuildScope) -> Result<String, CliErro
             )?);
         }
         RebuildScope::Layer(layer) => {
-            // The layer rollup plus each of its type-folders, so the preview
-            // matches what a layer-scoped write produces.
+            // The layer rollup plus each of its type-folders AND the root rollup,
+            // so the preview matches what a layer-scoped write produces (the write
+            // re-renders root from the now-current sidecars — see `rebuild_layer`).
             for tf in type_folders_in_layer(store, *layer) {
                 out.push_str(&Index::render_dry_run(store, &IndexLevel::TypeFolder(tf))?);
             }
             out.push_str(&Index::render_dry_run(store, &IndexLevel::Layer(*layer))?);
+            out.push_str(&Index::render_dry_run(store, &IndexLevel::Root)?);
         }
         RebuildScope::Full => {
             for layer in Layer::all() {
@@ -220,6 +222,13 @@ fn rebuild_layer(store: &Store, layer: Layer) -> Result<(), dbmd_core::Error> {
         Index::write_level(store, &IndexLevel::TypeFolder(tf))?;
     }
     Index::write_level(store, &IndexLevel::Layer(layer))?;
+    // The root `index.md` embeds per-folder `(n)` counts, per-layer totals, and a
+    // derived `updated:` rolled up from the folder sidecars. A `--layer` repair
+    // that changes a folder's record count would otherwise leave those stale —
+    // the exact root/folder desync `Index::rebuild_folder` was written to avoid
+    // (it cascades to root via `update_parents`). Re-render root from the
+    // now-current sidecars so the whole hierarchy stays consistent.
+    Index::write_level(store, &IndexLevel::Root)?;
     Ok(())
 }
 

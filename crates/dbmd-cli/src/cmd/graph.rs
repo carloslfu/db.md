@@ -80,6 +80,13 @@ pub fn run_forwardlinks(ctx: &Context, args: &GraphTargetArgs) -> CliResult {
     Ok(())
 }
 
+/// Default cap on how many nodes `graph neighborhood` traverses when the caller
+/// passes no `--limit`. Each expanded node triggers a full-store backlinks scan,
+/// so an uncapped neighborhood of a densely-linked hub is O(reached × store).
+/// This bound keeps the command from ever being unbounded while staying generous
+/// enough that ordinary context hydration returns in full.
+const DEFAULT_NEIGHBORHOOD_CAP: usize = 200;
+
 /// `dbmd graph neighborhood <seed>` — bounded BFS hydration: each reached node,
 /// its `summary`, and how it connects back toward the seed.
 pub fn run_neighborhood(ctx: &Context, args: &NeighborhoodArgs) -> CliResult {
@@ -90,18 +97,24 @@ pub fn run_neighborhood(ctx: &Context, args: &NeighborhoodArgs) -> CliResult {
     // union of incoming and outgoing edges. The `--in`/`--type` filters narrow
     // the *result*, not the edge direction.
     let types: Vec<String> = args.r#type.clone().into_iter().collect();
-    let slice = graph::neighborhood(
+    // Bound the BFS *traversal*, not just the printed result: route `--limit`
+    // (or the default cap) into `neighborhood_capped` so the expensive per-node
+    // full-store backlinks scans stop once the cap is reached. A post-hoc
+    // `.take()` would cap the output but still pay O(reached × store) in scans.
+    let cap = args.limit.unwrap_or(DEFAULT_NEIGHBORHOOD_CAP);
+    let slice = graph::neighborhood_capped(
         &store,
         Path::new(&args.seed),
         args.hops as u32,
         &types,
         Direction::Both,
+        Some(cap),
     )
     .map_err(dbmd_core::Error::from)?;
 
-    // Apply the layer filter (the core fn filters by type, not layer) and the
-    // presentation-only `--limit`, then format. Both are CLI-boundary shaping,
-    // not graph logic.
+    // Apply the layer filter (the core fn filters by type, not layer) and keep
+    // the output `.take()` so an explicit `--limit` still bounds the printed set
+    // exactly after the layer filter. Both are CLI-boundary shaping.
     let nodes: Vec<&dbmd_core::graph::ContextNode> = slice
         .nodes
         .iter()

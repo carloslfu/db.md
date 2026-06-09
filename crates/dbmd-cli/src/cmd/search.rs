@@ -33,7 +33,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use grep::regex::RegexMatcher;
-use grep::searcher::sinks::UTF8;
+use grep::searcher::sinks::Lossy;
 use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use ignore::WalkBuilder;
 
@@ -100,7 +100,12 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
         let scan = searcher.search_path(
             &matcher,
             &abs,
-            UTF8(|lineno, line| {
+            // `Lossy`, not `UTF8`: the matched line is decoded with U+FFFD
+            // substitution rather than erroring on the first invalid byte, so a
+            // single non-UTF-8 byte on a matched line can't abort the whole
+            // search (the `UTF8` sink would surface an io::Error → SEARCH_FAILED,
+            // discarding every match found so far). `rg` is lossy by default too.
+            Lossy(|lineno, line| {
                 matches.push(Match {
                     file: rel_str.clone(),
                     line: lineno,
@@ -114,6 +119,19 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
             }),
         );
         if let Err(e) = scan {
+            // A candidate that vanished from disk between resolution and scan is
+            // not a fatal error: `search_path` does `File::open` and surfaces a
+            // `NotFound` for it. The structured (`--type` / `--where`) candidate
+            // set comes verbatim from the type-folder `index.jsonl` sidecar,
+            // which is existence-unchecked, so a stale entry (a file removed
+            // out-of-band — `rm` / `git checkout` an older branch — without a
+            // re-`index`) would otherwise abort the whole search and discard
+            // every match collected so far. Mirror the all-content and link
+            // paths, which already tolerate missing files: skip the dead
+            // candidate and keep scanning the rest.
+            if e.kind() == io::ErrorKind::NotFound {
+                continue 'outer;
+            }
             return Err(CliError::new(
                 ExitCode::Runtime,
                 "SEARCH_FAILED",
@@ -570,7 +588,7 @@ fn is_content_file(rel: &Path) -> bool {
 }
 
 /// A searcher configured the way `rg` scans content: skip binary files, report
-/// line numbers (the [`UTF8`] sink requires them).
+/// line numbers (the [`Lossy`] sink requires them).
 fn build_searcher() -> Searcher {
     SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(b'\x00'))

@@ -2124,6 +2124,11 @@ fn is_content_file(rel: &Path) -> bool {
 /// must start at the very first line with `---` and end at the next `---`.
 /// Returns `None` if there's no leading frontmatter block.
 fn split_frontmatter(text: &str) -> Option<(String, String, u32)> {
+    // Tolerate a single leading UTF-8 BOM, matching parser/store/index (which
+    // already strip it). Without this, a BOM-prefixed file is read as having no
+    // frontmatter here while the catalog still indexes it — so validate would
+    // silently skip frontmatter checks on a file the rest of the toolkit sees.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.lines();
     let first = lines.next()?;
     if first.trim_end() != "---" {
@@ -2572,7 +2577,9 @@ fn parse_index_entries(text: &str) -> Vec<IndexEntry> {
 
 /// Pull the summary portion out of the text trailing an index entry's
 /// wiki-link: drop a leading `(N files)` count, then the `—`/`-` separator, then
-/// strip a trailing `· #tag` suffix.
+/// strip a trailing `  ·  #tag` suffix **only when it is a genuine tag block**
+/// (so a literal `·` inside the summary text is preserved, not mistaken for the
+/// renderer's tag separator).
 fn extract_index_entry_summary(after: &str) -> Option<String> {
     let mut s = after.trim();
     // Drop a leading "(N ...)" count segment, if present.
@@ -2592,12 +2599,36 @@ fn extract_index_entry_summary(after: &str) -> Option<String> {
     if s.is_empty() {
         return None;
     }
-    // Strip a trailing `  ·  #tag #tag` suffix.
-    let s = match s.split_once(" · ") {
-        Some((summary, _tags)) => summary.trim(),
-        None => s,
+    // Strip a trailing `  ·  #tag #tag` tag suffix — but ONLY when the segment
+    // after the `·` separator is a genuine tag block (whitespace-separated
+    // `#`-prefixed tokens), the exact shape the renderer emits
+    // (`crate::index::format_md_entry`: `  ·  #tag #tag`, dot omitted when there
+    // are no tags). A bare `·` inside the summary text itself (e.g. a free-text
+    // `Acme · Q2 renewal`) is NOT a tag separator and must be preserved, or the
+    // index-summary comparison spuriously reports `INDEX_SUMMARY_MISMATCH` on a
+    // clean store. Match from the right (`rsplit_once`) so only the real trailing
+    // tag block is considered, and accept either the renderer's double-spaced
+    // delimiter or a single-spaced one as long as the suffix is all tags.
+    let s = match s.rsplit_once(" · ") {
+        Some((summary, tags)) if is_tag_suffix(tags) => summary.trim(),
+        _ => s,
     };
     Some(s.to_string())
+}
+
+/// True if `s` is a non-empty tag block: one or more whitespace-separated tokens
+/// each starting with `#`, the exact shape the index renderer appends after the
+/// `·` separator (`crate::index::format_md_entry`). Used to distinguish the
+/// renderer's `  ·  #tag` suffix from a literal `·` inside the summary text.
+fn is_tag_suffix(s: &str) -> bool {
+    let mut any = false;
+    for tok in s.split_whitespace() {
+        if !tok.starts_with('#') || tok.len() < 2 {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// Parse a `log.md` entry header `## [YYYY-MM-DD HH:MM] <kind> | <object>`.
@@ -2636,72 +2667,131 @@ fn parse_log_header(line: &str) -> Option<(DateTime<FixedOffset>, String, Option
     Some((ts, kind, object))
 }
 
-/// The timestamp of the most recent `validate` entry across `log.md` (active)
-/// — the default working-set cutoff. Reads only headers; never the whole store.
+/// Every log file that holds entries for the working-set scan: the active
+/// `log.md` plus every `log/<YYYY-MM>.md` archive. [`Log::append`] rotates
+/// strictly-prior-month entries into the archives, so the active file alone is
+/// NOT the full timeline — both the last `validate` cutoff and a changed-but-
+/// unvalidated object can live in an archive after a month rollover. Reading the
+/// archives here keeps the working-set readers in sync with the rest of the log
+/// layer (`Log::since`/`Log::tail`), which deliberately cross archives, and
+/// prevents `dbmd validate` from silently skipping archived changed files. Reads
+/// only log headers, never the content store, so the loop budget is preserved.
+fn log_files_for_working_set(store: &Store) -> Vec<PathBuf> {
+    let mut files = vec![store.root.join("log.md")];
+    let archive_dir = store.root.join("log");
+    if let Ok(entries) = std::fs::read_dir(&archive_dir) {
+        let mut archives: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|s| s.to_str())
+                        .and_then(|n| n.strip_suffix(".md"))
+                        .is_some_and(is_year_month_archive)
+            })
+            .collect();
+        // Deterministic order (oldest month first); the callers fold across all
+        // files so order doesn't affect the result, but a stable order keeps the
+        // scan reproducible.
+        archives.sort();
+        files.extend(archives);
+    }
+    files
+}
+
+/// True if `s` looks like a `YYYY-MM` archive stem (4 digits, `-`, 2 digits) —
+/// the `log/<YYYY-MM>.md` naming the rotation in [`crate::log`] emits.
+fn is_year_month_archive(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+}
+
+/// The timestamp of the most recent `validate` entry across the active `log.md`
+/// **and** the `log/<YYYY-MM>.md` archives — the default working-set cutoff.
+/// Reads only headers; never the whole store. Archive-aware so a `validate`
+/// entry that rotated into an archive after a month rollover still anchors the
+/// cutoff (without this, the cutoff silently resets to `None`).
 fn last_validate_at(store: &Store) -> Option<DateTime<FixedOffset>> {
-    let text = std::fs::read_to_string(store.root.join("log.md")).ok()?;
     let mut latest: Option<DateTime<FixedOffset>> = None;
-    for line in text.lines() {
-        if !line.starts_with("## [") {
+    for file in log_files_for_working_set(store) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
-        }
-        if let Some((ts, kind, _)) = parse_log_header(line) {
-            if kind == "validate" {
-                latest = Some(match latest {
-                    Some(p) if p >= ts => p,
-                    _ => ts,
-                });
+        };
+        for line in text.lines() {
+            if !line.starts_with("## [") {
+                continue;
+            }
+            if let Some((ts, kind, _)) = parse_log_header(line) {
+                if kind == "validate" {
+                    latest = Some(match latest {
+                        Some(p) if p >= ts => p,
+                        _ => ts,
+                    });
+                }
             }
         }
     }
     latest
 }
 
-/// The set of content objects changed since `cutoff`, read from `log.md`
-/// entries whose kind mutates a file. When `cutoff` is `None`, every mutating
-/// entry counts (no prior validate window). Returns store-relative `.md` paths.
+/// The set of content objects changed since `cutoff`, read from log entries
+/// whose kind mutates a file. When `cutoff` is `None`, every mutating entry
+/// counts (no prior validate window). Returns store-relative `.md` paths.
+///
+/// Scans the active `log.md` **and** every `log/<YYYY-MM>.md` archive: after a
+/// month rollover [`Log::append`] rotates prior-month entries out of the active
+/// file, so an object changed-but-never-validated in a prior month lives only in
+/// an archive. Reading the archives here is what keeps `dbmd validate` from
+/// silently skipping those files. Reads only log headers, never the content
+/// store.
 fn changed_objects_since(
     store: &Store,
     cutoff: Option<DateTime<FixedOffset>>,
 ) -> BTreeSet<PathBuf> {
     let mut out = BTreeSet::new();
-    let Ok(text) = std::fs::read_to_string(store.root.join("log.md")) else {
-        return out;
-    };
-    for line in text.lines() {
-        if !line.starts_with("## [") {
-            continue;
-        }
-        let Some((ts, kind, object)) = parse_log_header(line) else {
+    for file in log_files_for_working_set(store) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
-        if let Some(c) = cutoff {
-            if ts < c {
+        for line in text.lines() {
+            if !line.starts_with("## [") {
                 continue;
             }
-        }
-        if !matches!(
-            kind.as_str(),
-            "create" | "update" | "ingest" | "rename" | "delete" | "link"
-        ) {
-            continue;
-        }
-        if let Some(obj) = object {
-            // The object slot is a store-relative path (or a wiki-link target).
-            let bare = obj
-                .trim()
-                .trim_start_matches("[[")
-                .trim_end_matches("]]")
-                .split('|')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_end_matches(".md")
-                .to_string();
-            if bare.is_empty() {
+            let Some((ts, kind, object)) = parse_log_header(line) else {
+                continue;
+            };
+            if let Some(c) = cutoff {
+                if ts < c {
+                    continue;
+                }
+            }
+            if !matches!(
+                kind.as_str(),
+                "create" | "update" | "ingest" | "rename" | "delete" | "link"
+            ) {
                 continue;
             }
-            out.insert(PathBuf::from(format!("{bare}.md")));
+            if let Some(obj) = object {
+                // The object slot is a store-relative path (or a wiki-link target).
+                let bare = obj
+                    .trim()
+                    .trim_start_matches("[[")
+                    .trim_end_matches("]]")
+                    .split('|')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches(".md")
+                    .to_string();
+                if bare.is_empty() {
+                    continue;
+                }
+                out.insert(PathBuf::from(format!("{bare}.md")));
+            }
         }
     }
     out
@@ -2960,6 +3050,24 @@ mod tests {
     use crate::parser::{Config, FieldSpec};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn split_frontmatter_tolerates_leading_bom() {
+        // Regression (finding #19 cross-module): a UTF-8 BOM before the opening
+        // fence must not make validate treat the file as frontmatter-less while
+        // the catalog indexes it. Pre-fix `first.trim_end() != "---"` was true
+        // for `\u{feff}---` and the function returned None.
+        let text = "\u{feff}---\ntype: contact\nsummary: hi\n---\nbody\n";
+        let parsed = split_frontmatter(text);
+        assert!(
+            parsed.is_some(),
+            "a leading BOM must not hide frontmatter from validate"
+        );
+        let (yaml, body, close_line) = parsed.unwrap();
+        assert_eq!(yaml, "type: contact\nsummary: hi\n");
+        assert_eq!(body, "body");
+        assert_eq!(close_line, 4, "BOM is inline on line 1, not a new line");
+    }
 
     /// A test store builder over a real tempdir. Every helper writes real files
     /// so the assertions exercise real behavior, not mocks.

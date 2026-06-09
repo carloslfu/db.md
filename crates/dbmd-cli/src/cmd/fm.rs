@@ -181,7 +181,11 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
     // default for this type and write it to `summary:`. An already-present
     // summary is only overwritten by an explicit `--summary`.
     if let Some(s) = &args.summary {
-        fm.summary = Some(summary::normalize(s));
+        // An explicit `--summary` is the agent's ceiling: collapse to a single
+        // line but never truncate (parity with `dbmd fm set`, which preserves
+        // the value verbatim). Over-length surfaces as a `SUMMARY_TOO_LONG`
+        // validate warning, not silent loss of the agent's trailing content.
+        fm.summary = Some(summary::collapse_whitespace(s));
     } else if fm.summary.as_deref().unwrap_or("").trim().is_empty() {
         let composed = summary::compose_default(&store, &type_, &fm, &body)?;
         fm.summary = Some(composed);
@@ -215,11 +219,52 @@ fn read_or_seed_raw_body(file: &Path) -> Result<(parser::Frontmatter, String), C
     match parser::read_file(file) {
         Ok(parsed) => Ok(parsed),
         Err(dbmd_core::ParseError::MissingFrontmatter { .. }) => {
+            // `MissingFrontmatter` covers TWO distinct shapes: a truly
+            // headerless file (no opening `---` fence) and a malformed file
+            // that OPENS a `---` fence but never closes it. Seeding a fresh
+            // frontmatter block is only correct for the first — for the second
+            // it would silently demote the operator's intended frontmatter keys
+            // into the body and inject a stray dangling `---`. Distinguish them
+            // by re-reading the raw text and inspecting the opening line the way
+            // `split_frontmatter` does; refuse the unterminated-fence case with
+            // a clear `FM_MALFORMED` error instead of corrupting its shape.
             let body = std::fs::read_to_string(file).map_err(CliError::from)?;
+            if opens_frontmatter_fence(&body) {
+                return Err(malformed_frontmatter_error(file));
+            }
             Ok((parser::Frontmatter::default(), body))
         }
         Err(e) => Err(CliError::from(dbmd_core::Error::from(e))),
     }
+}
+
+/// True when `text` opens with a `---` frontmatter fence on its first line —
+/// the exact test `parser::split_frontmatter` uses (the line, with any trailing
+/// CR/LF stripped, equals `---`, nothing before it, no BOM tolerance). A file
+/// that opens a fence but reached `read_or_seed_raw_body` did so because the
+/// fence was never closed, so this distinguishes an unterminated/malformed
+/// block from a genuinely headerless import.
+fn opens_frontmatter_fence(text: &str) -> bool {
+    let first = text.split_inclusive('\n').next().unwrap_or("");
+    first.trim_end_matches(['\r', '\n']) == "---"
+}
+
+/// The refusal for a file whose frontmatter block opens with `---` but never
+/// closes (exit 1). Seeding fresh frontmatter here would silently demote the
+/// operator's intended keys into the body and inject a dangling `---`, so we
+/// refuse and tell the agent how to make the intent explicit.
+fn malformed_frontmatter_error(file: &Path) -> CliError {
+    CliError::new(
+        ExitCode::Runtime,
+        "FM_MALFORMED",
+        format!(
+            "{} opens a `---` frontmatter fence that is never closed",
+            file.display()
+        ),
+    )
+    .with_hint(
+        "close the frontmatter block with a `---` line, or remove the opening `---` to import it as a raw body",
+    )
 }
 
 /// Split a `key=value` assignment at the first `=`. The value may itself contain

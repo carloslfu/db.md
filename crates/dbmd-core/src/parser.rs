@@ -149,12 +149,22 @@ impl Frontmatter {
                 None => format!("{k:?}"),
             };
             match key.as_str() {
-                "type" => fm.type_ = v.as_str().map(str::to_string),
-                "id" => fm.id = v.as_str().map(str::to_string),
+                // Coerce scalar values rather than `v.as_str()` (which is None
+                // for Number/Bool/Null). A bare scalar that YAML reads as a
+                // non-string — `summary: 2026`, `id: 100`, `status: 0` — would
+                // otherwise be set to None AND dropped (it is a matched arm, so
+                // the raw value never reaches `extra`), and `to_yaml` then omits
+                // the None field, so `dbmd format` (read_file -> write_file)
+                // silently deletes the line from disk. `scalar_string` mirrors
+                // the coercion `validate`/`store` already apply to these fields,
+                // so a numeric/bool-looking scalar is preserved as its string
+                // form and round-trips instead of being destroyed.
+                "type" => fm.type_ = scalar_string(&v),
+                "id" => fm.id = scalar_string(&v),
                 "created" => fm.created = parse_timestamp(&v, "created", file)?,
                 "updated" => fm.updated = parse_timestamp(&v, "updated", file)?,
-                "summary" => fm.summary = v.as_str().map(str::to_string),
-                "status" => fm.status = v.as_str().map(str::to_string),
+                "summary" => fm.summary = scalar_string(&v),
+                "status" => fm.status = scalar_string(&v),
                 "tags" => fm.tags = parse_tags(&v),
                 _ => {
                     fm.extra.insert(key, v);
@@ -562,6 +572,16 @@ pub struct ParsedFile {
 /// `---` on its own line at start and end. Returns
 /// [`ParseError::MissingFrontmatter`] if absent.
 pub fn split_frontmatter(text: &str, file: &Path) -> Result<ParsedFile, ParseError> {
+    // Tolerate a single leading UTF-8 BOM (U+FEFF) before the opening fence,
+    // matching `store::frontmatter_block` and `index::extract_frontmatter_block`
+    // which already strip it. Without this, a BOM-prefixed file (common from
+    // Windows / exported markdown dropped into `sources/`) gets walked and
+    // indexed by `dbmd index` yet hard-fails every write/edit surface that
+    // routes through `read_file` (`fm get/set`, `format`, `link`, `write`). The
+    // BOM is dropped from the emitted body so the canonical writer never carries
+    // it forward.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
     // The opening fence must be the very first line: `---` (optionally with a
     // trailing CR), no leading whitespace, nothing before it.
     let mut lines = text.split_inclusive('\n');
@@ -1056,6 +1076,23 @@ fn parse_rfc3339(s: &str, key: &str, file: &Path) -> Result<DateTime<FixedOffset
         key: key.to_string(),
         value: s.to_string(),
     })
+}
+
+/// Coerce a YAML scalar value to its string form for the universal-contract
+/// fields (`type`/`id`/`summary`/`status`). Mirrors `validate::scalar_string`
+/// and `store::yaml_scalar_string` so the four modules agree on one coercion
+/// rule: a bare numeric/bool scalar (`id: 100`, `summary: 2026`, `status: 0`)
+/// is preserved as its string form rather than being read as None and silently
+/// dropped on the next `to_yaml` re-emit. Returns `None` only for genuinely
+/// non-scalar values (sequences, mappings, null), which were never a valid
+/// shape for these fields.
+fn scalar_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 /// Read a `tags` value into a flat `Vec<String>`. Accepts a sequence of scalars
@@ -1790,6 +1827,98 @@ mod tests {
         assert!(!yaml.contains("status"));
         assert!(!yaml.contains("tags"));
         assert!(!yaml.contains("summary"));
+    }
+
+    // ── Regression: non-string scalar universal fields round-trip (finding #1) ─
+
+    #[test]
+    fn regression_parse_preserves_non_string_scalar_universal_fields() {
+        // A hand/externally-authored file whose universal fields are bare
+        // scalars YAML reads as Number/Bool — `id: 100`, `summary: 2026`,
+        // `status: 0`, `type: 42` — must be PRESERVED as their string form, not
+        // read as None. Before the fix, `v.as_str()` returned None for these and
+        // the matched arm discarded the value entirely (never reaching `extra`).
+        let yaml = "type: 42\nid: 100\nsummary: 2026\nstatus: 0";
+        let fm = Frontmatter::parse(yaml, Path::new("x.md")).unwrap();
+        assert_eq!(fm.type_.as_deref(), Some("42"), "type scalar dropped");
+        assert_eq!(fm.id.as_deref(), Some("100"), "id scalar dropped");
+        assert_eq!(fm.summary.as_deref(), Some("2026"), "summary scalar dropped");
+        assert_eq!(fm.status.as_deref(), Some("0"), "status scalar dropped");
+        // The values must surface through the public `get` accessor too.
+        assert_eq!(
+            fm.get("summary").and_then(|v| v.as_str().map(str::to_string)),
+            Some("2026".to_string())
+        );
+    }
+
+    #[test]
+    fn regression_format_round_trip_does_not_delete_numeric_frontmatter() {
+        // The exact finding-#1 trigger: `dbmd format` is read_file -> write_file.
+        // A file whose `id`/`summary`/`status` are bare numeric scalars must
+        // still carry those fields after the canonical re-emit. Before the fix,
+        // the lines were silently deleted from disk (only `type` survived).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("x.md");
+        let original = "---\ntype: contact\nid: 100\nsummary: 2026\nstatus: 0\n---\nbody\n";
+        std::fs::write(&path, original).unwrap();
+
+        // Re-emit through the canonical writer, exactly as `dbmd format` does.
+        let (fm, body) = read_file(&path).unwrap();
+        write_file(&path, &fm, &body).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        // None of the four fields may vanish; they survive as string scalars.
+        let reparsed = Frontmatter::parse(
+            &split_frontmatter(&after, &path).unwrap().frontmatter_yaml,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(reparsed.type_.as_deref(), Some("contact"));
+        assert_eq!(reparsed.id.as_deref(), Some("100"), "id deleted by format");
+        assert_eq!(
+            reparsed.summary.as_deref(),
+            Some("2026"),
+            "summary deleted by format"
+        );
+        assert_eq!(
+            reparsed.status.as_deref(),
+            Some("0"),
+            "status deleted by format"
+        );
+        // The body is preserved verbatim.
+        assert_eq!(body, "body\n");
+    }
+
+    // ── Regression: BOM-prefixed files parse like store/index (finding #19) ────
+
+    #[test]
+    fn regression_split_frontmatter_tolerates_leading_utf8_bom() {
+        // A BOM-prefixed file (EF BB BF + `---\n...`) is walked and indexed by
+        // `dbmd index` (store/index strip the BOM) but, before the fix, every
+        // write/edit surface routed through `read_file` hard-failed with
+        // MissingFrontmatter. `split_frontmatter` must now strip a single leading
+        // U+FEFF and emit a BOM-free body.
+        let text = "\u{feff}---\ntype: note\nsummary: x\n---\nbody\n";
+        let parsed = split_frontmatter(text, Path::new("note.md")).unwrap();
+        assert_eq!(parsed.frontmatter_yaml, "type: note\nsummary: x\n");
+        // Body never carries the BOM forward into the canonical writer.
+        assert_eq!(parsed.body, "body\n");
+        assert!(!parsed.body.starts_with('\u{feff}'));
+    }
+
+    #[test]
+    fn regression_read_file_parses_bom_prefixed_file() {
+        // End-to-end through the same `read_file` path `dbmd fm get/set`,
+        // `format`, `link`, and `write` use. Before the fix this returned
+        // Err(MissingFrontmatter) on a file the catalog had already indexed.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "\u{feff}---\ntype: note\nsummary: x\n---\nbody\n").unwrap();
+
+        let (fm, body) = read_file(&path).expect("BOM-prefixed file must parse");
+        assert_eq!(fm.type_.as_deref(), Some("note"));
+        assert_eq!(fm.summary.as_deref(), Some("x"));
+        assert_eq!(body, "body\n");
     }
 
     #[test]

@@ -89,16 +89,29 @@ pub fn compose_from_body(body: &str) -> String {
     first_paragraph(body).unwrap_or_default()
 }
 
-/// Normalize any candidate summary to the contract: collapse runs of
-/// whitespace (including newlines) to single spaces, trim, and truncate to
-/// [`MAX_SUMMARY_LEN`] **chars** (never splitting a UTF-8 codepoint). Every
-/// composer runs its output through this.
-pub fn normalize(candidate: &str) -> String {
+/// Collapse a candidate summary to the **single-line** half of the contract:
+/// runs of whitespace (including newlines) become single spaces and the result
+/// is trimmed — but the length is **not** truncated. This is what an explicit
+/// agent-supplied `--summary` is normalized through (`dbmd write`/`dbmd fm
+/// init`): it must satisfy `SUMMARY_MULTILINE` without losing the agent's
+/// content, matching the `dbmd fm set` path (which preserves the value
+/// verbatim) and the SPEC stance that the agent provides the ceiling. The
+/// validator surfaces an over-long value as a `SUMMARY_TOO_LONG` *warning*, not
+/// silent truncation.
+pub fn collapse_whitespace(candidate: &str) -> String {
     // `split_whitespace` collapses any run of ASCII/Unicode whitespace
     // (spaces, tabs, newlines) and trims leading/trailing — giving the
     // single-line, trimmed form in one pass.
-    let collapsed = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&collapsed, MAX_SUMMARY_LEN)
+    candidate.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Normalize a candidate summary to the full deterministic-**floor** contract:
+/// collapse whitespace (via [`collapse_whitespace`]) then truncate to
+/// [`MAX_SUMMARY_LEN`] **chars** (never splitting a UTF-8 codepoint). Used by
+/// [`compose_default`] for the tool-generated floor. Explicit agent summaries
+/// go through [`collapse_whitespace`] instead, so they are never silently cut.
+pub fn normalize(candidate: &str) -> String {
+    truncate_chars(&collapse_whitespace(candidate), MAX_SUMMARY_LEN)
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────
@@ -381,6 +394,38 @@ mod tests {
     #[test]
     fn normalize_leaves_short_strings_untouched() {
         assert_eq!(normalize("short"), "short");
+    }
+
+    // ── collapse_whitespace (explicit `--summary` path) ──────────────────────
+
+    #[test]
+    fn regression_collapse_whitespace_preserves_long_explicit_summary() {
+        // Finding #17: an explicit agent `--summary` longer than the 200-char
+        // floor must be collapsed to a single line but NOT truncated — the
+        // `normalize` floor would have silently dropped the tail. The trailing
+        // qualifier (the part a >200-char summary would lose) must survive.
+        let long = format!(
+            "Director of Operations at Northstar; renewal champion who drove the 175-seat expansion and {}",
+            "x".repeat(150)
+        );
+        assert!(long.chars().count() > MAX_SUMMARY_LEN);
+        let collapsed = collapse_whitespace(&long);
+        // No truncation: every char is preserved.
+        assert_eq!(collapsed.chars().count(), long.chars().count());
+        assert_eq!(collapsed, long);
+        // Pre-fix `normalize` would have cut this to exactly MAX_SUMMARY_LEN.
+        assert!(normalize(&long).chars().count() == MAX_SUMMARY_LEN);
+        assert_ne!(collapse_whitespace(&long), normalize(&long));
+    }
+
+    #[test]
+    fn collapse_whitespace_still_collapses_to_single_line() {
+        // The single-line `SUMMARY_MULTILINE` half of the contract still holds —
+        // newlines/tabs collapse and the value is trimmed, just never cut.
+        assert_eq!(
+            collapse_whitespace("  multi\nline\tsummary  "),
+            "multi line summary"
+        );
     }
 
     // ── summary_template rendering ───────────────────────────────────────────

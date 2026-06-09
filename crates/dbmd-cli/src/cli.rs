@@ -397,7 +397,10 @@ pub struct NeighborhoodArgs {
     #[arg(long, value_name = "LAYER")]
     pub r#in: Option<String>,
 
-    /// Cap the number of reached nodes.
+    /// Cap the number of reached nodes. Also bounds the BFS traversal work (the
+    /// per-node full-store backlinks scans), not just the printed result, and
+    /// defaults to 200 when unset so the command is never unbounded on a
+    /// densely-linked hub.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 
@@ -690,7 +693,8 @@ pub struct LogArgs {
 /// The `dbmd log` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum LogCommand {
-    /// Read the last N entries (default 20), newest first.
+    /// Read the last N entries (default 20), oldest→newest (chronological): the
+    /// last printed line is the most recent.
     Tail(LogTailArgs),
 
     /// Read entries newer than an RFC3339 timestamp (date-only is treated as
@@ -707,7 +711,8 @@ pub enum LogCommand {
 /// `dbmd log tail [N]`.
 #[derive(Debug, Args)]
 pub struct LogTailArgs {
-    /// How many entries to read (newest first).
+    /// How many entries to read. The returned window is the last N entries,
+    /// printed oldest→newest (chronological); the last line is the most recent.
     #[arg(value_name = "N", default_value_t = 20)]
     pub n: usize,
 

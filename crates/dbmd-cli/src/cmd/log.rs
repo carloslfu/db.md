@@ -9,7 +9,10 @@
 //! routes any first token that is not `tail`/`since`/`help` here). The body
 //! parses `<kind> <object> [-m|--message <note>]` out of those tokens — clap
 //! does NOT parse flags inside an external subcommand, so `-m` is captured
-//! verbatim in the vector.
+//! verbatim in the vector. For the same reason the global `--json` / `--color`
+//! flags are captured verbatim too when they trail the append form; the body
+//! recognizes and strips them so `dbmd log <kind> <object> --json` behaves like
+//! the flag-first `dbmd --json log <kind> <object>` clap parses elsewhere.
 //!
 //! Thin wrapper: parse args, build a `dbmd_core::log::LogEntry`, call
 //! `Log::{append,tail,since}`, format output (text or `--json`). The append
@@ -20,7 +23,7 @@ use std::path::Path;
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
 
 use crate::cli::{LogArgs, LogCommand, LogSinceArgs, LogTailArgs};
-use crate::context::Context;
+use crate::context::{ColorChoice, Context};
 use crate::error::{CliError, CliResult, ExitCode};
 
 use dbmd_core::{Log, LogEntry, LogKind, Store};
@@ -60,6 +63,15 @@ pub fn run_since(ctx: &Context, args: &LogSinceArgs) -> CliResult {
 /// months into `log/<YYYY-MM>.md`).
 pub fn run_append(ctx: &Context, tokens: &[String]) -> CliResult {
     let parsed = ParsedAppend::from_tokens(tokens)?;
+
+    // The append form is a clap `external_subcommand`, so the global `--json` /
+    // `--color` flags are NOT parsed by clap when they trail the form (the
+    // natural, every-other-subcommand-accepts-it habit). `from_tokens` strips
+    // them out of the token stream and reports them here; we fold them onto the
+    // inherited `ctx` so `dbmd log <kind> <object> -m … --json` behaves the same
+    // as the flag-first `dbmd --json log <kind> <object> -m …`.
+    let ctx = parsed.effective_context(ctx);
+    let ctx = &ctx;
 
     // The store root is not a flag on the append form (clap can't parse flags
     // inside an external subcommand), so the append form always operates on the
@@ -112,16 +124,42 @@ struct ParsedAppend {
     kind: String,
     object: String,
     note: Option<String>,
+    /// `--json` seen trailing/embedded in the append form (clap can't parse it
+    /// there). `None` ⇒ inherit `ctx.json`; `Some(true)` ⇒ force JSON.
+    json: Option<bool>,
+    /// `--color <when>` / `--color=<when>` seen trailing/embedded in the append
+    /// form. `None` ⇒ inherit `ctx.color`.
+    color: Option<ColorChoice>,
 }
 
 impl ParsedAppend {
+    /// Fold the global flags captured off the append token stream onto the
+    /// inherited `ctx`, yielding the [`Context`] the body should actually emit
+    /// with. Lets a trailing `--json` / `--color` on the append form behave the
+    /// same as the flag-first placement clap parses for every other subcommand.
+    fn effective_context(&self, ctx: &Context) -> Context {
+        Context {
+            json: self.json.unwrap_or(ctx.json),
+            color: self.color.unwrap_or(ctx.color),
+        }
+    }
+
     /// Split the raw external-subcommand tokens into `<kind> <object>` plus an
     /// optional `-m`/`--message` note. The two leading positionals are required;
     /// the note flag may appear before or after them. A `--message=<note>` /
     /// `-m<note>` joined form is also accepted.
+    ///
+    /// The global `--json` and `--color <when>` flags are recognized and stripped
+    /// here (not counted as positionals): clap routes the append form through an
+    /// `external_subcommand`, so these globals are captured verbatim when they
+    /// trail the form — the natural placement every other subcommand accepts. We
+    /// strip them, report them via `json`/`color`, and let the body fold them onto
+    /// the inherited context (see [`Self::effective_context`]).
     fn from_tokens(tokens: &[String]) -> Result<ParsedAppend, CliError> {
         let mut positionals: Vec<String> = Vec::new();
         let mut note: Option<String> = None;
+        let mut json: Option<bool> = None;
+        let mut color: Option<ColorChoice> = None;
 
         let mut i = 0;
         while i < tokens.len() {
@@ -147,6 +185,26 @@ impl ParsedAppend {
                     continue;
                 }
             }
+            // Strip the global `--json` flag wherever it lands on the append form.
+            if tok == "--json" {
+                json = Some(true);
+                i += 1;
+                continue;
+            }
+            // Strip the global `--color <when>` / `--color=<when>` flag.
+            if tok == "--color" {
+                let val = tokens.get(i + 1).ok_or_else(|| {
+                    usage_error("`--color` requires a value: auto, always, or never")
+                })?;
+                color = Some(parse_color(val)?);
+                i += 2;
+                continue;
+            }
+            if let Some(rest) = tok.strip_prefix("--color=") {
+                color = Some(parse_color(rest)?);
+                i += 1;
+                continue;
+            }
             positionals.push(tok.to_string());
             i += 1;
         }
@@ -166,7 +224,23 @@ impl ParsedAppend {
             kind: positionals[0].clone(),
             object: positionals[1].clone(),
             note,
+            json,
+            color,
         })
+    }
+}
+
+/// Parse a `--color` value (`auto` | `always` | `never`) captured off the append
+/// token stream. Mirrors clap's `value_enum` for [`ColorChoice`] so the trailing
+/// form matches the flag-first form exactly; an unknown value is a usage error.
+fn parse_color(value: &str) -> Result<ColorChoice, CliError> {
+    match value {
+        "auto" => Ok(ColorChoice::Auto),
+        "always" => Ok(ColorChoice::Always),
+        "never" => Ok(ColorChoice::Never),
+        other => Err(usage_error(&format!(
+            "invalid --color value {other:?}: expected auto, always, or never"
+        ))),
     }
 }
 

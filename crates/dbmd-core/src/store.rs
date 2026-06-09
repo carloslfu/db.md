@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, FixedOffset};
 use grep::regex::RegexMatcher;
-use grep::searcher::sinks::UTF8;
+use grep::searcher::sinks::Lossy;
 use grep::searcher::Searcher;
 use ignore::WalkBuilder;
 
@@ -443,10 +443,22 @@ impl Store {
             let abs = self.abs_path(&rel);
             let mut matched_here = false;
             let mut searcher = Searcher::new();
+            // `Lossy`, not `UTF8`: a `.md` file verbatim-ingested into
+            // `sources/` can carry a stray non-UTF-8 byte (e.g. a mis-decoded
+            // Latin-1 import). The `UTF8` sink runs `std::str::from_utf8` on
+            // each matched line and returns an `io::Error` on invalid bytes,
+            // which propagated out of `search_path` and aborted the *entire*
+            // store scan for every caller (`graph backlinks`, the working-set
+            // validate incoming-linker pass) — one bad byte on a single
+            // link-bearing line took the whole batch down. `Lossy` substitutes
+            // replacement characters instead of erroring; the closure ignores
+            // the line text entirely (presence is all we need), so the lossy
+            // conversion has no downside and the scan degrades to "still finds
+            // the link" rather than failing hard.
             let res = searcher.search_path(
                 &matcher,
                 &abs,
-                UTF8(|_lnum, _line| {
+                Lossy(|_lnum, _line| {
                     matched_here = true;
                     // Stop at the first hit: presence is all we need.
                     Ok(false)
@@ -465,35 +477,35 @@ impl Store {
         Ok(hits.into_iter().collect())
     }
 
-    /// Candidate set for a `type` query: read the relevant type-folder
-    /// `index.jsonl` sidecar(s) and return their records. Complete and
-    /// cold-cache-proof — NOT a walk-and-parse or a frontmatter ripgrep scan,
-    /// and **never a store-wide read**. The common path is one sequential read
-    /// of the canonical type-folder sidecar (O(entities)); when that sidecar is
-    /// absent the read is bounded to the type's single layer subtree
-    /// (O(entities-in-layer)), so a `--type proposal` query before that folder
-    /// has been indexed still stays inside the interactive loop's O(entities)
-    /// contract instead of fanning out across every sidecar in the store.
+    /// Candidate set for a `type` query: read every type-folder `index.jsonl`
+    /// sidecar in the type's single layer and return the records of that
+    /// `type`. Complete and cold-cache-proof — NOT a walk-and-parse or a
+    /// frontmatter ripgrep scan, and **never a store-wide read**.
+    ///
+    /// The read is bounded to the type's one layer subtree
+    /// (O(entities-in-layer)): a type lives in exactly one layer, and
+    /// `default_type_folder` always encodes it (recognized → its SPEC layer;
+    /// unrecognized → `records/`), so the walk never fans out across every
+    /// sidecar in the store and stays inside the interactive loop's
+    /// O(entities) contract.
+    ///
+    /// The whole-layer read — rather than reading only the type's canonical
+    /// folder sidecar when it happens to exist — is what makes the result
+    /// *complete*. A single `type` can legitimately be filed across several
+    /// folders within its layer: `wiki-page` under `wiki/<topic>/` for any
+    /// topic (SPEC), or a `contact` filed in `records/clients/` alongside the
+    /// canonical `records/contacts/`. The previous code read only the
+    /// canonical-guess sidecar whenever it was a file, which silently dropped
+    /// those non-canonical records the moment the canonical sidecar existed —
+    /// returning an incomplete set, and a *different* set as the store grew
+    /// (the omission flipped on once one canonical record was added). That
+    /// broke the dedup/enumeration premise this primitive backs and disagreed
+    /// with `find_by_where_in`, which already walks the whole layer. Filtering
+    /// the layer read by `type` keeps the result complete regardless of how the
+    /// type's records are foldered.
     pub fn find_by_type(&self, type_: &str) -> Result<Vec<IndexRecord>, StoreError> {
-        // Read the type's canonical-folder sidecar when it exists (the common,
-        // O(entities) path). Otherwise fall back to the sidecars of the *one
-        // layer* the type belongs to and filter by `type` — complete for records
-        // filed under a non-canonical folder name within that layer (e.g. a
-        // custom `proposal` filed in `records/proposals/` when the canonical
-        // guess is the bare `records/proposal/`), without the whole-store
-        // sidecar fan-out that would break the interactive loop's O(entities)
-        // contract. A type lives in exactly one layer, and `default_type_folder`
-        // always encodes it (recognized → its SPEC layer; unrecognized →
-        // `records/`), so the fallback walk is bounded to that layer's subtree —
-        // O(entities-in-layer), never O(store). Either way: sequential, complete
-        // sidecar reads, never a walk-and-parse of the tree.
         let canonical_folder = default_type_folder(type_);
-        let canonical = self.root.join(&canonical_folder).join(TYPE_INDEX_FILE);
-        let records = if canonical.is_file() {
-            self.read_type_index(&canonical)?
-        } else {
-            self.read_all_type_indexes_in(layer_of_folder(&canonical_folder))?
-        };
+        let records = self.read_all_type_indexes_in(layer_of_folder(&canonical_folder))?;
         Ok(records.into_iter().filter(|r| r.type_ == type_).collect())
     }
 
@@ -858,9 +870,9 @@ pub fn layer_for_type(type_: &str) -> Layer {
 
 /// The [`Layer`] a type-folder path lives in, read from its first component
 /// (`sources/` → `Sources`, `records/` → `Records`, `wiki/` → `Wiki`). Used to
-/// bound [`Store::find_by_type`]'s canonical-folder-absent fallback to a single
-/// layer subtree. Returns `None` for a path with no recognized layer prefix;
-/// every value [`default_type_folder`] produces has one, so in practice this is
+/// bound [`Store::find_by_type`]'s whole-layer sidecar read to a single layer
+/// subtree. Returns `None` for a path with no recognized layer prefix; every
+/// value [`default_type_folder`] produces has one, so in practice this is
 /// always `Some` on the call path — `None` degrades to a store-wide read.
 fn layer_of_folder(folder: &Path) -> Option<Layer> {
     let first = folder.components().next()?.as_os_str().to_str()?;
@@ -1812,6 +1824,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn regression_find_links_to_tolerates_invalid_utf8_on_a_matched_line() {
+        // Regression: the scan used the `UTF8` sink, which ran
+        // `std::str::from_utf8` on every matched line and returned an
+        // `io::Error` when a `.md` file carried a stray non-UTF-8 byte on the
+        // SAME line as a `[[target]]` link. That error propagated out and
+        // aborted the WHOLE store scan — `find_links_to` / `find_links_to_any`
+        // (and `graph backlinks` + the working-set validate incoming-linker
+        // pass) returned an error instead of the legitimate UTF-8 linkers.
+        // Verbatim-ingested `sources/` artifacts can carry such bytes, so this
+        // is reachable. The `Lossy` sink must let the scan still report the link.
+        let dir = empty_store();
+        let root = dir.path();
+        let target = "records/contacts/sarah-chen";
+
+        // A clean, fully-UTF-8 linker that MUST be returned regardless.
+        write(
+            root,
+            "wiki/people/clean.md",
+            &format!("---\ntype: wiki-page\nsummary: s\n---\nSee [[{target}]].\n"),
+        );
+
+        // A linker whose link line ALSO carries a stray 0xFF byte (a mis-decoded
+        // Latin-1 import). Write raw bytes so the invalid byte survives — a
+        // `&str` fixture could not express it. The byte-level regex still
+        // matches `[[target]]` on this line; pre-fix the UTF8 sink aborted here.
+        let mut bytes: Vec<u8> =
+            b"---\ntype: email\nsummary: s\n---\nSee [[records/contacts/sarah-chen]] \xFF here\n"
+                .to_vec();
+        let dirty_abs = root.join("sources/emails/2026/05/raw.md");
+        fs::create_dir_all(dirty_abs.parent().unwrap()).unwrap();
+        fs::write(&dirty_abs, &bytes).unwrap();
+        // Defensive: confirm the fixture really is invalid UTF-8 (so the test
+        // exercises the bug, not a coincidentally-valid file).
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "fixture must contain invalid UTF-8 to exercise the regression"
+        );
+        bytes.clear();
+
+        let store = open(&dir);
+        let got = rels(
+            &store
+                .find_links_to(Path::new(target))
+                .expect("a stray non-UTF-8 byte must not abort the backlink scan"),
+        );
+        assert_eq!(
+            got,
+            vec![
+                "sources/emails/2026/05/raw.md".to_string(),
+                "wiki/people/clean.md".to_string(),
+            ],
+            "both the clean linker and the one with an invalid byte on the link \
+             line are reported; the scan degrades, it does not fail"
+        );
+    }
+
     // ── find_links_to_any (batch — the O(changed × store) fix) ─────────────────
 
     /// The working-set validate's incoming-linker discovery runs through
@@ -2018,6 +2087,108 @@ mod tests {
         let names: Vec<_> = recs.iter().map(|r| r.summary.clone()).collect();
         assert_eq!(names, vec!["Elena".to_string(), "Sarah".to_string()]); // path-sorted
         assert!(recs.iter().all(|r| r.type_ == "contact"));
+    }
+
+    #[test]
+    fn regression_find_by_type_includes_non_canonical_folder_when_canonical_exists() {
+        // Regression for the silent-incompleteness bug: once the canonical
+        // type-folder sidecar exists, `find_by_type` used to read ONLY that
+        // sidecar and drop same-type records filed in a non-canonical folder in
+        // the SAME layer — so the result flipped to incomplete the moment a
+        // canonical record was added. The write path actively enables such a
+        // layout (`records/clients/` for a `contact`, `wiki/<topic>/` for any
+        // `wiki-page`), so this is a reachable, dedup-breaking omission.
+        let dir = empty_store();
+        let root = dir.path();
+
+        // CANONICAL folder sidecar exists (`records/contacts/` for `contact`),
+        // which is exactly the condition that triggered the bug.
+        write(
+            root,
+            "records/contacts/index.jsonl",
+            &jsonl_line("records/contacts/sarah.md", "contact", "Sarah", ""),
+        );
+        // A `contact` filed in a NON-canonical folder within the same (Records)
+        // layer. Pre-fix this was silently dropped because the canonical
+        // sidecar existed; it must now come back.
+        write(
+            root,
+            "records/clients/index.jsonl",
+            &jsonl_line("records/clients/elena.md", "contact", "Elena", ""),
+        );
+        // A different type in the same layer must NOT leak in (proves the read
+        // is type-filtered, not just a blind whole-layer dump).
+        write(
+            root,
+            "records/companies/index.jsonl",
+            &jsonl_line("records/companies/acme.md", "company", "Acme", ""),
+        );
+
+        let store = open(&dir);
+        let got: std::collections::BTreeSet<String> = store
+            .find_by_type("contact")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            ["records/clients/elena.md", "records/contacts/sarah.md"]
+                .into_iter()
+                .map(String::from)
+                .collect::<std::collections::BTreeSet<_>>(),
+            "both the canonical-folder and the non-canonical-folder contact must \
+             be returned; the company record must be excluded"
+        );
+    }
+
+    #[test]
+    fn regression_find_by_type_wiki_page_spans_multiple_topic_folders() {
+        // Regression for the scoped-backlinks variant of the same bug
+        // (`graph backlinks --type wiki-page`): `wiki-page`'s canonical folder
+        // is `wiki/topics`, but the SPEC files wiki pages under `wiki/<topic>/`
+        // for ANY topic. With a `wiki/topics/index.jsonl` present, the old code
+        // read only that folder and dropped pages in `wiki/people/`,
+        // `wiki/projects/`, etc. — under-reporting dependents in a blast-radius
+        // check. The whole-`wiki/`-layer read must surface all of them.
+        let dir = empty_store();
+        let root = dir.path();
+        write(
+            root,
+            "wiki/topics/index.jsonl",
+            &jsonl_line("wiki/topics/billing.md", "wiki-page", "Billing", ""),
+        );
+        write(
+            root,
+            "wiki/people/index.jsonl",
+            &jsonl_line("wiki/people/sarah-chen.md", "wiki-page", "Sarah Chen", ""),
+        );
+        write(
+            root,
+            "wiki/projects/index.jsonl",
+            &jsonl_line("wiki/projects/atlas.md", "wiki-page", "Atlas", ""),
+        );
+
+        let store = open(&dir);
+        let got: std::collections::BTreeSet<String> = store
+            .find_by_type("wiki-page")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "wiki/people/sarah-chen.md",
+                "wiki/projects/atlas.md",
+                "wiki/topics/billing.md",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>(),
+            "a wiki-page query must return pages from every topic folder, not \
+             just the canonical wiki/topics/"
+        );
     }
 
     #[test]

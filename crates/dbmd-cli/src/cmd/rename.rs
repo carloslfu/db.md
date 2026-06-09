@@ -2,9 +2,20 @@
 //!
 //! Thin wrapper target: parse [`RenameArgs`], enforce the `DB.md` frozen-page
 //! policy, find every incoming link via `Store::find_links_to` (embedded
-//! ripgrep), move the file and rewrite all linkers atomically, then update both
-//! affected type-folder indexes write-through (`dbmd_core::index::on_rename`).
-//! Report the rewrite count (text or `--json`).
+//! ripgrep), rewrite every linker first, move the file only once every rewrite
+//! has succeeded, then update both affected type-folder indexes write-through
+//! (`dbmd_core::index::on_rename`). Report the rewrite count (text or `--json`).
+//!
+//! **Failure ordering (no half-renamed store).** The file move is the *last*
+//! disk mutation, performed only after every linker rewrite committed. So a
+//! rewrite that fails (a non-UTF8 linker, a transient I/O error) leaves the
+//! source file in place at `<old>` and every linker still pointing at `<old>` —
+//! a self-consistent store, never a moved-file-with-dangling-links half-state.
+//! This is not a transaction (no rollback of the linkers already rewritten when
+//! a *later* linker fails), but it is **monotone toward consistency**: the only
+//! linkers changed before an abort already point at the surviving `<old>` file,
+//! and `dbmd index rebuild` reconciles the catalog. A single non-UTF8 linker is
+//! skipped (counted as a warning) rather than aborting the whole rename.
 //!
 //! Wiki-links are full store-relative paths, so an incoming reference to `<old>`
 //! is the literal text `[[<old>]]` (optionally `|display`, optionally a trailing
@@ -30,11 +41,13 @@ use crate::error::{CliError, CliResult, ExitCode};
 /// Steps: (1) open the store; (2) refuse if `<old>` (the moved file) or `<new>`
 /// (the destination) is a frozen page; (3) refuse if `<old>` is missing or
 /// `<new>` already exists; (4) find every incoming linker (embedded ripgrep);
-/// (5) move the file, then rewrite each linker's `[[old]]` → `[[new]]`;
-/// (6) update the moved file's old + new type-folder indexes write-through, then
-/// refresh the index entry of every rewritten linker (its indexed frontmatter
-/// changed), so the loop path stays byte-identical to a full `index rebuild`;
-/// (7) report the rewrite count.
+/// (5) rewrite each linker's `[[old]]` → `[[new]]` *while the file still sits at
+/// `<old>`*, then move the file last (so a rewrite failure leaves the source in
+/// place and the store self-consistent, never half-renamed); (6) update the
+/// moved file's old + new type-folder indexes write-through, then refresh the
+/// index entry of every rewritten linker (its indexed frontmatter changed), so
+/// the loop path stays byte-identical to a full `index rebuild`; (7) report the
+/// rewrite count.
 pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     let store = open_store(&args.dir)?;
 
@@ -63,7 +76,68 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     // what ripgrep matches). Embedded ripgrep, loop-fast — no whole-store parse.
     let linkers = store.find_links_to(&old_rel).map_err(core_err)?;
 
-    // Move the file: create the destination's parent, then rename.
+    // ── Rewrite every linker FIRST, while the file still lives at `<old>` ─────
+    // The move is deferred to AFTER this loop. If a rewrite fails (a non-UTF8
+    // linker, a transient I/O error), the source file is still at `<old>` and
+    // every linker still references the *existing* `<old>` file — a
+    // self-consistent store, not a moved-file-with-dangling-links half-state.
+    //
+    // The moved file may itself carry a self-link `[[old]]`. It is still at
+    // `<old>` here, so its self-link is rewritten to `[[new]]` in place; the
+    // deferred move then carries the rewritten file to `<new>`. We track the
+    // self-link separately so it is NOT double-counted with `on_rename` below.
+    //
+    // Track the *post-move* store-relative path of every OTHER rewritten linker:
+    // their indexed frontmatter (e.g. a meeting's `attendees: [[old]]`) just
+    // changed on disk, so their `index.jsonl`/`index.md` entries must be
+    // refreshed write-through too — otherwise the loop path drifts from a full
+    // `index rebuild` (which re-reads the rewritten files). A linker that fails
+    // to read as UTF-8 is *skipped* (surfaced as a warning) rather than aborting
+    // the whole rename: ripgrep's byte-level matcher can report a file whose
+    // valid ASCII link line lives beside a stray non-UTF8 byte, and one such
+    // externally-dropped source must not break a rename of an unrelated file.
+    let mut rewritten = 0usize;
+    let mut rewritten_linkers: Vec<PathBuf> = Vec::new();
+    let mut skip_warnings: Vec<String> = Vec::new();
+    for linker_rel in &linkers {
+        // The linker is rewritten at its CURRENT path (`<old>` for a self-link),
+        // because the move has not happened yet.
+        let linker_abs = store.abs_path(linker_rel);
+        match rewrite_links_in_file(&linker_abs, &old_rel, &new_rel) {
+            Ok(true) => {
+                rewritten += 1;
+                // The self-link (the moved file itself) is handled by
+                // `on_rename` below — do not queue it as an `on_write` too.
+                // A derived index artifact (`index.md` / `index.jsonl`) can
+                // legitimately contain `[[old]]` and gets its link text
+                // rewritten in place above, but it must NEVER be re-indexed *as
+                // content* — `Index::on_write` would catalog the index file as a
+                // row in its own type-folder. The catalog owns those files;
+                // `on_rename` / `on_write` already keep them current.
+                if linker_rel != &old_rel && !is_index_artifact(linker_rel) {
+                    rewritten_linkers.push(linker_rel.clone());
+                }
+            }
+            Ok(false) => {}
+            Err(RewriteError::NotUtf8) => {
+                // A non-UTF8 linker: skip it, surface a warning, keep going.
+                // The rename still completes; this one stray file keeps its
+                // `[[old]]` text and a `dbmd validate` flags the dangling link.
+                skip_warnings.push(format!(
+                    "skipped non-UTF8 linker {} (its `[[{}]]` link was not rewritten)",
+                    path_to_unix(linker_rel),
+                    path_to_unix(&old_rel)
+                ));
+            }
+            // A real I/O failure (not a UTF-8 issue) aborts BEFORE the move, so
+            // the source survives at `<old>` and the store stays consistent.
+            Err(RewriteError::Io(e)) => return Err(e),
+        }
+    }
+
+    // ── Move the file LAST, only after every rewrite committed ───────────────
+    // Create the destination's parent, then rename. Reaching here means no
+    // linker rewrite hard-failed, so the move cannot strand a dangling link.
     if let Some(parent) = new_abs.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CliError::runtime(format!("cannot create destination folder: {e}")))?;
@@ -71,48 +145,23 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     std::fs::rename(&old_abs, &new_abs)
         .map_err(|e| CliError::runtime(format!("cannot move file: {e}")))?;
 
-    // Rewrite every incoming link. The moved file may itself contain a
-    // self-link; it now lives at `<new>`, so include it in the rewrite set.
-    // Track the *post-move* store-relative path of every linker we actually
-    // rewrote: their indexed frontmatter (e.g. a meeting's `attendees:
-    // [[old]]`) just changed on disk, so their `index.jsonl`/`index.md`
-    // entries must be refreshed write-through too — otherwise the loop path
-    // drifts from a full `index rebuild` (which re-reads the rewritten files).
-    let mut rewritten = 0usize;
-    let mut rewritten_linkers: Vec<PathBuf> = Vec::new();
-    for linker_rel in &linkers {
-        // A linker that WAS the old file is now at the new path.
-        let linker_rel_now = if linker_rel == &old_rel {
-            new_rel.clone()
-        } else {
-            linker_rel.clone()
-        };
-        let linker_abs = store.abs_path(&linker_rel_now);
-        if rewrite_links_in_file(&linker_abs, &old_rel, &new_rel)? {
-            rewritten += 1;
-            // A derived index artifact (`index.md` / `index.jsonl`) can legitimately
-            // contain `[[old]]` and gets its link text rewritten in place above, but
-            // it must NEVER be re-indexed *as content* — `Index::on_write` would
-            // catalog the index file as a row in its own type-folder. The catalog
-            // owns those files; `on_rename` / `on_write` already keep them current.
-            if !is_index_artifact(&linker_rel_now) {
-                rewritten_linkers.push(linker_rel_now);
-            }
-        }
-    }
-
     // Keep both affected type-folder indexes current write-through (the moved
     // file's old + new folders).
     let mut index_warning = index_on_rename(&store, &old_rel, &new_rel);
 
+    // Surface any skipped non-UTF8 linkers as a (non-fatal) warning, preferring
+    // an index warning if one already exists so the most actionable line shows.
+    if let Some(w) = skip_warnings.into_iter().next() {
+        index_warning.get_or_insert(w);
+    }
+
     // Refresh the index entry of every *other* rewritten linker so its indexed
     // frontmatter reflects the rewritten link. The moved file itself is already
-    // handled by `on_rename`; a linker outside any type-folder simply has no
-    // entry to refresh (non-fatal, same doctrine as every index write-through).
+    // excluded from `rewritten_linkers` (it is handled by `on_rename`); each
+    // remaining linker never moved, so its store-relative path is unchanged by
+    // the rename. A linker outside any type-folder simply has no entry to refresh
+    // (non-fatal, same doctrine as every index write-through).
     for linker in &rewritten_linkers {
-        if linker == &new_rel {
-            continue;
-        }
         if let Some(w) = index_on_write(&store, linker) {
             index_warning.get_or_insert(w);
         }
@@ -128,20 +177,60 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     Ok(())
 }
 
+/// Outcome of a single linker rewrite that the caller must distinguish.
+///
+/// A non-UTF8 linker is *recoverable* — the rename skips it and warns — so it is
+/// a distinct variant from a genuine I/O failure (which aborts the rename before
+/// the file move, leaving the store self-consistent). Modeling the two kinds
+/// separately is what lets the loop in [`run`] not abort the whole rename on a
+/// stray non-UTF8 byte that ripgrep matched but `read_to_string` rejects.
+#[derive(Debug)]
+enum RewriteError {
+    /// The linker is not valid UTF-8 (`io::ErrorKind::InvalidData` from
+    /// `read_to_string`). Recoverable: skip the file, do not abort the rename.
+    NotUtf8,
+    /// A genuine I/O failure (permissions, removed file, write error). Fatal to
+    /// the rename — but it aborts *before* the file move, so the store stays
+    /// consistent.
+    Io(CliError),
+}
+
 /// Rewrite every `[[old]]` wiki-link in a file to `[[new]]`, delegating the
 /// link grammar to [`dbmd_core::graph::rewrite_links_to`] — the write-side twin
 /// of the core's backlink parser, so the rewrite recognizes exactly the edges
-/// `Store::find_links_to` reported. Returns `true` if the file changed. Reads +
-/// writes the raw bytes (not the parser round-trip) so a link inside
-/// frontmatter or body is rewritten uniformly and nothing else is reflowed.
-fn rewrite_links_in_file(abs: &Path, old_rel: &Path, new_rel: &Path) -> Result<bool, CliError> {
-    let text = std::fs::read_to_string(abs)
-        .map_err(|e| CliError::runtime(format!("cannot read linker {}: {e}", abs.display())))?;
+/// `Store::find_links_to` reported. Returns `Ok(true)` if the file changed,
+/// `Ok(false)` for a no-op. Reads + writes the raw bytes (not the parser
+/// round-trip) so a link inside frontmatter or body is rewritten uniformly and
+/// nothing else is reflowed.
+///
+/// A read that fails because the bytes are not UTF-8 returns
+/// [`RewriteError::NotUtf8`] (recoverable — the caller skips this linker) rather
+/// than a fatal error: `find_links_to`'s byte-level ripgrep matcher can report a
+/// file whose valid ASCII `[[old]]` line sits beside a stray non-UTF8 byte, and
+/// one such externally-dropped source must not abort an otherwise-clean rename.
+/// Every other read/write failure is a genuine [`RewriteError::Io`].
+fn rewrite_links_in_file(
+    abs: &Path,
+    old_rel: &Path,
+    new_rel: &Path,
+) -> Result<bool, RewriteError> {
+    let text = match std::fs::read_to_string(abs) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(RewriteError::NotUtf8);
+        }
+        Err(e) => {
+            return Err(RewriteError::Io(CliError::runtime(format!(
+                "cannot read linker {}: {e}",
+                abs.display()
+            ))));
+        }
+    };
     let rewritten = dbmd_core::graph::rewrite_links_to(&text, old_rel, new_rel);
     if rewritten == text {
         return Ok(false);
     }
-    write_atomic(abs, &rewritten)?;
+    write_atomic(abs, &rewritten).map_err(RewriteError::Io)?;
     Ok(true)
 }
 

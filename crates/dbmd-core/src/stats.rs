@@ -213,14 +213,33 @@ fn wiki_link_regex() -> Regex {
 
 /// Every wiki-link target in a file's full text (frontmatter + body), trimmed,
 /// with any trailing `.md` removed. Order-preserving; not deduped.
+///
+/// Fenced code blocks (```/~~~) are skipped, mirroring
+/// `validate::extract_wiki_links`: a `[[...]]` that lives only inside a code
+/// fence is illustrative syntax in a doc, not a graph edge, so stats must not
+/// count it as broken or use it to un-orphan a file. (Frontmatter never carries
+/// code fences, so this scan stays line-based over the whole file without
+/// dropping the frontmatter links stats deliberately counts as edges.)
 fn extract_link_targets(text: &str, re: &Regex) -> Vec<PathBuf> {
-    re.captures_iter(text)
-        .filter_map(|c| c.get(1))
-        .map(|m| {
-            let raw = m.as_str().trim();
-            strip_md(Path::new(raw))
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        for cap in re.captures_iter(line) {
+            if let Some(m) = cap.get(1) {
+                let raw = m.as_str().trim();
+                out.push(strip_md(Path::new(raw)));
+            }
+        }
+    }
+    out
 }
 
 /// Drop a trailing `.md` from a path, leaving everything else intact.
@@ -232,11 +251,25 @@ fn strip_md(path: &Path) -> PathBuf {
     }
 }
 
-/// True if a wiki-link target is a full store-relative path (contains a path
-/// separator). Short-form targets like `sarah-chen` are false. Doctrine: only
-/// full paths resolve to a node.
+/// True if a wiki-link target is a full store-relative path: it has a path
+/// separator AND its first segment is a recognized layer (`sources`/`records`/
+/// `wiki`) with a non-empty remainder. Short-form targets like `sarah-chen`
+/// are false, and so are non-layer multi-segment targets like
+/// `contacts/sarah-chen` (a missing layer prefix). Doctrine: only true
+/// store-relative paths resolve to a node.
+///
+/// This mirrors `validate::is_full_store_path` so `stats.broken_link_count`
+/// agrees with `validate`'s `WIKI_LINK_BROKEN` total: a non-layer target like
+/// `[[contacts/sarah]]` is a short-form error in `validate` (never broken), and
+/// must likewise be excluded here rather than counted as a broken edge.
 fn is_full_path(target: &Path) -> bool {
-    target.components().count() > 1
+    let mut parts = target.components();
+    let first = match parts.next() {
+        Some(std::path::Component::Normal(s)) => s.to_string_lossy(),
+        _ => return false,
+    };
+    let has_rest = parts.next().is_some();
+    matches!(first.as_ref(), "sources" | "records" | "wiki") && has_rest
 }
 
 /// Read the `type:` value from a file's leading YAML frontmatter block, if the
@@ -650,6 +683,67 @@ mod tests {
         let s = compute(&store).expect("compute");
         assert_eq!(s.broken_link_count, 0, "markdown links aren't graph edges");
         assert_eq!(s.orphan_count, 1, "the file has no wiki-links => orphan");
+    }
+
+    #[test]
+    fn regression_non_layer_multi_segment_link_is_not_broken() {
+        // Finding #20: a target like `[[contacts/sarah-chen]]` omits the layer
+        // prefix. It has a `/` but its first segment (`contacts`) is not a
+        // recognized layer, so it's a short-form error in `validate`, NOT a
+        // broken link. stats must agree: it counts neither as broken nor as an
+        // outgoing edge. Pre-fix `is_full_path` (components().count() > 1)
+        // accepted it and reported broken_link_count = 1.
+        let (_d, store) = temp_store();
+        write_rel(
+            &store,
+            "records/contacts/a.md",
+            "---\ntype: contact\nsummary: a\n---\n\nSee [[contacts/sarah-chen]].\n",
+        );
+        let s = compute(&store).expect("compute");
+        assert_eq!(
+            s.broken_link_count, 0,
+            "a non-layer multi-segment target is a short-form error, not broken"
+        );
+        // The non-layer link is not a graph edge, so `a` has no outgoing edge
+        // and is an orphan — matching how validate/graph treat it.
+        assert_eq!(
+            s.orphan_count, 1,
+            "the non-layer link does not wire `a` out of orphan status"
+        );
+    }
+
+    #[test]
+    fn regression_wiki_links_in_code_fences_are_ignored() {
+        // Finding #21: a wiki-link that appears only inside a fenced code block
+        // is illustrative syntax, not a graph edge. validate skips fenced
+        // regions; stats must too. Pre-fix the regex ran over the whole file
+        // with no fence tracking, so the fenced ghost link inflated
+        // broken_link_count to 1 and the fenced real link un-orphaned the page.
+        let (_d, store) = temp_store();
+        // A howto page whose ONLY wiki-links live inside ``` and ~~~ fences:
+        // one to a missing target, one to an existing target.
+        write_rel(
+            &store,
+            "wiki/pages/howto.md",
+            "---\ntype: wiki-page\nsummary: howto\n---\n\
+             \nWrite links like this:\n\
+             \n```\n[[records/contacts/ghost]]\n```\n\
+             \nor this:\n\
+             \n~~~\n[[wiki/pages/real]]\n~~~\n",
+        );
+        write_rel(&store, "wiki/pages/real.md", &doc("wiki-page", "real"));
+        let s = compute(&store).expect("compute");
+        assert_eq!(
+            s.broken_link_count, 0,
+            "a `[[...]]` inside a code fence is not a real (broken) edge"
+        );
+        // howto has no real edges => orphan. real is not linked-to by any real
+        // edge => orphan. Both orphaned (2), proving the fenced link to `real`
+        // did not wire either file out of orphan status.
+        assert_eq!(
+            s.orphan_count, 2,
+            "fenced wiki-links do not wire files out of orphan status: {s:?}"
+        );
     }
 
     #[test]

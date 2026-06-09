@@ -20,7 +20,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, TimeZone};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, TimeZone, Utc};
 
 use crate::store::Store;
 
@@ -330,8 +330,16 @@ impl Log {
         }
 
         // The cutoff's own (year, month): any archive strictly before it holds
-        // only older entries and is skippable.
-        let cutoff_ym = (time.year(), time.month());
+        // only older entries and is skippable. Archive months are bucketed on
+        // the UTC calendar (on-disk timestamps are offset-free and re-read as
+        // UTC; rotation buckets by the entry's UTC year-month), so the pruning
+        // calendar must be UTC too. A non-UTC `since` offset (advertised in the
+        // CLI hint, e.g. `…T00:30:00+07:00`) whose local month differs from its
+        // UTC month would otherwise prune away an archive holding entries that
+        // are strictly newer than `time` — `time.year()/.month()` read the
+        // offset-LOCAL calendar, not UTC.
+        let cutoff_utc = time.with_timezone(&Utc);
+        let cutoff_ym = (cutoff_utc.year(), cutoff_utc.month());
 
         for archive in list_archives_desc(store)? {
             // Archives are newest-month-first; once a month is strictly before
@@ -666,14 +674,40 @@ fn compose_active(header: &str, body: &str) -> String {
 /// Append entries to a month archive, creating it with `type: log` frontmatter
 /// if absent. Atomic (temp-file rename). Entries are appended in the given
 /// order (callers pass them already chronological within the month).
+///
+/// **Idempotent re-roll.** Rotation in [`Log::append`] is two non-atomic durable
+/// writes — roll prior-month entries into the archive, *then* rewrite the active
+/// file. If the process crashes or the active rewrite errors (e.g. ENOSPC,
+/// permission) *after* the archive write commits, the prior-month entries remain
+/// in the still-untrimmed active file, and `Log::append` surfaces the error so
+/// the agent retries. The retry re-partitions the same prior-month entries and
+/// re-rolls them here — so a naive concatenate would duplicate every entry in
+/// the month archive, amplifying on each retry, with no validate check to detect
+/// or repair it (the log is primary, no-rewrite data). To make the re-roll a
+/// no-op, we skip any incoming entry already present verbatim in the archive,
+/// keyed on the full entry identity `(timestamp, kind, object, note)`.
 fn append_to_archive(path: &Path, entries: &[LogEntry]) -> crate::Result<()> {
-    let mut body = String::new();
-    for e in entries {
-        body.push_str(&e.render());
-    }
-
     if path.exists() {
         let existing = fs::read_to_string(path)?;
+        // Identities already on disk in this archive, so an interrupted-then-
+        // retried rotation re-rolling identical entries adds nothing.
+        let (_header, existing_entries) = parse_active(&existing);
+        let present: std::collections::HashSet<EntryKey> =
+            existing_entries.iter().map(entry_key).collect();
+
+        let mut body = String::new();
+        for e in entries {
+            if present.contains(&entry_key(e)) {
+                continue;
+            }
+            body.push_str(&e.render());
+        }
+        // Nothing new to add (a fully-duplicate re-roll): leave the archive
+        // byte-for-byte untouched (append-only: don't rewrite identical data).
+        if body.is_empty() {
+            return Ok(());
+        }
+
         let mut full = existing;
         if !full.ends_with('\n') {
             full.push('\n');
@@ -681,6 +715,10 @@ fn append_to_archive(path: &Path, entries: &[LogEntry]) -> crate::Result<()> {
         full.push_str(&body);
         crate::fsx::write_atomic(path, full.as_bytes())?;
     } else {
+        let mut body = String::new();
+        for e in entries {
+            body.push_str(&e.render());
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -688,6 +726,27 @@ fn append_to_archive(path: &Path, entries: &[LogEntry]) -> crate::Result<()> {
         crate::fsx::write_atomic(path, full.as_bytes())?;
     }
     Ok(())
+}
+
+/// A hashable identity for a log entry, used to dedup an idempotent archive
+/// re-roll (see [`append_to_archive`]). Two entries are "the same" when their
+/// timestamp, kind, object, and note all match — exactly the fields that
+/// round-trip through `render`/`parse`, so a re-rolled entry compares equal to
+/// the one already archived. Owned (rather than borrowed) so keys from the
+/// existing archive and from the incoming entries share one type regardless of
+/// where they came from; the cost is paid only on the cold rotation path.
+type EntryKey = (DateTime<FixedOffset>, String, Option<String>, String);
+
+/// Derive the dedup key for `e` (see [`EntryKey`]). Keying on `kind.as_str()`
+/// (rather than `LogKind`, which is not `Hash`) is exact: `as_str`/`parse`
+/// round-trips every recognized kind and preserves any `Custom` token.
+fn entry_key(e: &LogEntry) -> EntryKey {
+    (
+        e.timestamp,
+        e.kind.as_str().to_string(),
+        e.object.clone(),
+        e.note.clone(),
+    )
 }
 
 /// Every `log/<YYYY-MM>.md` archive, sorted **newest month first**.
@@ -852,8 +911,18 @@ where
     Ok(())
 }
 
-/// Absolute byte offsets of every `## [` line-start in `buf`, where `buf`
-/// begins at absolute offset `base`.
+/// Absolute byte offsets of every **valid** entry-header line-start (`## […]`)
+/// in `buf`, where `buf` begins at absolute offset `base`.
+///
+/// Only a `## [` line that [`Log::parse_header`] accepts is an entry boundary,
+/// mirroring the forward parser ([`parse_entries`]), which folds an unparseable
+/// `## [` line into the preceding entry's note rather than starting a new entry.
+/// Without this validity check the reverse reader would split a real entry's
+/// multi-line note at a continuation line beginning at column 0 with `## [`
+/// (a shape the SPEC permits — notes are "one or more lines" with no
+/// restriction), truncating the note and dropping the carved pseudo-entry, so
+/// `tail`/`since`/`last_validate_at` would return a note diverging from the
+/// intact on-disk bytes.
 fn header_offsets(buf: &[u8], base: u64) -> Vec<u64> {
     const PAT: &[u8] = b"## [";
     let mut out = Vec::new();
@@ -862,7 +931,7 @@ fn header_offsets(buf: &[u8], base: u64) -> Vec<u64> {
     while i + PAT.len() <= n {
         if &buf[i..i + PAT.len()] == PAT {
             let at_line_start = i == 0 || buf[i - 1] == b'\n';
-            if at_line_start {
+            if at_line_start && is_valid_header_line(buf, i) {
                 out.push(base + i as u64);
                 // skip ahead past this marker
                 i += PAT.len();
@@ -872,6 +941,21 @@ fn header_offsets(buf: &[u8], base: u64) -> Vec<u64> {
         i += 1;
     }
     out
+}
+
+/// Whether the `## [` line starting at byte `i` in `buf` parses as a valid
+/// entry header. Reads the line up to (but not including) the next `\n` (or
+/// buffer end) and defers to [`Log::parse_header`] — the same validity gate the
+/// forward parser applies, keeping the reverse reader's boundary set identical
+/// to the forward one.
+fn is_valid_header_line(buf: &[u8], i: usize) -> bool {
+    let line_end = buf[i..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| i + p)
+        .unwrap_or(buf.len());
+    let line = String::from_utf8_lossy(&buf[i..line_end]);
+    Log::parse_header(&line).is_some()
 }
 
 /// Extract the text of the entry whose header is at absolute offset
@@ -1861,5 +1945,233 @@ Second.
             });
             assert_eq!(parsed, e, "round-trip mismatch for {e:?}");
         }
+    }
+
+    // ── regression: rotation re-roll must not duplicate archive entries (#3) ──
+
+    /// Count occurrences of `needle` in `haystack` (non-overlapping).
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn regression_archive_reroll_is_idempotent_after_interrupted_rotation() {
+        // Reconstructs the finding's exact failure window: rotation is two
+        // non-atomic durable writes — (1) roll prior-month entries into the
+        // archive, then (2) trim the active file. If the process crashes or the
+        // active rewrite errors AFTER step (1) commits, the prior-month entries
+        // stay in the untrimmed active file, the agent retries, and the retry
+        // re-rolls the SAME entries into the archive a second time. The
+        // mechanism is precisely a second `append_to_archive` of identical
+        // entries onto an archive that already holds them.
+        let (_d, store) = temp_store();
+        let dir = archive_dir(&store);
+        let arch = archive_path(&store, 2026, 4);
+
+        let apr1 = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("apr-a"), "apr one");
+        let apr2 = entry(2026, 4, 20, 9, 0, LogKind::Create, Some("apr-b"), "apr two");
+        let month = [apr1.clone(), apr2.clone()];
+
+        // First roll (the committed step-(1) write before the crash).
+        fs::create_dir_all(&dir).unwrap();
+        append_to_archive(&arch, &month).unwrap();
+
+        // The retry re-rolls the identical prior-month entries. Pre-fix this
+        // blindly concatenated, doubling every entry; do it twice to prove the
+        // amplification a real retry loop would cause is fully suppressed.
+        append_to_archive(&arch, &month).unwrap();
+        append_to_archive(&arch, &month).unwrap();
+
+        let archived = fs::read_to_string(&arch).unwrap();
+        // Each entry header must appear EXACTLY once despite the re-rolls.
+        assert_eq!(
+            count_occurrences(&archived, "## [2026-04-10 09:00] ingest | apr-a"),
+            1,
+            "re-rolled archive duplicated the first April entry; got:\n{archived}"
+        );
+        assert_eq!(
+            count_occurrences(&archived, "## [2026-04-20 09:00] create | apr-b"),
+            1,
+            "re-rolled archive duplicated the second April entry; got:\n{archived}"
+        );
+
+        // And the reader surface (`since`) must return each entry once, not the
+        // duplicated set the pre-fix archive would have yielded.
+        let got = Log::since(&store, ts(2026, 4, 1, 0, 0)).unwrap();
+        assert_eq!(
+            got,
+            vec![apr1, apr2],
+            "since over the re-rolled archive must return each April entry once"
+        );
+    }
+
+    #[test]
+    fn regression_rotation_reroll_after_active_untrimmed_does_not_duplicate() {
+        // End-to-end variant driving the real `Log::append` rotation path. We
+        // rotate April into its archive via a May append, then SIMULATE the
+        // partial failure by restoring the pre-trim active file (April + May)
+        // and re-running `append` — exactly the state a crash-between-the-two-
+        // writes / failed-active-rewrite + agent-retry produces. The archive
+        // must still hold each April entry once.
+        let (_d, store) = temp_store();
+        let apr1 = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("apr-a"), "apr one");
+        let apr2 = entry(2026, 4, 20, 9, 0, LogKind::Create, Some("apr-b"), "apr two");
+        Log::append(&store, &apr1).unwrap();
+        Log::append(&store, &apr2).unwrap();
+
+        // Snapshot the active file holding both April entries (this is what is
+        // still on disk if the post-rotation active rewrite never lands).
+        let active_path = active_log_path(&store);
+        let pre_rotation_active = fs::read_to_string(&active_path).unwrap();
+
+        // A May append rotates April out and trims the active file.
+        let may = entry(2026, 5, 2, 8, 0, LogKind::Update, Some("may-a"), "may one");
+        Log::append(&store, &may).unwrap();
+        let arch = archive_path(&store, 2026, 4);
+        assert!(arch.exists(), "April should have rotated to its archive");
+
+        // Simulate the crash/error: the active rewrite never persisted, so the
+        // active file still contains the (now also archived) April entries.
+        fs::write(&active_path, &pre_rotation_active).unwrap();
+
+        // The agent retries the append. Re-partitioning sees April as prior
+        // months again and re-rolls them — which must NOT duplicate the archive.
+        let may2 = entry(2026, 5, 3, 8, 0, LogKind::Update, Some("may-b"), "may two");
+        Log::append(&store, &may2).unwrap();
+
+        let archived = fs::read_to_string(&arch).unwrap();
+        assert_eq!(
+            count_occurrences(&archived, "## [2026-04-10 09:00] ingest | apr-a"),
+            1,
+            "retried rotation duplicated an April entry in the archive; got:\n{archived}"
+        );
+        assert_eq!(
+            count_occurrences(&archived, "## [2026-04-20 09:00] create | apr-b"),
+            1,
+            "retried rotation duplicated an April entry in the archive; got:\n{archived}"
+        );
+    }
+
+    // ── regression: reverse reader keeps a `## [` continuation note line (#10) ─
+
+    #[test]
+    fn regression_reverse_reader_preserves_note_line_starting_with_bracket_header() {
+        // SPEC permits a note of "one or more lines" with no restriction on a
+        // continuation line starting at column 0 with `## [`. The forward parser
+        // folds such an unparseable `## [` line into the note; the reverse
+        // reader (tail/since/last_validate_at) must agree, not split on it.
+        let (_d, store) = temp_store();
+        let multi = "First line.\n## [draft outline] more\nThird line.";
+        let e = entry(
+            2026,
+            5,
+            27,
+            10,
+            0,
+            LogKind::Update,
+            Some("records/x"),
+            multi,
+        );
+        // Author the log verbatim (render writes the note as-is); this is the
+        // on-disk shape a hand-written / appended multi-line note produces.
+        write_raw_log(&store, std::slice::from_ref(&e));
+
+        // Pre-fix: header_offsets treated `## [draft outline] more` as a second
+        // entry boundary, truncating the note to "First line." and dropping the
+        // carved (non-header) fragment. Post-fix: the full note survives.
+        let got = Log::tail(&store, 1).unwrap();
+        assert_eq!(got.len(), 1, "the single entry must be returned");
+        assert_eq!(
+            got[0].note, multi,
+            "reverse reader truncated the note at the `## [` continuation line; \
+             got {:?}",
+            got[0].note
+        );
+        assert_eq!(got[0], e, "the whole entry must round-trip through tail");
+
+        // `since` (the other reverse-reading surface) must agree.
+        let since = Log::since(&store, ts(2026, 5, 27, 9, 0)).unwrap();
+        assert_eq!(since, vec![e]);
+    }
+
+    // ── regression: `since` archive pruning uses the UTC month, not local (#11) ─
+
+    /// A `DateTime<FixedOffset>` at the given fixed offset (hours east of UTC).
+    fn ts_offset(
+        y: i32,
+        mo: u32,
+        d: u32,
+        h: u32,
+        mi: u32,
+        offset_hours: i32,
+    ) -> DateTime<FixedOffset> {
+        let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap();
+        FixedOffset::east_opt(offset_hours * 3600)
+            .unwrap()
+            .from_local_datetime(&naive)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn regression_since_prunes_archives_on_utc_month_not_local_offset_month() {
+        // Archive months are bucketed on the UTC calendar. A `since` cutoff with
+        // a non-UTC offset near a month boundary must not prune an archive whose
+        // UTC month equals the cutoff's UTC month just because the cutoff's
+        // LOCAL month is later.
+        let (_d, store) = temp_store();
+
+        // April archive: an entry late on 2026-04-30 at 18:00 UTC.
+        let apr = entry(
+            2026,
+            4,
+            30,
+            18,
+            0,
+            LogKind::Update,
+            Some("apr-late"),
+            "april late",
+        );
+        let dir = archive_dir(&store);
+        fs::create_dir_all(&dir).unwrap();
+        let mut arch = String::from(LOG_FRONTMATTER);
+        arch.push('\n');
+        arch.push_str(&apr.render());
+        fs::write(archive_path(&store, 2026, 4), arch).unwrap();
+
+        // Active file: a clean May entry, so an archive scan is actually needed.
+        let may = entry(2026, 5, 5, 8, 0, LogKind::Update, Some("may-a"), "may one");
+        write_raw_log(&store, std::slice::from_ref(&may));
+
+        // Cutoff 2026-05-01T00:30:00+07:00 == 2026-04-30T17:30:00Z. The April
+        // 18:00 UTC entry is strictly newer than this instant.
+        let cutoff = ts_offset(2026, 5, 1, 0, 30, 7);
+        // Sanity: the cutoff's UTC month is April, its local month is May.
+        assert_eq!((cutoff.year(), cutoff.month()), (2026, 5));
+        assert_eq!(
+            (
+                cutoff.with_timezone(&Utc).year(),
+                cutoff.with_timezone(&Utc).month()
+            ),
+            (2026, 4)
+        );
+
+        // Pre-fix: cutoff_ym = (2026, 5) from local fields, so the (2026, 4)
+        // archive was pruned and the genuinely-newer 18:00 UTC entry was dropped
+        // — `since` returned only the May entry. Post-fix: cutoff_ym is UTC
+        // (2026, 4), the April archive is scanned, and both come back.
+        let got = Log::since(&store, cutoff).unwrap();
+        let stamps: std::collections::BTreeSet<_> = got.iter().map(|e| e.timestamp).collect();
+        assert_eq!(
+            stamps,
+            [ts(2026, 4, 30, 18, 0), ts(2026, 5, 5, 8, 0)]
+                .into_iter()
+                .collect(),
+            "since(non-UTC cutoff near a month boundary) must include the April \
+             archive entry newer than the cutoff instant; got {got:?}"
+        );
     }
 }

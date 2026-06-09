@@ -253,25 +253,28 @@ pub fn extract(path: &Path) -> Result<Extracted> {
 pub fn normalize_text(raw: &str) -> String {
     let unix = raw.replace("\r\n", "\n").replace('\r', "\n");
 
-    let mut lines: Vec<&str> = unix.lines().map(|l| l.trim_end()).collect();
+    let lines: Vec<&str> = unix.lines().map(|l| l.trim_end()).collect();
 
-    // Trim leading blank lines.
-    while lines.first().is_some_and(|l| l.is_empty()) {
-        lines.remove(0);
-    }
-    // Trim trailing blank lines.
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-
-    if lines.is_empty() {
+    // Trim leading/trailing blank lines by locating the first and last
+    // non-blank line ONCE, then slicing. The previous `while … lines.remove(0)`
+    // shifted every remaining element on each removal — O(n²) when the document
+    // is dominated by leading blanks (e.g. an adapter that emits millions of
+    // empty paragraphs), letting a few-hundred-KB document hang extraction for
+    // minutes. Index-and-slice is O(n) regardless of how many blanks lead.
+    let Some(first) = lines.iter().position(|l| !l.is_empty()) else {
         return String::new();
-    }
+    };
+    // `first` exists, so a last non-blank line exists too (rposition can't be None).
+    let last = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .expect("a non-blank line exists once `first` is found");
+    let lines = &lines[first..=last];
 
     // Collapse runs of 2+ blank lines down to a single blank line.
     let mut out = String::new();
     let mut blank_run = 0usize;
-    for line in lines {
+    for &line in lines {
         if line.is_empty() {
             blank_run += 1;
             if blank_run >= 2 {
@@ -448,6 +451,19 @@ fn local_name(qname: &[u8]) -> &[u8] {
 // Spreadsheet — calamine (xlsx / xlsm / xlsb / ods)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Ceiling on a single sheet's dense cell grid (`rows × cols`). `calamine`
+/// materializes a worksheet as a DENSE `Vec<Data>` sized from the MIN/MAX cell
+/// positions (`Range::from_sparse`), so two cells at `A1` and `XFD1048576` in a
+/// few-hundred-byte file force a ~1.7e10-element (~400 GB) allocation that
+/// **aborts** the process — bypassing the docx/epub zip-entry cap and the
+/// PDF panic guard (an allocation failure aborts, it does not unwind, so
+/// `catch_unwind` cannot contain it). `sources/` is untrusted input, so we
+/// bound the read the same way docx/epub do: refuse before the allocation.
+///
+/// 50M cells is ~1.2 GB worst-case dense (`Data` ≈ 24 bytes) — far above any
+/// real spreadsheet's used range, far below the weaponizable extreme.
+const MAX_SPREADSHEET_CELLS: u64 = 50_000_000;
+
 /// Extract every sheet of a spreadsheet via `calamine`, rendering each row as
 /// tab-separated cells, one row per line, sheets in workbook order separated by
 /// a blank line.
@@ -456,6 +472,12 @@ fn local_name(qname: &[u8]) -> &[u8] {
 /// trailing `.0` (`1200`, not `1200.0`); other floats via their default
 /// formatting; booleans as `TRUE`/`FALSE`; empty/error cells as the empty
 /// string. Metadata carries the sheet count and the joined sheet-name list.
+///
+/// Before materializing each sheet, [`spreadsheet_dense_cells`] bounds the
+/// would-be dense grid against [`MAX_SPREADSHEET_CELLS`] and returns a typed
+/// [`ExtractError::Parse`] refusal rather than letting an attacker-supplied
+/// sheet OOM/abort the process — upholding the module's "never panics on
+/// untrusted `sources/` input" contract for the spreadsheet adapter.
 fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
     use calamine::{open_workbook_auto, Reader};
 
@@ -471,6 +493,22 @@ fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
         if idx > 0 {
             text.push('\n'); // blank line between sheets
         }
+
+        // Bound the dense grid BEFORE calamine allocates it. For the zip-XML /
+        // record backends that expose a sparse cell iterator (xlsx-family,
+        // xlsb) this never densely allocates; over-cap sheets refuse cleanly.
+        if let Some(cells) = spreadsheet_dense_cells(&mut workbook, name)? {
+            if cells > MAX_SPREADSHEET_CELLS {
+                return Err(ExtractError::Parse {
+                    format: "spreadsheet",
+                    message: format!(
+                        "sheet {name:?} declares a {cells}-cell grid, over the \
+                         {MAX_SPREADSHEET_CELLS}-cell cap (malformed or hostile spreadsheet)"
+                    ),
+                });
+            }
+        }
+
         let range = workbook
             .worksheet_range(name)
             .map_err(|e| ExtractError::Parse {
@@ -491,6 +529,94 @@ fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
         out.put_str("sheet_names", sheet_names.join(", "));
     }
     Ok(out)
+}
+
+/// Compute the would-be dense cell count (`rows × cols`) of one sheet WITHOUT
+/// the dense allocation, by streaming the sheet's sparse cells and tracking the
+/// MIN/MAX non-empty position — exactly the bounds `Range::from_sparse` uses.
+///
+/// Returns `Some(rows * cols)` for the formats that expose a sparse cell
+/// iterator (`.xlsx`/`.xlsm`/`.xlsb`/`.xlam`), which are the realistic
+/// decompression/dimension-bomb vectors (an OOXML/record sheet can place two
+/// cells 1e10 apart in a few hundred bytes). Returns `None` for `.xls` (BIFF,
+/// format-bounded to ≤ 65 536 × 256 ≈ 1.7e7 cells) and `.ods`, neither of which
+/// exposes a sparse iterator on the auto-detected reader; those fall through to
+/// the normal materialization path. A row/col delta is saturated into `u64` so
+/// the multiply cannot overflow.
+fn spreadsheet_dense_cells(
+    workbook: &mut calamine::Sheets<std::io::BufReader<std::fs::File>>,
+    name: &str,
+) -> Result<Option<u64>> {
+    use calamine::{DataRef, Sheets};
+
+    // Stream cells, tracking the non-empty MIN/MAX extent that `from_sparse`
+    // would allocate. Empty cells are excluded (calamine drops them before
+    // computing the dense bounds), matching the dense grid exactly.
+    fn extent<E: std::fmt::Display>(
+        mut next: impl FnMut() -> std::result::Result<Option<((u32, u32), bool)>, E>,
+    ) -> Result<Option<u64>> {
+        let (mut r0, mut r1, mut c0, mut c1) = (u32::MAX, 0u32, u32::MAX, 0u32);
+        let mut any = false;
+        loop {
+            match next() {
+                Ok(Some(((r, c), is_empty))) => {
+                    if is_empty {
+                        continue;
+                    }
+                    any = true;
+                    r0 = r0.min(r);
+                    r1 = r1.max(r);
+                    c0 = c0.min(c);
+                    c1 = c1.max(c);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(ExtractError::Parse {
+                        format: "spreadsheet",
+                        message: format!("scanning sheet dimensions: {e}"),
+                    })
+                }
+            }
+        }
+        if !any {
+            return Ok(Some(0));
+        }
+        let rows = u64::from(r1 - r0) + 1;
+        let cols = u64::from(c1 - c0) + 1;
+        Ok(Some(rows.saturating_mul(cols)))
+    }
+
+    match workbook {
+        Sheets::Xlsx(xlsx) => {
+            let mut reader = xlsx.worksheet_cells_reader(name).map_err(|e| {
+                ExtractError::Parse {
+                    format: "spreadsheet",
+                    message: format!("sheet {name:?}: {e}"),
+                }
+            })?;
+            extent(|| {
+                reader.next_cell().map(|opt| {
+                    opt.map(|c| (c.get_position(), matches!(c.get_value(), DataRef::Empty)))
+                })
+            })
+        }
+        Sheets::Xlsb(xlsb) => {
+            let mut reader = xlsb.worksheet_cells_reader(name).map_err(|e| {
+                ExtractError::Parse {
+                    format: "spreadsheet",
+                    message: format!("sheet {name:?}: {e}"),
+                }
+            })?;
+            extent(|| {
+                reader.next_cell().map(|opt| {
+                    opt.map(|c| (c.get_position(), matches!(c.get_value(), DataRef::Empty)))
+                })
+            })
+        }
+        // `.xls` (BIFF, format-bounded) and `.ods` expose no sparse iterator on
+        // the auto reader; let them materialize normally.
+        Sheets::Xls(_) | Sheets::Ods(_) => Ok(None),
+    }
 }
 
 /// Render one spreadsheet cell to its text form. Whole-valued floats drop the
@@ -1104,5 +1230,106 @@ mod tests {
         // MetaValue::Num serializes as a bare JSON number, Str as a bare string.
         assert!(json["metadata"]["sheets"].is_number());
         assert!(json["metadata"]["format"].is_string());
+    }
+
+    // ── regression: leading-blank normalization is linear (finding #13) ────────
+
+    /// `normalize_text` must trim leading blank lines in O(n), not O(n²). The
+    /// pre-fix loop used `lines.remove(0)` per blank line — O(n) shift each, so a
+    /// document dominated by leading blanks took O(n²) and hung extraction.
+    ///
+    /// 500_000 leading blank lines is ~2.5e11 element shifts under the old code
+    /// (minutes-to-hours, effectively a hang) but instant under the index-and-
+    /// slice path; the test reconstructs the finding's trigger (an adapter output
+    /// that is mostly leading blanks then one line of text) and asserts the
+    /// correct, fully-trimmed result. Against the pre-fix code this test does not
+    /// complete in a reasonable time — encoding the quadratic regression.
+    #[test]
+    fn regression_normalize_text_leading_blanks_is_linear() {
+        let blanks = "\n".repeat(500_000);
+        let raw = format!("{blanks}only real line\n");
+        // Leading blanks fully trimmed; single trailing newline; body intact.
+        assert_eq!(normalize_text(&raw), "only real line\n");
+
+        // A wholly-blank giant input still collapses to empty (the other branch).
+        assert_eq!(normalize_text(&"   \n".repeat(500_000)), "");
+    }
+
+    // ── regression: spreadsheet dense-grid bomb is refused (finding #4) ────────
+
+    /// Build a VALID `.xlsx` whose single sheet declares two real cells at the
+    /// opposite corners of Excel's grid (`A1` and `XFD1048576`). `calamine`
+    /// materializes a sheet as a DENSE `Vec<Data>` sized from the MIN/MAX cell
+    /// positions, so this two-cell sheet would force a ~1.7e10-element (~400 GB)
+    /// allocation and abort the process. We reuse the corpus `sample.xlsx`
+    /// container verbatim and swap ONLY `xl/worksheets/sheet1.xml`, so every
+    /// other part (workbook, rels, content-types) is a real, openable workbook.
+    fn write_dense_bomb_xlsx(dest: &Path) {
+        use std::io::Write;
+
+        let base = std::fs::read(fixture("sample.xlsx")).expect("corpus sample.xlsx exists");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(base)).expect("sample.xlsx is a valid zip");
+
+        let bomb_sheet = b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
+<sheetData>\
+<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>\
+<row r=\"1048576\"><c r=\"XFD1048576\"><v>2</v></c></row>\
+</sheetData></worksheet>";
+
+        let out = std::fs::File::create(dest).unwrap();
+        let mut writer = zip::ZipWriter::new(out);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            if name == "xl/worksheets/sheet1.xml" {
+                writer.start_file(name, opts).unwrap();
+                writer.write_all(bomb_sheet).unwrap();
+            } else {
+                // Copy every other entry's already-compressed bytes verbatim.
+                writer.raw_copy_file(entry).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+
+    /// A spreadsheet whose declared dense grid exceeds [`MAX_SPREADSHEET_CELLS`]
+    /// is refused with a typed [`ExtractError::Parse`] BEFORE calamine allocates
+    /// the dense matrix — never an OOM/abort. Pre-fix, `extract_spreadsheet`
+    /// called `worksheet_range` directly and the process aborted on the
+    /// allocation; this test would not return (it would kill the test runner),
+    /// so it encodes the resource-exhaustion regression.
+    #[test]
+    fn regression_spreadsheet_dense_bomb_refused_not_oom() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bomb = tmp.path().join("invoice.xlsx");
+        write_dense_bomb_xlsx(&bomb);
+
+        // A few-hundred-byte file on disk — the whole point of the bomb.
+        assert!(
+            std::fs::metadata(&bomb).unwrap().len() < 10_000,
+            "the bomb must be tiny on disk; the danger is the in-memory expansion"
+        );
+
+        let err = extract(&bomb).unwrap_err();
+        assert!(
+            matches!(err, ExtractError::Parse { format: "spreadsheet", .. }),
+            "an over-cap dense grid must be a typed spreadsheet Parse refusal, got {err:?}"
+        );
+        assert_eq!(err.code(), "EXTRACT_PARSE_ERROR");
+    }
+
+    /// The cap is a guard, not a wall: a normal spreadsheet still extracts. Locks
+    /// down that the preflight bound does not regress the legitimate path (the
+    /// corpus `sample.xlsx` is a 3×3 grid, far under the cap).
+    #[test]
+    fn regression_spreadsheet_cap_allows_real_workbook() {
+        let got = extract(&fixture("sample.xlsx")).unwrap();
+        assert_eq!(got.metadata["sheets"], MetaValue::Num(1));
+        assert!(!got.text.is_empty());
     }
 }

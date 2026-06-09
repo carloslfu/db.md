@@ -67,11 +67,20 @@ fn emit(out: &Option<String>, content: &str, add_trailing_newline: bool) -> CliR
             } else {
                 write!(lock, "{content}")
             };
-            res.map_err(|e| {
-                // A broken pipe (downstream `head`/`grep` closed) is benign; any
-                // other write failure is a real runtime error.
-                CliError::new(ExitCode::Runtime, "IO_ERROR", format!("write failed: {e}"))
-            })
+            // A broken pipe (downstream `head`/`grep` closed the read end) is a
+            // benign truncation, not a failure: exit 0 with no error envelope, so
+            // an agent branching on the exit code of `dbmd extract big.pdf | head`
+            // doesn't see a spurious IO_ERROR. Every other write failure is a real
+            // runtime error.
+            match res {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(e) => Err(CliError::new(
+                    ExitCode::Runtime,
+                    "IO_ERROR",
+                    format!("write failed: {e}"),
+                )),
+            }
         }
     }
 }

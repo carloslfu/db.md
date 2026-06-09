@@ -29,7 +29,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Atomically and durably replace `path` with `bytes` (see the module docs for
 /// the write/fsync/rename/fsync sequence). The parent directory is created if
-/// missing. On a rename failure the temp file is cleaned up rather than leaked.
+/// missing. On *any* early return between temp-file creation and a successful
+/// rename — a `write_all`/`sync_all` failure (ENOSPC, EIO, quota) as well as a
+/// rename failure — the temp file is cleaned up rather than leaked, via the
+/// [`TempGuard`] `Drop` impl (mirroring `index.rs`'s `AtomicTemp`).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir)?;
@@ -38,22 +41,44 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("dbmd-tmp");
-    let (mut f, tmp) = create_temp_file(dir, file_name)?;
+    let (mut f, mut guard) = create_temp_file(dir, file_name)?;
 
-    // Scope the handle so it is flushed/closed before the rename.
+    // Scope the handle so it is flushed/closed before the rename. A failure here
+    // returns via `?`; `guard` then drops and removes the orphaned temp file.
     {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
 
-    match fs::rename(&tmp, path) {
-        Ok(()) => {
-            sync_parent_dir(dir);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
+    // The rename either errors (guard drops, cleaning up the temp) or succeeds
+    // (we disarm the guard so it does not remove the now-renamed destination).
+    fs::rename(&guard.path, path)?;
+    guard.disarm();
+    sync_parent_dir(dir);
+    Ok(())
+}
+
+/// Drop-based cleanup for the hidden temp file `write_atomic` creates. While
+/// armed, dropping the guard removes `path`; [`TempGuard::disarm`] is called
+/// only after a successful rename, so the renamed destination is never touched.
+struct TempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempGuard {
+    /// Stop cleaning up `path` on drop — used once the temp has been renamed
+    /// into place and is no longer a stray temp file.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        // Best-effort cleanup if an error path bailed out before the rename.
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
@@ -61,8 +86,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Create a uniquely-named temp file in `dir` with `create_new` (never clobbers
 /// a predictable name), retrying on the vanishingly-rare collision. The name is
 /// hidden (`.`-prefixed) and tagged with pid + nanos + a process-wide counter so
-/// concurrent writers in the same directory never pick the same path.
-fn create_temp_file(dir: &Path, file_name: &str) -> std::io::Result<(File, PathBuf)> {
+/// concurrent writers in the same directory never pick the same path. Returns the
+/// open handle plus an armed [`TempGuard`] so any early return cleans up the temp.
+fn create_temp_file(dir: &Path, file_name: &str) -> std::io::Result<(File, TempGuard)> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -74,7 +100,15 @@ fn create_temp_file(dir: &Path, file_name: &str) -> std::io::Result<(File, PathB
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".{file_name}.tmp.{pid}.{nanos}.{seq}"));
         match OpenOptions::new().write(true).create_new(true).open(&tmp) {
-            Ok(file) => return Ok((file, tmp)),
+            Ok(file) => {
+                return Ok((
+                    file,
+                    TempGuard {
+                        path: tmp,
+                        armed: true,
+                    },
+                ))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -125,5 +159,59 @@ mod tests {
         let target = tmp.path().join("empty.txt");
         write_atomic(&target, b"").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"");
+    }
+
+    /// Regression for finding #22: an early return between temp-file creation and
+    /// a successful rename (e.g. `write_all`/`sync_all` failing under ENOSPC/EIO)
+    /// must NOT leave the hidden temp file orphaned in the data directory.
+    ///
+    /// Pre-fix, `create_temp_file` handed back a bare `PathBuf` with no `Drop`
+    /// cleanup, so dropping it without a rename — exactly what `?` does on a
+    /// write/sync failure — left the temp on disk. This reconstructs that path by
+    /// dropping the guard without renaming and asserting the temp is gone.
+    #[test]
+    fn regression_armed_guard_removes_temp_on_early_drop() {
+        let dir = TempDir::new().unwrap();
+        let (file, guard) = create_temp_file(dir.path(), "file.txt").unwrap();
+        let tmp_path = guard.path.clone();
+        assert!(
+            tmp_path.exists(),
+            "temp file should exist after create_temp_file"
+        );
+
+        // Simulate a write/sync failure bailing out before the rename: the file
+        // handle and the (still-armed) guard go out of scope without a rename.
+        drop(file);
+        drop(guard);
+
+        assert!(
+            !tmp_path.exists(),
+            "armed guard must remove the orphaned temp file on early drop"
+        );
+        // No stray `.tmp.` files left in the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files may be left behind");
+    }
+
+    /// Once disarmed (after a successful rename) the guard must NOT delete the
+    /// path it was tracking — otherwise it would clobber the renamed destination.
+    #[test]
+    fn regression_disarmed_guard_leaves_file_intact() {
+        let dir = TempDir::new().unwrap();
+        let (file, mut guard) = create_temp_file(dir.path(), "kept.txt").unwrap();
+        drop(file);
+        let kept = guard.path.clone();
+
+        guard.disarm();
+        drop(guard);
+
+        assert!(
+            kept.exists(),
+            "disarmed guard must leave the renamed destination untouched"
+        );
     }
 }
