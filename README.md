@@ -1,27 +1,30 @@
 # db.md
 
-**The open database, in plain files.**
+**The database was a workaround for computers that couldn't read. They can now.**
 
 Your database is a folder of plain text files. No server, no tables, no query
 language. Every record is one markdown file you can open, read, and edit by
-hand. The links between records are written into the text itself. The folder is
-the database. That is all there is.
+hand, and the links between records are written into the text itself. The folder
+is the database.
 
 For fifty years that would have been a toy. You needed a server, because the
-data would not fit in memory. You needed a schema up front, because software
-could not read plain writing. You needed a query language, because nothing else
-could find anything in the pile. Every one of those reasons just expired. A
-capable AI agent reads the files, writes them, links them, and finds anything
-in them by plain meaning. The agent is the query engine, and it gets sharper
-every time the model behind it improves.
+data would not fit in memory. You needed a schema up front, and a query
+language, because software could not read plain writing or find anything in the
+pile. Every one of those reasons just expired. A capable agent reads the files,
+writes them, links them, and finds anything in them by plain meaning.
 
-So a database stops being software you run and becomes data you own. Text on
-disk, in a format a person reads easily and a model reads better than anything
-else, that outlasts every tool that ever touches it.
+The agent is the engine, and here is the bet that makes this a database and not
+just a folder: it gets sharper every time the model behind it improves. A SQL
+store queries exactly as well in ten years as the day you installed it. A db.md
+store gets smarter on the model curve, with nothing to migrate and nothing to
+rebuild.
 
-And it is not small. Millions of records live on plain files, with no vector
-database. db.md replaces a whole class of software: the products that were only
-ever a database with a screen on top.
+So a database stops being software you run and becomes data you own: text on
+disk that a person reads easily, a model reads better than anything else, and
+that outlasts every tool that ever touches it. It is not small. Millions of
+records live on plain files with no vector database. And it replaces a whole
+class of software: the products that were only ever a database with a screen on
+top.
 
 Here is a record. It is a file:
 
@@ -48,6 +51,26 @@ The frontmatter at the top is the schema. The `[[double bracket]]` entries are
 the relationships, the same links a wiki uses. The text below is for you, and
 for the agent. A person can read it. Git versions it. A model reads it better
 than any row in any table. That is the whole format.
+
+## What it replaces
+
+That whole class of software is a database with a screen bolted on: a CRM, an
+ops tracker, a contract register, the internal tool every company rebuilds, the
+SaaS product that is just a table behind a login. db.md replaces the database
+and the screen at once. The records are the files, the agent answers the
+questions, and the view gets built the moment you ask for one.
+
+This is built for company scale. A full email history, hundreds of thousands of
+records and sometimes millions, lives on plain files and stays fast with
+embedded ripgrep, no vector database anywhere. The genuinely hard cases still
+want a real engine: heavy write concurrency, ACID transactions, sub-millisecond
+reads, aggregates over billions of rows. That is the roadmap, not a claim for
+today, and until then the two compose cleanly.
+
+It is the pattern from Karpathy's April 2026 LLM Wiki, which scoped a single
+research topic, taken to company scope: customers, vendors, contracts,
+decisions, meetings, expenses, processes, playbooks, all curated by the agent
+your team directs.
 
 ## How it works
 
@@ -114,27 +137,6 @@ db.md turns the shape inside out:
 - **The index is derived.** A plain catalog plus embedded ripgrep reaches
   millions of files with no vector database. Want SQLite or a search index on
   top? Build one. The files stay the source of truth.
-
-## What it replaces
-
-Most software a company pays for is a database with a screen bolted on: a CRM,
-an ops tracker, a contract register, the internal tool every company rebuilds,
-the SaaS product that is just a table behind a login. db.md replaces the
-database and the screen at once, for that whole class. The records are the
-files, the agent answers the questions, and the view gets built the moment you
-ask for one.
-
-This is built for company scale. A full email history, hundreds of thousands of
-records and sometimes millions, lives on plain files and stays fast with
-embedded ripgrep, no vector database anywhere. The genuinely hard cases still
-want a real engine: heavy write concurrency, ACID transactions, sub-millisecond
-reads, aggregates over billions of rows. That is the roadmap, not a claim for
-today, and until then the two compose cleanly.
-
-It is the pattern from Karpathy's April 2026 LLM Wiki, which scoped a single
-research topic, taken to company scope: customers, vendors, contracts,
-decisions, meetings, expenses, processes, playbooks, all curated by the agent
-your team directs.
 
 ## Quick start
 
