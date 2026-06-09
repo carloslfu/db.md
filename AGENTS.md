@@ -5,8 +5,8 @@ Guidance for AI agents working in this repo. (Human contributors: see
 
 ## What this is
 
-`db.md` is **the open database in plain files** — a standard plus its
-reference toolkit. The toolkit is one Rust binary, `dbmd`, in a Cargo
+`db.md` is **the open standard for databases in plain files**: the spec
+plus its reference toolkit. The toolkit is one Rust binary, `dbmd`, in a Cargo
 workspace:
 
 - `crates/dbmd-core` — the library: all logic (parser, store, graph, validate,

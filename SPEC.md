@@ -1,6 +1,6 @@
 # db.md — v0.2
 
-`db.md` is **the open database, in plain files**. Records are markdown
+`db.md` is **the open standard for databases in plain files**. Records are markdown
 files with YAML frontmatter. Relationships are wiki-links. The database
 is the directory; the schema is the frontmatter; the index is whatever
 you want to build on top. It is built for agents: a database a harness

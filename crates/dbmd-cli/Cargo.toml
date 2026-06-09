@@ -25,7 +25,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 readme = "README.md"
-description = "The `dbmd` command-line tool for db.md — the open database in plain files. A thin wrapper over dbmd-core: validate, search, query, graph, write, index, and log over a db.md store. Zero AI dependencies."
+description = "The `dbmd` command-line tool for db.md, the open standard for databases in plain files. A thin wrapper over dbmd-core: validate, search, query, graph, write, index, and log over a db.md store. Zero AI dependencies."
 
 # One binary, named `dbmd` (git / cargo / kubectl shape). The crate is
 # `dbmd-cli`; the artifact the user installs is `dbmd`.

@@ -1,6 +1,6 @@
 # db.md
 
-> The open database, in plain files. Records are markdown files with YAML
+> The open standard for databases in plain files. Records are markdown files with YAML
 > frontmatter; relationships are wiki-links; the database is the directory.
 > Built for agents: a database a harness reads, writes, links, and curates
 > directly through the `dbmd` CLI. No daemon, no server, no embeddings.

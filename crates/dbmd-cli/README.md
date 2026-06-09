@@ -1,7 +1,7 @@
 # dbmd-cli
 
-The **`dbmd`** command-line tool for **db.md — the open database in
-plain files**.
+The **`dbmd`** command-line tool for **db.md, the open standard for
+databases in plain files**.
 
 `db.md` is a database made of markdown files: records are markdown with
 YAML frontmatter, relationships are wiki-links, the directory is the
