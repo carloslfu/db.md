@@ -38,6 +38,12 @@ use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
 fn main() {
+    // A reader can close our output pipe before we finish writing
+    // (`dbmd spec | head`, `dbmd search … | grep -q`). Make that a clean exit
+    // instead of a panic — see `install_broken_pipe_clean_exit`. Runs first, so
+    // it is in place before any output.
+    install_broken_pipe_clean_exit();
+
     // clap handles `--help` / `--version` (exit 0) and arg-parse errors
     // (exit 2) before returning. Everything past here is a parsed invocation.
     let cli = Cli::parse();
@@ -56,6 +62,38 @@ fn main() {
             std::process::exit(err.exit.code());
         }
     }
+}
+
+/// Make a reader closing our output early a clean exit, not a panic.
+///
+/// Rust sets `SIGPIPE` to `SIG_IGN`, so a write to a pipe whose reader has gone
+/// away (`dbmd spec | head`, `dbmd search … | grep -q`) returns `BrokenPipe`
+/// and `print!`/`println!` panic on it — the `std::io::stdio` panic that exits
+/// `101`, which the v0.3.3 release smoke test caught. Replace the panic hook so
+/// that one specific panic exits `0` (the Unix-friendly "consumer left, stop
+/// quietly" behavior); every other panic still reaches the default hook with its
+/// message and backtrace intact.
+fn install_broken_pipe_clean_exit() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if payload_is_broken_pipe(info.payload()) {
+            std::process::exit(ExitCode::Success.code());
+        }
+        default_hook(info);
+    }));
+}
+
+/// Whether a panic payload is the stdlib's broken-pipe print failure. Matches on
+/// the I/O error text the panic carries — the locale-independent `os error 32`
+/// and the `Broken pipe` kind string — not the surrounding wording, which can
+/// shift between toolchains.
+fn payload_is_broken_pipe(payload: &dyn std::any::Any) -> bool {
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    msg.contains("Broken pipe") || msg.contains("os error 32")
 }
 
 /// Exhaustive dispatch over the locked [`Command`] tree. Each arm calls exactly

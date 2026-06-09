@@ -8,9 +8,22 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.3**.
+  `Cargo.toml`, currently **v0.3.4**.
 
 ## [Unreleased]
+
+## [0.3.4] — 2026-06-09
+
+### Fixed
+
+- **Broken-pipe panic when a reader closed `dbmd`'s output early.** Piping a
+  command into a consumer that exits first (`dbmd spec | head`, `dbmd search …
+  | grep -q`) made `print!`/`println!` panic on the closed pipe and exit `101`
+  with a Rust backtrace. `dbmd` now stops cleanly with exit `0` when the reader
+  on its stdout has gone away, the standard Unix behavior for a producer whose
+  consumer has left. The v0.3.3 release smoke test caught it (`dbmd spec | head
+  -20` under `set -o pipefail`); a regression test (`tests/broken_pipe.rs`) now
+  locks the behavior in.
 
 ## [0.3.3] — 2026-06-04
 
