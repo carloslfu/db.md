@@ -140,7 +140,7 @@ db.md turns the shape inside out:
 
 ## Quick start
 
-Install the binary. One file, about 5MB, no toolchain:
+Install `dbmd`. One Rust binary, about 5MB, no toolchain:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh

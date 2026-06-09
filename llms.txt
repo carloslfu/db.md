@@ -15,7 +15,7 @@ machinery to depend on.
 contract → read the store's `DB.md` → operate with `dbmd`. The steps below get
 you the binary; `dbmd spec` is the single source of truth from there.
 
-## 1. Install the binary (one ~5MB binary, no toolchain)
+## 1. Install the binary (one ~5MB Rust binary, no toolchain)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
