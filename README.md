@@ -143,33 +143,44 @@ db.md turns the shape inside out:
 
 Put a number on "millions." A person who indexes every email they send and
 receive adds about **44,000 files a year**, around 440,000 in a decade; a
-whole career fits in **1 to 1.5 million plain files**, and a modern machine
-ripgreps a million files in seconds. **A ten-person company crosses a million
-files in two to three years.** That is the scale this format is built to hold.
+whole career fits in **1 to 1.5 million plain files**. **A ten-person company
+crosses a million files in two to three years.** That is the scale this format
+is built to hold.
 
-It holds because the interactive loop is **O(changed), never O(store)**: the
-cost of an operation tracks what changed, not how big the store has grown.
+And the agent never pays for it, because **the agent does not navigate files,
+it reads indexes.** Every type folder keeps a human `index.md` (the 500 most
+recent entries) and a complete machine `index.jsonl`, both updated in place on
+every write. A query reads one small sidecar file and goes straight to the
+right record. The interactive loop is **O(changed), never O(store)**: what an
+operation costs tracks what changed, not how big the store has grown.
 
 - **High-volume folders shard by date.** An email lands in
   `sources/emails/2026/05/`, an expense in `records/expenses/2026/05/`. No
   directory grows unbounded, and only the current shard is ever hot. Entity
   records and the wiki stay flat, because those sets are bounded by reality:
   you have only so many customers, however much mail they send.
-- **Every write maintains the catalog.** Each type folder keeps a human
-  `index.md` (the 500 most recent) and a complete machine `index.jsonl`, both
-  updated in place on every write. Structured queries read one sidecar file;
-  full-text search is embedded ripgrep. Nothing ever parses the whole store.
-- **The budgets are flat.** A write costs **under 100ms in a store of 10,000
-  files, and under 100ms in a store of a million.** Search stays under two
-  seconds at a million files. The full budget table is in the
+- **The budgets hold at a million files.** A write costs **under 100ms in a
+  store of 10,000 files, and under 100ms in a store of a million.** A
+  structured query stays **under two seconds at a million files**, and the
+  worst case, a cold full-text sweep with nothing indexed, is embedded ripgrep
+  clearing a million files in seconds. The full table is in the
   [spec](SPEC.md#scale).
+- **Whole-store passes run off the loop.** A full `dbmd validate --all` or
+  index rebuild is a linear repair and audit job you schedule. The agent never
+  waits on one.
 
-The honest ceilings: git over the raw store wants tuning past **100,000
-files** and tops out near a million, and the genuinely hard cases still want
-a real engine: heavy write concurrency, ACID transactions, sub-millisecond
-reads, aggregates over billions of rows. That territory is the packed flavor
-on the [roadmap](SPEC.md#roadmap), with the same contract and the files still
-the source of truth. Until then the two compose cleanly.
+The first ceiling you hit is not the format's. It is git's: vanilla git wants
+tuning past **100,000 tracked files** and slows near a million, because its
+index rewrites an entry for every tracked file, O(everything), not O(changed).
+The store has no such limit, and git is optional tooling over db.md, not part
+of it. At that point, version the curated layers (`records/`, `wiki/`) and let
+high-volume sources ride filesystem snapshots. The files keep working exactly
+the same.
+
+What still wants a real engine: heavy write concurrency, ACID transactions,
+sub-millisecond reads, aggregates over billions of rows. That territory is
+the packed flavor on the [roadmap](SPEC.md#roadmap), with the same contract
+and the files still the source of truth. Until then the two compose cleanly.
 
 ## Quick start
 
