@@ -66,13 +66,6 @@ the SaaS product that is just a table behind a login. **db.md replaces the
 database and the screen at once.** The records are the files, the agent answers
 the questions, and the view gets built the moment you ask for one.
 
-This is built for company scale. A full email history, hundreds of thousands of
-records and sometimes millions, lives on plain files and stays fast with
-embedded ripgrep, no vector database anywhere. The genuinely hard cases still
-want a real engine: heavy write concurrency, ACID transactions, sub-millisecond
-reads, aggregates over billions of rows. That is the roadmap, not a claim for
-today, and until then the two compose cleanly.
-
 It is the pattern from Karpathy's April 2026 LLM Wiki, which scoped a single
 research topic, taken to company scope: customers, vendors, contracts,
 decisions, meetings, expenses, processes, playbooks, all curated by the agent
@@ -146,6 +139,38 @@ db.md turns the shape inside out:
   millions of files with no vector database. Want SQLite or a search index on
   top? Build one. The files stay the source of truth.
 
+## How far it scales
+
+Put a number on "millions." A person who indexes every email they send and
+receive adds about **44,000 files a year**, around 440,000 in a decade; a
+whole career fits in **1 to 1.5 million plain files**, and a modern machine
+ripgreps a million files in seconds. **A ten-person company crosses a million
+files in two to three years.** That is the scale this format is built to hold.
+
+It holds because the interactive loop is **O(changed), never O(store)**: the
+cost of an operation tracks what changed, not how big the store has grown.
+
+- **High-volume folders shard by date.** An email lands in
+  `sources/emails/2026/05/`, an expense in `records/expenses/2026/05/`. No
+  directory grows unbounded, and only the current shard is ever hot. Entity
+  records and the wiki stay flat, because those sets are bounded by reality:
+  you have only so many customers, however much mail they send.
+- **Every write maintains the catalog.** Each type folder keeps a human
+  `index.md` (the 500 most recent) and a complete machine `index.jsonl`, both
+  updated in place on every write. Structured queries read one sidecar file;
+  full-text search is embedded ripgrep. Nothing ever parses the whole store.
+- **The budgets are flat.** A write costs **under 100ms in a store of 10,000
+  files, and under 100ms in a store of a million.** Search stays under two
+  seconds at a million files. The full budget table is in the
+  [spec](SPEC.md#scale).
+
+The honest ceilings: git over the raw store wants tuning past **100,000
+files** and tops out near a million, and the genuinely hard cases still want
+a real engine: heavy write concurrency, ACID transactions, sub-millisecond
+reads, aggregates over billions of rows. That territory is the packed flavor
+on the [roadmap](SPEC.md#roadmap), with the same contract and the files still
+the source of truth. Until then the two compose cleanly.
+
 ## Quick start
 
 Install `dbmd`. One Rust binary, about 5MB, no toolchain:
@@ -191,11 +216,11 @@ The installer is text. Hand an agent the repo's [llms.txt](llms.txt) and it
 sets itself up by reading it and running the commands.
 
 To make your agent reach for db.md on every session, place a skill where it
-reads skills, in the open [Agent Skills](https://agentskills.io) format. The canonical file ships at
-[`skills/db-md/SKILL.md`](skills/db-md/SKILL.md), and its body just points at
-`dbmd spec`, so it cannot drift. There is no install command for this, on
-purpose. Copy the file, use your agent's own skill installer, or tell the agent
-to set itself up.
+reads skills, in the open [Agent Skills](https://agentskills.io) format. The
+canonical file ships at [`skills/db-md/SKILL.md`](skills/db-md/SKILL.md), and
+its body just points at `dbmd spec`, so it cannot drift. There is no install
+command for this, on purpose. Copy the file, use your agent's own skill
+installer, or tell the agent to set itself up.
 
 ## The toolkit
 
