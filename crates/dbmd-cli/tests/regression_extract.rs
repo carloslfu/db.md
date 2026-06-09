@@ -202,7 +202,9 @@ fn write_large_html(dest: &Path) {
     let mut body = String::with_capacity(2 * 1024 * 1024);
     body.push_str("<html><body>");
     for i in 0..40_000 {
-        body.push_str(&format!("<p>line number {i} with some filler words here</p>"));
+        body.push_str(&format!(
+            "<p>line number {i} with some filler words here</p>"
+        ));
     }
     body.push_str("</body></html>");
     std::fs::write(dest, body).unwrap();

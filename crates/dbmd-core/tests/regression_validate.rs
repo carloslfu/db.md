@@ -80,7 +80,11 @@ fn regression_index_summary_with_middle_dot_does_not_false_positive() {
 
     // No tags → the rendered index entry is `- [[...]] — Acme · Q2 renewal`
     // with the middle dot belonging to the summary, not a tag suffix.
-    write(root, "records/companies/acme.md", &contact("Acme · Q2 renewal"));
+    write(
+        root,
+        "records/companies/acme.md",
+        &contact("Acme · Q2 renewal"),
+    );
 
     let store = open(root);
     // Build the canonical index.md + index.jsonl the same way `dbmd index
@@ -171,10 +175,8 @@ fn regression_working_set_validates_archived_changed_file() {
     let store = open(root);
     let issues = validate_working_set(&store, None).unwrap();
     assert!(
-        issues
-            .iter()
-            .any(|i| i.code == codes::WIKI_LINK_SHORT_FORM
-                && i.file == Path::new("records/contacts/sarah-chen.md")),
+        issues.iter().any(|i| i.code == codes::WIKI_LINK_SHORT_FORM
+            && i.file == Path::new("records/contacts/sarah-chen.md")),
         "the archived May change must be validated, surfacing its short-form link: {issues:#?}"
     );
 }

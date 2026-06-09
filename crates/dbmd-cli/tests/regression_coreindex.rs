@@ -70,7 +70,8 @@ fn regression_rebuild_layer_refreshes_root_index_counts() {
 
     // The type-folder + layer rollups are corrected (this part worked pre-fix —
     // asserting it proves the repair actually ran and reached the new state).
-    let contacts_jsonl = std::fs::read_to_string(store.join("records/contacts/index.jsonl")).unwrap();
+    let contacts_jsonl =
+        std::fs::read_to_string(store.join("records/contacts/index.jsonl")).unwrap();
     assert!(
         contacts_jsonl.contains("records/contacts/nadia-petrov.md"),
         "folder sidecar must catalog the new contact:\n{contacts_jsonl}"

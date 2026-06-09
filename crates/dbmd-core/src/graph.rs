@@ -1726,10 +1726,22 @@ mod tests {
 
         // Uncapped over 3 hops: all four reachable nodes appear (a, b, c at hop 1,
         // deep at hop 2) — the full set the cap is measured against.
-        let full =
-            neighborhood(&fx.store, &fx.p("wiki/n/seed.md"), 3, &[], Direction::Outgoing).unwrap();
+        let full = neighborhood(
+            &fx.store,
+            &fx.p("wiki/n/seed.md"),
+            3,
+            &[],
+            Direction::Outgoing,
+        )
+        .unwrap();
         assert_eq!(
-            paths(&full.nodes.iter().map(|n| n.path.clone()).collect::<Vec<_>>()),
+            paths(
+                &full
+                    .nodes
+                    .iter()
+                    .map(|n| n.path.clone())
+                    .collect::<Vec<_>>()
+            ),
             vec!["wiki/n/a", "wiki/n/b", "wiki/n/c", "wiki/n/deep"],
             "uncapped traversal reaches every node within the hop budget"
         );
@@ -1785,12 +1797,7 @@ mod tests {
         let fx = Fixture::new();
         fx.write("wiki/h/hub.md", "wiki-page", "Hub", "");
         for n in ["a", "b", "c", "d", "e"] {
-            fx.write(
-                &format!("wiki/h/{n}.md"),
-                "wiki-page",
-                n,
-                "[[wiki/h/hub]]",
-            );
+            fx.write(&format!("wiki/h/{n}.md"), "wiki-page", n, "[[wiki/h/hub]]");
         }
         fx.reindex();
 

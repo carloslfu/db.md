@@ -588,12 +588,12 @@ fn spreadsheet_dense_cells(
 
     match workbook {
         Sheets::Xlsx(xlsx) => {
-            let mut reader = xlsx.worksheet_cells_reader(name).map_err(|e| {
-                ExtractError::Parse {
-                    format: "spreadsheet",
-                    message: format!("sheet {name:?}: {e}"),
-                }
-            })?;
+            let mut reader =
+                xlsx.worksheet_cells_reader(name)
+                    .map_err(|e| ExtractError::Parse {
+                        format: "spreadsheet",
+                        message: format!("sheet {name:?}: {e}"),
+                    })?;
             extent(|| {
                 reader.next_cell().map(|opt| {
                     opt.map(|c| (c.get_position(), matches!(c.get_value(), DataRef::Empty)))
@@ -601,12 +601,12 @@ fn spreadsheet_dense_cells(
             })
         }
         Sheets::Xlsb(xlsb) => {
-            let mut reader = xlsb.worksheet_cells_reader(name).map_err(|e| {
-                ExtractError::Parse {
-                    format: "spreadsheet",
-                    message: format!("sheet {name:?}: {e}"),
-                }
-            })?;
+            let mut reader =
+                xlsb.worksheet_cells_reader(name)
+                    .map_err(|e| ExtractError::Parse {
+                        format: "spreadsheet",
+                        message: format!("sheet {name:?}: {e}"),
+                    })?;
             extent(|| {
                 reader.next_cell().map(|opt| {
                     opt.map(|c| (c.get_position(), matches!(c.get_value(), DataRef::Empty)))
@@ -1317,7 +1317,13 @@ mod tests {
 
         let err = extract(&bomb).unwrap_err();
         assert!(
-            matches!(err, ExtractError::Parse { format: "spreadsheet", .. }),
+            matches!(
+                err,
+                ExtractError::Parse {
+                    format: "spreadsheet",
+                    ..
+                }
+            ),
             "an over-cap dense grid must be a typed spreadsheet Parse refusal, got {err:?}"
         );
         assert_eq!(err.code(), "EXTRACT_PARSE_ERROR");

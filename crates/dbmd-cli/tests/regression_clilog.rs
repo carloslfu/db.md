@@ -176,10 +176,7 @@ fn regression_append_still_rejects_a_real_third_positional() {
 /// misleading an agent into reading entry[0] as the most recent.
 #[test]
 fn regression_tail_help_describes_chronological_order() {
-    let out = dbmd()
-        .args(["log", "tail", "--help"])
-        .assert()
-        .success();
+    let out = dbmd().args(["log", "tail", "--help"]).assert().success();
     let help = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let lower = help.to_lowercase();
 

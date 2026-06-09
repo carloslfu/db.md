@@ -118,9 +118,7 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     // file — gets `AlreadyExists` and the structured `PATH_COLLISION` refusal.
     claim_new_path(&abs).map_err(|kind| match kind {
         ClaimError::Exists => collision_error(&store, &resolved),
-        ClaimError::Io(e) => {
-            CliError::runtime(format!("cannot create `{resolved_disp}`: {e}"))
-        }
+        ClaimError::Io(e) => CliError::runtime(format!("cannot create `{resolved_disp}`: {e}")),
     })?;
 
     // ── write, then maintain the catalog write-through ───────────────────────

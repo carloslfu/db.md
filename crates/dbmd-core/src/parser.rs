@@ -1842,11 +1842,16 @@ mod tests {
         let fm = Frontmatter::parse(yaml, Path::new("x.md")).unwrap();
         assert_eq!(fm.type_.as_deref(), Some("42"), "type scalar dropped");
         assert_eq!(fm.id.as_deref(), Some("100"), "id scalar dropped");
-        assert_eq!(fm.summary.as_deref(), Some("2026"), "summary scalar dropped");
+        assert_eq!(
+            fm.summary.as_deref(),
+            Some("2026"),
+            "summary scalar dropped"
+        );
         assert_eq!(fm.status.as_deref(), Some("0"), "status scalar dropped");
         // The values must surface through the public `get` accessor too.
         assert_eq!(
-            fm.get("summary").and_then(|v| v.as_str().map(str::to_string)),
+            fm.get("summary")
+                .and_then(|v| v.as_str().map(str::to_string)),
             Some("2026".to_string())
         );
     }

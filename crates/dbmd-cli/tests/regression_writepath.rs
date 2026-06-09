@@ -157,10 +157,7 @@ fn regression_concurrent_write_never_silently_clobbers() {
             .filter(|(_, code)| *code == Some(0))
             .map(|(s, _)| s)
             .collect();
-        let collisions = results
-            .iter()
-            .filter(|(_, code)| *code == Some(5))
-            .count();
+        let collisions = results.iter().filter(|(_, code)| *code == Some(5)).count();
 
         // Exactly one writer may win; the other MUST be told PATH_COLLISION
         // (exit 5) rather than silently succeeding and clobbering.
@@ -191,7 +188,8 @@ fn regression_concurrent_write_never_silently_clobbers() {
 #[test]
 fn regression_write_atomic_claim_still_refuses_existing_file_without_overwrite() {
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
-    let original = "---\ntype: contact\nsummary: ORIGINAL\nname: Sarah\n---\n\n# Sarah\n\nOriginal body.\n";
+    let original =
+        "---\ntype: contact\nsummary: ORIGINAL\nname: Sarah\n---\n\n# Sarah\n\nOriginal body.\n";
     write_file(&store, "records/contacts/collide.md", original);
 
     dbmd()
@@ -281,8 +279,14 @@ fn regression_fm_init_still_imports_headerless_file() {
         .success();
 
     let written = std::fs::read_to_string(store.join("records/contacts/tom-raw.md")).unwrap();
-    assert!(written.starts_with("---\n"), "frontmatter added:\n{written}");
-    assert!(written.contains("type: contact"), "type inferred:\n{written}");
+    assert!(
+        written.starts_with("---\n"),
+        "frontmatter added:\n{written}"
+    );
+    assert!(
+        written.contains("type: contact"),
+        "type inferred:\n{written}"
+    );
     assert!(
         written.ends_with(raw),
         "the raw headerless body must be preserved verbatim:\n{written}"

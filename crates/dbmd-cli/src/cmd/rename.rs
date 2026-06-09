@@ -209,11 +209,7 @@ enum RewriteError {
 /// file whose valid ASCII `[[old]]` line sits beside a stray non-UTF8 byte, and
 /// one such externally-dropped source must not abort an otherwise-clean rename.
 /// Every other read/write failure is a genuine [`RewriteError::Io`].
-fn rewrite_links_in_file(
-    abs: &Path,
-    old_rel: &Path,
-    new_rel: &Path,
-) -> Result<bool, RewriteError> {
+fn rewrite_links_in_file(abs: &Path, old_rel: &Path, new_rel: &Path) -> Result<bool, RewriteError> {
     let text = match std::fs::read_to_string(abs) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
