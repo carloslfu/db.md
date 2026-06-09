@@ -5,7 +5,7 @@ files with YAML frontmatter. Relationships are wiki-links. The database
 is the directory; the schema is the frontmatter; the index is whatever
 you want to build on top. It is built for agents: a database a harness
 reads, writes, links, and curates directly, and the native persistence
-layer for the agent-native tools and apps built on it. An agent wants
+layer for the agent-native tools built on it. An agent wants
 files, not a schema to migrate or a query language to wrap around. db.md
 is files. Simple and open by design.
 

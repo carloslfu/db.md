@@ -54,10 +54,10 @@ than any row in any table. That is the whole format.
 
 ## What it replaces
 
-That whole class of software is a database with a screen bolted on: a CRM, an
-ops tracker, a contract register, the internal tool every company rebuilds, the
-SaaS product that is just a table behind a login. db.md replaces the database
-and the screen at once. The records are the files, the agent answers the
+Most software a company pays for is a database with a screen bolted on: a CRM,
+an ops tracker, a contract register, the internal tool every company rebuilds,
+the SaaS product that is just a table behind a login. db.md replaces the
+database and the screen at once. The records are the files, the agent answers the
 questions, and the view gets built the moment you ask for one.
 
 This is built for company scale. A full email history, hundreds of thousands of
@@ -242,11 +242,11 @@ this hold at company scale?" is to read the store of how db.md itself was built.
 
 ## Use it on its own
 
-db.md is a self-contained standard. A plain markdown vault becomes a db.md
-store, with no platform and no account required: Obsidian users, a researcher
-running a topic wiki, an agentic computer keeping a company brain, any agent
-runtime with a folder of markdown. The [spec](SPEC.md) is the contract. The
-runtime is replaceable.
+db.md is an open standard, and it stands on its own. A plain markdown vault
+becomes a db.md store, with no platform and no account required: Obsidian
+users, a researcher running a topic wiki, an agentic computer keeping a company
+brain, any agent runtime with a folder of markdown. The [spec](SPEC.md) is the
+contract. The runtime is replaceable. The files outlast both.
 
 ## License
 
