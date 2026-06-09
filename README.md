@@ -2,277 +2,279 @@
 
 **The open database, in plain files.**
 
-`db.md` is a database where records are markdown files with YAML
-frontmatter, relationships are wiki-links, and the index is whatever
-you build on top. The database is the directory; the schema is the
-frontmatter.
+Your database is a folder of plain text files. No server, no tables, no query
+language. Every record is one markdown file you can open, read, and edit by
+hand. The links between records are written into the text itself. The folder is
+the database. That is all there is.
 
-One file at the root, **`DB.md`**, says how the store behaves — its
-identity, the agent's instructions, the policies, the schemas. A
-capable agent reads `DB.md` and curates the files directly. That file
-is the center of it; the rest is plain data the agent operates.
+For fifty years that would have been a toy. You needed a server, because the
+data would not fit in memory. You needed a schema up front, because software
+could not read plain writing. You needed a query language, because nothing else
+could find anything in the pile. Every one of those reasons just expired. A
+capable AI agent reads the files, writes them, links them, and finds anything
+in them by plain meaning. The agent is the query engine, and it gets sharper
+every time the model behind it improves.
 
-One directory, three layers, one config file: raw evidence in
-`sources/`, atomic typed data in `records/`, curator-synthesized
-narrative in `wiki/` — all governed by `DB.md`. Bring any agent
-runtime (Claude Code, Codex, or your own); it plays the curator role,
-guided by the [SPEC](SPEC.md) and the store's `DB.md`.
+So a database stops being software you run and becomes data you own. Text on
+disk, in a format a person reads easily and a model reads better than anything
+else, that outlasts every tool that ever touches it.
+
+And it is not small. Millions of records live on plain files, with no vector
+database. db.md replaces a whole class of software: the products that were only
+ever a database with a screen on top.
+
+Here is a record. It is a file:
+
+```markdown
+---
+type: contact
+name: Elena Rodriguez
+email: elena.rodriguez@northstar.io
+company: [[records/companies/northstar]]
+role: Director of Operations
+created: 2025-09-14
+updated: 2026-05-22
+---
+
+# Elena Rodriguez
+
+Director of Operations at [[records/companies/northstar]]. Champion on the
+renewal that expands to 175 seats. See the thread in
+[[sources/emails/2026-05-22-elena-rodriguez-renewal]]. Prefers async over
+calls unless something is stuck.
+```
+
+The frontmatter at the top is the schema. The `[[double bracket]]` entries are
+the relationships, the same links a wiki uses. The text below is for you, and
+for the agent. A person can read it. Git versions it. A model reads it better
+than any row in any table. That is the whole format.
+
+## How it works
+
+One directory. Three folders for your data, and one file that runs the place.
 
 ```
 db/
-├── DB.md          # identity + agent instructions + policies + schemas
-├── index.md       # curator-maintained catalog (hierarchical)
-├── log.md         # chronological log (append-only; rotates monthly)
-├── sources/       # raw evidence (immutable; date-sharded at scale)
-├── records/       # atomic typed data (contacts, expenses, meetings, ...)
-└── wiki/          # curator-synthesized narrative with wiki-links
+├── DB.md          # identity, agent instructions, policies, schemas
+├── index.md       # a catalog the agent keeps current
+├── sources/       # raw evidence, kept as it arrived: emails, PDFs, exports
+├── records/       # atomic typed data: contacts, companies, expenses, meetings
+└── wiki/          # the agent's synthesis, linked back to the rest
 ```
 
-## Quick start
+`DB.md` is the file that matters most. It holds the store's identity, the
+instructions for the agent, the policies it has to follow, and the schemas your
+records conform to. The agent reads `DB.md` first and curates everything else
+against it. You never write a config format or stand up a service. The agent
+writes `DB.md` for you and keeps it honest.
 
-```bash
-# install the toolkit (one prebuilt binary, ~5MB, no toolchain)
-curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
+Bring any agent runtime. Claude Code, Codex, or your own. It plays the curator:
+reading the files, writing new ones, keeping the links and the catalog in order,
+following the contract in `DB.md` and the [spec](SPEC.md). The format is at
+v0.2, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
-# create a store — you write DB.md (the agent authors it; there is no `dbmd init`)
-mkdir -p db/{sources,records,wiki}
-printf -- '---\ntype: db-md\nscope: personal\nowner: me\n---\n' > db/DB.md
+## How it compares
 
-dbmd validate db                          # frontmatter + link + schema check
-dbmd search "renewal" --in records        # search across the store
-dbmd links records/contacts/sarah-chen    # who links to this record?
-dbmd index rebuild db                     # regenerate the index hierarchy
-```
-
-**Point your coding agent at the store.** The installer is text: db.md is installed and integrated by reading markdown and acting on it, and a capable agent is the installer. Hand the agent the repo-root [`llms.txt`](llms.txt) — the agent-readable entry point for what db.md is and how to install, integrate, and operate it — and it can do the whole bootstrap by reading it and running the commands below. There is no per-harness machinery to depend on: the mechanism is generic text plus a smart model.
-
-Load the contract once per session — `dbmd spec` is the single source of truth:
-
-```bash
-claude --append-system "$(dbmd spec)"     # any runtime with a system-prompt hook
-```
-
-To persist that across sessions, place a skill where your harness reads skills, in the open [Agent Skills](https://agentskills.io) format — the canonical file ships in the repo at [`skills/db-md/SKILL.md`](skills/db-md/SKILL.md) (a `name`/`description` frontmatter pointer that runs `dbmd spec`): Claude Code reads `~/.claude/skills/db-md/`, Codex reads `~/.codex/skills/db-md/`; any other harness uses its own skills dir or loads `dbmd spec` into its system prompt. Placing it is generic file work — copy the file, use your harness's own skill installer (Codex's `skill-installer`, a Claude Code plugin), or just tell your agent to set itself up. db.md ships **no per-harness install command**; the installer is text and the model does the rest. The skill never copies the SPEC (it points at `dbmd spec`), so it cannot drift.
-
-The format is at **v0.2**: schema enforcement is solely the store's own `DB.md ## Schemas`, and the example types (`contact`, `expense`, …) are illustrative, not normative (v0.1 was the first tagged release, [`v0.1`](https://github.com/carloslfu/db.md/releases/tag/v0.1)). From v0.2 on, changes are additive. See the [CHANGELOG](CHANGELOG.md).
-
-## The curator is your agent
-
-db.md ships **no LLM runtime and no API keys**. "Curator" is a role
-any agent runtime plays: Claude Code, Codex, or your own. The agent
-loads the contract with `dbmd spec` — the single source of truth, read
-once per session — then follows the curator contract and operates the
-store through `dbmd` subcommands. Persisting that across sessions is a
-skill in the open Agent Skills format (`skills/db-md/SKILL.md` in the
-repo) — placed by copying the file, the harness's own skill installer,
-or the agent itself; db.md ships no per-harness install command. The
-toolkit is deterministic file/data plumbing; the
-agent does the reasoning. See [SPEC.md](SPEC.md) § The curator
-contract and § The agent session.
-
-## Why files
-
-The database has been a service for decades: a daemon, a wire
-protocol, a schema migration tool, an admin UI. That made sense when
-storage was expensive and indexes had to live in RAM. It doesn't
-anymore.
-
-db.md inverts the shape:
-
-- **The database is the directory.** No daemon, no port.
-- **The schema is the frontmatter.** Type-tagged, additive, optional.
-- **The index is derived.** db.md ships its own (a hierarchical
-  `index.md` catalog plus embedded ripgrep) and reaches millions of
-  files with no vector database. Build a SQLite or tantivy index on
-  top if another tool needs one; the files stay the source of truth.
-
-Three properties files have that tables don't:
-
-- **Human-editable.** A record is a file. Open it, edit it, commit it.
-- **Version-controllable.** Git is the audit log.
-- **LLM-native.** The format an LLM reads best is the format a human
-  reads best.
-
-Most databases are not Google-scale; they are records with a form
-or a dashboard on top: a CRM, an ops tracker, a contract register,
-the internal tools a company rebuilds, the SaaS apps that are a
-database with a UI bolted on. db.md replaces the database for that
-whole class, and the app over it. The agent reads the records and
-builds the view on demand. The genuinely hard remainder (high write
-concurrency, ACID, sub-millisecond reads, billions-row aggregates)
-is where the roadmap takes db.md next (the packed engine, projected
-through a VFS); a real engine still earns its place there today, and
-until then the two compose cleanly. The direction is one way:
-eventually, all of them, and never by adding vectors.
-
-Extends Karpathy's April 2026 LLM Wiki pattern from topic scope to
-**company scope**: customers, vendors, contracts, decisions,
-meetings, expenses, processes, playbooks, all maintained by the
-curator agent the team directs.
-
-The native toolkit holds company scale: a company's full email
-history (hundreds of thousands to millions of records) on plain
-files with embedded ripgrep, no vector database. See
-[SPEC.md § Scale](SPEC.md) for the budgets and the sizing model.
-
-## Tooling
-
-db.md is plain files; any tool that reads files works. The reference
-toolkit is **one Rust binary**, `dbmd`:
-
-- **One binary, many subcommands** (git / cargo / kubectl shape) for
-  read / write / validate / extract / graph / index / log ops.
-- **Embedded ripgrep** (via the `grep` crate) for fast search, with
-  no separate `rg` to install.
-- **Built-in extraction** (`dbmd extract`) for PDF / docx / xlsx /
-  epub / html via MIT Rust crates. No GPL `pdfgrep`, no AGPL `rga`.
-- **Zero LLM dependencies.** No provider SDKs, no API keys. The agent
-  runtime is BYO.
-- **`dbmd-core` library.** All logic lives in the library crate; the
-  binary is thin wrappers. `cargo add dbmd-core` to build
-  db.md-aware Rust tools.
-
-### Install
-
-One self-contained binary (~5MB, no runtime deps). Every path below
-installs the **same prebuilt, checksummed binary** built in CI — pick one:
-
-```sh
-# Recommended — prebuilt binary, no toolchain (macOS + Linux)
-curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
-
-# Homebrew
-brew install carloslfu/tap/dbmd
-
-# Already have the Rust toolchain? Build from crates.io instead.
-cargo install dbmd-cli
-```
-
-The install script resolves the latest release and downloads the binary
-**directly from this repo's [GitHub Releases](https://github.com/carloslfu/db.md/releases)** —
-no account, no platform, nothing between you and the binary. Prefer no
-script at all? Download a tarball and verify it yourself — every release
-ships `SHA256SUMS` plus a build-provenance attestation (see [Security](#security)):
-
-```sh
-gh release download -R carloslfu/db.md -p 'dbmd-*-darwin-aarch64.tar.gz' -p 'SHA256SUMS'
-shasum -a 256 -c SHA256SUMS --ignore-missing && tar -xzf dbmd-*.tar.gz
-```
-
-See [TOOLS.md](TOOLS.md) for the full subcommand surface and the agent
-bootstrap pattern.
-
-## Repository layout
-
-```
-db.md/
-├── SPEC.md             # format spec + curator contract + validation codes (v0.2)
-├── README.md
-├── TOOLS.md            # toolkit reference (subcommand surface, install, bootstrap)
-├── skills/db-md/       # the canonical Agent Skill (SKILL.md) — the distributable agents/harnesses install
-├── Cargo.toml          # Rust workspace
-├── crates/
-│   ├── dbmd-core/      # library: parser, store, graph, validate, stats, query, index, log
-│   └── dbmd-cli/       # the `dbmd` binary (thin wrappers)
-├── db/                 # the project's own db.md store (the dogfood, see below)
-├── examples/           # role-flavored example stores (three-layer: sources/ records/ wiki/)
-│   ├── research-wiki/
-│   ├── ops-store/
-│   ├── personal-second-brain/
-│   ├── agency-knowledge-base/
-│   └── customer-database/
-└── tests/corpora/      # test stores (canonical, edges, formats, scale, agent)
-```
-
-The flagship worked example is `db/`, db.md's own knowledge as a
-db.md store: the research that grounds the design under `sources/`,
-every material build decision under `records/decisions/`, and the
-narrative synthesis under `wiki/`. It is how db.md itself was built,
-and the answer to "how do you run db.md at company scale?" is to read
-the store of how db.md itself was built. It is co-located with the
-code and operated by `dbmd` as the toolkit grows. An agentic computer
-typically ships with its own db.md store at `~/db/`.
-
-## License
-
-[Apache-2.0](LICENSE). Patent grant, trademark clause, explicit
-modification disclosure. CLA on every PR via CLA Assistant. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
-## How db.md relates to other approaches
-
-db.md is the open database in plain files: your data lives in files you can read, edit, and own, and a capable agent operates them directly. Most software that looks like an app is a database with a UI bolted on. db.md replaces both: the records become files, the agent is the query engine, and the view is built on demand.
-
-The question under every alternative is the same, asked on two axes: what sits between you and your data, and what each rides on as the models improve. With db.md nothing sits between, and what it rides on is the model itself. Every other approach puts a layer in the way, a server, a vendor, an engine, or a derived cache, and that layer is machinery you maintain, not intelligence you rent from the model. Machinery only gets better when you do the work; the model gets better on its own, and db.md compounds with every release.
+Every other way to store data puts something between you and it. Ask two
+questions of each one: what sits in the middle, and what does it ride on as
+models improve. db.md puts nothing in the middle, and it rides on the model
+itself. Everything else rides on machinery you maintain, and machinery only
+improves when you do the work.
 
 | Approach | What sits between you and your data | What it rides on |
 |---|---|---|
-| **db.md** | nothing: the data is the files; you read and edit them directly, and the agent works the same files | the model curve, directly: every new model works the same files better, with nothing to migrate or rebuild |
-| SQL / relational databases | a schema you design up front and migrate when reality changes, a query language, and an app to use it | your schema and the app layer; a better model can write the SQL, but the store sits outside the model curve and never gets smarter |
-| Airtable / Notion (the database with a UI) | a vendor's service you rent, your data on their servers; export is lossy and drops the relations and formulas | the vendor's roadmap; you get the AI they bolt on, when they ship it, and only inside their walls |
-| Graphify | a derived knowledge-graph beside your files, queried through its API, stale until the next rebuild | a better model too, but spent rebuilding a derived graph that drifts from your files, not on the files themselves |
-| QMD | a SQLite search index and bundled small models, kept beside files you still own | its bundled small models, capped at their size; recall climbs when QMD ships new ones, not when the frontier moves |
-| Vector RAG | a vector store of embeddings you cannot read or edit, reached only through a retrieval service | a separate, smaller embedding model and reranker; recall is capped by that retrieval stack, re-paid every query, and a better reasoning model does not lift it |
-| Karpathy's LLM Wiki | nothing: plain markdown the model reads (db.md's lineage) | the model curve, directly on the files (db.md's lineage) |
+| **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with nothing to migrate or rebuild |
+| SQL databases | a schema you design up front and migrate when reality shifts, a query language, and an app to drive it | your schema and the app layer. A better model can write the SQL, but the store itself never gets smarter |
+| Airtable, Notion | a vendor's service you rent, your data on their servers, an export that drops the relations and the formulas | the vendor's roadmap. You get the AI they bolt on, when they ship it, inside their walls |
+| Vector RAG | a store of embeddings you cannot read or edit, reached only through a retrieval service | a separate, smaller embedding model. Recall is capped by it, re-paid on every query, and a smarter reasoning model does not lift it |
+| Knowledge-graph memory | a derived graph beside your files, queried through an API, stale until the next rebuild | a better model too, but spent rebuilding a graph that drifts from your files, not the files themselves |
+| Karpathy's LLM Wiki | nothing. Plain markdown the model reads. This is db.md's lineage | the model curve, directly on the files. Also db.md's lineage |
 
-Vector RAG is the approach db.md bets most directly against: db.md computes, stores, and searches no vector, ever. Where RAG engineers retrieval over embeddings of your data, db.md keeps the data as files and lets the frontier model read them, with semantic recall coming from the agent expanding the query over plain lexical search, not a separate embedding model.
+The fight db.md picks most directly is with vector RAG. db.md computes, stores,
+and searches no vector, ever. RAG engineers a retrieval pipeline over
+embeddings of your data; db.md keeps the data as files and lets the model read
+them, with semantic recall coming from the agent widening its own search in
+plain language. An embedding cannot tell you when a fact was true or whether
+something later replaced it. A dated file can. The clearest sign this is the
+right cut: Mem0's 2026 rewrite went append-only and bolted keyword and entity
+matching onto its vectors, moving onto ground db.md already stood on.
 
-The memory products built on that approach, by name, and what each stands for:
+## Why files
 
-| Memory tool | What it stands for | What sits between you and your data |
+The database has been a service for decades: a daemon, a wire protocol, a
+migration tool, an admin panel. That made sense when storage was expensive and
+the index had to live in memory. It does not anymore.
+
+db.md turns the shape inside out:
+
+- **The database is the directory.** There is no daemon and no port. You can
+  `cd` into it and `ls` your data.
+- **The schema is the frontmatter.** It is typed, optional, and additive. You
+  change it by editing a file, not by running a migration.
+- **The index is derived.** A plain catalog plus embedded ripgrep reaches
+  millions of files with no vector database. Want SQLite or a search index on
+  top? Build one. The files stay the source of truth.
+
+## What it replaces
+
+Most software a company pays for is a database with a screen bolted on: a CRM,
+an ops tracker, a contract register, the internal tool every company rebuilds,
+the SaaS product that is just a table behind a login. db.md replaces the
+database and the screen at once, for that whole class. The records are the
+files, the agent answers the questions, and the view gets built the moment you
+ask for one.
+
+This is built for company scale. A full email history, hundreds of thousands of
+records and sometimes millions, lives on plain files and stays fast with
+embedded ripgrep, no vector database anywhere. The genuinely hard cases still
+want a real engine: heavy write concurrency, ACID transactions, sub-millisecond
+reads, aggregates over billions of rows. That is the roadmap, not a claim for
+today, and until then the two compose cleanly.
+
+It is the pattern from Karpathy's April 2026 LLM Wiki, which scoped a single
+research topic, taken to company scope: customers, vendors, contracts,
+decisions, meetings, expenses, processes, playbooks, all curated by the agent
+your team directs.
+
+## Quick start
+
+Install the binary. One file, about 5MB, no toolchain:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
+# or: brew install carloslfu/tap/dbmd
+# or: cargo install dbmd-cli
+```
+
+Load the contract once per session. `dbmd spec` prints the whole standard:
+
+```bash
+dbmd spec
+```
+
+Point your agent at a folder and let it work. It writes `DB.md`, sorts your
+files into the three layers, and curates from there. Then, from inside the
+store:
+
+```bash
+dbmd search "renewal" --in records                   # search content and frontmatter
+dbmd query --type contact --where status=active      # filter by frontmatter
+dbmd links records/contacts/elena-rodriguez          # who links to this record
+dbmd graph neighborhood records/companies/northstar  # the local web around a record
+dbmd validate                                        # frontmatter, links, schemas, all checked
+```
+
+Every command speaks `--json`, so anything you build on top reads it cleanly.
+
+## The agent is the engine
+
+db.md ships no model and no API keys. The curator is whatever agent you already
+use: Claude Code, Codex, or your own. The whole flow is four moves. It discovers
+db.md, runs `dbmd spec` for the contract, reads the store's `DB.md`, then
+operates with `dbmd`. The binary is deterministic plumbing. The agent does the
+thinking. You are never locked to a model, because the model is the one part you
+bring and the one part that keeps improving.
+
+The installer is text. Hand an agent the repo's [llms.txt](llms.txt) and it sets
+itself up by reading it and running the commands. To make your agent reach for
+db.md on every session, place a skill where it reads skills, in the open
+[Agent Skills](https://agentskills.io) format. The canonical file ships at
+[`skills/db-md/SKILL.md`](skills/db-md/SKILL.md), and its body just points at
+`dbmd spec`, so it cannot drift. There is no install command for this, on
+purpose. Copy the file, use your agent's own skill installer, or tell the agent
+to set itself up.
+
+## The toolkit
+
+db.md is plain files, so any tool that reads files works. The reference toolkit
+is one Rust binary, `dbmd`, in the git / cargo / kubectl shape: one binary, many
+subcommands for read, write, validate, extract, graph, index, and log work.
+
+- **Embedded ripgrep.** Fast search with no separate tool to install.
+- **Built-in extraction.** `dbmd extract` pulls text out of PDF, docx, xlsx,
+  epub, and html, all through Rust crates under MIT and Apache licenses. No GPL
+  `pdfgrep`, no AGPL `rga`.
+- **Zero AI dependencies.** No provider SDKs, no API keys, no model calls in
+  the binary. The agent runtime is yours.
+- **A library, not just a CLI.** All the logic lives in `dbmd-core`. Run `cargo
+  add dbmd-core` to build your own db.md-aware tool.
+
+See [TOOLS.md](TOOLS.md) for the full command surface and the agent bootstrap.
+
+## The memory tools, by name
+
+A wave of products sells "memory" for agents. Each ships a system you adopt and
+maintain. db.md ships a convention you own.
+
+| Tool | What it is | What sits between you and your data |
 |---|---|---|
-| **Mem0** | managed memory: an LLM extracts facts, embeds them, and retrieves by similarity (keyword and entity matching added in 2026) | a vector-and-graph service you call; your memories kept as embeddings you cannot read, recall capped by a separate, smaller retrieval model and re-paid on every query |
-| **Letta / MemGPT** | self-editing agent memory; it asked whether a filesystem is all you need and answered files plus embeddings | an embedding index built automatically over your files; db.md is that same filesystem thesis with the vectors removed |
-| **Zep / Graphiti** | temporal memory built as a derived knowledge graph | a hosted graph and its API, a derived structure built from your data and kept in step with it |
-| **Cognee** | an extract-cognify-load pipeline into a graph-and-vector store | one more derived store to build and keep in sync with your files |
-| **db.md** | the data is the files; the agent is the query engine; no vector, ever | nothing: it rides the frontier model directly on the files you own |
+| **Mem0** | managed memory: an LLM extracts facts, embeds them, retrieves by similarity | a vector-and-graph service you call. Your memories live as embeddings you cannot read, recall capped by a smaller retrieval model and re-paid on every query |
+| **Letta / MemGPT** | self-editing agent memory; it asked whether a filesystem is all you need | an embedding index built over your files. db.md is that filesystem thesis with the vectors removed |
+| **Zep / Graphiti** | temporal memory built as a derived knowledge graph | a hosted graph and its API, a second structure kept in step with your data |
+| **Cognee** | an extract-and-load pipeline into a graph-and-vector store | one more derived store to build and keep in sync |
+| **db.md** | the data is the files; the agent is the query engine; no vector, ever | nothing. It rides the model directly on the files you own |
 
-The mechanism is the whole argument. An embedding has no notion of when a fact was true or whether it was later superseded; a dated file does. db.md answers time and knowledge-update questions by filtering frontmatter, not by hoping a vector lands nearby. The clearest proof that this is the right cut is that Mem0's own 2026 rewrite went append-only and bolted keyword and entity matching onto its vectors, moving onto the ground db.md already stands on. db.md is that endpoint, without the vector tax.
+The memory layer was always a database with the data hidden. db.md is the same
+job with the data left in the open. It also composes with the rest of the stack:
+[computer.md](https://github.com/carloslfu/computer.md) for the agentic computer
+that runs it, AGENTS.md for instructions, MCP for tools. Different layers, not
+rivals.
 
-Every tool here ships a memory system you adopt: a service, an engine, an index you rent and maintain. db.md ships a convention you own: plain files the frontier model reads and writes directly. The memory layer was always a database with the data hidden; db.md is the same job with the data left in the open.
+## What's in this repo
 
-For the genuinely hard remainder (high write concurrency, ACID, sub-millisecond reads, billions-row aggregates), a real database still backs db.md. That is the roadmap, not the claim for today.
+```
+db.md/
+├── SPEC.md          # the format, the curator contract, the validation codes (v0.2)
+├── TOOLS.md         # the toolkit: every subcommand, install, agent bootstrap
+├── crates/
+│   ├── dbmd-core/   # the library: parser, store, graph, validate, query, index, log
+│   └── dbmd-cli/    # the dbmd binary (thin wrappers over the library)
+├── examples/        # five real stores: research wiki, ops, second brain, agency, CRM
+├── skills/db-md/    # the canonical Agent Skill you place in your own agent
+└── db/              # db.md's own knowledge, kept as a db.md store
+```
 
-db.md composes with the rest of the agent stack: [computer.md](https://github.com/carloslfu/computer.md/blob/main/spec/SPEC.md) for the agentic computer that runs it, AGENTS.md for instructions, MCP for tools. Different layers, not alternatives.
+The store under `db/` is the proof. db.md's own research, every build decision,
+and the synthesis over them live there as a db.md store. The answer to "does
+this hold at company scale?" is to read the store of how db.md itself was built.
 
-Your data belongs in files you own, not behind a server, a vendor, or a cache. The tool stays small and model-free; the intelligence is the agent's, rented not built. Every other approach asks you to maintain more machinery; db.md asks you to trust the model, and the model is the thing that compounds. db.md and its LLM Wiki lineage are the only approaches that ride that curve directly on the files; db.md is the agent-native build-out of that bet, at company scale, replacing the database and the app over it for the whole class that was only ever records with a view on top. Bet on the model, not the machinery.
+## Use it on its own
 
-## Independently usable
+db.md is a self-contained standard. A plain markdown vault becomes a db.md
+store, with no platform and no account required: Obsidian users, a researcher
+running a topic wiki, an agentic computer keeping a company brain, any agent
+runtime with a folder of markdown. The [spec](SPEC.md) is the contract. The
+runtime is replaceable.
 
-db.md is a self-contained standard. A plain markdown vault becomes a
-db.md store: Obsidian users, researchers running a topic wiki, an
-agentic computer keeping its company brain, any agent runtime with a
-folder of markdown. No platform, no account, no hosted service
-required. [The spec](SPEC.md) is the contract; the runtime is replaceable.
+## License
+
+[Apache-2.0](LICENSE), with a patent grant, a trademark clause, and an explicit
+modification-disclosure term. Every pull request signs the Apache ICLA through
+the CLA Assistant bot. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Sign the Apache ICLA via
-the CLA Assistant bot on your first PR.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Sign the Apache ICLA through the CLA
+Assistant bot on your first pull request.
 
 ## Security
 
-Report vulnerabilities privately via GitHub's "Report a vulnerability"
-(Security tab); do not open a public issue for security problems. See
-[SECURITY.md](SECURITY.md).
+Report vulnerabilities privately through GitHub's "Report a vulnerability"
+button on the Security tab. Do not open a public issue for a security problem.
+See [SECURITY.md](SECURITY.md).
 
-**Releases are auditable and trusted.** Every release is built in CI from
-a tagged commit, not from a developer's machine. Prebuilt tarballs carry
-SHA256 checksums and build-provenance attestations, so anyone can confirm
-a download came from this repo's CI and was not tampered with:
+Releases are built in CI from a tagged commit, never from a developer's laptop.
+Every tarball carries a SHA256 checksum and a build-provenance attestation, so
+anyone can confirm a download came from this repo's CI and was not tampered
+with:
 
 ```bash
 gh attestation verify dbmd-<version>-<target>.tar.gz --repo carloslfu/db.md
 ```
 
 The `dbmd-cli` and `dbmd-core` crates publish to crates.io through Trusted
-Publishing (OIDC), so no long-lived registry token exists to leak. The
-toolkit ships zero AI/LLM dependencies and its tree is MIT/Apache, so you
-can audit it or build from source. See [RELEASING.md](RELEASING.md).
-
-**Dependencies are continuously audited.** Every pull request runs
-`cargo deny check advisories`, so the build fails on any open RustSec
-advisory (vulnerability, unsound, or unmaintained). The tree is also
-watched by GitHub Dependabot and Socket supply-chain scanning (malware,
-typosquats, suspicious install scripts), and every crate plus its license
-is recorded in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+Publishing (OIDC), so there is no long-lived registry token to leak. The binary
+ships zero AI dependencies and its tree is MIT and Apache licensed, so you can
+audit it or build it from source. Every pull request runs `cargo deny check
+advisories` and fails on any open RustSec advisory, and the tree is watched by
+Dependabot and Socket supply-chain scanning. See [RELEASING.md](RELEASING.md).
