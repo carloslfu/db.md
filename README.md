@@ -1,20 +1,23 @@
 # db.md
 
-**The database was a workaround for computers that couldn't read. They can now.**
+**For a huge class of software, the database was a workaround for programs
+that couldn't read meaning-rich text. Agents can.**
 
-**Your database is a folder of plain text files.** No server, no tables, no
-query language. Every record is one markdown file you can open, read, and edit
-by hand. The links between records are written into the text itself.
+**Your database is a folder of plain text files.** No daemon, no fixed tables,
+no query language standing between the agent and the data. Every record is one
+markdown file you can open, read, and edit by hand. The links between records
+are written into the text itself.
 
 The folder is the database.
 
-For fifty years that would have sounded like a toy. Databases earned their
-place by doing hard things files alone did not: durable writes, indexes,
-transactions, concurrent access, permissions, fast queries. But they also
-carried a workaround: software could not read plain writing, so the world had
-to be forced into tables before software could use it.
+For fifty years that would have sounded like a toy. Database engines earned
+their place by doing hard things files alone did not: durable writes, indexes,
+transactions, concurrent access, permissions, fast queries. But for the broad
+middle of software, they also carried a workaround: ordinary programs could not
+read and maintain plain writing, so messy reality had to be squeezed into
+tables before software could use it.
 
-**That workaround just expired.** A capable agent reads the files, writes them,
+**That workaround is expiring.** A capable agent reads the files, writes them,
 links them, and finds the connections between them by meaning. The agent is the
 engine.
 
@@ -24,9 +27,9 @@ repair them with more judgment, and reshape the schema without a migration
 ceremony. SQL can still be queried by better agents, but the store's meaning
 lives in schema and app code. Your files ride the model curve.
 
-So the database stops being software you run and becomes **data you own.**
-Text on disk that a person reads easily, a model can read directly, and that
-outlasts every tool that ever touches it.
+So the database stops being a service you run and becomes **data you own.** Text
+on disk that a person reads easily, a model can read directly, and that outlasts
+every tool that ever touches it.
 
 It is not tiny. **db.md is built for stores that grow into millions of plain
 files**, with no vector database anywhere.
@@ -46,9 +49,9 @@ So db.md replaces a whole class of software: **the products that were only ever
 a database with a screen on top.** If it is mostly tasks, trips, habits,
 customers, deals, contracts, expenses, decisions, or notes with a workflow
 wrapped around them, it should not stay a rented SaaS product forever. For
-builders: the old Postgres + ORM + migrations + CRUD layer becomes markdown
-records, frontmatter, wiki-links, and a model that can change the shape as
-reality changes.
+builders: the records-plus-a-surface stack becomes markdown records,
+frontmatter, wiki-links, and a model that can change the shape as reality
+changes.
 
 Here is a record. It is a file:
 
@@ -75,27 +78,28 @@ in the morning, Maya wants one open afternoon for wandering, and nobody wants
 another spreadsheet.
 ```
 
-The small YAML block at the top is frontmatter. In db.md, that is the schema:
-simple labels the agent can sort, filter, and repair. The `[[double bracket]]`
+The small YAML block at the top is frontmatter. In db.md, that is the structured
+surface of the record: simple labels the agent can sort, filter, and repair,
+with store-specific schemas declared in `DB.md`. The `[[double bracket]]`
 entries are the relationships, the same links a wiki uses. The text below is
-for you, and for the agent. A person can read it. Git versions it. A model
-reads it with the context a row usually hides. That is the whole format.
+for you, and for the agent. A person can read it. Git versions it. A model reads
+it with the context a row usually hides. That is the whole format.
 
 ## What it replaces
 
-Most software is smaller and softer than the databases we designed for it. A
-trip planner, baby tracker, migraine log, reading system, local CRM, ops
-tracker, contract register, decision log, backlog, internal admin panel:
+Most software is smaller and softer than the database/app stacks we designed
+for it. A trip planner, baby tracker, migraine log, reading system, local CRM,
+ops tracker, contract register, decision log, backlog, internal admin panel:
 underneath, they are usually records plus a surface. The old default was to put
 those records in Postgres, freeze a schema, wrap it in an app, and pay the
 migration tax every time reality changed.
 
-**db.md replaces that layer.** The records are the files, the schema is text,
-the relationships are links, and the agent answers questions or builds the
-surface the moment you ask for it. Add a field by adding frontmatter. Split a
-type by editing `DB.md`. Let the agent repair the store because it can read the
-store. The database becomes fluid because the thing operating it understands
-the medium.
+**db.md replaces that layer where fluidity matters more than hard transactional
+machinery.** The records are the files, the schema is text, the relationships
+are links, and the agent answers questions or builds the surface the moment you
+ask for it. Add a field by adding frontmatter. Split a type by editing `DB.md`.
+Let the agent repair the store because it can read the store. The database
+becomes fluid because the thing operating it understands the medium.
 
 Karpathy's April 2026 LLM Wiki is the proof of life: a model can maintain a
 coherent markdown world. db.md generalizes that from a wiki into a database.
@@ -160,18 +164,19 @@ keep the facts as dated files and skip the vector store.
 
 ## Why files
 
-The database has been a service for decades: a daemon, a wire protocol, a
-migration tool, an admin panel. That made sense when useful software over data
-had to be built around a database engine. It is no longer the only shape.
+The application database has been a service for decades: a daemon, a wire
+protocol, a migration tool, an admin panel. That made sense when useful software
+over data had to be built around a database engine. It is no longer the only
+shape.
 
 db.md turns the shape inside out:
 
 - **The database is the directory.** There is no daemon and no port. You can
   `cd` into it and `ls` your data.
-- **The schema is the frontmatter.** It is typed, optional, and additive. You
-  change it by editing text, not by running a migration. Add a field, rename a
-  type, tighten a schema in `DB.md`; the agent can read the diff and repair the
-  records.
+- **Structured fields live in frontmatter.** They are typed, optional, and
+  additive. You change the store shape by editing text, not by running a
+  migration. Add a field, rename a type, tighten a schema in `DB.md`; the agent
+  can read the diff and repair the records.
 - **The index is derived.** A plain catalog plus embedded ripgrep is built to
   carry millions of files with no vector database. Want SQLite or a search
   index on top? Build one. The files stay the source of truth.
@@ -185,12 +190,12 @@ million plain files**. **A ten-person shared store can cross a million files in
 two to three years.** That is the scale this format is built to hold.
 
 And the agent should not pay the whole-store cost in its normal loop, because
-**the agent does not navigate files, it reads indexes.** Every type folder keeps
-a human `index.md` (the 500 most recent entries) and a complete machine
-`index.jsonl`, both updated on writes. A query reads the relevant sidecar and
-goes straight to the right record. The interactive loop is designed around
-**O(changed), not O(store)**: what an operation costs should track what changed,
-not how big the store has grown.
+**the agent does not have to inspect every file; it reads indexes.** Every type
+folder keeps a human `index.md` (the 500 most recent entries) and a complete
+machine `index.jsonl`, both updated on writes. A query reads the relevant
+sidecar and goes straight to the right record. The interactive loop is designed
+around **O(changed), not O(store)**: what an operation costs should track what
+changed, not how big the store has grown.
 
 - **High-volume folders shard by date.** An email lands in
   `sources/emails/2026/05/`, an expense in `records/expenses/2026/05/`. No

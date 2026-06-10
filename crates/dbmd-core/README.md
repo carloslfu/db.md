@@ -4,10 +4,11 @@ The reference library for **db.md, the open standard for databases in plain file
 
 `db.md` is a database made of markdown files: records are markdown with
 YAML frontmatter, relationships are wiki-links, the directory is the
-database, the frontmatter is the schema, and an agent is the query
-engine. `dbmd-core` is the Rust library that implements every db.md
-operation; the [`dbmd`](https://crates.io/crates/dbmd-cli) binary is a
-thin command-line wrapper over it.
+database, frontmatter carries structured fields, `DB.md` declares schemas,
+and an agent is the query engine. `dbmd-core` is the Rust library that
+implements every db.md operation; the
+[`dbmd`](https://crates.io/crates/dbmd-cli) binary is a thin command-line
+wrapper over it.
 
 ## What it provides
 
@@ -23,13 +24,15 @@ thin command-line wrapper over it.
 
 - **Zero AI dependencies.** No model calls, no embeddings, no vectors — ever. The intelligence lives in the caller's agent; this library is the deterministic, fast tool it drives.
 - **Embedded ripgrep** via the `grep` + `ignore` crates — no separate binary, no shelling out.
-- **Permissive licensing only** (MIT / Apache-2.0 / BSD / Unlicense / MPL).
+- **Permissive licensing only** under the allowlist in the repo root
+  (`MIT`, `Apache-2.0`, BSD variants, `0BSD`, `Unlicense`, `MPL-2.0`, `Zlib`,
+  `Unicode-3.0`).
 
 ## Usage
 
 ```toml
 [dependencies]
-dbmd-core = "0.2"
+dbmd-core = "0.3.5"
 ```
 
 ```rust

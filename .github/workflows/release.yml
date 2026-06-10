@@ -346,17 +346,16 @@ jobs:
         with:
           subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
 
-  # ── Publish the crates to crates.io (Trusted Publishing, manual-gated) ───
+  # ── Publish the crates to crates.io (Trusted Publishing, no stored token) ─
   publish-crates:
     name: Publish to crates.io
     needs: [version, publish]
     runs-on: ubuntu-latest
     if: ${{ github.ref_type == 'tag' }}
     # The `crates-io` environment binds Trusted Publishing: crates.io only
-    # accepts an OIDC publish from a job running in this environment. No
-    # required reviewers are configured (solo maintainer), so a tag push
-    # publishes without a manual approval step; add required reviewers on the
-    # environment if a human gate is ever wanted.
+    # accepts an OIDC publish from a job running in this environment. If the
+    # environment has required reviewers, GitHub pauses here for approval; the
+    # intended solo-maintainer setup keeps this ungated.
     environment: crates-io
     permissions:
       id-token: write   # OIDC -> short-lived crates.io token (Trusted Publishing)

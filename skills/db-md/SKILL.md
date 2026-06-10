@@ -1,7 +1,7 @@
 ---
 name: db-md
 description: Operate a db.md store, the open standard for databases in plain files, with the `dbmd` CLI. Use when reading, writing, searching, validating, or curating any folder that has a DB.md at its root. Run `dbmd spec` for the full contract.
-version: 0.2.0
+version: 0.3.5
 license: Apache-2.0
 ---
 

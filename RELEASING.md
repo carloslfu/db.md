@@ -6,9 +6,9 @@ Written so an agent or a human can run it cold.
 ## TL;DR
 
 Bump the version, push `main`, push a `vX.Y.Z` tag. The tag triggers CI,
-which builds all platforms and **auto-publishes** to crates.io via Trusted
-Publishing (OIDC, no token) and creates the GitHub release. There is no
-manual approval step.
+which builds all platforms and publishes to crates.io via Trusted Publishing
+(OIDC, no token), then creates the GitHub release. In the intended
+solo-maintainer setup, there is no manual approval step.
 
 ```sh
 # 1. bump version (see "Files to bump" below), then:
@@ -29,8 +29,8 @@ Then watch the run and verify (see "Verify" below).
 | Version bump + changelog | **you / agent** (before tagging) |
 | Build 4 platforms, GitHub release, SHA256SUMS, provenance attestation | CI (`release.yml`, on tag) |
 | Publish `dbmd-core` then `dbmd-cli` to crates.io via OIDC | CI (`publish-crates` job, on tag) |
-| Bump the Homebrew tap formula (`carloslfu/homebrew-tap`) | CI (`homebrew` job, on tag) — **active** (scoped deploy key is set) |
-| Approval click | **none** — the `crates-io` environment has no required reviewers |
+| Bump the Homebrew tap formula (`carloslfu/homebrew-tap`) | CI (`homebrew` job, on tag) when `HOMEBREW_TAP_DEPLOY_KEY` is configured; otherwise it skips cleanly |
+| Approval click | None in the intended solo-maintainer setup; adding required reviewers to the `crates-io` environment turns this into a GitHub approval gate |
 
 Pushing to `main` never publishes. Only a `vX.Y.Z` tag does.
 
@@ -39,13 +39,12 @@ Pushing to `main` never publishes. Only a `vX.Y.Z` tag does.
 `Formula/dbmd.rb` to `carloslfu/homebrew-tap`. It authenticates with an SSH
 **deploy key** scoped to the tap repo only (write), stored as the
 `HOMEBREW_TAP_DEPLOY_KEY` secret on this repo — least-privilege, no broad
-account token in CI. **The key is set, so the bump runs automatically on every
-tagged release.** If the secret is ever removed the job **skips cleanly** and
-the formula can be bumped by hand: `HomebrewFormula/render.sh X.Y.Z SHA256SUMS
-> Formula/dbmd.rb` (download `SHA256SUMS` from the release first), then commit
-to the tap. To rotate: generate a new ed25519 pair, replace the tap's deploy
-key (tap repo → Settings → Deploy keys) and the `HOMEBREW_TAP_DEPLOY_KEY`
-secret on this repo.
+account token in CI. If that secret is absent the job **skips cleanly** and the
+formula can be bumped by hand: `HomebrewFormula/render.sh X.Y.Z SHA256SUMS >
+Formula/dbmd.rb` (download `SHA256SUMS` from the release first), then commit to
+the tap. To rotate: generate a new ed25519 pair, replace the tap's deploy key
+(tap repo → Settings → Deploy keys) and the `HOMEBREW_TAP_DEPLOY_KEY` secret on
+this repo.
 
 ## Files to bump (must all agree on the version)
 
@@ -100,8 +99,8 @@ the version and contents right before tagging. There is no un-publish.
   crates.io token via GitHub OIDC at run time — **no token is stored anywhere.**
 - The **`crates-io` GitHub environment** must exist (repo → Settings →
   Environments). It binds the OIDC trust — crates.io only accepts a publish
-  from a job running in that environment. It currently has **no required
-  reviewers** (solo maintainer), which is why publishing is hands-off.
+  from a job running in that environment. The intended solo-maintainer setup has
+  no required reviewers, so publishing is hands-off.
 - **To re-add a manual approval gate** (e.g. if more maintainers join): repo →
   Settings → Environments → `crates-io` → add yourself/others as Required
   reviewers. The publish job will then wait for a one-click approval per release.

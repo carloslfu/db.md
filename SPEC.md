@@ -2,10 +2,10 @@
 
 `db.md` is **the open standard for databases in plain files**. Records are markdown
 files with YAML frontmatter. Relationships are wiki-links. The database
-is the directory; the schema is the frontmatter; the index is whatever
-you want to build on top. It is built for agents: a database a harness
-reads, writes, links, and curates directly, and the native persistence
-layer for the agent-native tools built on it.
+is the directory; structured fields live in frontmatter; schemas live in
+`DB.md`; the index is whatever you want to build on top. It is built for
+agents: a database a harness reads, writes, links, and curates directly,
+and the native persistence layer for the agent-native tools built on it.
 
 The bet is that agents create more software, not less: personal apps,
 home-cooked tools, team workflows, agent-native products, and company
@@ -965,14 +965,15 @@ The database has been a service for decades — a daemon, a wire
 protocol, a schema migration tool, an admin UI. That made sense when
 useful software over data had to be built around a database engine. It
 is no longer the only shape. A modern computer can ripgrep a million
-files in seconds. An LLM reads markdown directly. Git already does what
-database snapshots try to.
+files in seconds. An LLM reads markdown directly. Git gives curated
+plain-file layers a durable, inspectable history.
 
 db.md inverts the shape:
 
 - **The database is the directory.** No daemon, no port, no
   migration tool.
-- **The schema is the frontmatter.** Type-tagged, additive, optional.
+- **Structured fields are frontmatter.** Type-tagged, additive,
+  optional; store-specific schemas live in `DB.md`.
 - **The index is derived.** db.md ships its own — the hierarchical
   `index.md` catalog plus embedded ripgrep — and it carries the store
   to millions of files with no vector database. Want a SQLite catalog
@@ -994,9 +995,9 @@ ops tracker, contract register, decision log, internal admin panel, or
 SaaS product that is a database with a UI bolted on. The old default was
 to put those records in Postgres, freeze a schema, wrap it in an app, and
 migrate every time reality moved.
-db.md replaces the database for that whole class — and the app over it,
-because the agent reads and relates the records directly and builds the
-surface on demand.
+db.md replaces the database for that broad middle — and the app over it
+when the surface is agent-built — because the agent reads and relates
+the records directly and builds the surface on demand.
 
 The genuinely hard remainder is real: high write concurrency, ACID
 transactions, sub-millisecond reads, aggregates over billions of rows.
@@ -1005,8 +1006,8 @@ A real engine still earns its place there today, and that is where the
 projected through a VFS) under this same contract: the directory is the
 database, the files are the source of truth. Until then the two compose
 cleanly — write to both, treat db.md as the canonical, human-readable
-layer. The direction is one way: eventually, all of them, and never by
-adding vectors.
+layer. The long bet still points one way: more of this territory moves
+into agent-readable files, and never by adding vectors.
 
 ## Writers and readers
 

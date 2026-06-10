@@ -61,8 +61,10 @@ store you operate on.
 
 `dbmd` is a single Rust binary with a small, audited dependency
 tree (every crate + its license is recorded in
-[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES); MIT/Apache/BSD/
-Unlicense/MPL only, zero AI/LLM crates). Build from source to verify.
+[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES); dependency licenses must stay
+inside the allowlist enforced by `deny.toml` and
+`crates/dbmd-cli/tests/license_policy.rs`; zero AI/LLM crates). Build from
+source to verify.
 
 CI runs format, build, test, and clippy on every pull request. Dependency
 changes also run `cargo deny check licenses bans` (the permissive-only license

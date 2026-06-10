@@ -75,8 +75,10 @@ do the work; `rg` is the thin binary.)
   folder — without any account or hosted service.
 - **Heavy dependencies.** Keep the dependency tree small, and
   record every new crate plus its license in
-  [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES). Licenses must be
-  MIT / Apache-2.0 / BSD / Unlicense / MPL — no GPL/AGPL/LGPL-static.
+  [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES). Licenses must stay inside the
+  allowlist in `deny.toml` and `crates/dbmd-cli/tests/license_policy.rs`
+  (MIT / Apache-2.0 / BSD / 0BSD / Unlicense / MPL-2.0 / Zlib /
+  Unicode-3.0) — no GPL/AGPL/LGPL-static.
 - **AI/LLM dependencies.** `dbmd` is deterministic and ships zero
   AI: no provider SDKs, no API keys, no model calls, and no
   embeddings / vectors / ANN — ever. The user's own agent harness

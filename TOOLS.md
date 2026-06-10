@@ -120,11 +120,11 @@ validation, stats, query, index/log ops. Precedent: ripgrep's
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 ```
 
-**Alternatives** (same binary, different mechanism):
+**Alternatives**:
 
 ```bash
-brew install carloslfu/tap/dbmd     # Homebrew tap
-cargo install dbmd-cli              # if you already have the Rust toolchain
+brew install carloslfu/tap/dbmd     # prebuilt release through the Homebrew tap
+cargo install dbmd-cli              # build from crates.io with your Rust toolchain
 # or download a prebuilt tarball from the GitHub releases page:
 #   https://github.com/carloslfu/db.md/releases
 ```
@@ -143,7 +143,7 @@ is, plus how to install, integrate, and operate); the canonical path is **read
 
 ```bash
 # 1 — get the binary (prebuilt; brew / cargo are alternatives, same
-#      checksummed binary)
+#      release artifacts)
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
 # 2 — load the contract: read it once per session and act on it.
@@ -151,8 +151,8 @@ dbmd spec                                        # the single source of truth
 
 # OPTIONAL — persist the contract so it loads every future session.
 #   Still text: place the skill file, or carry the spec in a prompt.
-claude --append-system "$(dbmd spec)"            # carry it in any system prompt
-dbmd spec > /path/to/harness/system-prompt       # or any other harness's own dir
+dbmd spec > /tmp/dbmd-spec.md                    # capture the contract
+# paste or load /tmp/dbmd-spec.md into your harness's system prompt
 ```
 
 There is one source of truth — `dbmd spec`, which prints the SPEC. Read it (or
@@ -160,13 +160,14 @@ the repo-root `llms.txt`) and act; that is the whole mechanism. Persisting it
 is optional: place a skill where your harness reads skills (the open `SKILL.md`
 format — the canonical file is `skills/db-md/SKILL.md`, dropped into
 `~/.claude/skills/db-md`, `~/.codex/skills/db-md`, or any other harness's skills
-dir), or load `dbmd spec` into the system prompt. Placing the file is generic
-work — copy it, use your harness's own skill installer, or tell your agent to;
-db.md ships no per-harness install command. The skill body just points at `dbmd
-spec` (never an inlined copy, so it cannot drift). Either way the agent carries
-the canonical SPEC for the session — the format, example types, curator
-contract, session lifecycle, the full subcommand surface, and the validation
-issue-code vocabulary. Per-store overrides come from `DB.md` on every operation.
+dir), or configure your harness to include the captured `dbmd spec` output in
+the prompt. Placing the file is generic work — copy it, use your harness's own
+skill installer, or tell your agent to; db.md ships no per-harness install
+command. The skill body just points at `dbmd spec` (never an inlined copy, so it
+cannot drift). Either way the agent has the canonical SPEC for the session —
+the format, example types, curator contract, session lifecycle, the full
+subcommand surface, and the validation issue-code vocabulary. Per-store
+overrides come from `DB.md` on every operation.
 
 ## Status
 

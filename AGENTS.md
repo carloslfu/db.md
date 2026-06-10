@@ -13,7 +13,7 @@ workspace:
   query, index, log, summary, stats, render, extract).
 - `crates/dbmd-cli` — the thin `dbmd` binary that wraps `dbmd-core`.
 - `SPEC.md` — the canonical format + curator contract (single source of truth).
-- `tests/corpora/` — frozen test stores. `db/` — the dogfood store.
+- `tests/corpora/` — frozen test stores. `examples/` — small worked stores.
 
 ## Hard rules (do not violate)
 
@@ -23,12 +23,16 @@ workspace:
 - **All logic in `dbmd-core`; `dbmd-cli` is thin wrappers.**
 - **Embedded ripgrep** via the `grep` + `ignore` crates — never bundle or shell
   out to `rg`.
-- **Permissive dependency licenses only** (MIT / Apache-2.0 / BSD / Unlicense /
-  MPL); record every new dep in `THIRD_PARTY_NOTICES`. Enforced by
+- **Permissive dependency licenses only** (MIT / Apache-2.0 / BSD / 0BSD /
+  Unlicense / MPL-2.0 / Zlib / Unicode-3.0); record every new dep in
+  `THIRD_PARTY_NOTICES`. Enforced by `deny.toml` plus
   `crates/dbmd-cli/tests/license_policy.rs`.
-- **Interactive-loop ops are O(changed), never O(store)** — no full `Store::walk`
-  on the loop path (walks only in `validate --all`, `index rebuild`, `stats`).
-- **Self-contained.** db.md references no other project/platform. Copyright is
+- **Interactive-loop ops avoid whole-store walks.** Use sidecars, changed sets,
+  and bounded type-folder work on the loop path; full `Store::walk` belongs in
+  sweep paths (`validate --all`, `index rebuild`, `stats`) or explicit repair.
+- **Standalone by design.** db.md must not require any platform, account, or
+  runtime outside a folder of files plus the toolkit. Comparative references to
+  adjacent standards are fine; dependencies on them are not. Copyright is
   Carlos Galarza.
 
 ## Build / test / checks
@@ -47,8 +51,9 @@ CI (`.github/workflows/`): `test.yml` (fmt/build/clippy/test), `publish-check.ym
 
 ## Releasing
 
-Bump the version, push `main`, push a `vX.Y.Z` tag. The tag auto-publishes via
-CI (Trusted Publishing / OIDC, no token, no approval gate). **Full procedure and
+Bump the version, push `main`, push a `vX.Y.Z` tag. The tag publishes via CI
+(Trusted Publishing / OIDC, no token; approval only if required reviewers are
+configured on the GitHub environment). **Full procedure and
 the files to bump: [RELEASING.md](RELEASING.md).** Do not try to `cargo publish`
 by hand — the release flow is the tag.
 

@@ -4,9 +4,9 @@
 > frontmatter; relationships are wiki-links; the database is the directory.
 > Built for agents: a database a harness reads, writes, links, and curates
 > directly through the `dbmd` CLI. For personal apps, home-cooked tools, team
-> workflows, and agent-native products, the old Postgres + migrations + CRUD
-> layer can become files, frontmatter, wiki-links, and a curator contract. No
-> daemon, no server, no embeddings.
+> workflows, and agent-native products, the records-plus-a-surface layer can
+> become files, frontmatter, wiki-links, and a curator contract. No daemon, no
+> embeddings.
 
 This file is the agent-readable entry point, in the spirit of llms.txt.
 **The installer is text:** if you are an AI agent, you install and integrate
@@ -24,8 +24,8 @@ you the binary; `dbmd spec` is the single source of truth from there.
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 ```
 
-Alternatives, same checksummed binary: `brew install carloslfu/tap/dbmd`, or
-`cargo install dbmd-cli` (if you have the Rust toolchain).
+Alternatives: `brew install carloslfu/tap/dbmd` for the prebuilt release, or
+`cargo install dbmd-cli` to build from crates.io if you already have Rust.
 
 ## 2. Load the contract (the single source of truth)
 
