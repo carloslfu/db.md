@@ -3,19 +3,23 @@
 `db.md` is **the open standard for databases in plain files**. Records are markdown
 files with YAML frontmatter. Relationships are wiki-links. The database
 is the directory; structured fields live in frontmatter; schemas live in
-`DB.md`; the index is whatever you want to build on top. It is built for
-agents: a database a harness reads, writes, links, and curates directly,
-and the native persistence layer for the agent-native tools built on it.
+`DB.md`; indexes are plain derived sidecars (`index.md` / `index.jsonl`).
+It is built for agents: a database a harness reads, writes, links, and
+curates directly.
 
-The bet is that agents create more software, not less: personal apps,
-home-cooked tools, team workflows, agent-native products, and company
-systems whose shape changes as reality changes. For the broad middle of
-that software — tasks, trips, habits, customers, contracts, expenses,
-decisions, notes, and workflows wrapped around them — what used to be a
-Postgres schema, an ORM, migrations, and a CRUD surface can become
-files, frontmatter, wiki-links, and a curator contract. An agent wants
-files it can reshape, not a schema to migrate or a query language to
-wrap around. db.md is files. Simple and open by design.
+The bet is that agents change the default shape of software. For a large
+class of semantic, evolving, workflow-heavy systems, the old stack —
+database, backend, frontend — collapses into readable context, an agent
+harness, and a generated surface. db.md is the persistence layer for
+that shape: agent-operated files-as-database.
+
+This is the broad middle of software: records, context, relationships,
+workflows, decisions, policies, history, and a surface. What used to be
+a Postgres schema, service layer, migrations, and a CRUD UI can become
+files, frontmatter, wiki-links, `DB.md`, `index.md` / `index.jsonl`, and
+a curator contract. An agent wants files it can reshape, not a schema to
+migrate or a query language to wrap around. db.md is files. Simple and
+open by design.
 
 One directory, three folders, one config file. Raw evidence lives in
 `sources/`. Atomic typed data lives in `records/`. Curator-synthesized
@@ -962,11 +966,15 @@ the operator wrote a section the toolkit will never read). Recognized
 ## Why files
 
 The database has been a service for decades — a daemon, a wire
-protocol, a schema migration tool, an admin UI. That made sense when
-useful software over data had to be built around a database engine. It
-is no longer the only shape. A modern computer can ripgrep a million
-files in seconds. An LLM reads markdown directly. Git gives curated
-plain-file layers a durable, inspectable history.
+protocol, a schema migration tool, an admin UI — because useful
+software over data had to be built as database, backend, frontend. The
+database held state, the backend encoded rules, and the frontend exposed
+fixed views and actions.
+
+Agents make another shape possible: markdown/wiki/files, an agent
+harness, and a generated surface. A modern computer can ripgrep a
+million files in seconds. An LLM reads markdown directly. Git gives
+curated plain-file layers a durable, inspectable history.
 
 db.md inverts the shape:
 
@@ -989,15 +997,16 @@ Three properties files have that tables don't:
 3. **LLM-native.** The format an LLM reads best is the format a
    human reads best.
 
-Most software is not Google-scale. It is records plus a surface: a trip
-planner, baby tracker, migraine log, reading system, CRM, knowledge base,
-ops tracker, contract register, decision log, internal admin panel, or
-SaaS product that is a database with a UI bolted on. The old default was
-to put those records in Postgres, freeze a schema, wrap it in an app, and
-migrate every time reality moved.
-db.md replaces the database for that broad middle — and the app over it
-when the surface is agent-built — because the agent reads and relates
-the records directly and builds the surface on demand.
+Most software is not Google-scale. It is records, context,
+relationships, workflows, decisions, policies, history, and a surface:
+a trip planner, baby tracker, migraine log, reading system, CRM,
+knowledge base, ops tracker, contract register, decision log, internal
+admin panel, or SaaS product that is a database with a UI bolted on.
+The old default was to put those records in Postgres, freeze a schema,
+wrap it in an app, and migrate every time reality moved. db.md replaces
+the database for that broad middle — and the app over it when the
+surface is agent-built — because the agent reads and relates the records
+directly and builds the surface on demand.
 
 The genuinely hard remainder is real: high write concurrency, ACID
 transactions, sub-millisecond reads, aggregates over billions of rows.
@@ -1006,7 +1015,8 @@ A real engine still earns its place there today, and that is where the
 projected through a VFS) under this same contract: the directory is the
 database, the files are the source of truth. Until then the two compose
 cleanly — write to both, treat db.md as the canonical, human-readable
-layer. The long bet still points one way: more of this territory moves
+layer. Postgres is for authoritative machinery. db.md is for living
+context. The long bet still points one way: more of this territory moves
 into agent-readable files, and never by adding vectors.
 
 ## Writers and readers
@@ -1053,7 +1063,8 @@ Four properties deliver it:
 
 - **Sources and event-type records are date-sharded; entity records
   and wiki stay flat.** Raw evidence never changes after ingest, so the
-  toolkit parses each source once and never again. High-volume folders
+  toolkit parses each source once and never again. When a conforming
+  writer uses `dbmd write`, high-volume source and event types
   auto-partition by date (`sources/emails/2026/05/…`,
   `records/expenses/2026/05/…`) so no directory holds an unbounded
   number of entries and only the current shard is ever "hot."

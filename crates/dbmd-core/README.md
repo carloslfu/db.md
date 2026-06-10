@@ -5,7 +5,10 @@ The reference library for **db.md, the open standard for databases in plain file
 `db.md` is a database made of markdown files: records are markdown with
 YAML frontmatter, relationships are wiki-links, the directory is the
 database, frontmatter carries structured fields, `DB.md` declares schemas,
-and an agent is the query engine. `dbmd-core` is the Rust library that
+and an agent is the query engine. It is the persistence layer for the
+agent-native stack where readable context, an agent harness, and generated
+surfaces replace much of the old database/backend/frontend shape.
+`dbmd-core` is the Rust library that
 implements every db.md operation; the
 [`dbmd`](https://crates.io/crates/dbmd-cli) binary is a thin command-line
 wrapper over it.

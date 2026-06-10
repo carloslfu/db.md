@@ -12,6 +12,12 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Changed
+
+- Tightened the README, SPEC, and agent/crate summaries around the stack-collapse
+  thesis: db.md as agent-operated files-as-database for software that becomes
+  readable context + agent harness + generated surface.
+
 ## [0.3.5] — 2026-06-09
 
 A correctness-and-robustness release. An adversarial multi-agent review of the

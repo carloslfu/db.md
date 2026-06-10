@@ -3,10 +3,11 @@
 > The open standard for databases in plain files. Records are markdown files with YAML
 > frontmatter; relationships are wiki-links; the database is the directory.
 > Built for agents: a database a harness reads, writes, links, and curates
-> directly through the `dbmd` CLI. For personal apps, home-cooked tools, team
-> workflows, and agent-native products, the records-plus-a-surface layer can
-> become files, frontmatter, wiki-links, and a curator contract. No daemon, no
-> embeddings.
+> directly through the `dbmd` CLI. For semantic, evolving, workflow-heavy
+> software, the old database/backend/frontend stack can become readable context,
+> an agent harness, and a generated surface. db.md is agent-operated
+> files-as-database: files, frontmatter, wiki-links, DB.md, indexes, and a
+> curator contract. No daemon, no embeddings.
 
 This file is the agent-readable entry point, in the spirit of llms.txt.
 **The installer is text:** if you are an AI agent, you install and integrate

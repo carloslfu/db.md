@@ -6,10 +6,9 @@ databases in plain files**.
 `db.md` is a database made of markdown files: records are markdown with
 YAML frontmatter, relationships are wiki-links, the directory is the
 database, frontmatter carries structured fields, `DB.md` declares schemas,
-and your agent is the query engine. For personal apps, home-cooked tools, team
-workflows, and the broad middle of agent-written software, the
-records-plus-a-surface layer becomes files, frontmatter, wiki-links, and a
-curator contract. `dbmd` is a
+and your agent is the query engine. For semantic, evolving, workflow-heavy
+software, the old database/backend/frontend stack can become readable context,
+an agent harness, and a generated surface. `dbmd` is a
 single deterministic binary that performs every db.md file/data operation; all
 logic lives in
 [`dbmd-core`](https://crates.io/crates/dbmd-core) and the binary is a

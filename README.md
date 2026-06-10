@@ -1,7 +1,8 @@
 # db.md
 
-**For a huge class of software, the database was a workaround for programs
-that couldn't read meaning-rich text. Agents can.**
+**A huge class of future software will not be built as database + backend +
+frontend. It will be built as readable context + agent harness + generated
+surface. db.md is the persistence layer for that world.**
 
 **Your database is a folder of plain text files.** No daemon, no fixed tables,
 no query language standing between the agent and the data. Every record is one
@@ -10,12 +11,15 @@ are written into the text itself.
 
 The folder is the database.
 
-For fifty years that would have sounded like a toy. Database engines earned
-their place by doing hard things files alone did not: durable writes, indexes,
-transactions, concurrent access, permissions, fast queries. But for the broad
-middle of software, they also carried a workaround: ordinary programs could not
-read and maintain plain writing, so messy reality had to be squeezed into
-tables before software could use it.
+Before agents, text was documentation. After agents, text becomes operational
+state.
+
+For fifty years a folder-as-database would have sounded like a toy. Database
+engines earned their place by doing hard things files alone did not: durable
+writes, indexes, transactions, concurrent access, permissions, fast queries.
+But for the broad middle of software, they also carried a workaround: ordinary
+programs could not read and maintain meaning-rich state directly, so messy
+reality had to be squeezed into tables before software could use it.
 
 **That workaround is expiring.** A capable agent reads the files, writes them,
 links them, and finds the connections between them by meaning. The agent is the
@@ -34,24 +38,65 @@ every tool that ever touches it.
 It is not tiny. **db.md is built for stores that grow into millions of plain
 files**, with no vector database anywhere.
 
-This is the contrarian bet: the future has more software, not less, but much of
-it will be too personal, too specific, and too alive to become a SaaS product.
-One person will make an app for one habit. A family will make an app for one
-routine. A researcher will make an app for one field. A company will make an
-app for one workflow. Agents make software cheap enough for the long tail to
-exist.
+## The stack collapse
 
-That software needs a new database. Not a server. Not a vendor. Not a schema
-that hardens before the idea is done. A folder of text the agent can inspect,
-reshape, and keep alive.
+For decades, the default app shape was:
 
-So db.md replaces a whole class of software: **the products that were only ever
-a database with a screen on top.** If it is mostly tasks, trips, habits,
-customers, deals, contracts, expenses, decisions, or notes with a workflow
-wrapped around them, it should not stay a rented SaaS product forever. For
-builders: the records-plus-a-surface stack becomes markdown records,
-frontmatter, wiki-links, and a model that can change the shape as reality
-changes.
+```
+Database -> Backend -> Frontend
+Postgres + service layer + React app
+```
+
+The database held the state. The backend encoded the rules. The frontend
+exposed fixed views and actions. That shape made sense when programs could not
+understand the data they operated on.
+
+Agents change the default.
+
+For a large class of semantic, evolving, workflow-heavy software, the new shape
+is:
+
+```
+Markdown/wiki/files -> Agent harness -> Generated surface
+db.md + agent harness -> voice, chat, canvas, forms, approvals, dashboards
+```
+
+The files hold the records, context, relationships, policies, and history. The
+agent harness reads, writes, validates, repairs, migrates, plans, and acts. The
+surface appears when needed: chat, voice, canvas, forms, approval cards,
+dashboards, or whatever the task requires.
+
+The old app becomes an agent operating over readable state.
+
+The claim is not "no database." It is **agent-operated files-as-database**:
+records are markdown files, fields are YAML frontmatter, relationships are
+wiki-links, schemas and policies live in `DB.md`, indexes are `index.md` /
+`index.jsonl`, the deterministic tool is `dbmd`, and the engine is the agent
+driving it.
+
+That is why db.md is not merely a Markdown database. It is the default
+persistence layer for agent-native software: the class of software whose main
+substance is records, context, relationships, decisions, workflows, and a
+surface.
+
+Personal software is the easiest place to see the collapse first. The same
+shape fits internal tools, company brains, ops trackers, lightweight CRMs,
+research systems, project systems, support workflows, agency workflows,
+contract registers, decision logs, admin tools, family tools, field-specific
+tools, and agent-native products whose shape changes every week.
+
+Many of those were previously too small, too specific, too fluid, or too alive
+to justify becoming full SaaS products. Agents change that. The long tail of
+software becomes possible because the app no longer has to be a rigid
+database-backed product with a hand-built backend and frontend. It can be
+readable state plus an agent that knows how to operate on it.
+
+Hard truth still exists. Payments, ledgers, high-concurrency shared state,
+strict permission systems, sub-millisecond reads, billion-row analytics, and
+regulated financial correctness still want hard engines. Postgres is for
+authoritative machinery. db.md is for living context.
+
+Files for meaning. Tools for authority. Agents for execution.
 
 Here is a record. It is a file:
 
@@ -85,16 +130,19 @@ entries are the relationships, the same links a wiki uses. The text below is
 for you, and for the agent. A person can read it. Git versions it. A model reads
 it with the context a row usually hides. That is the whole format.
 
-## What it replaces
+## What it is for
 
-Most software is smaller and softer than the database/app stacks we designed
-for it. A trip planner, baby tracker, migraine log, reading system, local CRM,
-ops tracker, contract register, decision log, backlog, internal admin panel:
-underneath, they are usually records plus a surface. The old default was to put
-those records in Postgres, freeze a schema, wrap it in an app, and pay the
-migration tax every time reality changed.
+db.md fits software that is mostly meaning-rich context under a surface: a trip
+planner, baby tracker, migraine log, reading system, local CRM, ops tracker,
+contract register, decision log, backlog, internal admin panel, support queue,
+or project system. Underneath, these are records, relationships, workflows, and
+judgment.
 
-**db.md replaces that layer where fluidity matters more than hard transactional
+The old default was Postgres + backend + React because that was the default
+shape. Now much of this territory can start as db.md + agent harness +
+generated UI.
+
+**db.md replaces the layer where fluidity matters more than hard transactional
 machinery.** The records are the files, the schema is text, the relationships
 are links, and the agent answers questions or builds the surface the moment you
 ask for it. Add a field by adding frontmatter. Split a type by editing `DB.md`.
@@ -132,6 +180,16 @@ Bring any agent runtime. Claude Code, Codex, or your own. It plays the curator:
 reading the files, writing new ones, keeping the links and the catalog in order,
 following the contract in `DB.md` and the [spec](SPEC.md). The format is at
 v0.2, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
+
+| Old stack part | db.md shape |
+|---|---|
+| Row | Markdown record |
+| Column | YAML frontmatter field |
+| Foreign key | Wiki-link |
+| Migration | Text edit to `DB.md` plus agent repair |
+| Index | `index.md` for browsing, `index.jsonl` for complete structured reads |
+| Backend logic | Agent harness plus deterministic `dbmd` operations |
+| UI | Chat, voice, canvas, forms, approval cards, dashboards, or generated UI |
 
 ## How it compares
 
@@ -197,11 +255,14 @@ sidecar and goes straight to the right record. The interactive loop is designed
 around **O(changed), not O(store)**: what an operation costs should track what
 changed, not how big the store has grown.
 
-- **High-volume folders shard by date.** An email lands in
-  `sources/emails/2026/05/`, an expense in `records/expenses/2026/05/`. No
-  directory grows unbounded, and only the current shard is ever hot. Entity
-  records and the wiki stay flat, because those sets are bounded by reality:
-  you have only so many customers, however much mail they send.
+- **High-volume folders shard by date.** When the agent writes through
+  `dbmd write`, source and event types are placed in the shard path
+  automatically: an email lands in `sources/emails/2026/05/`, an expense in
+  `records/expenses/2026/05/`. The agent supplies the type and date; `dbmd`
+  does the folder math. No directory grows unbounded, and only the current shard
+  is ever hot. Entity records and the wiki stay flat, because those sets are
+  bounded by reality: you have only so many customers, however much mail they
+  send.
 - **The measured 10k tier is interactive; the million-file tier is an opt-in
   gate.** Sidecar reads are millisecond-scale at 10k, typed/full-text searches
   and working-set validation stay inside their documented budgets, and full
