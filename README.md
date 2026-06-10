@@ -289,24 +289,32 @@ and the files still the source of truth. Until then the two compose cleanly.
 
 ## Quick start
 
-Install `dbmd`. One Rust binary, about 6MB in the current release build, no
-toolchain:
+db.md is operated by agents, and the installer is text. The quick start is a
+prompt. Paste it into Claude Code, Codex, or any agent with a shell:
+
+```text
+Read https://raw.githubusercontent.com/carloslfu/db.md/main/llms.txt and set
+up db.md on this machine. Audit before you install: read the install script
+and check the release provenance (gh attestation verify <tarball> --repo
+carloslfu/db.md). Then install dbmd, run `dbmd spec` to load the standard,
+and set up a store at ~/db, or the folder I point you at.
+```
+
+The agent reads [llms.txt](llms.txt) and the install script, checks the
+provenance, installs the binary, loads the contract, writes `DB.md`, sorts
+your files into the three layers, and curates from there.
+
+Installing by hand is the same one Rust binary, about 6MB in the current
+release build, no toolchain:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 # or: brew install carloslfu/tap/dbmd
-# or: cargo install dbmd-cli
+# or: cargo install dbmd-cli    # build from source
 ```
 
-Load the contract once per session. `dbmd spec` prints the whole standard:
-
-```bash
-dbmd spec
-```
-
-Point your agent at a folder and let it work. It writes `DB.md`, sorts your
-files into the three layers, and curates from there. Then, from inside the
-store:
+Load the contract once per session. `dbmd spec` prints the whole standard.
+Then, from inside the store:
 
 ```bash
 dbmd search "renewal" --in records                   # search content and frontmatter
@@ -318,6 +326,45 @@ dbmd validate                                        # frontmatter, links, schem
 
 Every command speaks `--json`, so anything you build on top reads it cleanly.
 
+### Safe to paste
+
+A prompt that ends in an installed binary deserves suspicion. The chain is
+built to be checked, by you or by the agent you hand it to:
+
+- **The installer is readable.** [`scripts/install.sh`](scripts/install.sh)
+  is about 140 lines of POSIX sh: detect the platform, download the tarball
+  from this repo's GitHub Releases, verify its SHA-256 against the release's
+  `SHA256SUMS`, install to `~/.dbmd/bin`. No sudo, no shell-config edits,
+  nothing outside that folder. `DBMD_VERSION` pins a version.
+- **Every binary traces back to source.** Releases are built in CI from a
+  tagged commit, never on a developer's laptop, and every tarball carries a
+  signed build-provenance attestation tying it to the exact commit and
+  workflow that built it. Anyone can check it:
+
+  ```bash
+  gh attestation verify dbmd-<version>-<target>.tar.gz --repo carloslfu/db.md
+  ```
+
+- **The binary makes no network calls.** No telemetry, no API keys, no AI
+  SDKs. `dbmd` reads and writes local files and does nothing else.
+- **No stored publish token.** crates.io releases go through Trusted
+  Publishing (OIDC): CI mints a short-lived token per release, so there is
+  no long-lived registry credential to leak.
+- **The dependency tree is audited in CI.** Small, permissively licensed,
+  zero AI crates. The license allowlist is machine-enforced, and RustSec
+  advisories run on every dependency change and on a daily schedule.
+
+Do not take the list's word for it. The audit is one more prompt:
+
+```text
+Read scripts/install.sh and .github/workflows/release.yml in carloslfu/db.md
+and tell me whether this is safe to install.
+```
+
+If you want no prebuilt binary at all, `cargo install dbmd-cli` builds from
+source. [SECURITY.md](SECURITY.md) holds the threat model.
+[RELEASING.md](RELEASING.md) documents the release pipeline end to end.
+
 ## The agent is the engine
 
 db.md ships no model and no API keys. The curator is whatever agent you already
@@ -328,9 +375,6 @@ operates with `dbmd`.
 The binary is deterministic plumbing. The agent does the thinking. You are
 never locked to a model, because the model is the one part you bring and the
 one part that keeps improving.
-
-The installer is text. Hand an agent the repo's [llms.txt](llms.txt) and it
-sets itself up by reading it and running the commands.
 
 To make your agent reach for db.md on every session, place a skill where it
 reads skills, in the open [Agent Skills](https://agentskills.io) format. The
@@ -417,21 +461,9 @@ Assistant bot on your first pull request.
 
 Report vulnerabilities privately through GitHub's "Report a vulnerability"
 button on the Security tab. Do not open a public issue for a security problem.
-See [SECURITY.md](SECURITY.md).
+See [SECURITY.md](SECURITY.md) for the threat model.
 
-Releases are built in CI from a tagged commit, never from a developer's laptop.
-Every tarball carries a SHA256 checksum and a build-provenance attestation, so
-anyone can confirm a download came from this repo's CI and was not tampered
-with:
-
-```bash
-gh attestation verify dbmd-<version>-<target>.tar.gz --repo carloslfu/db.md
-```
-
-The `dbmd-cli` and `dbmd-core` crates publish to crates.io through Trusted
-Publishing (OIDC), so there is no long-lived registry token to leak. The binary
-ships zero AI dependencies and a permissive dependency tree, so you can audit it
-or build it from source. CI runs format, build, test, and clippy on every PR;
-dependency-changing PRs run `cargo deny check licenses bans`, and RustSec
-advisories are checked on dependency changes plus a daily schedule. See
-[RELEASING.md](RELEASING.md) and [SECURITY.md](SECURITY.md).
+The supply chain is covered in [Safe to paste](#safe-to-paste) above: built
+in CI from tagged commits, checksummed, provenance-attested, published with
+no stored token, dependency policy machine-enforced.
+[RELEASING.md](RELEASING.md) documents the release pipeline end to end.

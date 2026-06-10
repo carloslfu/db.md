@@ -25,6 +25,19 @@ you the binary; `dbmd spec` is the single source of truth from there.
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 ```
 
+Audit before you run — the chain is built for it. The script is about 140
+lines of POSIX sh: it downloads a tarball from this repo's GitHub Releases,
+verifies its SHA-256 against the release's `SHA256SUMS`, and installs to
+`~/.dbmd/bin` with no sudo and no shell-config edits. Releases are built in CI
+from a tagged commit, and every tarball carries a signed build-provenance
+attestation tying it to the exact commit and workflow that built it:
+
+```sh
+gh attestation verify dbmd-<version>-<target>.tar.gz --repo carloslfu/db.md
+```
+
+The binary makes no network calls: no telemetry, no API keys, no AI SDKs.
+
 Alternatives: `brew install carloslfu/tap/dbmd` for the prebuilt release, or
 `cargo install dbmd-cli` to build from crates.io if you already have Rust.
 
