@@ -8,15 +8,26 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.5**.
+  `Cargo.toml`, currently **v0.3.6**.
 
-## [Unreleased]
+## [0.3.6] — 2026-06-10
+
+A docs-in-binary release. No code behavior changes.
 
 ### Changed
 
-- Tightened the README, SPEC, and agent/crate summaries around the stack-collapse
-  thesis: db.md as agent-operated files-as-database for software that becomes
-  readable context + agent harness + generated surface.
+- `dbmd spec` prints the current contract: the embedded SPEC picks up the
+  stack-collapse thesis, the agent-operated files-as-database framing, the
+  sharded write surface, and the claims audit that landed since 0.3.5. The
+  same tightening runs across the README, llms.txt, and the crate summaries
+  shipped to crates.io.
+- `dbmd --help` and the installer header carry the current tagline, "the open
+  standard for databases in plain files", matching the README, SPEC, llms.txt,
+  and crate descriptions.
+- README: the quick start is now a prompt you hand to an agent, and a new
+  "Safe to paste" section documents the verifiable install chain (SHA256SUMS
+  verification, CI-from-tag builds, signed build-provenance attestations,
+  Trusted Publishing). llms.txt carries the same audit story.
 
 ## [0.3.5] — 2026-06-09
 
