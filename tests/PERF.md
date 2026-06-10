@@ -17,7 +17,7 @@ below for how to run it. Its budgets are listed below as targets.
 | Machine | Apple M3 Pro, 12 cores, 18 GB RAM |
 | OS | macOS 14.5 (23F79) |
 | Toolchain | rustc 1.96.0 |
-| Binary | `target/release/dbmd` 0.2.0 (`--release`: LTO, codegen-units=1, strip) |
+| Binary | `target/release/dbmd` 0.3.5 (`--release`: LTO, codegen-units=1, strip) |
 | Corpus | `tests/corpora/corpus-d-scale` — 10,032 files (5,201 sources / 4,700 records / 100 wiki + indexes/log) |
 | Overflow folder | `sources/emails` = 3,000 files; `index.md` capped at 500 + `## More`; `index.jsonl` = 3,000 lines |
 | Largest jsonl | `sources/emails/index.jsonl` 3,000 / `records/expenses/index.jsonl` 2,000 |
@@ -197,7 +197,7 @@ O(folder) floor, not O(store). The cost is `Index::on_write`
 (`crates/dbmd-core/src/index.rs`): it reads the **entire** type-folder
 `index.jsonl` and **rewrites it compacted** on every write (deliberate — keeps
 the jsonl byte-identical to a rebuild and git-diffable, per the module doc),
-rather than the O(1) append the plan's hard-rule text describes. For the
+rather than an O(1) append. For the
 3,000-line emails jsonl that read+rewrite is the bulk of `write`'s 123 ms.
 
 This is a coherent design tradeoff (clean, rebuild-identical jsonl over

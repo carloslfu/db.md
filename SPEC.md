@@ -584,8 +584,8 @@ my-store/
 
 - **Root `index.md`** — exists whenever the store has any files. Lightweight: lists each layer + each type folder under it with counts. One entry per type folder; does NOT enumerate every file. Wiki-links target the layer indexes.
 - **Layer `index.md`** (`sources/index.md`, `records/index.md`, `wiki/index.md`) — exists whenever that layer has any files. Lists each type folder under the layer with counts and brief summaries. Wiki-links target type-folder indexes.
-- **Type-folder `index.md`** — exists whenever the type folder has any files. The **human / recency browse view**: lists files in the type-folder, **across date-shards**, with a one-line summary, **capped at 500 entries** selected by recency (newest first by the frontmatter `updated` field — clone-stable, unlike filesystem mtime, which `git clone` resets — ties broken by store-relative path ascending). Above the cap it lists the 500 most-recent and ends with a `## More` section pointing to `dbmd fm query` / `dbmd index query --type <t> --in <layer>` (the complete twin below) for full enumeration. The cap keeps the browse view inside an LLM context budget and write-through O(1), regardless of corpus growth — completeness lives in the `index.jsonl` twin, not here.
-- **Type-folder `index.jsonl`** — the complete, **uncapped** machine twin of `index.md`: one JSON object per file in the folder (across date-shards), `{path, type, summary, tags, links, created, updated, <other frontmatter fields>}` — where **`tags` and `links` are the document's expansion** (`tags` = the LLM's flat semantic labels; `links` = wiki-links to concept pages + related records). Same kind of artifact as `index.md` — a derived, write-through, rebuildable **plain file** (JSONL, so appends are O(1), it stays git-diffable line-by-line, and it's ripgrep-able), not a database engine. It is the **backing for structured reads**: `dbmd fm query`, `dbmd index query`, `dbmd search --type/--where`, the dedup pre-write checks, and `dbmd graph backlinks` read it (one sequential, complete read per type-folder — cold-cache-proof) instead of scanning frontmatter across the tree. This is what makes the catalog complete *and* fast with no engine; ad-hoc full-text body search stays ripgrep. **Tags ≠ concepts:** a tag is a flat label (the agent filters/aggregates it on demand from this sidecar; no page of its own); a concept is a wiki page the doc links to (`links`), navigated via `graph backlinks`. Both are LLM-authored, never inferred — they are the *doc-side* of query expansion, so the agent's expanded query and the document's tags/concepts meet lexically here, with no embeddings. (Root and layer levels stay markdown-only rollups — the `.jsonl` twin lives at the type-folder level, where the records are.)
+- **Type-folder `index.md`** — exists whenever the type folder has any files. The **human / recency browse view**: lists files in the type-folder, **across date-shards**, with a one-line summary, **capped at 500 entries** selected by recency (newest first by the frontmatter `updated` field — clone-stable, unlike filesystem mtime, which `git clone` resets — ties broken by store-relative path ascending). Above the cap it lists the 500 most-recent and ends with a `## More` section pointing to `dbmd fm query` / `dbmd index query --type <t> --in <layer>` (the complete twin below) for full enumeration. The cap keeps the browse view inside an LLM context budget and bounded in the write loop; completeness lives in the `index.jsonl` twin, not here.
+- **Type-folder `index.jsonl`** — the complete, **uncapped** machine twin of `index.md`: one JSON object per file in the folder (across date-shards), `{path, type, summary, tags, links, created, updated, <other frontmatter fields>}` — where **`tags` and `links` are the document's expansion** (`tags` = the LLM's flat semantic labels; `links` = wiki-links to concept pages + related records). Same kind of artifact as `index.md` — a derived, write-through, rebuildable **plain file** (JSONL, so it stays git-diffable line-by-line and ripgrep-able), not a database engine. The current toolkit keeps it compacted on write for byte-for-byte rebuild equivalence; readers also tolerate un-compacted append-style lines by applying last-write-wins by path. It is the **backing for structured reads**: `dbmd fm query`, `dbmd index query`, `dbmd search --type/--where`, the dedup pre-write checks, and `dbmd graph backlinks` read it (one sequential, complete read per type-folder — cold-cache-proof) instead of scanning frontmatter across the tree. This is what makes the catalog complete *and* fast with no engine; ad-hoc full-text body search stays ripgrep. **Tags ≠ concepts:** a tag is a flat label (the agent filters/aggregates it on demand from this sidecar; no page of its own); a concept is a wiki page the doc links to (`links`), navigated via `graph backlinks`. Both are LLM-authored, never inferred — they are the *doc-side* of query expansion, so the agent's expanded query and the document's tags/concepts meet lexically here, with no embeddings. (Root and layer levels stay markdown-only rollups — the `.jsonl` twin lives at the type-folder level, where the records are.)
 
 **Empty folders have no `index.md`.** Folders below the type-folder level (sub-sub-folders, if an operator creates them) are operator territory — not part of the canonical hierarchy, no auto-indexing.
 
@@ -645,7 +645,7 @@ updated: 2026-05-27T10:00:00Z
   This folder has 12,348 files. The 500 most recent are listed above.
   Use `dbmd index query --type email --in sources` for the complete catalog.
   ```
-- **Indexes are maintained write-through, not rebuilt in the loop.** The write commands (`dbmd write` / `dbmd fm init` / `dbmd fm set` / `dbmd rename`) update the affected entries in place as the agent works — bounded work: splice the ≤500-entry `index.md`, append/upsert one line in `index.jsonl`, plus two parent counts. The catalog is always current; there is no rebuild step in the normal session. `dbmd index rebuild` is the from-scratch repair — after a bulk external drop into `sources/`, or to recover a damaged index — walking the store once, rewriting all three levels (both `index.md` and the complete `index.jsonl`, compacting the jsonl), deleting stale indexes. Never edited by hand.
+- **Indexes are maintained write-through, not rebuilt in the loop.** The write commands (`dbmd write` / `dbmd fm init` / `dbmd fm set` / `dbmd rename`) update the affected entries as the agent works — bounded to the affected type-folder: splice the ≤500-entry `index.md`, read/update/rewrite that folder's compact `index.jsonl`, plus refresh the parent counts. The catalog is always current; there is no full-store rebuild step in the normal session. `dbmd index rebuild` is the from-scratch repair — after a bulk external drop into `sources/`, or to recover a damaged index — walking the store once, rewriting all three levels (both `index.md` and the complete `index.jsonl`, compacting the jsonl), deleting stale indexes. Never edited by hand.
 
 ### `log.md` — chronological action log
 
@@ -1040,10 +1040,10 @@ no vector store, no external catalog required. The store *is* the
 database; the filesystem, embedded ripgrep, and a write-through
 catalog are the engine. One rule makes this hold:
 
-**The interactive loop is O(changed), never O(store).** Every
+**The interactive loop is designed around O(changed), not O(store).** Every
 operation the agent runs in its write loop — search, frontmatter
 lookup, backlinks, the pre-write dedup checks, the per-write catalog
-update, the post-write validate — costs in proportion to what changed,
+update, the post-write validate — should cost in proportion to what changed,
 not to how large the store is. Whole-store passes exist (`dbmd
 validate --all`, a full `dbmd index rebuild`, `dbmd stats`) but they
 are repair/audit operations, off the interactive path.
@@ -1078,21 +1078,25 @@ Four properties deliver it:
   type-folder.** `dbmd write` / `dbmd fm init` / `dbmd fm set` /
   `dbmd rename` update both the human `index.md` (capped 500, recency
   browse — splice the ≤500-line file) and the machine `index.jsonl`
-  (uncapped, complete, structured — O(1) append/upsert) in place,
-  plus two parent counts. The catalog is always current; `dbmd index
-  rebuild` is a from-scratch repair (compacting the jsonl), not a
-  per-change step. Both are plain files — derived, rebuildable, no
-  engine.
+  (uncapped, complete, structured) for the affected type-folder, plus
+  refresh parent counts. The current toolkit keeps `index.jsonl`
+  compacted on write, so write cost is O(type-folder jsonl), not O(store);
+  `dbmd index rebuild` is a from-scratch repair, not a per-change step.
+  Both are plain files — derived, rebuildable, no engine.
 - **The log rotates.** `log.md` is the active timeline; older months
   roll into `log/<YYYY-MM>.md`. `dbmd log tail` / `since` reverse-read
   from the end. The active log stays small regardless of store age.
 
-**Performance budgets** (modern laptop). Loop ops are flat in store
-size; sweep ops are linear and run off the loop:
+**Performance budgets** (modern laptop). These are implementation targets. The
+10k tier is measured by the default perf gate; the 1M tier is opt-in
+(`#[ignore]`) and should be read as the scale target until explicitly run on a
+given release. Sidecar read ops are flat in store size; sweep ops are linear and
+run off the loop. Current write paths are O(type-folder jsonl) and documented as
+marginally over the tight 100ms target at 10k in `tests/PERF.md`.
 
 | Operation                              | Class           | 10k    | ~1M    |
 |----------------------------------------|-----------------|--------|--------|
-| `dbmd write` / `fm set` (+ catalog)    | loop            | <100ms | <100ms |
+| `dbmd write` / `fm set` (+ catalog)    | loop            | target <100ms; measured near target | target <100ms |
 | `dbmd fm query <k>=<v>`                | loop (ripgrep)  | <300ms | <2s    |
 | `dbmd search <query>`                  | loop (ripgrep)  | <300ms | <2s    |
 | `dbmd graph backlinks <path>`          | loop (ripgrep)  | <200ms | <2s    |
@@ -1117,14 +1121,12 @@ millions to billions. The separated, file-per-record flavor with
 ripgrep carries the individual and the small team; the packed flavor
 and the engine (see [Roadmap](#roadmap)) carry the larger end.
 
-**The flagship worked example is `db/`** — db.md's own knowledge kept
-as a db.md store, co-located with the toolkit's source. How do you run
-db.md beyond a demo? Read the store of how db.md itself was built: the
-research grounding the design under `sources/`, every material build
-decision under `records/decisions/`, and the narrative synthesis (the
-scale story, the sizing model, the roadmap) under `wiki/`. It is
-operated by `dbmd` as the toolkit grows — the same contract an
-agent-built tool, research wiki, or agentic computer can use.
+**Worked examples ship under `examples/` and `tests/corpora/`.** The
+examples are small, complete stores for research, operations, personal
+software, agency knowledge, and customer data. The corpora are the
+executable proof surface: canonical stores, edge cases, format fixtures,
+scale generation, and the agent-eval expected output all exercise the
+same contract a real agent-built tool or agentic computer uses.
 
 **Two ceilings, not one.** The filesystem + ripgrep store reaches
 millions, but **git over the raw store is the tighter limit**
@@ -1141,8 +1143,8 @@ misses synonyms — but the agent driving `dbmd` is a language model, so
 *it* supplies them: it expands a concept into its related terms
 (`revenue → revenue, sales, income, ARR, top-line`) and runs them as one
 search. `dbmd` stays a dumb lexical tool and computes nothing; the model
-is the semantic layer — and a frontier model is a *richer* semantic model
-than any embedding index. This is the whole semantic story: no vectors to
+is the semantic layer, working over text the operator can read instead of
+vectors they cannot. This is the whole semantic story: no vectors to
 compute or store, now or ever, and nothing needed beyond the v0.2 toolkit.
 (A maintained keyword index makes this a sublinear fast path at scale —
 see the [Roadmap](#roadmap) — but it is a *lexical* index, never a vector
@@ -1150,15 +1152,16 @@ index; db.md adds no embeddings and no ANN.)
 
 The files remain the source of truth. You *can* derive anything you
 like on top — a SQLite catalog, a tantivy index, embeddings for some
-other tool — but you do not *need* to: the native toolkit is the query
-layer, at company scale and beyond.
+other tool — but you do not *need* to for the separated plain-file
+flavor's sweet spot. The packed engine is the path past that.
 
 ## Roadmap
 
-v0.2 is deliberately the simplest thing that already works at company
-scale: plain files, YAML frontmatter, wiki-links, embedded ripgrep.
-No daemon, no engine, no magic — and it carries a store to the low
-millions of files. That is the floor, not the ceiling.
+v0.2 is deliberately the simplest useful separated flavor: plain files,
+YAML frontmatter, wiki-links, embedded ripgrep. No daemon, no engine, no
+magic. It is built for the low millions of files; the packed engine is
+the path beyond the point where literal directories, whole-tree walks, or
+git over the raw store stop being the right physical shape.
 
 Where db.md is going — additively, without breaking the "it's just
 files" contract or the format you read today:
@@ -1238,7 +1241,7 @@ the installer. Two layers, both reachable as text — the repo-root
 `llms.txt` is the agent-readable entry point:
 
 ```bash
-# 1 — get the binary (one ~5MB binary, no toolchain; brew or cargo also work)
+# 1 — get the binary (one ~6MB binary, no toolchain; brew or cargo also work)
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
 # 2 — load the contract (the single source of truth)

@@ -15,20 +15,21 @@ carried a workaround: software could not read plain writing, so the world had
 to be forced into tables before software could use it.
 
 **That workaround just expired.** A capable agent reads the files, writes them,
-links them, and finds anything in them by plain meaning. The agent is the
+links them, and finds the connections between them by meaning. The agent is the
 engine.
 
 And the engine is the bet. **A db.md store gets sharper every time the model
-behind it improves.** A SQL database queries exactly as well in ten years as
-the day you installed it. Your files ride the model curve, with nothing to
-migrate and nothing to rebuild.
+behind it improves.** A better model can read the same files with more context,
+repair them with more judgment, and reshape the schema without a migration
+ceremony. SQL can still be queried by better agents, but the store's meaning
+lives in schema and app code. Your files ride the model curve.
 
 So the database stops being software you run and becomes **data you own.**
-Text on disk that a person reads easily, a model reads better than anything
-else, and that outlasts every tool that ever touches it.
+Text on disk that a person reads easily, a model can read directly, and that
+outlasts every tool that ever touches it.
 
-It is not small. **Millions of records live on plain files**, with no vector
-database anywhere.
+It is not tiny. **db.md is built for stores that grow into millions of plain
+files**, with no vector database anywhere.
 
 This is the contrarian bet: the future has more software, not less, but much of
 it will be too personal, too specific, and too alive to become a SaaS product.
@@ -78,7 +79,7 @@ The small YAML block at the top is frontmatter. In db.md, that is the schema:
 simple labels the agent can sort, filter, and repair. The `[[double bracket]]`
 entries are the relationships, the same links a wiki uses. The text below is
 for you, and for the agent. A person can read it. Git versions it. A model
-reads it better than any row in any table. That is the whole format.
+reads it with the context a row usually hides. That is the whole format.
 
 ## What it replaces
 
@@ -130,19 +131,19 @@ v0.2, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
 ## How it compares
 
-Every other way to store data puts something between you and it. Ask two
+Most other ways to store data put something between you and it. Ask two
 questions of each one: what sits in the middle, and what does it ride on as
 models improve. **db.md puts nothing in the middle, and it rides on the model
-itself.** Everything else rides on machinery you maintain, and machinery only
-improves when you do the work.
+itself.** The alternatives ride on machinery you maintain, and machinery only
+improves when someone does the work.
 
 | Approach | What sits between you and your data | What it rides on |
 |---|---|---|
-| **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with nothing to migrate or rebuild |
-| SQL databases | a schema you design up front and migrate when reality shifts, a query language, and an app to drive it | your schema and the app layer. A better model can write the SQL, but the store itself never gets smarter |
-| Airtable, Notion | a vendor's service you rent, your data on their servers, an export that drops the relations and the formulas | the vendor's roadmap. You get the AI they bolt on, when they ship it, inside their walls |
-| Vector RAG | a store of embeddings you cannot read or edit, reached only through a retrieval service | a separate, smaller embedding model. Recall is capped by it, re-paid on every query, and a smarter reasoning model does not lift it |
-| Knowledge-graph memory | a derived graph beside your files, queried through an API, stale until the next rebuild | a better model too, but spent rebuilding a graph that drifts from your files, not the files themselves |
+| **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index to rebuild |
+| SQL databases | a schema you design up front and migrate when reality shifts, a query language, and an app to drive it | your schema and the app layer. A better model can write better SQL, but the store's meaning still lives outside the model |
+| Airtable, Notion | a vendor's service you rent, your data on their servers, exports that commonly lose live behavior, views, formulas, or relations | the vendor's roadmap. You get the AI they bolt on, when they ship it, inside their walls |
+| Vector RAG | a store of embeddings you cannot read or edit, reached only through a retrieval service | a separate retrieval stack. Recall is bounded by embeddings, rerankers, and tuning you keep paying for |
+| Knowledge-graph memory | a derived graph beside your files, queried through an API, kept fresh only if the sync path stays correct | a better model too, but spent rebuilding a graph that can drift from your files, not working the files themselves |
 | Karpathy's LLM Wiki | nothing. Plain markdown the model reads. This is db.md's lineage | the model curve, directly on the files. Also db.md's lineage |
 
 The fight db.md picks most directly is with vector RAG. **db.md computes,
@@ -151,10 +152,11 @@ embeddings of your data; db.md keeps the data as files and lets the model read
 them, with semantic recall coming from the agent widening its own search in
 plain language.
 
-An embedding cannot tell you when a fact was true or whether something later
-replaced it. A dated file can. The clearest sign this is the right cut: Mem0's
-2026 rewrite went append-only and bolted keyword and entity matching onto its
-vectors, moving onto ground db.md already stood on.
+An embedding does not naturally tell you when a fact was true or whether
+something later replaced it. A dated file can. The memory stack is already
+moving in this direction: Mem0's 2026 migration docs call out ADD-only
+extraction, hybrid search, and entity linking. db.md takes the further bet:
+keep the facts as dated files and skip the vector store.
 
 ## Why files
 
@@ -170,47 +172,49 @@ db.md turns the shape inside out:
   change it by editing text, not by running a migration. Add a field, rename a
   type, tighten a schema in `DB.md`; the agent can read the diff and repair the
   records.
-- **The index is derived.** A plain catalog plus embedded ripgrep reaches
-  millions of files with no vector database. Want SQLite or a search index on
-  top? Build one. The files stay the source of truth.
+- **The index is derived.** A plain catalog plus embedded ripgrep is built to
+  carry millions of files with no vector database. Want SQLite or a search
+  index on top? Build one. The files stay the source of truth.
 
 ## How far it scales
 
-Put a number on "millions." A person who indexes every email they send and
-receive adds about **44,000 files a year**, around 440,000 in a decade; a
-whole career fits in **1 to 1.5 million plain files**. **A ten-person company
-crosses a million files in two to three years.** That is the scale this format
-is built to hold.
+Put a number on "millions." Using roughly 120 sent-plus-received work emails a
+day, a person who indexes their mail adds about **44,000 files a year**, around
+440,000 in a decade; a heavy whole-career archive fits around **1 to 1.5
+million plain files**. **A ten-person shared store can cross a million files in
+two to three years.** That is the scale this format is built to hold.
 
-And the agent never pays for it, because **the agent does not navigate files,
-it reads indexes.** Every type folder keeps a human `index.md` (the 500 most
-recent entries) and a complete machine `index.jsonl`, both updated in place on
-every write. A query reads one small sidecar file and goes straight to the
-right record. The interactive loop is **O(changed), never O(store)**: what an
-operation costs tracks what changed, not how big the store has grown.
+And the agent should not pay the whole-store cost in its normal loop, because
+**the agent does not navigate files, it reads indexes.** Every type folder keeps
+a human `index.md` (the 500 most recent entries) and a complete machine
+`index.jsonl`, both updated on writes. A query reads the relevant sidecar and
+goes straight to the right record. The interactive loop is designed around
+**O(changed), not O(store)**: what an operation costs should track what changed,
+not how big the store has grown.
 
 - **High-volume folders shard by date.** An email lands in
   `sources/emails/2026/05/`, an expense in `records/expenses/2026/05/`. No
   directory grows unbounded, and only the current shard is ever hot. Entity
   records and the wiki stay flat, because those sets are bounded by reality:
   you have only so many customers, however much mail they send.
-- **The budgets hold at a million files.** A write costs **under 100ms in a
-  store of 10,000 files, and under 100ms in a store of a million.** A
-  structured query stays **under two seconds at a million files**, and the
-  worst case, a cold full-text sweep with nothing indexed, is embedded ripgrep
-  clearing a million files in seconds. The full table is in the
-  [spec](SPEC.md#scale).
+- **The measured 10k tier is interactive; the million-file tier is an opt-in
+  gate.** Sidecar reads are millisecond-scale at 10k, typed/full-text searches
+  and working-set validation stay inside their documented budgets, and full
+  sweeps run off-loop. Write paths are currently near, not under, the tight
+  100ms target because they compact a type-folder `index.jsonl`; that gap is
+  documented in [tests/PERF.md](tests/PERF.md). The 1M test is opt-in and
+  asserts the sidecar-backed loop/sweep targets when run.
 - **Whole-store passes run off the loop.** A full `dbmd validate --all` or
   index rebuild is a linear repair and audit job you schedule. The agent never
   waits on one.
 
-The first ceiling you hit is not the format's. It is git's: vanilla git wants
-tuning past **100,000 tracked files** and slows near a million, because its
-index rewrites an entry for every tracked file, O(everything), not O(changed).
-The store has no such limit, and git is optional tooling over db.md, not part
-of it. At that point, version the curated layers (`records/`, `wiki/`) and let
-high-volume sources ride filesystem snapshots. The files keep working exactly
-the same.
+The first practical ceiling you hit is often git, not the format. Large working
+trees need tuning (`fsmonitor`, `feature.manyFiles`, sparse/partial checkout,
+or Scalar-style tooling) because git's index is still one structure with an
+entry for every tracked path. Git is optional tooling over db.md, not part of
+the format. At that point, version the curated layers (`records/`, `wiki/`) and
+let high-volume sources ride filesystem snapshots. The files keep working
+exactly the same.
 
 What still wants a real engine: heavy write concurrency, ACID transactions,
 sub-millisecond reads, aggregates over billions of rows. That territory is
@@ -219,7 +223,8 @@ and the files still the source of truth. Until then the two compose cleanly.
 
 ## Quick start
 
-Install `dbmd`. One Rust binary, about 5MB, no toolchain:
+Install `dbmd`. One Rust binary, about 6MB in the current release build, no
+toolchain:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
@@ -276,8 +281,8 @@ subcommands for read, write, validate, extract, graph, index, and log work.
 
 - **Embedded ripgrep.** Fast search with no separate tool to install.
 - **Built-in extraction.** `dbmd extract` pulls text out of PDF, docx, xlsx,
-  epub, and html, all through Rust crates under MIT and Apache licenses. No GPL
-  `pdfgrep`, no AGPL `rga`.
+  epub, and html through permissively licensed Rust crates. No GPL `pdfgrep`,
+  no AGPL `rga`.
 - **Zero AI dependencies.** No provider SDKs, no API keys, no model calls in
   the binary. The agent runtime is yours.
 - **A library underneath.** All the logic lives in `dbmd-core`. Run `cargo
@@ -292,10 +297,10 @@ maintain. db.md ships a convention you own.
 
 | Tool | What it is | What sits between you and your data |
 |---|---|---|
-| **Mem0** | managed memory: an LLM extracts facts, embeds them, retrieves by similarity | a vector-and-graph service you call. Your memories live as embeddings you cannot read, recall capped by a smaller retrieval model and re-paid on every query |
-| **Letta / MemGPT** | self-editing agent memory; it asked whether a filesystem is all you need | an embedding index built over your files. db.md is that filesystem thesis with the vectors removed |
+| **Mem0** | managed memory: an LLM extracts facts, embeds them, and retrieves by similarity; its 2026 migration adds ADD-only extraction, hybrid search, and entity linking | a vector-and-graph service you call. Your memories are mediated by a retrieval stack |
+| **Letta / MemGPT** | agent memory with editable memory blocks and archival retrieval | a runtime and retrieval layer around context. db.md keeps durable state as files |
 | **Zep / Graphiti** | temporal memory built as a derived knowledge graph | a hosted graph and its API, a second structure kept in step with your data |
-| **Cognee** | an extract-and-load pipeline into a graph-and-vector store | one more derived store to build and keep in sync |
+| **Cognee** | an extract-and-load pipeline into graph and vector stores | one more derived store to build and keep in sync |
 | **db.md** | the data is the files; the agent is the query engine; no vector, ever | nothing. It rides the model directly on the files you own |
 
 The memory layer was always a database with the data hidden. db.md is the same
@@ -313,14 +318,14 @@ db.md/
 ├── crates/
 │   ├── dbmd-core/   # the library: parser, store, graph, validate, query, index, log
 │   └── dbmd-cli/    # the dbmd binary (thin wrappers over the library)
-├── examples/        # five real stores: research wiki, ops, second brain, agency, CRM
-├── skills/db-md/    # the canonical Agent Skill you place in your own agent
-└── db/              # db.md's own knowledge, kept as a db.md store
+├── examples/        # five complete stores: research wiki, ops, second brain, agency, CRM
+├── tests/corpora/   # canonical, edge-case, format, scale, and agent-eval stores
+└── skills/db-md/    # the canonical Agent Skill you place in your own agent
 ```
 
-The store under `db/` is the proof. db.md's own research, every build decision,
-and the synthesis over them live there as a db.md store. The answer to "does
-this hold beyond a demo?" is to read the store of how db.md itself was built.
+The examples and corpora are the proof surface: small enough to read, complete
+enough to exercise the real contract, and varied enough to show the shape across
+personal, team, research, agency, and customer-data stores.
 
 ## Use it on its own
 
@@ -333,9 +338,9 @@ replaceable. **The files outlast both.**
 
 ## License
 
-[Apache-2.0](LICENSE), with a patent grant, a trademark clause, and an explicit
-modification-disclosure term. Every pull request signs the Apache ICLA through
-the CLA Assistant bot. See [CONTRIBUTING.md](CONTRIBUTING.md).
+[Apache-2.0](LICENSE), including the Apache patent grant and NOTICE/attribution
+terms. First-time contributors sign the Apache ICLA through the CLA Assistant
+bot. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Contributing
 
@@ -359,7 +364,8 @@ gh attestation verify dbmd-<version>-<target>.tar.gz --repo carloslfu/db.md
 
 The `dbmd-cli` and `dbmd-core` crates publish to crates.io through Trusted
 Publishing (OIDC), so there is no long-lived registry token to leak. The binary
-ships zero AI dependencies and its tree is MIT and Apache licensed, so you can
-audit it or build it from source. Every pull request runs `cargo deny check
-advisories` and fails on any open RustSec advisory, and the tree is watched by
-Dependabot and Socket supply-chain scanning. See [RELEASING.md](RELEASING.md).
+ships zero AI dependencies and a permissive dependency tree, so you can audit it
+or build it from source. CI runs format, build, test, and clippy on every PR;
+dependency-changing PRs run `cargo deny check licenses bans`, and RustSec
+advisories are checked on dependency changes plus a daily schedule. See
+[RELEASING.md](RELEASING.md) and [SECURITY.md](SECURITY.md).

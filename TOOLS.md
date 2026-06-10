@@ -19,8 +19,9 @@ so there are no external tools to install or license.
   generates what a capable agent authors itself — there is no `dbmd
   init`, no wizards: you write `DB.md` and summaries; `dbmd` validates,
   indexes, queries, and links.
-- **MIT/Apache only.** No GPL, no AGPL anywhere in the binary.
-- **One install.** ~5MB, cross-platform (darwin / linux ×
+- **Permissive dependency policy.** No GPL, no AGPL, no AI SDKs, no
+  vector database crates anywhere in the binary.
+- **One install.** ~6MB, cross-platform (darwin / linux ×
   x86_64 / arm64).
 
 ## Why one binary, not a kit
@@ -30,9 +31,9 @@ fd, jq, git) behind a smart installer. We collapsed it to one binary:
 
 1. **License hygiene.** rga (AGPL-3) and pdfgrep (GPL-2 + poppler)
    force a permanent compliance program — source-mirror obligations,
-   enterprise license-scanner flags. Embedding ripgrep (MIT) and
-   building extraction on MIT-licensed Rust crates keeps the whole
-   artifact MIT/Apache-clean.
+   enterprise license-scanner flags. Embedding ripgrep-compatible
+   search and building extraction on permissively licensed Rust crates
+   keeps the artifact clean to ship and audit.
 2. **One thing to install.** `curl | sh` drops a single binary — no
    version resolution, no `command -v` probing, no PATH juggling
    across six tools.
@@ -45,9 +46,10 @@ fd, jq, git) behind a smart installer. We collapsed it to one binary:
 Grouped by the agent session phase (SPEC.md § The agent session).
 Every subcommand supports `--json` and `--help`; none prompt
 interactively. **Loop ops** (search, fm, backlinks, write, log tail,
-working-set validate) are O(changed) and flat at scale; **SWEEP ops**
-(`validate --all`, `index rebuild`, `stats`, whole-graph queries) are
-O(store) and run off the interactive loop. See SPEC.md § Scale.
+working-set validate) are designed around the changed working set and
+sidecar reads; **SWEEP ops** (`validate --all`, `index rebuild`,
+`stats`, whole-graph queries) are O(store) and run off the interactive
+loop. See SPEC.md § Scale.
 
 ### Open
 - `dbmd spec` — print the bundled canonical SPEC. This is the
