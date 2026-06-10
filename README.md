@@ -30,7 +30,9 @@ It is not small. **Millions of records live on plain files**, with no vector
 database anywhere.
 
 And it replaces a whole class of software: **the products that were only ever
-a database with a screen on top.**
+a database with a screen on top.** For the broad middle of software, what used
+to be a Postgres table, an ORM, migrations, and a CRUD app becomes files,
+frontmatter, links, and a model that can change the shape as reality changes.
 
 Here is a record. It is a file:
 
@@ -60,16 +62,23 @@ than any row in any table. That is the whole format.
 
 ## What it replaces
 
-Most software a company pays for is a database with a screen bolted on: a CRM,
-an ops tracker, a contract register, the internal tool every company rebuilds,
-the SaaS product that is just a table behind a login. **db.md replaces the
-database and the screen at once.** The records are the files, the agent answers
-the questions, and the view gets built the moment you ask for one.
+Most software is smaller and softer than the databases we designed for it. A
+CRM, an ops tracker, a contract register, a decision log, a backlog, an internal
+admin panel: structurally, they are records plus a view. The old default was to
+put those records in Postgres, freeze a schema, wrap it in an app, and pay the
+migration tax every time the real world changed.
 
-It is the pattern from Karpathy's April 2026 LLM Wiki, which scoped a single
-research topic, taken to company scope: customers, vendors, contracts,
-decisions, meetings, expenses, processes, playbooks, all curated by the agent
-your team directs.
+**db.md replaces that layer.** The records are the files, the schema is text,
+the relationships are links, and the agent answers questions or builds the view
+the moment you ask for it. Add a field by adding frontmatter. Split a type by
+editing `DB.md` and letting the agent repair the store. The database becomes
+fluid because the thing operating it can read.
+
+Karpathy's April 2026 LLM Wiki is the proof of life: a model can maintain a
+coherent markdown world. db.md generalizes that from a wiki into a database.
+A company brain is one obvious use case. It is not the category. The category
+is agent-native persistence: the database for software written, operated, and
+reshaped by models.
 
 ## How it works
 
@@ -134,7 +143,9 @@ db.md turns the shape inside out:
 - **The database is the directory.** There is no daemon and no port. You can
   `cd` into it and `ls` your data.
 - **The schema is the frontmatter.** It is typed, optional, and additive. You
-  change it by editing a file, not by running a migration.
+  change it by editing text, not by running a migration. Add a field, rename a
+  type, tighten a schema in `DB.md`; the agent can read the diff and repair the
+  records.
 - **The index is derived.** A plain catalog plus embedded ripgrep reaches
   millions of files with no vector database. Want SQLite or a search index on
   top? Build one. The files stay the source of truth.
@@ -285,15 +296,16 @@ db.md/
 
 The store under `db/` is the proof. db.md's own research, every build decision,
 and the synthesis over them live there as a db.md store. The answer to "does
-this hold at company scale?" is to read the store of how db.md itself was built.
+this hold beyond a demo?" is to read the store of how db.md itself was built.
 
 ## Use it on its own
 
 db.md is an open standard, and it stands on its own. A plain markdown vault
-becomes a db.md store, with no platform and no account required: Obsidian
-users, a researcher running a topic wiki, an agentic computer keeping a company
-brain, any agent runtime with a folder of markdown. The [spec](SPEC.md) is the
-contract. The runtime is replaceable. **The files outlast both.**
+becomes a db.md store, with no platform and no account required: an agent-built
+internal tool, an Obsidian vault, a research wiki, a customer database, an
+agentic computer's operating store, any runtime with a folder of markdown. The
+[spec](SPEC.md) is the contract. The runtime is replaceable. **The files
+outlast both.**
 
 ## License
 

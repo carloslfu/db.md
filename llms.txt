@@ -3,7 +3,9 @@
 > The open standard for databases in plain files. Records are markdown files with YAML
 > frontmatter; relationships are wiki-links; the database is the directory.
 > Built for agents: a database a harness reads, writes, links, and curates
-> directly through the `dbmd` CLI. No daemon, no server, no embeddings.
+> directly through the `dbmd` CLI. What used to be a Postgres schema plus
+> migrations can become files, frontmatter, and a curator contract. No daemon,
+> no server, no embeddings.
 
 This file is the agent-readable entry point, in the spirit of llms.txt.
 **The installer is text:** if you are an AI agent, you install and integrate

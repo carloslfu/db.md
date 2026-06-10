@@ -5,9 +5,12 @@ files with YAML frontmatter. Relationships are wiki-links. The database
 is the directory; the schema is the frontmatter; the index is whatever
 you want to build on top. It is built for agents: a database a harness
 reads, writes, links, and curates directly, and the native persistence
-layer for the agent-native tools built on it. An agent wants
-files, not a schema to migrate or a query language to wrap around. db.md
-is files. Simple and open by design.
+layer for the agent-native tools built on it. For the broad middle of
+software, what used to be a Postgres schema, an ORM, migrations, and a
+CRUD surface becomes files, frontmatter, wiki-links, and a curator
+contract. An agent wants files it can reshape, not a schema to migrate
+or a query language to wrap around. db.md is files. Simple and open by
+design.
 
 One directory, three folders, one config file. Raw evidence lives in
 `sources/`. Atomic typed data lives in `records/`. Curator-synthesized
@@ -980,21 +983,24 @@ Three properties files have that tables don't:
 3. **LLM-native.** The format an LLM reads best is the format a
    human reads best.
 
-Most databases are not Google-scale. They are a set of records with a
-form or a dashboard on top: a CRM, a knowledge base, an ops tracker, a
-contract register, the internal tools a company builds and rebuilds,
-the SaaS apps that are a database with a UI bolted on. db.md replaces
-the database for that whole class — and the app over it, because the
-agent reads and relates the records directly and builds the view on
-demand. The genuinely hard remainder is real: high write concurrency,
-ACID transactions, sub-millisecond reads, aggregates over billions of
-rows. A real engine still earns its place there today, and that is
-where the [roadmap](#roadmap) takes db.md next — the packed engine
-(SQLite-class, projected through a VFS) under this same contract: the
-directory is the database, the files are the source of truth. Until
-then the two compose cleanly — write to both, treat db.md as the
-canonical, human-readable layer. The direction is one way: eventually,
-all of them, and never by adding vectors.
+Most software is not Google-scale. It is records plus a view: a CRM, a
+knowledge base, an ops tracker, a contract register, a decision log, an
+internal admin panel, the SaaS apps that are a database with a UI
+bolted on. The old default was to put those records in Postgres, freeze
+a schema, wrap it in an app, and migrate every time reality moved.
+db.md replaces the database for that whole class — and the app over it,
+because the agent reads and relates the records directly and builds the
+view on demand.
+
+The genuinely hard remainder is real: high write concurrency, ACID
+transactions, sub-millisecond reads, aggregates over billions of rows.
+A real engine still earns its place there today, and that is where the
+[roadmap](#roadmap) takes db.md next — the packed engine (SQLite-class,
+projected through a VFS) under this same contract: the directory is the
+database, the files are the source of truth. Until then the two compose
+cleanly — write to both, treat db.md as the canonical, human-readable
+layer. The direction is one way: eventually, all of them, and never by
+adding vectors.
 
 ## Writers and readers
 
@@ -1096,33 +1102,33 @@ embedded ripgrep, write-through catalog, reverse-read log — so the
 agent can call `dbmd` after every write without compounding latency
 into seconds.
 
-**How much is "company scale"?** A single user indexing their entire
-Gmail runs ~120 emails/day — roughly 44k files a year, ~440k over a
-decade, ~1–1.5M across a heavy career: comfortably inside the native
-sweet spot. A company is the larger object — even ten people cross a
+**How much data is this?** A single user indexing their entire Gmail
+runs ~120 emails/day — roughly 44k files a year, ~440k over a decade,
+~1–1.5M across a heavy career: comfortably inside the native sweet spot.
+A shared operating store is larger — even ten people can cross a
 million files within a few years, and a large org reaches hundreds of
 millions to billions. The separated, file-per-record flavor with
 ripgrep carries the individual and the small team; the packed flavor
-and the engine (see [Roadmap](#roadmap)) carry the company.
+and the engine (see [Roadmap](#roadmap)) carry the larger end.
 
 **The flagship worked example is `db/`** — db.md's own knowledge kept
 as a db.md store, co-located with the toolkit's source. How do you run
-db.md at company scale? Read the store of how db.md itself was built:
-the research grounding the design under `sources/`, every material
-build decision under `records/decisions/`, and the narrative synthesis
-(the scale story, the sizing model, the roadmap) under `wiki/`. It is
-operated by `dbmd` as the toolkit grows — the same shape an agentic
-computer ships with its store at `~/db/`.
+db.md beyond a demo? Read the store of how db.md itself was built: the
+research grounding the design under `sources/`, every material build
+decision under `records/decisions/`, and the narrative synthesis (the
+scale story, the sizing model, the roadmap) under `wiki/`. It is
+operated by `dbmd` as the toolkit grows — the same contract an
+agent-built tool, research wiki, or agentic computer can use.
 
 **Two ceilings, not one.** The filesystem + ripgrep store reaches
 millions, but **git over the raw store is the tighter limit**
 (comfortable to ~100k files, tuning by ~500k, special tooling past
-~1M). So git-as-audit-log is the individual / small-team property;
-company-scale history is the packed flavor plus external snapshots — an
-agentic computer on a managed VM has hourly / daily snapshots as
-its real audit log. Sharding fixes per-directory growth, not the
-whole-tree-walk cost that git and backups pay; the maintained engine
-index is what removes that.
+~1M). So git-as-audit-log is the individual / small-team property; very
+large history is the packed flavor plus external snapshots — an agentic
+computer on a managed VM has hourly / daily snapshots as its real audit
+log. Sharding fixes per-directory growth, not the whole-tree-walk cost
+that git and backups pay; the maintained engine index is what removes
+that.
 
 **Semantic recall without embeddings.** Lexical search looks like it
 misses synonyms — but the agent driving `dbmd` is a language model, so
@@ -1204,11 +1210,11 @@ not change.
 ## Independently usable
 
 db.md is a self-contained standard with no external dependency. A plain
-markdown vault becomes a db.md store — Obsidian users, researchers
-running a topic wiki, an agentic computer keeping its company brain at
-`~/db/`, any harness with a folder of markdown. No platform, no
-account, no hosted service required. The spec is the contract; the
-runtime is replaceable.
+markdown vault becomes a db.md store — an agent-built internal tool, an
+Obsidian vault, a research wiki, a customer database, an agentic
+computer keeping its operating store at `~/db/`, any harness with a
+folder of markdown. No platform, no account, no hosted service
+required. The spec is the contract; the runtime is replaceable.
 
 ## Tooling
 
