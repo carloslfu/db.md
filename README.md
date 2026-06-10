@@ -467,3 +467,13 @@ The supply chain is covered in [Safe to paste](#safe-to-paste) above: built
 in CI from tagged commits, checksummed, provenance-attested, published with
 no stored token, dependency policy machine-enforced.
 [RELEASING.md](RELEASING.md) documents the release pipeline end to end.
+
+## Star history
+
+<a href="https://www.star-history.com/#carloslfu/db.md&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=carloslfu/db.md&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=carloslfu/db.md&type=Date" />
+   <img alt="Star history chart for carloslfu/db.md" src="https://api.star-history.com/svg?repos=carloslfu/db.md&type=Date" />
+ </picture>
+</a>
