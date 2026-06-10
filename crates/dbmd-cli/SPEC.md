@@ -963,10 +963,10 @@ the operator wrote a section the toolkit will never read). Recognized
 
 The database has been a service for decades — a daemon, a wire
 protocol, a schema migration tool, an admin UI. That made sense when
-storage was expensive and indexes had to live in RAM. It doesn't
-anymore. A modern computer can ripgrep a million files in seconds.
-An LLM reads markdown directly. Git already does what database
-snapshots try to.
+useful software over data had to be built around a database engine. It
+is no longer the only shape. A modern computer can ripgrep a million
+files in seconds. An LLM reads markdown directly. Git already does what
+database snapshots try to.
 
 db.md inverts the shape:
 

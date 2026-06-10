@@ -8,14 +8,15 @@ by hand. The links between records are written into the text itself.
 
 The folder is the database.
 
-For fifty years that would have been a toy. You needed a server, because the
-data would not fit in memory. You needed a schema up front, and a query
-language, because software could not read plain writing or find anything in
-the pile.
+For fifty years that would have sounded like a toy. Databases earned their
+place by doing hard things files alone did not: durable writes, indexes,
+transactions, concurrent access, permissions, fast queries. But they also
+carried a workaround: software could not read plain writing, so the world had
+to be forced into tables before software could use it.
 
-**Every one of those reasons just expired.** A capable agent reads the files,
-writes them, links them, and finds anything in them by plain meaning. The
-agent is the engine.
+**That workaround just expired.** A capable agent reads the files, writes them,
+links them, and finds anything in them by plain meaning. The agent is the
+engine.
 
 And the engine is the bet. **A db.md store gets sharper every time the model
 behind it improves.** A SQL database queries exactly as well in ten years as
@@ -158,8 +159,8 @@ vectors, moving onto ground db.md already stood on.
 ## Why files
 
 The database has been a service for decades: a daemon, a wire protocol, a
-migration tool, an admin panel. That made sense when storage was expensive and
-the index had to live in memory. It does not anymore.
+migration tool, an admin panel. That made sense when useful software over data
+had to be built around a database engine. It is no longer the only shape.
 
 db.md turns the shape inside out:
 
