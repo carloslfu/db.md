@@ -5,12 +5,15 @@ files with YAML frontmatter. Relationships are wiki-links. The database
 is the directory; the schema is the frontmatter; the index is whatever
 you want to build on top. It is built for agents: a database a harness
 reads, writes, links, and curates directly, and the native persistence
-layer for the agent-native tools built on it. For the broad middle of
-software, what used to be a Postgres schema, an ORM, migrations, and a
-CRUD surface becomes files, frontmatter, wiki-links, and a curator
-contract. An agent wants files it can reshape, not a schema to migrate
-or a query language to wrap around. db.md is files. Simple and open by
-design.
+layer for the agent-native tools built on it.
+
+The bet is that the next software stack is text-first and agent-run. For
+the broad middle of software — customers, deals, tasks, contracts,
+expenses, decisions, notes, and workflows wrapped around them — what
+used to be a Postgres schema, an ORM, migrations, and a CRUD surface can
+become files, frontmatter, wiki-links, and a curator contract. An agent
+wants files it can reshape, not a schema to migrate or a query language
+to wrap around. db.md is files. Simple and open by design.
 
 One directory, three folders, one config file. Raw evidence lives in
 `sources/`. Atomic typed data lives in `records/`. Curator-synthesized
@@ -983,14 +986,14 @@ Three properties files have that tables don't:
 3. **LLM-native.** The format an LLM reads best is the format a
    human reads best.
 
-Most software is not Google-scale. It is records plus a view: a CRM, a
-knowledge base, an ops tracker, a contract register, a decision log, an
-internal admin panel, the SaaS apps that are a database with a UI
+Most software is not Google-scale. It is records plus a surface: a CRM,
+a knowledge base, an ops tracker, a contract register, a decision log,
+an internal admin panel, the SaaS products that are a database with a UI
 bolted on. The old default was to put those records in Postgres, freeze
 a schema, wrap it in an app, and migrate every time reality moved.
 db.md replaces the database for that whole class — and the app over it,
 because the agent reads and relates the records directly and builds the
-view on demand.
+surface on demand.
 
 The genuinely hard remainder is real: high write concurrency, ACID
 transactions, sub-millisecond reads, aggregates over billions of rows.
