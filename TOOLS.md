@@ -78,7 +78,7 @@ loop. See SPEC.md § Scale.
 
 ### Write
 Each write maintains the `index.md` catalog write-through (no rebuild step in the loop).
-- `dbmd write <path> --type <t> [--summary --fm --body-file]` — source-layer writes auto-shard by date (`sources/<type>/<YYYY>/<MM>/`); prints the resolved path
+- `dbmd write <path> --type <t> [--summary --fm --body-file]` — sharded source and event types resolve to date paths (`sources/<type>/<YYYY>/<MM>/`, `records/<type>/<YYYY>/<MM>/`); flat entity types stay flat; prints the resolved path
 - `dbmd fm set <file> <key>=<value>`
 - `dbmd fm init <file>` — generate canonical frontmatter + default
   `summary`; the reconcile primitive for externally-dropped sources
