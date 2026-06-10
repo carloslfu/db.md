@@ -6,10 +6,11 @@ databases in plain files**.
 `db.md` is a database made of markdown files: records are markdown with
 YAML frontmatter, relationships are wiki-links, the directory is the
 database, the frontmatter is the schema, and your agent is the query
-engine. For the broad middle of agent-written software, the old
-Postgres/migrations/CRUD layer becomes files, frontmatter, wiki-links, and a
-curator contract. `dbmd` is a single deterministic binary that performs every
-db.md file/data operation; all logic lives in
+engine. For personal apps, home-cooked tools, team workflows, and the broad
+middle of agent-written software, the old Postgres/migrations/CRUD layer
+becomes files, frontmatter, wiki-links, and a curator contract. `dbmd` is a
+single deterministic binary that performs every db.md file/data operation; all
+logic lives in
 [`dbmd-core`](https://crates.io/crates/dbmd-core) and the binary is a
 thin arg-parse/format wrapper.
 

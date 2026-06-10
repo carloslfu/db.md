@@ -29,36 +29,48 @@ else, and that outlasts every tool that ever touches it.
 It is not small. **Millions of records live on plain files**, with no vector
 database anywhere.
 
-This is the contrarian bet: the next staff stack is text-first and
-agent-run. Instructions, tools, logs, memory, and databases should live in
-files the agent can inspect and change, not behind product walls.
+This is the contrarian bet: the future has more software, not less, but much of
+it will be too personal, too specific, and too alive to become a SaaS product.
+One person will make an app for one habit. A family will make an app for one
+routine. A researcher will make an app for one field. A company will make an
+app for one workflow. Agents make software cheap enough for the long tail to
+exist.
+
+That software needs a new database. Not a server. Not a vendor. Not a schema
+that hardens before the idea is done. A folder of text the agent can inspect,
+reshape, and keep alive.
 
 So db.md replaces a whole class of software: **the products that were only ever
-a database with a screen on top.** If it is mostly customers, deals, tasks,
-contracts, expenses, decisions, or notes with a workflow wrapped around them,
-it should not stay a rented SaaS product forever. For builders: the old Postgres +
-ORM + migrations + CRUD layer becomes markdown records, frontmatter,
-wiki-links, and a model that can change the shape as reality changes.
+a database with a screen on top.** If it is mostly tasks, trips, habits,
+customers, deals, contracts, expenses, decisions, or notes with a workflow
+wrapped around them, it should not stay a rented SaaS product forever. For
+builders: the old Postgres + ORM + migrations + CRUD layer becomes markdown
+records, frontmatter, wiki-links, and a model that can change the shape as
+reality changes.
 
 Here is a record. It is a file:
 
 ```markdown
 ---
-type: contact
-name: Elena Rodriguez
-email: elena.rodriguez@northstar.io
-company: [[records/companies/northstar]]
-role: Director of Operations
-created: 2025-09-14
-updated: 2026-05-22
+type: trip
+name: Kyoto spring trip
+dates: 2026-04-11..2026-04-18
+status: planning
+travelers:
+  - [[records/people/maya]]
+  - [[records/people/jules]]
+home_base: [[records/places/kyoto-station]]
+created: 2026-01-12
+updated: 2026-06-03
 ---
 
-# Elena Rodriguez
+# Kyoto spring trip
 
-Director of Operations at [[records/companies/northstar]]. Champion on the
-renewal that expands to 175 seats. See the thread in
-[[sources/emails/2026-05-22-elena-rodriguez-renewal]]. Prefers async over
-calls unless something is stuck.
+Seven days in Kyoto with Maya and Jules. The current plan keeps the first
+two nights near [[records/places/kyoto-station]], then moves to the ryokan
+from [[sources/emails/2026-06-03-ryokan-confirmation]]. Jules wants temples
+in the morning, Maya wants one open afternoon for wandering, and nobody wants
+another spreadsheet.
 ```
 
 The small YAML block at the top is frontmatter. In db.md, that is the schema:
@@ -70,10 +82,11 @@ reads it better than any row in any table. That is the whole format.
 ## What it replaces
 
 Most software is smaller and softer than the databases we designed for it. A
-CRM, an ops tracker, a contract register, a decision log, a backlog, an internal
-admin panel: underneath, they are usually records plus a surface. The old
-default was to put those records in Postgres, freeze a schema, wrap it in an
-app, and pay the migration tax every time reality changed.
+trip planner, baby tracker, migraine log, reading system, local CRM, ops
+tracker, contract register, decision log, backlog, internal admin panel:
+underneath, they are usually records plus a surface. The old default was to put
+those records in Postgres, freeze a schema, wrap it in an app, and pay the
+migration tax every time reality changed.
 
 **db.md replaces that layer.** The records are the files, the schema is text,
 the relationships are links, and the agent answers questions or builds the
@@ -84,9 +97,11 @@ the medium.
 
 Karpathy's April 2026 LLM Wiki is the proof of life: a model can maintain a
 coherent markdown world. db.md generalizes that from a wiki into a database.
-A company brain is one obvious use case. It is not the category. The category
-is agent-native persistence: the database layer of the text-first, agent-run
-stack for software written, operated, and reshaped by models.
+A company brain is one obvious use case. So is personal software. So is
+home-cooked software. So is the next agent-native product whose shape changes
+every week. None of those is the category. The category is agent-native
+persistence: the database layer for software written, operated, and reshaped by
+models.
 
 ## How it works
 
@@ -309,11 +324,11 @@ this hold beyond a demo?" is to read the store of how db.md itself was built.
 ## Use it on its own
 
 db.md is an open standard, and it stands on its own. A plain markdown vault
-becomes a db.md store, with no platform and no account required: an agent-built
-internal tool, an Obsidian vault, a research wiki, a customer database, an
-agentic computer's operating store, any runtime with a folder of markdown. The
-[spec](SPEC.md) is the contract. The runtime is replaceable. **The files
-outlast both.**
+becomes a db.md store, with no platform and no account required: a personal
+app, a family tool, an Obsidian vault, a research wiki, an agent-built internal
+tool, a customer database, an agentic computer's operating store, any runtime
+with a folder of markdown. The [spec](SPEC.md) is the contract. The runtime is
+replaceable. **The files outlast both.**
 
 ## License
 
