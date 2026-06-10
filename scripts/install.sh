@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 #
-# dbmd installer — the open database in plain files.
+# dbmd installer — the open standard for databases in plain files.
 #
 #   curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 #

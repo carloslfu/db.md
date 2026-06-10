@@ -35,7 +35,7 @@ use crate::context::ColorChoice;
 #[command(
     name = "dbmd",
     version,
-    about = "The reference CLI for db.md — the open database in plain files.",
+    about = "The reference CLI for db.md — the open standard for databases in plain files.",
     long_about = None,
     propagate_version = true,
     // Show the most useful help when invoked bare, rather than a terse error.
