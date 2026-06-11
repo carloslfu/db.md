@@ -290,20 +290,29 @@ and the files still the source of truth. Until then the two compose cleanly.
 ## Quick start
 
 db.md is operated by agents, and the installer is text. The quick start is a
-prompt you hand to an agent. It is safe to paste: the whole install chain is
-verifiable and the install itself stays fast, so you can run it now and check
-it later, or never. Paste this into Claude Code, Codex, or any agent with a
-shell:
+prompt you hand to an agent, and it covers both cases — a clean start, or
+bringing an existing knowledge base across. You do not have to decide which;
+the agent looks at what you have and proposes the path. It is safe to paste:
+the install chain is verifiable and the install stays fast. Paste this into
+Claude Code, Codex, or any agent with a shell:
 
 ```text
 Read https://raw.githubusercontent.com/carloslfu/db.md/main/llms.txt and set
 up db.md on this machine: install dbmd, run `dbmd spec` to load the standard,
-and set up a store at ~/db, or the folder I point you at.
+and set up a store at ~/db, or the folder I point you at. If I already have
+notes, documents, exports, or a knowledge base to bring in — a folder of
+files, an Obsidian vault, a Notion export, anything — evaluate it first and
+show me a migration plan that maps it into the store's sources, records, and
+wiki with frontmatter and links; once I am happy with the plan, migrate all
+of it. If I am starting fresh, just scaffold the store. Ask me where my data
+lives if it is not obvious.
 ```
 
-The agent reads [llms.txt](llms.txt), installs the binary, loads the
-contract, writes `DB.md`, sorts your files into the three layers, and curates
-from there.
+The agent reads [llms.txt](llms.txt), installs the binary, and loads the
+contract. If you have existing data, it evaluates it and proposes a migration
+into the three layers — sources, records, wiki — with frontmatter and links,
+then moves it once you approve. If you are starting fresh, it scaffolds an
+empty store. Either way it writes `DB.md` and curates from there.
 
 Want to confirm it is safe before trusting it? You do not have to verify
 anything to install, but you can: [Safe to paste](#safe-to-paste) below has
