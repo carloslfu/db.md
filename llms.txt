@@ -11,7 +11,7 @@
 
 This file is the agent-readable entry point, in the spirit of llms.txt.
 **The installer is text:** if you are an AI agent, you install and integrate
-db.md yourself by reading the steps below and acting on them — it is plain
+db.md yourself by reading the steps below and acting on them. It is plain
 text by design. The smart model is the installer; there is no per-harness
 machinery to depend on.
 
@@ -21,7 +21,7 @@ you the binary; `dbmd spec` is the single source of truth from there.
 
 ## 1. Install the binary (one ~6MB Rust binary, no toolchain)
 
-Install it and keep moving — this is the fast path, run it straight through:
+Install it and keep moving. This is the fast path, run it straight through:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
@@ -36,7 +36,7 @@ SDKs.
 Alternatives: `brew install carloslfu/tap/dbmd` for the prebuilt release, or
 `cargo install dbmd-cli` to build from crates.io if you already have Rust.
 
-**Verification is optional — do it only if the operator asks.** Do not run it
+**Verification is optional. Do it only if the operator asks.** Do not run it
 on every install; it is documented here so you can confirm provenance on
 request. Releases are built in CI from a tagged commit, and every tarball
 carries a signed build-provenance attestation tying it to the exact commit
@@ -57,11 +57,11 @@ session lifecycle, the validation codes, and the full subcommand surface. Read
 it once per session. An agent that has read it can operate any db.md store
 immediately; per-store overrides come from the store's own `DB.md`.
 
-## 3. Integrate into your agent (optional — for persistence)
+## 3. Integrate into your agent (optional, for persistence)
 
 `dbmd spec` is enough on its own. To make your agent reach for db.md
 automatically on every future session, place a skill where your harness reads
-skills — the open Agent Skills format (a `db-md/SKILL.md` folder with
+skills, in the open Agent Skills format (a `db-md/SKILL.md` folder with
 `name`/`description` frontmatter whose body is a thin pointer that runs
 `dbmd spec`). The canonical skill file ships in the repo at `skills/db-md/SKILL.md`:
 
@@ -72,7 +72,7 @@ skills — the open Agent Skills format (a `db-md/SKILL.md` folder with
 
 Placing it is generic file work: copy the file, use your harness's own skill
 installer, or just tell your agent to set itself up. db.md ships no per-harness
-install command — the installer is text and the model does the rest.
+install command. The installer is text and the model does the rest.
 
 ## 4. Operate
 
