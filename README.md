@@ -290,19 +290,25 @@ and the files still the source of truth. Until then the two compose cleanly.
 ## Quick start
 
 db.md is operated by agents, and the installer is text. The quick start is a
-prompt. Paste it into Claude Code, Codex, or any agent with a shell:
+prompt you hand to an agent. It is safe to paste: the whole install chain is
+verifiable and the install itself stays fast, so you can run it now and check
+it later, or never. Paste this into Claude Code, Codex, or any agent with a
+shell:
 
 ```text
 Read https://raw.githubusercontent.com/carloslfu/db.md/main/llms.txt and set
-up db.md on this machine. Audit before you install: read the install script
-and check the release provenance (gh attestation verify <tarball> --repo
-carloslfu/db.md). Then install dbmd, run `dbmd spec` to load the standard,
+up db.md on this machine: install dbmd, run `dbmd spec` to load the standard,
 and set up a store at ~/db, or the folder I point you at.
 ```
 
-The agent reads [llms.txt](llms.txt) and the install script, checks the
-provenance, installs the binary, loads the contract, writes `DB.md`, sorts
-your files into the three layers, and curates from there.
+The agent reads [llms.txt](llms.txt), installs the binary, loads the
+contract, writes `DB.md`, sorts your files into the three layers, and curates
+from there.
+
+Want to confirm it is safe before trusting it? You do not have to verify
+anything to install, but you can: [Safe to paste](#safe-to-paste) below has
+the receipts and a one-line verify command, and you can ask your agent to run
+the audit for you.
 
 Installing by hand is the same one Rust binary, about 6MB in the current
 release build, no toolchain:
@@ -328,8 +334,9 @@ Every command speaks `--json`, so anything you build on top reads it cleanly.
 
 ### Safe to paste
 
-A prompt that ends in an installed binary deserves suspicion. The chain is
-built to be checked, by you or by the agent you hand it to:
+You do not need to verify anything to install — the install is the fast path
+above. But a prompt that ends in an installed binary deserves the option, so
+the chain is built to be checked, by you or by the agent you hand it to:
 
 - **The installer is readable.** [`scripts/install.sh`](scripts/install.sh)
   is about 140 lines of POSIX sh: detect the platform, download the tarball
