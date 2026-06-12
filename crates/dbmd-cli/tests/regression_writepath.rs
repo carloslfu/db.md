@@ -183,10 +183,10 @@ fn regression_concurrent_write_never_silently_clobbers() {
 }
 
 /// A plain pre-existing file is still refused with the structured
-/// `PATH_COLLISION` and left byte-for-byte untouched — the atomic claim must not
-/// regress the ordinary collision contract.
+/// `PATH_COLLISION` and left byte-for-byte untouched — the core create-new
+/// writer must not regress the ordinary collision contract.
 #[test]
-fn regression_write_atomic_claim_still_refuses_existing_file_without_overwrite() {
+fn regression_write_atomic_new_still_refuses_existing_file_without_overwrite() {
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
     let original =
         "---\ntype: contact\nsummary: ORIGINAL\nname: Sarah\n---\n\n# Sarah\n\nOriginal body.\n";

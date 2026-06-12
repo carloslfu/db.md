@@ -630,6 +630,32 @@ pub fn read_file(path: &Path) -> Result<(Frontmatter, String), ParseError> {
 /// temp-file-rename so a reader never sees a half-written file. Preserves the
 /// operator-edited body exactly as given.
 pub fn write_file(path: &Path, frontmatter: &Frontmatter, body: &str) -> Result<(), ParseError> {
+    let contents = render_file(frontmatter, body);
+
+    // One durable, atomic write for all primary data (see `crate::fsx`):
+    // temp-file + fsync + rename + parent-fsync. Content records are primary
+    // data, so they get the durable path (unlike the rebuildable index).
+    crate::fsx::write_atomic(path, contents.as_bytes())?;
+    Ok(())
+}
+
+/// Atomically create a markdown file from frontmatter + body, refusing with
+/// [`std::io::ErrorKind::AlreadyExists`] if the destination already exists.
+///
+/// This is the create-new sibling of [`write_file`]: same canonical rendering
+/// and durable temp-file path, but backed by [`crate::fsx::write_atomic_new`] so
+/// two concurrent creators for the same path cannot both succeed.
+pub fn write_file_new(
+    path: &Path,
+    frontmatter: &Frontmatter,
+    body: &str,
+) -> Result<(), ParseError> {
+    let contents = render_file(frontmatter, body);
+    crate::fsx::write_atomic_new(path, contents.as_bytes())?;
+    Ok(())
+}
+
+fn render_file(frontmatter: &Frontmatter, body: &str) -> String {
     let yaml = frontmatter.to_yaml();
     // `to_yaml` already terminates each block with a newline. Compose the file
     // as: opening fence, frontmatter YAML, closing fence, then body verbatim.
@@ -638,12 +664,7 @@ pub fn write_file(path: &Path, frontmatter: &Frontmatter, body: &str) -> Result<
     contents.push_str(&yaml);
     contents.push_str("---\n");
     contents.push_str(body);
-
-    // One durable, atomic write for all primary data (see `crate::fsx`):
-    // temp-file + fsync + rename + parent-fsync. Content records are primary
-    // data, so they get the durable path (unlike the rebuildable index).
-    crate::fsx::write_atomic(path, contents.as_bytes())?;
-    Ok(())
+    contents
 }
 
 /// Extract every wiki-link from a body (and inline frontmatter), returning the

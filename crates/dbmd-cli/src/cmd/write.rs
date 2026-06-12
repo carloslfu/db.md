@@ -19,7 +19,7 @@
 //! already declared in `cmd/mod.rs`.
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use dbmd_core::{summary, Frontmatter, Store};
@@ -105,28 +105,16 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     // ── policy: also refuse on the resolved path (sharded destination) ───────
     enforce_frozen(&store, &resolved)?;
 
-    // ── collision refusal (after the frozen-page gate) ───────────────────────
-    // ATOMIC claim, not a TOCTOU pre-check. A bare `abs.exists()` test is racy:
-    // `write_file` finishes with an UNCONDITIONAL `fs::rename` over the
-    // destination (`fsx::write_atomic`), so two sanctioned concurrent writers
-    // (the spec allows many writers to `records/` via `dbmd write` + scripts)
-    // could both observe `exists()==false` and the second would silently
-    // clobber the first's primary content. Instead, atomically claim the path
-    // with `create_new` (which the OS resolves atomically against any other
-    // creator): the winner holds an empty sentinel that its own `write_atomic`
-    // rename replaces; every loser — concurrent creator OR an already-existing
-    // file — gets `AlreadyExists` and the structured `PATH_COLLISION` refusal.
-    claim_new_path(&abs).map_err(|kind| match kind {
-        ClaimError::Exists => collision_error(&store, &resolved),
-        ClaimError::Io(e) => CliError::runtime(format!("cannot create `{resolved_disp}`: {e}")),
-    })?;
-
-    // ── write, then maintain the catalog write-through ───────────────────────
-    // If the real write fails after we claimed the path, remove the empty
-    // sentinel so a retry does not see a spurious `PATH_COLLISION` on a
-    // zero-byte stub (pre-fix, a failed write left nothing behind).
-    if let Err(e) = dbmd_core::parser::write_file(&abs, &fm, &body) {
-        let _ = std::fs::remove_file(&abs);
+    // ── create, then maintain the catalog write-through ──────────────────────
+    // The durable writer owns the collision guard: it writes/fsyncs a sibling
+    // temp file, then atomically hard-links it into `abs`, which fails with
+    // `AlreadyExists` if a prior file or concurrent creator won the path. This
+    // keeps create-new semantics in `dbmd-core` and avoids the old empty-sentinel
+    // placeholder window at the CLI layer.
+    if let Err(e) = dbmd_core::parser::write_file_new(&abs, &fm, &body) {
+        if matches!(&e, dbmd_core::ParseError::Io(io) if io.kind() == ErrorKind::AlreadyExists) {
+            return Err(collision_error(&store, &resolved));
+        }
         return Err(core_err(e));
     }
     let index_warning = index_on_write(&store, &resolved);
@@ -401,36 +389,6 @@ fn collision_error(store: &Store, resolved: &Path) -> CliError {
     // it whether this is the same entity.
     CliError::new(ExitCode::Collision, "PATH_COLLISION", message)
         .with_hint("update the existing file (dbmd fm set), or write to a disambiguated path")
-}
-
-/// Why claiming a fresh write path failed.
-enum ClaimError {
-    /// The destination already exists (a prior file or a concurrent creator who
-    /// won the atomic create) → a `PATH_COLLISION` refusal.
-    Exists,
-    /// A genuine I/O error (permission, ENOSPC creating the parent, …).
-    Io(std::io::Error),
-}
-
-/// Atomically claim `abs` as a brand-new write target, closing the collision
-/// TOCTOU. `OpenOptions::create_new` is resolved atomically by the OS against
-/// every other creator, so exactly one of N racing `dbmd write`s for the same
-/// resolved path wins; the rest (and any pre-existing file) get
-/// [`ClaimError::Exists`]. The winner leaves an empty sentinel that its own
-/// `parser::write_file` (temp-file + `rename`) immediately replaces with the
-/// real content, so the claim adds no observable intermediate state on success.
-///
-/// The parent directory is created first (mirroring `fsx::write_atomic`, which
-/// also `create_dir_all`s) so the claim works for a fresh type-folder.
-fn claim_new_path(abs: &Path) -> Result<(), ClaimError> {
-    if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent).map_err(ClaimError::Io)?;
-    }
-    match OpenOptions::new().write(true).create_new(true).open(abs) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(ClaimError::Exists),
-        Err(e) => Err(ClaimError::Io(e)),
-    }
 }
 
 /// The refusal for a content file that has no usable summary (exit `1`). A

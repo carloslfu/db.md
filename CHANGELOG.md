@@ -8,7 +8,16 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.6**.
+  `Cargo.toml`, currently **v0.3.7**.
+
+## [0.3.7] — 2026-06-11
+
+### Changed
+
+- `dbmd write` now uses a reusable `dbmd-core` create-new durable writer
+  (`write_atomic_new`) instead of a CLI-level empty sentinel. Existing
+  `PATH_COLLISION` behavior is unchanged, but the collision guarantee now lives
+  beside the core atomic write primitive and no placeholder file is created.
 
 ## [0.3.6] — 2026-06-10
 

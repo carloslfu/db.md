@@ -49,7 +49,7 @@ pub mod validate;
 // These are the locked interface every other crate and module builds against.
 
 pub use extract::{ExtractError, Extracted, Format, MetaValue};
-pub use fsx::write_atomic;
+pub use fsx::{write_atomic, write_atomic_new};
 pub use graph::ContextSlice;
 pub use index::{Index, IndexLevel, IndexRecord};
 pub use log::{Log, LogEntry, LogKind};
