@@ -22,4 +22,4 @@ Other contacts: [[records/contacts/anh-tran]] (CTO, technical evaluator)
 Key context:
 - Compliance-heavy industry — care about SOC 2, audit trails.
 - Renewal renews in July 2026.
-- Expansion driven by their growth from 95 to 175 ops staff over Q1-Q2.
+- Expansion driven by their ops team roughly doubling over Q1-Q2, so they need more PM seats.

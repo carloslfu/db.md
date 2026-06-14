@@ -52,5 +52,3 @@ constraint here is **client confidentiality.**
 - Playbook pages: pattern + example (anonymized). 300-800 words.
 - Client tone: match the client's voice in any draft you produce
   (formal for enterprise, casual for startups).
-</content>
-</invoke>

@@ -5,7 +5,7 @@ created: 2026-05-20T15:05:00Z
 updated: 2026-05-20T15:05:00Z
 summary: "DeepMind's AlphaZero: one self-play + MCTS + neural-net recipe reaching superhuman chess, shogi, and Go with no domain knowledge beyond the rules"
 title: "Mastering Chess and Shogi by Self-Play with a General Reinforcement Learning Algorithm"
-authors: [Silver, Hubinger, Schrittwieser, Antonoglou, Lai, Guez, Lanctot, Sifre, Kumaran, Graepel, Lillicrap, Simonyan, Hassabis]
+authors: [Silver, Hubert, Schrittwieser, Antonoglou, Lai, Guez, Lanctot, Sifre, Kumaran, Graepel, Lillicrap, Simonyan, Hassabis]
 year: 2017
 venue: arXiv
 arxiv_id: "1712.01815"
@@ -16,6 +16,7 @@ concepts:
   - [[wiki/concepts/self-play]]
   - [[wiki/concepts/mcts]]
   - [[wiki/concepts/policy-iteration]]
+  - [[wiki/concepts/value-network]]
 ---
 
 # AlphaZero

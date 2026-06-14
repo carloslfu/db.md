@@ -24,3 +24,5 @@ tags: [ai, software, agents]
 My note: the "slider" framing is the part that stuck. It reframes
 "how much should I let the AI do?" as a dial I set per task, not a
 yes/no I decide once.
+
+Watched it as [the YC AI Startup School keynote](https://www.youtube.com/watch?v=LCEmiRjPEtQ).
