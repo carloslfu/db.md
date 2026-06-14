@@ -10,6 +10,17 @@ Two things version independently:
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
   `Cargo.toml`, currently **v0.3.9**.
 
+## [Unreleased]
+
+### Changed
+
+- Migration guidance now reconciles the surrounding system, not just the data.
+  The quick-start prompt (README, llms.txt) tells the agent that moving an
+  existing knowledge base into the store is only half the job: it must also find
+  whatever already connects to that knowledge base (skills, commands, scripts)
+  and update them to point at the new store, so nothing keeps reading the old
+  location.
+
 ## [0.3.9] — 2026-06-14
 
 A launch-readiness correctness and security release. An adversarial code
