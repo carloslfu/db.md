@@ -92,10 +92,12 @@ otherwise `git init` the store or place it in a synced folder. Only skip version
 control if the operator explicitly asks for a throwaway store. Never move
 repo-owned data out to an external path without the operator's say-so. A global
 alias like `~/db` is fine only as a symlink to the real, versioned store. When
-you migrate an existing knowledge base in, the move is only half the job: find
-whatever already connects to it (skills, commands, scripts) and update them to
-point at the new store, so nothing keeps reading the old location. See `dbmd
-spec` for the store contract.
+you migrate an existing knowledge base in, preserve each source's provenance and
+verify nothing was lost. The move is only half the job: find whatever already
+connects to it (skills, commands, scripts) and update them to point at the new
+store, so nothing keeps reading the old location. Don't create long-lived
+migration-map pages or temporary artifacts unless asked; git is the audit and
+rollback trail. See `dbmd spec` for the store contract.
 
 ## Links
 

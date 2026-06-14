@@ -311,11 +311,13 @@ control if I explicitly tell you I want a throwaway, unversioned store. If I
 already have notes, exports, or a knowledge base to bring in (a folder of files,
 an Obsidian vault, a Notion export, anything), evaluate it first and show me a
 migration plan that maps it into the store's sources, records, and wiki with
-frontmatter and links, then migrate it once I approve. Moving the data is only
-half of it: also find whatever already connects to that knowledge base (my
-skills, commands, and scripts) and update them to point at the new store, so
-nothing keeps reading the old location. Confirm where the store lives and how it
-is backed up before you scaffold.
+frontmatter and links, then migrate it once I approve, preserving each source's
+provenance and verifying nothing was lost. Moving the data is only half of it:
+also find whatever already connects to that knowledge base (my skills, commands,
+and scripts) and update them to point at the new store, so nothing keeps reading
+the old location. Don't create long-lived migration-map pages or temporary
+artifacts unless I ask; git is the audit and rollback trail. Confirm where the
+store lives and how it is backed up before you scaffold.
 ```
 
 The agent reads [llms.txt](llms.txt), installs the binary, and loads the

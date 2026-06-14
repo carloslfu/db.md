@@ -19,7 +19,9 @@ Two things version independently:
   existing knowledge base into the store is only half the job: it must also find
   whatever already connects to that knowledge base (skills, commands, scripts)
   and update them to point at the new store, so nothing keeps reading the old
-  location.
+  location. It also preserves each source's provenance, verifies nothing was
+  lost, and leaves no long-lived migration-map artifacts behind (git is the
+  audit and rollback trail).
 
 ## [0.3.9] — 2026-06-14
 
