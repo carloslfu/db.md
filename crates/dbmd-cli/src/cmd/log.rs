@@ -12,7 +12,13 @@
 //! verbatim in the vector. For the same reason the global `--json` / `--color`
 //! flags are captured verbatim too when they trail the append form; the body
 //! recognizes and strips them so `dbmd log <kind> <object> --json` behaves like
-//! the flag-first `dbmd --json log <kind> <object>` clap parses elsewhere.
+//! the flag-first `dbmd --json log <kind> <object>` clap parses elsewhere. The
+//! equivalence holds on the ERROR path too: the append form recovers the
+//! effective `--json` before any fallible step and renders its own error
+//! envelope through it, so a usage error / `NOT_A_STORE` / append failure under
+//! a trailing `--json` is the same machine-parseable `{"error": {...}}` the
+//! flag-first form emits (errors do not bubble to `main.rs`'s top-level emitter,
+//! which never saw the trailing flag).
 //!
 //! Thin wrapper: parse args, build a `dbmd_core::log::LogEntry`, call
 //! `Log::{append,tail,since}`, format output (text or `--json`). The append
@@ -62,16 +68,30 @@ pub fn run_since(ctx: &Context, args: &LogSinceArgs) -> CliResult {
 /// a [`LogEntry`] timestamped now (UTC), and appends it (auto-rotating older
 /// months into `log/<YYYY-MM>.md`).
 pub fn run_append(ctx: &Context, tokens: &[String]) -> CliResult {
-    let parsed = ParsedAppend::from_tokens(tokens)?;
-
     // The append form is a clap `external_subcommand`, so the global `--json` /
-    // `--color` flags are NOT parsed by clap when they trail the form (the
-    // natural, every-other-subcommand-accepts-it habit). `from_tokens` strips
-    // them out of the token stream and reports them here; we fold them onto the
-    // inherited `ctx` so `dbmd log <kind> <object> -m … --json` behaves the same
-    // as the flag-first `dbmd --json log <kind> <object> -m …`.
-    let ctx = parsed.effective_context(ctx);
-    let ctx = &ctx;
+    // `--color` flags are NOT parsed by clap when they trail the form. Recover
+    // the EFFECTIVE context FIRST — infallibly, before any step that can error —
+    // so every error path (`from_tokens` usage error, `NOT_A_STORE` from
+    // `open_store`, an append I/O error) honors a trailing `--json` exactly like
+    // the success path and the flag-first `dbmd --json log …` do. Without this,
+    // the `?`-propagated error would reach `main.rs`'s emitter under the
+    // top-level ctx (where `--json` was never seen by clap), printing human prose
+    // on the very failure paths an agent parses as JSON.
+    let effective = scan_global_flags(tokens).effective_context(ctx);
+
+    // Run the body; on any error, render it through the EFFECTIVE context here
+    // (not the top-level one `main.rs` holds) and exit with its code. On success
+    // return `Ok(())` so `main.rs` exits 0 as usual.
+    match run_append_inner(&effective, tokens) {
+        Ok(()) => Ok(()),
+        Err(err) => emit_append_error_and_exit(&effective, &err),
+    }
+}
+
+/// The fallible body of the append form, separated from [`run_append`] so the
+/// latter can render any error through the effective (`--json`-aware) context.
+fn run_append_inner(ctx: &Context, tokens: &[String]) -> CliResult {
+    let parsed = ParsedAppend::from_tokens(tokens)?;
 
     // The store root is not a flag on the append form (clap can't parse flags
     // inside an external subcommand), so the append form always operates on the
@@ -117,6 +137,93 @@ pub fn run_append(ctx: &Context, tokens: &[String]) -> CliResult {
         }
     }
     Ok(())
+}
+
+/// The global `--json` / `--color` flags recovered from the append token stream
+/// *before* any fallible parse, so error paths honor a trailing `--json` too.
+struct GlobalFlags {
+    json: Option<bool>,
+    color: Option<ColorChoice>,
+}
+
+impl GlobalFlags {
+    /// Fold the recovered globals onto the inherited `ctx` (same contract as
+    /// [`ParsedAppend::effective_context`]).
+    fn effective_context(&self, ctx: &Context) -> Context {
+        Context {
+            json: self.json.unwrap_or(ctx.json),
+            color: self.color.unwrap_or(ctx.color),
+        }
+    }
+}
+
+/// Recover the global `--json` / `--color` flags from the raw append tokens
+/// without failing on anything. This is deliberately tolerant: it skips `-m`'s
+/// value so a `--color` that appears *inside* a note is not mistaken for the
+/// flag, and it ignores a malformed/absent `--color` value (that error, if real,
+/// surfaces from [`ParsedAppend::from_tokens`] and is then rendered through the
+/// context this pass recovered). Its only job is to get `--json` right on every
+/// path so error envelopes are machine-parseable when the caller asked for JSON.
+fn scan_global_flags(tokens: &[String]) -> GlobalFlags {
+    let mut json: Option<bool> = None;
+    let mut color: Option<ColorChoice> = None;
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        // Skip `-m <note>` so a `--json` / `--color` literally inside the note
+        // value is not misread as a global flag (mirrors `from_tokens`, which
+        // consumes the next token as the note).
+        if tok == "-m" || tok == "--message" {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with("--message=") || (tok.starts_with("-m") && tok.len() > 2) {
+            i += 1;
+            continue;
+        }
+        if tok == "--json" {
+            json = Some(true);
+            i += 1;
+            continue;
+        }
+        if tok == "--color" {
+            if let Some(val) = tokens.get(i + 1) {
+                if let Ok(c) = parse_color(val) {
+                    color = Some(c);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(rest) = tok.strip_prefix("--color=") {
+            if let Ok(c) = parse_color(rest) {
+                color = Some(c);
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    GlobalFlags { json, color }
+}
+
+/// Render an append-form error through the EFFECTIVE (`--json`-aware) context
+/// and exit with its code. Mirrors `main.rs`'s `emit_error` so a trailing
+/// `--json` produces the same `{"error": {...}}` envelope the flag-first form
+/// does — the append form is the one place `main.rs` cannot see the recovered
+/// flag, so it is rendered here instead of bubbling to the top-level emitter.
+fn emit_append_error_and_exit(ctx: &Context, err: &CliError) -> ! {
+    if ctx.json {
+        eprintln!("{}", err.to_json());
+    } else {
+        eprintln!("dbmd: {}", err.message);
+        if let Some(hint) = &err.hint {
+            eprintln!("  hint: {hint}");
+        }
+    }
+    std::process::exit(err.exit.code());
 }
 
 /// The parsed pieces of a `log <kind> <object> [-m <note>]` append invocation.
@@ -343,4 +450,93 @@ pub(crate) fn parse_flexible_timestamp(raw: &str) -> Result<DateTime<FixedOffset
 fn usage_error(message: &str) -> CliError {
     CliError::new(ExitCode::Runtime, "LOG_USAGE", message)
         .with_hint("dbmd log <kind> <object> [-m <note>]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toks(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn base_ctx() -> Context {
+        Context {
+            json: false,
+            color: ColorChoice::Auto,
+        }
+    }
+
+    // ── regression: trailing `--json` is recovered for the ERROR path too ──────
+    //
+    // The append form is a clap `external_subcommand`, so a trailing `--json`
+    // never reaches the top-level context `main.rs` renders errors with. Before
+    // the fix, error paths (`NOT_A_STORE`, `LOG_USAGE`) printed human prose even
+    // when the caller appended `--json`. `scan_global_flags` recovers the flag
+    // BEFORE any fallible parse so the effective context — used by the append
+    // form's own error emitter — is JSON when the caller asked for JSON.
+
+    #[test]
+    fn scan_global_flags_recovers_trailing_json() {
+        // `dbmd log create records/x.md --json`
+        let flags = scan_global_flags(&toks(&["create", "records/x.md", "--json"]));
+        assert_eq!(flags.json, Some(true));
+        assert!(flags.effective_context(&base_ctx()).json);
+    }
+
+    #[test]
+    fn scan_global_flags_recovers_json_before_positionals() {
+        // The flag can lead too: `dbmd log --json create records/x.md`.
+        let flags = scan_global_flags(&toks(&["--json", "create", "records/x.md"]));
+        assert_eq!(flags.json, Some(true));
+    }
+
+    #[test]
+    fn scan_global_flags_absent_json_inherits_ctx() {
+        let flags = scan_global_flags(&toks(&["create", "records/x.md"]));
+        assert_eq!(flags.json, None);
+        // With no trailing flag, the effective json is whatever ctx carries.
+        let json_ctx = Context {
+            json: true,
+            color: ColorChoice::Auto,
+        };
+        assert!(flags.effective_context(&json_ctx).json);
+        assert!(!flags.effective_context(&base_ctx()).json);
+    }
+
+    #[test]
+    fn scan_global_flags_skips_json_inside_note_value() {
+        // A `--json` that is the `-m` note VALUE must NOT be read as the global
+        // flag (mirrors `from_tokens` consuming the note token).
+        let flags = scan_global_flags(&toks(&["create", "records/x.md", "-m", "--json"]));
+        assert_eq!(
+            flags.json, None,
+            "a `--json` that is the note value is note text, not the global flag"
+        );
+    }
+
+    #[test]
+    fn scan_global_flags_recovers_color_both_forms() {
+        let split = scan_global_flags(&toks(&["create", "x", "--color", "always"]));
+        assert_eq!(split.color, Some(ColorChoice::Always));
+        let joined = scan_global_flags(&toks(&["create", "x", "--color=never"]));
+        assert_eq!(joined.color, Some(ColorChoice::Never));
+        // A malformed `--color` value is tolerated here (the real error surfaces
+        // from `from_tokens`, rendered through the recovered context).
+        let bad = scan_global_flags(&toks(&["create", "x", "--color=bogus"]));
+        assert_eq!(bad.color, None);
+    }
+
+    #[test]
+    fn scan_global_flags_recovers_json_even_when_positionals_are_missing() {
+        // The whole point: a usage error (too few positionals) must STILL emit a
+        // JSON envelope when `--json` trails. `scan_global_flags` sees the flag
+        // regardless of positional validity, so the effective context is JSON
+        // before `from_tokens` ever returns its `LOG_USAGE` error.
+        let flags = scan_global_flags(&toks(&["onlyonearg", "--json"]));
+        assert_eq!(flags.json, Some(true));
+        // And `from_tokens` does reject the one-positional form (the error this
+        // context will now render as JSON).
+        assert!(ParsedAppend::from_tokens(&toks(&["onlyonearg", "--json"])).is_err());
+    }
 }

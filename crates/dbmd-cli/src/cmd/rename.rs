@@ -43,10 +43,12 @@ use crate::error::{CliError, CliResult, ExitCode};
 /// `<new>` already exists; (4) find every incoming linker (embedded ripgrep);
 /// (5) rewrite each linker's `[[old]]` → `[[new]]` *while the file still sits at
 /// `<old>`*, then move the file last (so a rewrite failure leaves the source in
-/// place and the store self-consistent, never half-renamed); (6) update the
+/// place and the store self-consistent, never half-renamed); (6) re-stamp the
+/// moved file's auto-maintained `updated` timestamp (a rename is an edit of that
+/// file), skipping gracefully if it has no parseable frontmatter; (7) update the
 /// moved file's old + new type-folder indexes write-through, then refresh the
 /// index entry of every rewritten linker (its indexed frontmatter changed), so
-/// the loop path stays byte-identical to a full `index rebuild`; (7) report the
+/// the loop path stays byte-identical to a full `index rebuild`; (8) report the
 /// rewrite count.
 pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     let store = open_store(&args.dir)?;
@@ -61,6 +63,30 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     }
     if new_abs.exists() {
         return Err(dest_exists_error(&new_rel));
+    }
+
+    // Policy: `rename` moves a single CONTENT file, rewriting incoming links.
+    // It is not a directory-mover and it must never touch the store's reserved
+    // meta files. Two guards enforce that invariant before any disk mutation:
+    //
+    //   1. Reject a directory source. `<old>` exists (checked above) — if it is
+    //      a directory, `std::fs::rename` would move the whole subtree, but
+    //      `find_links_to(&old_rel)` only matches `[[<old>]]` (the directory
+    //      path), which nothing links to, so ZERO inbound links to the moved
+    //      *files* get rewritten and both index sidecars drift. Refuse instead.
+    //   2. Reject a reserved root meta file as `<old>` OR `<new>`. Moving
+    //      `DB.md` out of the root destroys the store (every later command then
+    //      fails `NOT_A_STORE`); moving `log.md`/`index.md`/`index.jsonl`, or
+    //      landing a content file on top of one of those names, corrupts the
+    //      catalog. These files are the catalog's own; `rename` never owns them.
+    if old_abs.is_dir() {
+        return Err(rename_directory_error(&old_rel));
+    }
+    if let Some(name) = reserved_meta_name(&old_rel) {
+        return Err(reserved_meta_source_error(&old_rel, name));
+    }
+    if let Some(name) = reserved_meta_name(&new_rel) {
+        return Err(reserved_meta_dest_error(&new_rel, name));
     }
 
     // Policy: refuse moving a frozen page, and refuse landing on a frozen path.
@@ -145,6 +171,20 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     std::fs::rename(&old_abs, &new_abs)
         .map_err(|e| CliError::runtime(format!("cannot move file: {e}")))?;
 
+    // Re-stamp the MOVED file's auto-maintained `updated` to now: a rename IS an
+    // edit of that file (its path changed), so its recency must reflect the move
+    // the same way `write` seeds it on create and `fm set` bumps it on edit.
+    // Done BEFORE `index_on_rename` so the index picks up the new timestamp. If
+    // `new_abs` has no parseable frontmatter (a non-content file with no `---`
+    // block), `read_file` errors and we skip the re-stamp gracefully rather than
+    // failing the rename. We deliberately do NOT cascade the bump to the
+    // link-rewritten linker files: renaming a link target must not mark every
+    // linking record as freshly edited (that would pollute recency ordering).
+    if let Ok((mut fm, body)) = dbmd_core::parser::read_file(&new_abs) {
+        fm.updated = Some(dbmd_core::now());
+        dbmd_core::parser::write_file(&new_abs, &fm, &body).map_err(core_err)?;
+    }
+
     // Keep both affected type-folder indexes current write-through (the moved
     // file's old + new folders).
     let mut index_warning = index_on_rename(&store, &old_rel, &new_rel);
@@ -228,6 +268,72 @@ fn rewrite_links_in_file(abs: &Path, old_rel: &Path, new_rel: &Path) -> Result<b
     }
     write_atomic(abs, &rewritten).map_err(RewriteError::Io)?;
     Ok(true)
+}
+
+/// The reserved meta-file basenames `rename` must never move (as source) or
+/// land on (as destination). `DB.md` is the store marker — moving it out of the
+/// root destroys the store. `log.md` / `index.md` / `index.jsonl` are the
+/// catalog's own derived files; the index machinery owns them, so a rename must
+/// not relocate one or clobber another file onto one of these names.
+const RESERVED_META_BASENAMES: [&str; 4] = ["DB.md", "log.md", "index.md", "index.jsonl"];
+
+/// The reserved meta-file basename a store-relative path carries, if any —
+/// matched on the final path component (case-sensitive, the same spelling the
+/// content walks skip). Returns `None` for an ordinary content path.
+fn reserved_meta_name(rel: &Path) -> Option<&'static str> {
+    let name = rel.file_name().and_then(|n| n.to_str())?;
+    RESERVED_META_BASENAMES
+        .into_iter()
+        .find(|reserved| *reserved == name)
+}
+
+/// Structured error: `<old>` is a directory (exit `4`, policy refusal). `rename`
+/// moves a single content file and rewrites incoming links to it; a directory
+/// source would relocate the whole subtree while leaving every inbound link to
+/// the contained files dangling and both index sidecars stale.
+fn rename_directory_error(old: &Path) -> CliError {
+    CliError::new(
+        ExitCode::Policy,
+        "RENAME_NOT_A_FILE",
+        format!(
+            "rename refused: `{}` is a directory; `dbmd rename` moves one content file at a time",
+            path_to_unix(old)
+        ),
+    )
+    .with_hint("rename the individual files inside it, or move the folder with your shell + run `dbmd index rebuild`")
+}
+
+/// Structured error: `<old>` is a reserved meta file (exit `4`, policy refusal).
+/// Moving `DB.md` destroys the store; moving `log.md`/`index.md`/`index.jsonl`
+/// corrupts the catalog. The index machinery owns these files.
+fn reserved_meta_source_error(old: &Path, name: &str) -> CliError {
+    CliError::new(
+        ExitCode::Policy,
+        "RENAME_RESERVED_META",
+        format!(
+            "rename refused: `{}` is a reserved db.md meta file ({name}) and cannot be renamed",
+            path_to_unix(old)
+        ),
+    )
+    .with_hint(
+        "`DB.md`/`log.md`/`index.md`/`index.jsonl` are managed by db.md; never move them by hand",
+    )
+}
+
+/// Structured error: `<new>` would land on a reserved meta-file name (exit `4`,
+/// policy refusal). A content file must never be renamed onto `DB.md`,
+/// `log.md`, `index.md`, or `index.jsonl` — it would masquerade as catalog
+/// machinery and corrupt the index.
+fn reserved_meta_dest_error(new: &Path, name: &str) -> CliError {
+    CliError::new(
+        ExitCode::Policy,
+        "RENAME_RESERVED_META",
+        format!(
+            "rename refused: destination `{}` uses the reserved db.md meta-file name `{name}`",
+            path_to_unix(new)
+        ),
+    )
+    .with_hint("choose a destination filename that is not a db.md meta file")
 }
 
 /// Structured error: `<old>` doesn't exist (exit `1`).
@@ -338,6 +444,120 @@ mod tests {
             "Met [[records/contacts/sarah-chen|Sarah]] and [[records/contacts/sarah-2]]."
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A throwaway store: a `TempDir` with a parseable `DB.md` marker, matching
+    /// the DB.md shape the rename integration suite uses with `open_strict`.
+    fn make_store() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("DB.md"),
+            "---\ntype: db-md\nscope: company\nowner: T\n---\n\n# Store\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn rename_args(old: &str, new: &str, dir: &Path) -> RenameArgs {
+        RenameArgs {
+            old: old.to_string(),
+            new: new.to_string(),
+            dir: dir.to_str().unwrap().to_string(),
+        }
+    }
+
+    fn ctx() -> Context {
+        Context {
+            json: false,
+            color: crate::context::ColorChoice::default(),
+        }
+    }
+
+    #[test]
+    fn reserved_meta_name_matches_only_root_meta_files() {
+        // Exact reserved basenames are recognized regardless of folder depth.
+        assert_eq!(reserved_meta_name(Path::new("DB.md")), Some("DB.md"));
+        assert_eq!(reserved_meta_name(Path::new("log.md")), Some("log.md"));
+        assert_eq!(
+            reserved_meta_name(Path::new("records/notes/index.md")),
+            Some("index.md")
+        );
+        assert_eq!(
+            reserved_meta_name(Path::new("records/notes/index.jsonl")),
+            Some("index.jsonl")
+        );
+        // An ordinary content file is not reserved (substring/prefix don't count).
+        assert_eq!(reserved_meta_name(Path::new("records/notes/n.md")), None);
+        assert_eq!(
+            reserved_meta_name(Path::new("records/notes/DB-old.md")),
+            None
+        );
+        assert_eq!(reserved_meta_name(Path::new("records/db.md")), None); // case-sensitive
+    }
+
+    #[test]
+    fn rename_refuses_to_move_db_md_meta_marker() {
+        // The store-destroying case: `dbmd rename DB.md records/notes/moved.md`.
+        // Must refuse with a policy error and leave `DB.md` in place.
+        let dir = make_store();
+        let args = rename_args("DB.md", "records/notes/moved.md", dir.path());
+        let err = run(&ctx(), &args).unwrap_err();
+        assert_eq!(err.exit, ExitCode::Policy);
+        assert_eq!(err.code, "RENAME_RESERVED_META");
+        // DB.md survives; the store is intact.
+        assert!(
+            dir.path().join("DB.md").exists(),
+            "the store marker must not be moved"
+        );
+        assert!(
+            !dir.path().join("records/notes/moved.md").exists(),
+            "nothing must be written to the destination"
+        );
+    }
+
+    #[test]
+    fn rename_refuses_a_directory_source() {
+        // The store-corrupting case: `dbmd rename records/vendors records/suppliers`
+        // where `records/vendors` is a directory. Must refuse with a policy error
+        // and leave the directory (and its files) untouched.
+        let dir = make_store();
+        let vendors = dir.path().join("records/vendors");
+        std::fs::create_dir_all(&vendors).unwrap();
+        std::fs::write(
+            vendors.join("v1.md"),
+            "---\ntype: vendor\nsummary: V\n---\n# V\n",
+        )
+        .unwrap();
+
+        let args = rename_args("records/vendors", "records/suppliers", dir.path());
+        let err = run(&ctx(), &args).unwrap_err();
+        assert_eq!(err.exit, ExitCode::Policy);
+        assert_eq!(err.code, "RENAME_NOT_A_FILE");
+        // The source directory and its file survive; nothing moved.
+        assert!(
+            vendors.join("v1.md").exists(),
+            "the directory must be untouched"
+        );
+        assert!(
+            !dir.path().join("records/suppliers").exists(),
+            "no destination directory must be created"
+        );
+    }
+
+    #[test]
+    fn rename_refuses_landing_on_a_reserved_meta_name() {
+        // A content file must never be renamed onto a reserved meta-file name.
+        let dir = make_store();
+        let src = dir.path().join("records/notes/n.md");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, "---\ntype: note\nsummary: N\n---\n# N\n").unwrap();
+
+        let args = rename_args("records/notes/n.md", "records/notes/index.md", dir.path());
+        let err = run(&ctx(), &args).unwrap_err();
+        assert_eq!(err.exit, ExitCode::Policy);
+        assert_eq!(err.code, "RENAME_RESERVED_META");
+        // The source survives; nothing landed on the reserved name.
+        assert!(src.exists(), "the source content file must not be moved");
     }
 
     #[test]

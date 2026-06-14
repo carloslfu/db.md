@@ -42,9 +42,9 @@ fn text_lists_headings_indented_by_depth() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
 
     // `##` flush-left, `###` indented two spaces; H1 is never listed. Line
-    // numbers are body-relative (the body starts at the line after the closing
-    // fence — a leading blank line, so `## Timeline` is body line 6).
-    let expected = "Timeline  (L6)\n  Sub-detail  (L10)\nCommercials  (L14)\n";
+    // numbers are source-relative: the 4-line frontmatter (`---`, two YAML
+    // lines, `---`) precedes the body, so `## Timeline` is source line 10.
+    let expected = "Timeline  (L10)\n  Sub-detail  (L14)\nCommercials  (L18)\n";
     assert_eq!(stdout, expected);
 }
 
@@ -65,9 +65,9 @@ fn json_emits_heading_level_line_array() {
     // to pretty-printer whitespace while still pinning every value.
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let expected = serde_json::json!([
-        { "heading": "Timeline", "level": 2, "line": 6 },
-        { "heading": "Sub-detail", "level": 3, "line": 10 },
-        { "heading": "Commercials", "level": 2, "line": 14 },
+        { "heading": "Timeline", "level": 2, "line": 10 },
+        { "heading": "Sub-detail", "level": 3, "line": 14 },
+        { "heading": "Commercials", "level": 2, "line": 18 },
     ]);
     assert_eq!(parsed, expected);
 }

@@ -54,12 +54,34 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
 
+    // Preserve the destination's existing permission bits. The temp file was
+    // created with the default mode (0666 & umask → 0644), and a bare
+    // `rename(temp, dest)` would install *that* mode as the destination's new
+    // mode — silently widening a deliberately-restricted file (e.g. `chmod 600`
+    // on a record holding private data) to world-readable 0644 on every rewrite.
+    // Copy the live destination mode onto the temp before the rename so an
+    // in-place update keeps the file's permissions. Best-effort: if the
+    // destination does not exist yet (a fresh create) or its metadata can't be
+    // read, the default mode stands. A `set_permissions` failure is non-fatal —
+    // the rewrite still commits with the default mode rather than aborting.
+    copy_existing_permissions(path, &guard.path);
+
     // The rename either errors (guard drops, cleaning up the temp) or succeeds
     // (we disarm the guard so it does not remove the now-renamed destination).
     fs::rename(&guard.path, path)?;
     guard.disarm();
     sync_parent_dir(dir);
     Ok(())
+}
+
+/// Copy `dest`'s existing permission bits onto `temp` when `dest` already exists,
+/// so a replace-by-rename preserves the original mode rather than resetting it to
+/// the temp file's default. Best-effort and non-fatal: a missing destination (a
+/// first create) or an unreadable mode simply leaves the temp's default in place.
+fn copy_existing_permissions(dest: &Path, temp: &Path) {
+    if let Ok(meta) = fs::metadata(dest) {
+        let _ = fs::set_permissions(temp, meta.permissions());
+    }
 }
 
 /// Atomically and durably create `path` with `bytes`, failing with
@@ -334,5 +356,34 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "no temp files may be left behind");
+    }
+
+    /// Regression: rewriting an existing file via `write_atomic` must PRESERVE
+    /// its permission bits. Pre-fix the temp file's default mode (0644) replaced
+    /// a deliberately-restricted destination (0600) on every rewrite — a quiet
+    /// permission-widening on user data. A first create still uses the default
+    /// mode (there is no destination mode to copy).
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_existing_destination_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("private.md");
+
+        // Create, then restrict to 0600.
+        write_atomic(&target, b"secret v1").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(before, 0o600, "fixture must start at 0600");
+
+        // Rewrite in place: the 0600 mode must survive (not reset to 0644).
+        write_atomic(&target, b"secret v2").unwrap();
+        let after = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            after, 0o600,
+            "write_atomic must preserve the destination's 0600 mode, got {after:o}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret v2");
     }
 }

@@ -185,36 +185,84 @@ impl RebuildScope {
 /// layer + every type-folder; scoped runs preview just that level. Each rendered
 /// artifact carries a `--- <path> ---` separator (the format `render_dry_run`
 /// emits).
+///
+/// The preview must match what the *real* rebuild actually writes: `rebuild_all`
+/// / `write_level` skip empty type-folders and delete (rather than write) the
+/// `index.md` for a layer/root with no children (dbmd-core `index.rs`). Previewing
+/// a `--- … ---` block for an empty level would claim a file "would be written"
+/// that the rebuild instead skips or deletes, so every level is gated on the same
+/// emptiness check the core write path uses before it is rendered.
 fn render_dry_run(store: &Store, scope: &RebuildScope) -> Result<String, CliError> {
     let mut out = String::new();
     match scope {
         RebuildScope::Folder(folder) => {
-            out.push_str(&Index::render_dry_run(
-                store,
-                &IndexLevel::TypeFolder(folder.clone()),
-            )?);
+            push_type_folder_preview(&mut out, store, folder)?;
         }
         RebuildScope::Layer(layer) => {
             // The layer rollup plus each of its type-folders AND the root rollup,
             // so the preview matches what a layer-scoped write produces (the write
             // re-renders root from the now-current sidecars — see `rebuild_layer`).
             for tf in type_folders_in_layer(store, *layer) {
-                out.push_str(&Index::render_dry_run(store, &IndexLevel::TypeFolder(tf))?);
+                push_type_folder_preview(&mut out, store, &tf)?;
             }
-            out.push_str(&Index::render_dry_run(store, &IndexLevel::Layer(*layer))?);
-            out.push_str(&Index::render_dry_run(store, &IndexLevel::Root)?);
+            push_layer_preview(&mut out, store, *layer)?;
+            push_root_preview(&mut out, store)?;
         }
         RebuildScope::Full => {
             for layer in Layer::all() {
                 for tf in type_folders_in_layer(store, layer) {
-                    out.push_str(&Index::render_dry_run(store, &IndexLevel::TypeFolder(tf))?);
+                    push_type_folder_preview(&mut out, store, &tf)?;
                 }
-                out.push_str(&Index::render_dry_run(store, &IndexLevel::Layer(layer))?);
+                push_layer_preview(&mut out, store, layer)?;
             }
-            out.push_str(&Index::render_dry_run(store, &IndexLevel::Root)?);
+            push_root_preview(&mut out, store)?;
         }
     }
     Ok(out)
+}
+
+/// Preview one type-folder's artifacts, but only when the real rebuild would
+/// write them. `rebuild_all` / `write_level` skip a type-folder with no records
+/// (and delete any stale `index.md`/`index.jsonl`), so an empty folder yields no
+/// preview block — matching disk after a rebuild.
+fn push_type_folder_preview(
+    out: &mut String,
+    store: &Store,
+    folder: &Path,
+) -> Result<(), CliError> {
+    let idx = Index::build_type_folder(store, folder)?;
+    if idx.records.is_empty() {
+        return Ok(());
+    }
+    out.push_str(&Index::render_dry_run(
+        store,
+        &IndexLevel::TypeFolder(folder.to_path_buf()),
+    )?);
+    Ok(())
+}
+
+/// Preview a layer's `index.md`, but only when the real rebuild would write it.
+/// `rebuild_all` / `write_level` remove the layer `index.md` when the layer has
+/// no non-empty child type-folders, so an empty layer yields no preview block.
+fn push_layer_preview(out: &mut String, store: &Store, layer: Layer) -> Result<(), CliError> {
+    let idx = Index::build_layer(store, layer)?;
+    if idx.child_counts.is_empty() {
+        return Ok(());
+    }
+    out.push_str(&Index::render_dry_run(store, &IndexLevel::Layer(layer))?);
+    Ok(())
+}
+
+/// Preview the root `index.md`, but only when the real rebuild would write it.
+/// `rebuild_all` / `write_level` remove the root `index.md` when the store has no
+/// non-empty type-folders, so a fully-empty store yields no preview block.
+fn push_root_preview(out: &mut String, store: &Store) -> Result<(), CliError> {
+    let idx = Index::build_root(store)?;
+    if idx.child_counts.is_empty() {
+        return Ok(());
+    }
+    out.push_str(&Index::render_dry_run(store, &IndexLevel::Root)?);
+    Ok(())
 }
 
 fn rebuild_layer(store: &Store, layer: Layer) -> Result<(), dbmd_core::Error> {
@@ -404,4 +452,99 @@ fn path_str(p: &Path) -> String {
         .filter_map(|c| c.as_os_str().to_str())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a store with one populated type-folder (`records/contacts`) plus an
+    /// empty type-folder (`records/empty`) and two empty layers (`sources`,
+    /// `wiki`), mirroring the dry-run/real-rebuild divergence repro.
+    fn store_with_empty_scopes() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("DB.md"),
+            "---\ntype: db-md\nscope: company\nowner: Test Owner\n---\n# Test DB\n",
+        )
+        .unwrap();
+
+        // One real content file → records/contacts is non-empty.
+        std::fs::create_dir_all(root.join("records/contacts")).unwrap();
+        std::fs::write(
+            root.join("records/contacts/jane-doe.md"),
+            "---\ntype: contact\ncreated: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\nsummary: Jane Doe\n---\n# Jane Doe\n",
+        )
+        .unwrap();
+
+        // Empty type-folder + two empty layers: a real rebuild writes nothing for
+        // these (and deletes any stale artifacts).
+        std::fs::create_dir_all(root.join("records/empty")).unwrap();
+        std::fs::create_dir_all(root.join("sources")).unwrap();
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        let store = Store::open(root).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn dry_run_skips_empty_folders_and_layers() {
+        // The dry-run preview must match what the real rebuild writes: empty
+        // type-folders are skipped and empty layer/root index.md are deleted (not
+        // written), so the preview must NOT advertise those as would-be writes.
+        let (_dir, store) = store_with_empty_scopes();
+        let preview = render_dry_run(&store, &RebuildScope::Full).unwrap();
+
+        // Non-empty scopes are previewed.
+        assert!(
+            preview.contains("--- records/contacts/index.md ---"),
+            "non-empty folder must be previewed:\n{preview}"
+        );
+        assert!(
+            preview.contains("--- records/contacts/index.jsonl ---"),
+            "non-empty folder jsonl must be previewed:\n{preview}"
+        );
+        assert!(
+            preview.contains("--- records/index.md ---"),
+            "non-empty layer must be previewed:\n{preview}"
+        );
+        assert!(
+            preview.contains("--- index.md ---"),
+            "root with content must be previewed:\n{preview}"
+        );
+
+        // Empty scopes are NOT previewed (the real rebuild writes nothing there).
+        assert!(
+            !preview.contains("records/empty/index.md"),
+            "empty type-folder must not be previewed:\n{preview}"
+        );
+        assert!(
+            !preview.contains("sources/index.md"),
+            "empty layer must not be previewed:\n{preview}"
+        );
+        assert!(
+            !preview.contains("wiki/index.md"),
+            "empty layer must not be previewed:\n{preview}"
+        );
+    }
+
+    #[test]
+    fn dry_run_empty_store_previews_nothing() {
+        // A store with no content files at all: every level is empty, so the real
+        // rebuild deletes/skips everything and the preview is empty too.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("DB.md"),
+            "---\ntype: db-md\nscope: company\nowner: Test Owner\n---\n# Empty\n",
+        )
+        .unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let preview = render_dry_run(&store, &RebuildScope::Full).unwrap();
+        assert!(
+            preview.is_empty(),
+            "an all-empty store must preview nothing, got:\n{preview}"
+        );
+    }
 }

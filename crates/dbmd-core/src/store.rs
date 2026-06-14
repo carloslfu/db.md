@@ -8,21 +8,27 @@
 //! Scale discipline lives here: [`Store::walk`] and the layer/type-folder
 //! walks are **SWEEP** primitives used only by `validate --all`,
 //! `index rebuild`, and `stats`. The interactive loop instead uses
-//! [`Store::find_links_to`] / [`Store::find_links_to_any`] (embedded ripgrep,
-//! presence-only) and the `index.jsonl` sidecar readers
+//! [`Store::find_links_to`] / [`Store::find_links_to_any`] (a single
+//! presence-only content scan) and the `index.jsonl` sidecar readers
 //! ([`Store::find_by_type`] / [`Store::find_by_where`] /
 //! [`Store::read_type_index`]) — never a whole-store parse. The batch
 //! [`Store::find_links_to_any`] is what keeps the working-set validate's
 //! incoming-linker discovery a single store scan rather than one scan per
 //! changed object.
+//!
+//! Link edges are defined once, here, by the shared [`extract_edge_targets`] /
+//! [`canonical_link_target`] / [`link_edge_key`] helpers (fence-aware,
+//! whitespace-trimmed, case-folded to the filesystem), so the forward view
+//! (`graph::forwardlinks`), the backward view ([`Store::find_links_to_any`]),
+//! `rename`, and `validate` all agree on exactly which `[[...]]` is an edge.
+//! [`ensure_path_within_store`] is the within-store containment gate every
+//! caller-influenced path passes through before it is read or traversed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, FixedOffset};
-use grep::regex::RegexMatcher;
-use grep::searcher::sinks::Lossy;
-use grep::searcher::Searcher;
 use ignore::WalkBuilder;
 
 use crate::index::IndexRecord;
@@ -370,12 +376,14 @@ impl Store {
         Ok(folder.join(year).join(month).join(filename))
     }
 
-    /// Find files with an incoming wiki-link to `target`, via **embedded
-    /// ripgrep** for `[[target]]` across all layers. Loop-fast; no whole-graph
-    /// build. Returns store-relative paths.
+    /// Find files with an incoming wiki-link to `target` via a **single
+    /// presence-only content scan** for an edge to `target` across all layers,
+    /// using the shared fence-aware/whitespace-trimmed/case-folded edge notion
+    /// ([`extract_edge_targets`]). Loop-fast; no whole-graph build. Returns
+    /// store-relative paths.
     pub fn find_links_to(&self, target: &Path) -> Result<Vec<PathBuf>, StoreError> {
-        // A single target is just the degenerate batch case — one alternation
-        // arm, one store scan. Routing through `find_links_to_any` keeps the
+        // A single target is just the degenerate batch case — one key, one store
+        // scan. Routing through `find_links_to_any` keeps the
         // pattern construction and the scan loop in exactly one place. The
         // batch API takes `&[PathBuf]`, so the one-element slice is owned (a
         // single alloc on this single-target convenience path; the batch path
@@ -384,8 +392,8 @@ impl Store {
     }
 
     /// Find every file with an incoming wiki-link to **any** of `targets`, in a
-    /// **single embedded-ripgrep pass** over the store (one `.md` walk, one
-    /// presence-only scan per file). This is the batch incoming-linker finder the
+    /// **single content pass** over the store (one `.md` walk, one presence-only
+    /// edge scan per file). This is the batch incoming-linker finder the
     /// working-set [`crate::validate::validate_working_set`] sits on: it must find
     /// the linkers for the *whole* changed set without paying a full store read
     /// per changed object. Cost is therefore one store scan (O(store)), NOT
@@ -394,84 +402,75 @@ impl Store {
     /// `O(changed × store)` blow-up this method exists to prevent. Returns
     /// store-relative paths (deduped, sorted).
     ///
+    /// **One edge notion with `forwardlinks`/`rename`/`validate`.** A file links
+    /// to a target iff [`extract_edge_targets`] (fence-aware, whitespace-trimmed)
+    /// of its content yields a target whose [`link_edge_key`] equals the target's
+    /// — the *same* definition the forward view and the rename rewriter use. The
+    /// previous implementation used a literal-adjacency ripgrep regex that (a)
+    /// matched `[[...]]` text inside fenced code examples (which validate treats
+    /// as non-edges), (b) missed inner-whitespace padding (`[[ x ]]`), and (c)
+    /// compared case-sensitively even where the filesystem resolves links
+    /// case-insensitively — so backlinks/links/rename silently disagreed with
+    /// forwardlinks and validate. Reading content and routing through the shared
+    /// extractor removes all three divergences.
+    ///
     /// Why content scan and not the sidecar `links` field: the sidecar projects
     /// only the frontmatter `links:` array, so it misses edges written in the
     /// body or in typed fields (`company: [[…]]`). Finding an incoming link to an
-    /// arbitrary path therefore requires reading file content — the same reason
-    /// the single-target finder uses ripgrep.
+    /// arbitrary path therefore requires reading file content.
     pub fn find_links_to_any(&self, targets: &[PathBuf]) -> Result<Vec<PathBuf>, StoreError> {
-        // The wiki-link doctrine: a link is the full store-relative path, no
-        // `.md` extension. A reference to a target therefore appears literally
-        // as `[[<target>]]`, optionally with a `|display` suffix and (warned
-        // but accepted) a trailing `.md`. Build ONE regex that matches all
-        // accepted spellings of an incoming link to ANY target, escaping each
-        // target so path separators / dots stay literal and the alternation
-        // arms keep their boundaries (a link to `sarah` never matches
-        // `sarah-chen`).
-        let mut arms: Vec<String> = Vec::new();
-        for target in targets {
-            let target_str = path_to_link_str(target);
-            if target_str.is_empty() {
-                continue;
-            }
-            // [[ <target> (.md)? ( | display )? ]]
-            arms.push(format!(
-                r"\[\[{}(\.md)?(\|[^\]]*)?\]\]",
-                regex::escape(&target_str)
-            ));
-        }
-        // No usable targets → no possible incoming links, and an empty pattern
-        // would compile to a match-everything regex. Short-circuit instead.
-        if arms.is_empty() {
+        // Build the set of comparison keys for the requested targets, in the
+        // canonical (case-folded where the filesystem is case-insensitive) form
+        // the edge extractor emits. An empty key (a target that renders to no
+        // link text, e.g. `""` or `"./"`) contributes nothing — and crucially the
+        // empty set short-circuits below so we never report every file.
+        let want: std::collections::HashSet<String> = targets
+            .iter()
+            .filter_map(|t| {
+                let canonical = canonical_link_target(&t.to_string_lossy());
+                if canonical.is_empty() {
+                    None
+                } else {
+                    Some(link_edge_key(&canonical))
+                }
+            })
+            .collect();
+        if want.is_empty() {
             return Ok(Vec::new());
         }
-        let pattern = arms.join("|");
-
-        let matcher = RegexMatcher::new(&pattern).map_err(|e| StoreError::Search {
-            root: self.root.clone(),
-            message: format!("invalid backlink pattern: {e}"),
-        })?;
 
         let mut hits = std::collections::BTreeSet::new();
         // Scan every `.md` file in the store (skip hidden + `log/`), including
-        // `index.md` catalogs — an incoming reference is wherever the literal
-        // link text lives; the caller decides relevance. ONE walk for the whole
-        // target set; per file we stop at the first hit (presence is all we
-        // need), so a file that links to several targets is read once, not once
-        // per target.
+        // `index.md` catalogs — an incoming reference is wherever the link text
+        // lives; the caller decides relevance. ONE walk for the whole target set;
+        // per file we stop at the first matching edge (presence is all we need),
+        // so a file that links to several targets is read once, not once per
+        // target.
         for rel in self.walk_all_md()? {
             let abs = self.abs_path(&rel);
-            let mut matched_here = false;
-            let mut searcher = Searcher::new();
-            // `Lossy`, not `UTF8`: a `.md` file verbatim-ingested into
-            // `sources/` can carry a stray non-UTF-8 byte (e.g. a mis-decoded
-            // Latin-1 import). The `UTF8` sink runs `std::str::from_utf8` on
-            // each matched line and returns an `io::Error` on invalid bytes,
-            // which propagated out of `search_path` and aborted the *entire*
-            // store scan for every caller (`graph backlinks`, the working-set
-            // validate incoming-linker pass) — one bad byte on a single
-            // link-bearing line took the whole batch down. `Lossy` substitutes
-            // replacement characters instead of erroring; the closure ignores
-            // the line text entirely (presence is all we need), so the lossy
-            // conversion has no downside and the scan degrades to "still finds
-            // the link" rather than failing hard.
-            let res = searcher.search_path(
-                &matcher,
-                &abs,
-                Lossy(|_lnum, _line| {
-                    matched_here = true;
-                    // Stop at the first hit: presence is all we need.
-                    Ok(false)
-                }),
-            );
-            if let Err(e) = res {
-                return Err(StoreError::Search {
-                    root: self.root.clone(),
-                    message: format!("search failed in {}: {e}", abs.display()),
-                });
-            }
-            if matched_here {
-                hits.insert(rel);
+            // Read lossily: a `.md` verbatim-ingested into `sources/` can carry a
+            // stray non-UTF-8 byte (a mis-decoded Latin-1 import). Decoding
+            // lossily substitutes replacement characters instead of erroring, so
+            // one bad byte on a link-bearing line no longer aborts the whole
+            // store scan (the historical `UTF8`-sink failure). The link syntax is
+            // ASCII, so a replacement char elsewhere on the line never hides a
+            // `[[...]]`. A read error (not a decode error) is genuine I/O trouble
+            // and propagates.
+            let bytes = match std::fs::read(&abs) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(StoreError::Search {
+                        root: self.root.clone(),
+                        message: format!("read failed in {}: {e}", abs.display()),
+                    })
+                }
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            for target in extract_edge_targets(&text) {
+                if want.contains(&link_edge_key(&target)) {
+                    hits.insert(rel);
+                    break;
+                }
             }
         }
         Ok(hits.into_iter().collect())
@@ -687,15 +686,29 @@ impl Store {
     }
 
     /// Locate every `index.jsonl` sidecar under `layer` (when given) else the
-    /// whole store (skip hidden + `log/`), returning store-relative paths. The
-    /// walk root is `<root>/<layer>/` for a scoped read and `self.root` for the
-    /// store-wide read; a non-existent layer subtree yields no sidecars rather
-    /// than walking a missing path.
+    /// whole store (skip hidden + `log/`), returning store-relative paths. A
+    /// scoped read walks `<root>/<layer>/`; the store-wide read enumerates the
+    /// three canonical layer subtrees (`sources/`, `records/`, `wiki/`) — the
+    /// same store model [`Store::walk`] uses — rather than walking from
+    /// `self.root`. Walking from root would descend into non-layer top-level
+    /// dirs (`EXPECTED/` test goldens, an `archive/` of frozen index copies,
+    /// any sibling folder holding store-relative `path`s), pulling their
+    /// sidecars in and returning every record twice. A non-existent layer
+    /// subtree yields no sidecars rather than walking a missing path.
     fn find_type_index_files_in(&self, layer: Option<Layer>) -> Result<Vec<PathBuf>, StoreError> {
-        let walk_root = match layer {
-            Some(l) => self.root.join(l.dir_name()),
-            None => self.root.clone(),
+        // Store-wide read: union the per-layer scoped reads so only the three
+        // content layers are walked (never root meta files or non-layer dirs),
+        // matching `Store::walk`. The per-layer paths are disjoint by folder, so
+        // a plain concatenation preserves completeness.
+        let Some(layer) = layer else {
+            let mut out = Vec::new();
+            for l in Layer::all() {
+                out.extend(self.find_type_index_files_in(Some(l))?);
+            }
+            out.sort();
+            return Ok(out);
         };
+        let walk_root = self.root.join(layer.dir_name());
         // A scoped walk over a layer folder that does not exist yet must be an
         // empty result, mirroring `walk_layer`'s missing-dir guard — not a walk
         // error from `ignore` over a nonexistent path.
@@ -704,7 +717,10 @@ impl Store {
         }
         let mut out = Vec::new();
         let mut builder = WalkBuilder::new(&walk_root);
-        builder.standard_filters(false).hidden(true);
+        builder
+            .standard_filters(false)
+            .hidden(true)
+            .follow_links(true);
         for entry in builder.build() {
             let entry = entry.map_err(|e| StoreError::Search {
                 root: walk_root.clone(),
@@ -730,10 +746,18 @@ impl Store {
 
     /// A `WalkBuilder` configured for db.md SWEEPs: gitignore/global-ignore are
     /// OFF (a SWEEP must see every file even if the store is a git repo with a
-    /// `.gitignore`), but hidden files/dirs are skipped.
+    /// `.gitignore`), but hidden files/dirs are skipped. Symlinks are
+    /// **followed** (`follow_links(true)`) so a symlinked `.md` content file or
+    /// a symlinked type folder (e.g. `records/companies -> /other/disk/...`) is
+    /// walked like any other content rather than silently vanishing; a symlinked
+    /// layer dir was already traversed (the walk root is followed), so following
+    /// symlinks one level deeper just removes that inconsistency.
     fn md_walker(&self, root: &Path) -> WalkBuilder {
         let mut builder = WalkBuilder::new(root);
-        builder.standard_filters(false).hidden(true);
+        builder
+            .standard_filters(false)
+            .hidden(true)
+            .follow_links(true);
         builder
     }
 
@@ -776,11 +800,314 @@ impl Store {
     }
 }
 
+// ── Path containment (security) ─────────────────────────────────────────────
+
+/// Canonicalize `candidate` (resolving symlinks; for a not-yet-existing leaf,
+/// canonicalize its existing parent chain and re-append the leaf) and return it
+/// only if it resolves inside `store_root`; otherwise `Err`.
+///
+/// This is the single within-store containment gate. A wiki-link target, a
+/// rename destination, or any other caller-influenced path must pass through
+/// here before it is read or traversed, so a `..`-laden or symlink-escaping
+/// target can never turn a store operation into a read of an arbitrary file
+/// outside the store. `store_root` itself is canonicalized first so the
+/// `starts_with` comparison is symlink-stable on both sides (e.g. macOS's
+/// `/tmp` → `/private/tmp`).
+pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
+    // The `..` rejection below must apply only to the *caller-influenced* tail of
+    // the candidate — never to a `..` the trusted `store_root` itself carries.
+    // Callers build the candidate as `store_root.join(rel)`, so a user-supplied
+    // `--dir ../../some/store` legitimately seeds every candidate with leading
+    // `..` components that belong to the root, not to the sidecar/link target.
+    // Strip the trusted `store_root` prefix lexically and scrutinize only what
+    // remains; the root's own `..` is resolved safely by `canonicalize()` just
+    // below. A candidate that does NOT begin with `store_root` (an absolute
+    // out-of-store path, a CWD-relative target) keeps the whole path under
+    // scrutiny — there is no trusted prefix to exempt.
+    let scrutinized = candidate.strip_prefix(store_root).unwrap_or(candidate);
+
+    // Reject any `..` component in the scrutinized tail. A `ParentDir` can never
+    // be resolved safely by lexical normalization: once a symlink sits earlier in
+    // the path, `foo/../bar` does NOT equal `bar`, and canonicalizing the existing
+    // prefix (below) would silently collapse `records/contacts/../../outside` down
+    // to a path that *appears* inside the root, masking the traversal. There is no
+    // legitimate in-store caller that needs `..` in the tail — wiki-link targets,
+    // rename destinations, and graph reads are all forward (`Normal`-only) paths —
+    // so a tail `..` is always either an escape attempt or a malformed target.
+    if scrutinized
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "path {} contains a `..` component beyond the store root {} and cannot be contained",
+                candidate.display(),
+                store_root.display()
+            ),
+        ));
+    }
+
+    // Canonicalize the root so both sides of the containment check are in the
+    // same (fully-resolved) namespace. This also resolves any `..` the root
+    // itself carries (the user-supplied `--dir`), which the tail-only check above
+    // deliberately left in place.
+    let root = store_root.canonicalize()?;
+
+    // Resolve the candidate as far as it exists on disk. `canonicalize` fails on
+    // a not-yet-existing leaf, so peel trailing components until the remaining
+    // prefix exists, canonicalize that, then re-append the peeled tail. This
+    // resolves any symlink in the existing parent chain (an escape vector) while
+    // still working for a target that does not exist yet (a rename destination).
+    let mut existing = candidate.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let resolved_prefix = loop {
+        match existing.canonicalize() {
+            Ok(p) => break p,
+            Err(_) => {
+                // No existing prefix left to canonicalize → resolve relative to
+                // the canonical root (the candidate is somewhere under, or
+                // escaping from, the store) and let the containment check below
+                // decide. Pop one component and keep peeling.
+                match existing.file_name() {
+                    Some(name) => {
+                        tail.push(name.to_os_string());
+                        if !existing.pop() {
+                            // Ran out of components without finding an existing
+                            // prefix: anchor the un-resolvable remainder at the
+                            // canonical root so a relative candidate is judged
+                            // against the store, not the process CWD.
+                            break root.clone();
+                        }
+                    }
+                    None => {
+                        // A root/prefix component with no file name and no
+                        // on-disk existence: anchor at the canonical root.
+                        break root.clone();
+                    }
+                }
+            }
+        }
+    };
+
+    // Reassemble: canonical existing prefix + the peeled (still-virtual) tail,
+    // in original order (the peel pushed them reversed).
+    let mut resolved = resolved_prefix;
+    for name in tail.into_iter().rev() {
+        resolved.push(name);
+    }
+
+    if resolved.starts_with(&root) {
+        Ok(resolved)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "path {} resolves outside the store root {}",
+                candidate.display(),
+                store_root.display()
+            ),
+        ))
+    }
+}
+
+// ── The shared wiki-link edge notion (graph / stats / validate / rename) ─────
+//
+// One definition of "what `[[...]]` text is a real edge" that every relationship
+// op keys on, so `forwardlinks`, `backlinks`, `links`, `stats`, and `rename`
+// never disagree with each other (or with `validate`'s body extractor):
+//
+//   1. **Fence-aware.** A `[[...]]` inside a ``` / ~~~ fenced code block is a
+//      documentation example, not an edge — exactly `validate`'s rule. Counting
+//      it as an edge over-reports backlinks, falsely un-orphans the page, and
+//      (worst) lets `rename` rewrite verbatim example text.
+//   2. **Whitespace-trimmed.** `[[ records/contacts/sarah ]]` is the same edge
+//      as `[[records/contacts/sarah]]`. The inner padding is cosmetic; both the
+//      forward and the backward view must resolve it identically.
+//   3. **Case-folded to the filesystem.** Link *resolution* is `is_file()`,
+//      which is case-insensitive on macOS/Windows. So on a case-insensitive
+//      filesystem `[[records/contacts/Sarah-Chen]]` and the on-disk
+//      `sarah-chen.md` are the SAME edge; the comparison key must case-fold to
+//      match, or backlinks/rename silently miss the link while validate (which
+//      resolves via the filesystem) considers it fine.
+
+/// Canonicalize a raw `[[...]]` inner target into the wiki-link key: forward
+/// slashes, no leading `./` or `/`, no trailing `.md`, inner whitespace trimmed.
+/// The single key forward and backward edges are compared on. Pairs with
+/// [`link_edge_key`] for the case-fold step.
+pub fn canonical_link_target(raw: &str) -> String {
+    let mut s = raw.trim().replace('\\', "/");
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    let s = s.trim_start_matches('/');
+    let s = s.strip_suffix(".md").unwrap_or(s);
+    s.trim().to_string()
+}
+
+/// The comparison key for a canonical link target: identity on a case-sensitive
+/// filesystem, ASCII-lowercased on a case-insensitive one (macOS/Windows), so
+/// the string-keyed edge comparison agrees with the filesystem's case-folding
+/// `is_file()` resolution. Callers compare `link_edge_key(a) == link_edge_key(b)`.
+pub fn link_edge_key(canonical_target: &str) -> String {
+    if fs_is_case_insensitive() {
+        canonical_target.to_ascii_lowercase()
+    } else {
+        canonical_target.to_string()
+    }
+}
+
+/// Extract every wiki-link edge target from a markdown body, fence-aware and
+/// whitespace-trimmed, in document order (duplicates kept — callers dedup).
+/// Returns canonical targets (see [`canonical_link_target`]); the case-fold for
+/// comparison is applied separately via [`link_edge_key`] so the canonical form
+/// (used for rewrites/output) stays case-preserving.
+///
+/// Scans line-by-line tracking the fence state inline (no whole-body
+/// allocation), exactly mirroring validate's `extract_wiki_links`: the fence
+/// state is a `(fence char, run length)` tracked via [`fence_opens`] /
+/// [`fence_closes`] — NOT a bool toggled on any ``` / `~~~` line. The naive
+/// toggle inverts mid-block when a `~~~` block legally contains a ```` ``` ````
+/// line (the standard way to document a backtick fence), or when a `>3`-space-
+/// indented ``` is mistaken for a fence — both of which would let a fenced
+/// example `[[…]]` leak out as a live edge (a false dependent for
+/// backlinks/rename). Fenced lines never yield edges. Within a line, the text
+/// before the first `|` is the target; a target whose trimmed form starts with
+/// `[` is the rejected triple-bracket flow-form list mis-encoding
+/// (`[[[a]], [[b]]]`), not a real link — skipped, matching validate.
+pub fn extract_edge_targets(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+    for line in body.lines() {
+        let content = line.trim_end_matches('\r');
+        if let Some(f) = fence {
+            if fence_closes(content, f) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = fence_opens(content) {
+            fence = Some(opened);
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+                if let Some(close) = line[i + 2..].find("]]") {
+                    let inner = &line[i + 2..i + 2 + close];
+                    let raw_target = inner.split('|').next().unwrap_or(inner).trim();
+                    if !raw_target.is_empty() && !raw_target.starts_with('[') {
+                        let canonical = canonical_link_target(raw_target);
+                        if !canonical.is_empty() {
+                            out.push(canonical);
+                        }
+                    }
+                    i = i + 2 + close + 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// If `line` opens a fenced code block, return `(fence byte, run length)`. The
+/// single fence-open rule shared by [`extract_edge_targets`] and graph's
+/// `rewrite_links_to`, mirroring validate's `fence_opens` and the parser's
+/// `opening_fence` so every link op tracks fences identically: a fence is
+/// ```` ``` ```` or `~~~` (run ≥ 3) at ≤ 3 spaces of indent, and a backtick
+/// fence's info string may not itself contain a backtick.
+pub fn fence_opens(line: &str) -> Option<(u8, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let byte = rest.bytes().next()?;
+    if byte != b'`' && byte != b'~' {
+        return None;
+    }
+    let run = rest.len() - rest.trim_start_matches(byte as char).len();
+    if run < 3 {
+        return None;
+    }
+    // A backtick fence's info string may not itself contain a backtick.
+    if byte == b'`' && rest[run..].contains('`') {
+        return None;
+    }
+    Some((byte, run))
+}
+
+/// True if `line` closes the currently open `fence`: same char, run at least as
+/// long, nothing but trailing whitespace after. Mirrors validate's
+/// `fence_closes` / the parser's `is_closing_fence`, so an inner fence of the
+/// *other* character (a ```` ``` ```` line inside a `~~~` block) does NOT close
+/// the outer fence.
+pub fn fence_closes(line: &str, fence: (u8, usize)) -> bool {
+    let (byte, open_len) = fence;
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let run = rest.len() - rest.trim_start_matches(byte as char).len();
+    if run < open_len {
+        return false;
+    }
+    rest[run..].trim().is_empty()
+}
+
+/// True when the host filesystem resolves paths case-insensitively (macOS/
+/// Windows default). Probed once per process against the OS temp dir by creating
+/// a lowercase marker and stat-ing its uppercase spelling. A probe failure
+/// conservatively reports `false` (case-sensitive) — the historical behavior —
+/// so a transient temp-dir issue never silently widens matching.
+fn fs_is_case_insensitive() -> bool {
+    use std::sync::OnceLock;
+    static CASE_INSENSITIVE: OnceLock<bool> = OnceLock::new();
+    *CASE_INSENSITIVE.get_or_init(|| {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let lower = dir.join(format!(".dbmd-case-probe-{pid}-{nanos}"));
+        let upper = dir.join(format!(".DBMD-CASE-PROBE-{pid}-{nanos}"));
+        // Create the lowercase marker; if its uppercase spelling then resolves to
+        // a file, the filesystem folded the case → case-insensitive.
+        let result = match std::fs::File::create(&lower) {
+            Ok(_) => upper.is_file(),
+            Err(_) => false,
+        };
+        let _ = std::fs::remove_file(&lower);
+        result
+    })
+}
+
 // ── Free helpers (no `self`) ────────────────────────────────────────────────
 
-/// True if a walk entry is a regular file (not a dir / symlink-to-dir).
+/// True if a walk entry is a regular file, **following symlinks** so a
+/// symlinked `.md` content file (or a file inside a symlinked type folder) is
+/// counted like any other content file.
+///
+/// The store walks enable `follow_links(true)`, so a symlink entry's
+/// `file_type()` still reports `is_symlink()` (the `ignore` walker does not
+/// rewrite the entry's own type), not the followed target's type. Treat a
+/// symlink whose target is a regular file as a file: `stat` (follow) the path
+/// and check. A broken symlink (no target) is not a file.
 fn is_file_entry(entry: &ignore::DirEntry) -> bool {
-    entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+    match entry.file_type() {
+        Some(ft) if ft.is_file() => true,
+        Some(ft) if ft.is_symlink() => std::fs::metadata(entry.path())
+            .map(|m| m.is_file())
+            .unwrap_or(false),
+        // A `None` file type (the walk root itself) or a non-file/non-symlink
+        // entry is not a content file.
+        _ => false,
+    }
 }
 
 /// True if the path ends in a `.md` extension (case-sensitive — db.md files are
@@ -805,24 +1132,6 @@ fn ensure_md_extension(name: &str) -> String {
     } else {
         format!("{name}.md")
     }
-}
-
-/// Render a store-relative path as a wiki-link target string with `/`
-/// separators (never `\`), no leading `./`, no trailing `.md`.
-fn path_to_link_str(target: &Path) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for comp in target.components() {
-        if let std::path::Component::Normal(os) = comp {
-            if let Some(s) = os.to_str() {
-                parts.push(s.to_string());
-            }
-        }
-    }
-    let mut joined = parts.join("/");
-    if let Some(stripped) = joined.strip_suffix(".md") {
-        joined = stripped.to_string();
-    }
-    joined
 }
 
 /// The canonical default folder for a recognized type, per the SPEC type table
@@ -1826,15 +2135,14 @@ mod tests {
 
     #[test]
     fn regression_find_links_to_tolerates_invalid_utf8_on_a_matched_line() {
-        // Regression: the scan used the `UTF8` sink, which ran
-        // `std::str::from_utf8` on every matched line and returned an
-        // `io::Error` when a `.md` file carried a stray non-UTF-8 byte on the
-        // SAME line as a `[[target]]` link. That error propagated out and
-        // aborted the WHOLE store scan — `find_links_to` / `find_links_to_any`
-        // (and `graph backlinks` + the working-set validate incoming-linker
-        // pass) returned an error instead of the legitimate UTF-8 linkers.
-        // Verbatim-ingested `sources/` artifacts can carry such bytes, so this
-        // is reachable. The `Lossy` sink must let the scan still report the link.
+        // Regression: a `.md` file can carry a stray non-UTF-8 byte on the SAME
+        // line as a `[[target]]` link (a verbatim-ingested `sources/` artifact,
+        // e.g. a mis-decoded Latin-1 import). The scan must still report the
+        // link — `find_links_to` / `find_links_to_any` (and `graph backlinks` +
+        // the working-set validate incoming-linker pass) must not error out and
+        // drop the legitimate UTF-8 linkers. The content scan reads the file
+        // with `String::from_utf8_lossy`, so the invalid byte becomes a
+        // replacement char and the ASCII `[[target]]` link is still extracted.
         let dir = empty_store();
         let root = dir.path();
         let target = "records/contacts/sarah-chen";
@@ -2571,6 +2879,281 @@ mod tests {
         assert_eq!(
             infer_type_from_path(Path::new("records/expenses/2026/05/x.md")).as_deref(),
             Some("expense"),
+        );
+    }
+
+    // ── ensure_path_within_store (containment) ───────────────────────────────
+
+    #[test]
+    fn ensure_path_within_store_accepts_in_store_and_rejects_escape() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("records/contacts")).unwrap();
+        fs::write(root.join("records/contacts/sarah.md"), "x").unwrap();
+
+        // An existing in-store file resolves and is accepted.
+        let inside = root.join("records/contacts/sarah.md");
+        let got = ensure_path_within_store(root, &inside).expect("in-store path accepted");
+        // Canonical, but still under the (canonical) root.
+        assert!(got.starts_with(root.canonicalize().unwrap()));
+
+        // A not-yet-existing in-store leaf is accepted (rename destination).
+        let new_leaf = root.join("records/contacts/sarah-chen.md");
+        assert!(
+            ensure_path_within_store(root, &new_leaf).is_ok(),
+            "a non-existent in-store leaf must be accepted"
+        );
+
+        // A `..`-escaping path is rejected even though its prefix exists.
+        let escape = root.join("records/contacts/../../outside/secret.md");
+        assert!(
+            ensure_path_within_store(root, &escape).is_err(),
+            "a `..`-escaping path must be rejected"
+        );
+    }
+
+    #[test]
+    fn ensure_path_within_store_rejects_symlink_escape() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root).unwrap();
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let secret = outside_dir.join("secret.md");
+        fs::write(&secret, "TOPSECRET").unwrap();
+
+        // A symlink inside the store that points OUTSIDE it must be rejected:
+        // resolving the symlink lands outside the canonical root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.join("escape.md");
+            symlink(&secret, &link).unwrap();
+            assert!(
+                ensure_path_within_store(&root, &link).is_err(),
+                "a symlink resolving outside the store must be rejected"
+            );
+        }
+    }
+
+    // ── shared link-edge notion (fence / whitespace / case) ──────────────────
+
+    #[test]
+    fn extract_edge_targets_trims_inner_whitespace() {
+        // Padded `[[ x ]]` is the same edge as `[[x]]`.
+        assert_eq!(
+            extract_edge_targets("See [[ records/contacts/sarah ]] today."),
+            vec!["records/contacts/sarah".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_edge_targets_skips_fenced_code_blocks() {
+        // A `[[...]]` inside a ``` fence is a doc example, NOT an edge — matching
+        // validate's body extractor.
+        let body = "\
+Real [[records/contacts/sarah]] link.
+
+```markdown
+[[records/contacts/ghost-example]] is how you link.
+```
+
+After fence [[records/companies/acme]].
+";
+        let got = extract_edge_targets(body);
+        assert_eq!(
+            got,
+            vec![
+                "records/contacts/sarah".to_string(),
+                "records/companies/acme".to_string(),
+            ],
+            "fenced example link must not be an edge"
+        );
+    }
+
+    #[test]
+    fn extract_edge_targets_handles_nested_indented_and_long_run_fences() {
+        // Regression for the naive `starts_with("```")/("~~~")` toggle: a fence
+        // nested inside another, an over-indented (>3 space) marker, and a
+        // long-run fence wrapping a shorter inner one must all leave the block's
+        // links un-extracted (validate treats the whole block as opaque). The
+        // (char, run-length) tracker keys on the OPENING fence and closes only on
+        // a matching char with run ≥ the opener.
+
+        // (a) A ```` ```` ````-run block (run 4) wrapping a ``` example (run 3).
+        // The inner ``` does NOT close the outer run-4 fence, so both `[[...]]`
+        // inside stay fenced.
+        let nested = "\
+Doc:
+
+````
+```
+[[records/contacts/bob]]
+```
+still fenced [[records/contacts/bob]]
+````
+
+Real [[records/companies/acme]].
+";
+        assert_eq!(
+            extract_edge_targets(nested),
+            vec!["records/companies/acme".to_string()],
+            "a nested ``` inside a ````-run fence must not leak the fenced links"
+        );
+
+        // (b) A `~~~` block containing a ``` line (the standard way to document a
+        // backtick fence). The inner backtick line must not flip the state.
+        let tilde_wraps_backtick = "\
+~~~
+```
+[[records/contacts/ghost]]
+```
+~~~
+
+After [[records/companies/acme]].
+";
+        assert_eq!(
+            extract_edge_targets(tilde_wraps_backtick),
+            vec!["records/companies/acme".to_string()],
+            "a ``` line inside a ~~~ block must not invert the fence state"
+        );
+
+        // (c) An over-indented ```` ``` ```` (4 spaces) is NOT a fence; the link
+        // on the next line is live.
+        let over_indented = "    ```\nLive [[records/contacts/sarah]].\n";
+        assert_eq!(
+            extract_edge_targets(over_indented),
+            vec!["records/contacts/sarah".to_string()],
+            "a >3-space-indented ``` is not a fence opener"
+        );
+    }
+
+    #[test]
+    fn canonical_link_target_strips_md_dotslash_and_trims() {
+        assert_eq!(canonical_link_target("  records/x.md  "), "records/x");
+        assert_eq!(canonical_link_target("./wiki/y"), "wiki/y");
+        assert_eq!(canonical_link_target("/records/z"), "records/z");
+    }
+
+    #[test]
+    fn link_edge_key_folds_case_only_on_case_insensitive_fs() {
+        let a = link_edge_key("records/contacts/Sarah-Chen");
+        let b = link_edge_key("records/contacts/sarah-chen");
+        if fs_is_case_insensitive() {
+            assert_eq!(a, b, "case-insensitive FS must fold the key");
+        } else {
+            assert_ne!(a, b, "case-sensitive FS must keep the key case-exact");
+        }
+    }
+
+    // ── walk follows symlinked content ───────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_includes_symlinked_content_file_and_symlinked_folder() {
+        use std::os::unix::fs::symlink;
+        let dir = empty_store();
+        let root = dir.path();
+        // A regular file (control).
+        write(
+            root,
+            "records/contacts/sarah.md",
+            &content_md("2026-05-01T00:00:00Z"),
+        );
+        // A symlinked .md content file inside a real folder.
+        let external_file = root.join("external-elena.md");
+        fs::write(&external_file, content_md("2026-05-02T00:00:00Z")).unwrap();
+        symlink(&external_file, root.join("records/contacts/elena.md")).unwrap();
+        // A symlinked type folder.
+        let external_dir = dir.path().join("external-companies");
+        fs::create_dir_all(&external_dir).unwrap();
+        fs::write(
+            external_dir.join("acme.md"),
+            content_md("2026-05-03T00:00:00Z"),
+        )
+        .unwrap();
+        symlink(&external_dir, root.join("records/companies")).unwrap();
+
+        let store = open(&dir);
+        let got = rels(&store.walk().unwrap());
+        assert!(
+            got.contains(&"records/contacts/elena.md".to_string()),
+            "a symlinked content file must be walked: {got:?}"
+        );
+        assert!(
+            got.contains(&"records/companies/acme.md".to_string()),
+            "a file inside a symlinked type folder must be walked: {got:?}"
+        );
+    }
+
+    // ── find_links_to: padded / fenced / case ────────────────────────────────
+
+    #[test]
+    fn find_links_to_matches_whitespace_padded_link() {
+        let dir = empty_store();
+        let root = dir.path();
+        write(
+            root,
+            "wiki/people/a.md",
+            "---\ntype: wiki-page\nsummary: s\n---\nSee [[ records/contacts/sarah ]] today.\n",
+        );
+        let store = open(&dir);
+        let got = rels(
+            &store
+                .find_links_to(Path::new("records/contacts/sarah"))
+                .unwrap(),
+        );
+        assert_eq!(
+            got,
+            vec!["wiki/people/a.md".to_string()],
+            "a padded `[[ x ]]` link must be found as a backward edge, matching forwardlinks"
+        );
+    }
+
+    #[test]
+    fn find_links_to_ignores_fenced_example_link() {
+        let dir = empty_store();
+        let root = dir.path();
+        write(
+            root,
+            "wiki/topics/howto.md",
+            "---\ntype: wiki-page\nsummary: s\n---\n```markdown\n[[records/contacts/sarah]]\n```\n",
+        );
+        let store = open(&dir);
+        let got = store
+            .find_links_to(Path::new("records/contacts/sarah"))
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "a `[[...]]` only inside a fenced code block is not a backward edge: {got:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_links_to_matches_case_variant_on_case_insensitive_fs() {
+        // Only meaningful on a case-insensitive filesystem; on a case-sensitive
+        // one the case-variant link is genuinely a different target.
+        if !fs_is_case_insensitive() {
+            return;
+        }
+        let dir = empty_store();
+        let root = dir.path();
+        write(
+            root,
+            "wiki/people/bio.md",
+            "---\ntype: wiki-page\nsummary: s\n---\nSee [[records/contacts/Sarah-Chen]].\n",
+        );
+        let store = open(&dir);
+        let got = rels(
+            &store
+                .find_links_to(Path::new("records/contacts/sarah-chen"))
+                .unwrap(),
+        );
+        assert_eq!(
+            got,
+            vec!["wiki/people/bio.md".to_string()],
+            "a case-variant link must be found on a case-insensitive filesystem"
         );
     }
 }

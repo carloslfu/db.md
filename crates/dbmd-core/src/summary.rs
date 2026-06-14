@@ -245,6 +245,14 @@ fn reduce_wiki_link(s: &str) -> String {
     let Some(inner) = inner else {
         return s.to_string();
     };
+    // Only reduce when the ENTIRE trimmed value is a single `[[…]]` link. A
+    // value like `[[a]] and [[b]]` also starts `[[` and ends `]]`, but its
+    // `inner` (`a]] and [[b`) is not one link — reducing it would emit a garbled
+    // fragment of the last path (`b`), dropping the first link and the connecting
+    // text. Such a multi-link / mixed scalar is passed through unchanged.
+    if inner.contains("[[") || inner.contains("]]") {
+        return s.to_string();
+    }
     // `target|display` → prefer display.
     let (target, display) = match inner.split_once('|') {
         Some((t, d)) => (t, Some(d)),
@@ -262,34 +270,130 @@ fn reduce_wiki_link(s: &str) -> String {
 
 /// The first non-heading, non-blank paragraph of the body: consecutive
 /// non-heading text lines joined by a space, starting at the first such line.
-/// Heading lines (`#…`) are skipped. `None` when the body has no prose.
+///
+/// Heading lines are skipped before the paragraph and terminate it once started.
+/// "Heading" follows CommonMark, not "starts with `#`":
+///
+/// - **ATX** (`# Title`) requires a space (or end of line) after the `#` run
+///   ([`is_atx_heading`]); `#1 priority…` / `#hashtag` are prose, not headings.
+/// - **Setext** (a text line followed by an all-`=` or all-`-` underline) is a
+///   heading too; both the title line and its underline are skipped.
+/// - A leading **fenced code block** (```` ``` ````…```` ``` ````) is skipped in
+///   full, so the fence info-string (`` ```bash ``) and any `#`-comment inside
+///   the fence are never mistaken for prose or an ATX heading.
+///
+/// `None` when the body has no prose paragraph.
 fn first_paragraph(body: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
     let mut collected: Vec<&str> = Vec::new();
-    for line in body.lines() {
-        let t = line.trim();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
+        let t = raw.trim();
+
+        // A fenced code block opening (```` ``` ```` or `~~~`, optional info
+        // string) before any prose is skipped wholesale up to its closing fence.
+        if collected.is_empty() {
+            if let Some(fence) = code_fence_marker(t) {
+                i += 1;
+                while i < lines.len() {
+                    let inner = lines[i].trim();
+                    i += 1;
+                    if closes_code_fence(inner, fence) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
         if t.is_empty() {
             if collected.is_empty() {
                 // Still searching for the start of the first paragraph.
+                i += 1;
                 continue;
             }
             // Blank line ends the first paragraph.
             break;
         }
-        if t.starts_with('#') {
+
+        // ATX heading (CommonMark: `#`-run then space or EOL).
+        if is_atx_heading(t) {
             if collected.is_empty() {
-                // A heading before any prose — skip it.
+                i += 1;
                 continue;
             }
-            // A heading terminates the running paragraph.
             break;
         }
+
+        // Setext heading: this line is the title and the NEXT non-empty line is
+        // an all-`=` or all-`-` underline. Only valid as the FIRST line of a
+        // paragraph (an underline mid-paragraph is not a setext heading). When
+        // recognized, skip both the title and the underline.
+        if collected.is_empty() {
+            if let Some(next) = lines.get(i + 1).map(|l| l.trim()) {
+                if is_setext_underline(next) {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+
         collected.push(t);
+        i += 1;
     }
     if collected.is_empty() {
         None
     } else {
         Some(collected.join(" "))
     }
+}
+
+/// True if `line` (already trimmed) is an ATX heading per CommonMark: 1–6 `#`
+/// characters followed by a space/tab OR the end of the line. `#1 priority` and
+/// `#hashtag` are NOT headings (no space after the hash run); `#######` (7+) is
+/// not a heading either.
+fn is_atx_heading(line: &str) -> bool {
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return false;
+    }
+    match line[hashes..].chars().next() {
+        None => true,                     // bare `###` (hashes then EOL)
+        Some(c) => c == ' ' || c == '\t', // `### Title`
+    }
+}
+
+/// The fence marker char (`` ` `` or `~`) if `line` (already trimmed) opens a
+/// fenced code block: at least three of the same fence char, optionally followed
+/// by an info string. Returns `None` otherwise.
+fn code_fence_marker(line: &str) -> Option<char> {
+    let first = line.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let run = line.chars().take_while(|&c| c == first).count();
+    if run >= 3 {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// True if `line` (already trimmed) is a closing fence for an open block opened
+/// with `fence`: at least three of the same fence char and nothing else (a
+/// closing fence carries no info string per CommonMark).
+fn closes_code_fence(line: &str, fence: char) -> bool {
+    let run = line.chars().take_while(|&c| c == fence).count();
+    run >= 3 && line.chars().all(|c| c == fence)
+}
+
+/// True if `line` (already trimmed) is a setext heading underline: a non-empty
+/// run of all `=` or all `-` characters (CommonMark allows trailing whitespace,
+/// already removed by the caller's `trim`).
+fn is_setext_underline(line: &str) -> bool {
+    (!line.is_empty() && line.chars().all(|c| c == '='))
+        || (!line.is_empty() && line.chars().all(|c| c == '-'))
 }
 
 #[cfg(test)]
@@ -600,5 +704,132 @@ mod tests {
     #[test]
     fn reduce_wiki_link_passes_through_plain_text() {
         assert_eq!(reduce_wiki_link("just a vendor name"), "just a vendor name");
+    }
+
+    #[test]
+    fn regression_reduce_wiki_link_multiple_links_passthrough() {
+        // Finding #41: a scalar with more than one wiki-link starts `[[` and ends
+        // `]]` but is NOT a single link; reducing it dropped the first link and
+        // the connecting text, emitting a fragment of the last path (`globex`).
+        // It must now pass through unchanged.
+        let s = "[[records/companies/acme]] and [[records/companies/globex]]";
+        assert_eq!(reduce_wiki_link(s), s);
+        // The single-link and plain-text cases still reduce / pass as before.
+        assert_eq!(reduce_wiki_link("[[records/companies/acme]]"), "acme");
+        assert_eq!(reduce_wiki_link("Acme and Globex"), "Acme and Globex");
+    }
+
+    // ── first_paragraph heading-classification (findings #38, #39, #40) ────────
+
+    #[test]
+    fn regression_first_paragraph_skips_setext_heading() {
+        // Finding #38: a setext heading (title + `===` underline) is a heading,
+        // not prose — both lines must be skipped, yielding the real paragraph.
+        let body = "Launch Plan\n===========\n\nThis is the real first paragraph of prose.\n";
+        assert_eq!(
+            first_paragraph(body).as_deref(),
+            Some("This is the real first paragraph of prose.")
+        );
+        // Dash-underline setext (h2) is skipped the same way.
+        let body = "Section\n-------\n\nBody prose follows.\n";
+        assert_eq!(
+            first_paragraph(body).as_deref(),
+            Some("Body prose follows.")
+        );
+    }
+
+    #[test]
+    fn regression_first_paragraph_hash_without_space_is_prose() {
+        // Finding #39: `#1 priority…` / `#hashtag…` start with `#` but have no
+        // space after the hash run, so per CommonMark they are prose, not ATX
+        // headings — they must be summarized, not skipped/refused.
+        assert_eq!(
+            first_paragraph("#1 priority this week: fix onboarding drop-off.\n").as_deref(),
+            Some("#1 priority this week: fix onboarding drop-off.")
+        );
+        assert_eq!(
+            first_paragraph("#hashtag notes about the launch\n").as_deref(),
+            Some("#hashtag notes about the launch")
+        );
+        // With a following paragraph, the REAL first paragraph is summarized
+        // (not silently skipped to the second one).
+        assert_eq!(
+            first_paragraph("#1 priority: X\n\nSecond para.\n").as_deref(),
+            Some("#1 priority: X")
+        );
+        // A genuine ATX heading (hash + space) is still skipped.
+        assert_eq!(
+            first_paragraph("# Real heading\n\nThe actual prose.\n").as_deref(),
+            Some("The actual prose.")
+        );
+        // A bare `###` (hash run then EOL) is still a heading.
+        assert_eq!(
+            first_paragraph("###\n\nProse.\n").as_deref(),
+            Some("Prose.")
+        );
+    }
+
+    #[test]
+    fn regression_first_paragraph_skips_leading_fenced_code_block() {
+        // Finding #40: a body opening with a fenced code block must skip the
+        // whole block (fence info-string and any in-fence `#` comment) and take
+        // the first real prose paragraph after it.
+        let body =
+            "```bash\n# install dependencies\nnpm install\n```\n\nReal prose paragraph here.\n";
+        assert_eq!(
+            first_paragraph(body).as_deref(),
+            Some("Real prose paragraph here.")
+        );
+        // Tilde fences are handled the same way.
+        let body = "~~~\ncode line\n~~~\n\nProse after tilde fence.\n";
+        assert_eq!(
+            first_paragraph(body).as_deref(),
+            Some("Prose after tilde fence.")
+        );
+    }
+
+    #[test]
+    fn compose_from_body_handles_hash_prose_setext_and_fence() {
+        // End-to-end via `compose_from_body` (the `dbmd write` fallback path): a
+        // hash-prose sole paragraph composes a summary rather than yielding empty
+        // (which made `dbmd write` refuse the file).
+        assert_eq!(
+            compose_from_body("#1 priority this week: fix onboarding.\n"),
+            "#1 priority this week: fix onboarding."
+        );
+        assert_eq!(
+            compose_from_body("Launch Plan\n===========\n\nThe real prose.\n"),
+            "The real prose."
+        );
+        assert_eq!(
+            compose_from_body("```bash\n# step\n```\n\nThe real prose.\n"),
+            "The real prose."
+        );
+    }
+
+    #[test]
+    fn is_atx_heading_applies_commonmark_space_rule() {
+        assert!(is_atx_heading("# Title"));
+        assert!(is_atx_heading("###### Deep"));
+        assert!(is_atx_heading("###")); // hashes then EOL
+        assert!(!is_atx_heading("#1 priority"));
+        assert!(!is_atx_heading("#hashtag"));
+        assert!(!is_atx_heading("####### too many")); // 7 hashes
+        assert!(!is_atx_heading("plain"));
+    }
+
+    #[test]
+    fn code_fence_and_setext_helpers() {
+        assert_eq!(code_fence_marker("```bash"), Some('`'));
+        assert_eq!(code_fence_marker("~~~"), Some('~'));
+        assert_eq!(code_fence_marker("``"), None); // only two backticks
+        assert_eq!(code_fence_marker("plain"), None);
+        assert!(closes_code_fence("```", '`'));
+        assert!(!closes_code_fence("```bash", '`')); // info string ⇒ not a close
+        assert!(!closes_code_fence("~~~", '`')); // wrong fence char
+        assert!(is_setext_underline("==="));
+        assert!(is_setext_underline("---"));
+        assert!(!is_setext_underline("- item")); // not all dashes
+        assert!(!is_setext_underline(""));
     }
 }

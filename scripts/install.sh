@@ -15,7 +15,8 @@
 #   5. Installs the `dbmd` binary to ~/.dbmd/bin/ (no sudo).
 #   6. Prints the PATH line to add (and detects if it is already on PATH).
 #
-# POSIX sh. No bashisms. No sudo. Honors $DBMD_INSTALL_DIR and $DBMD_VERSION.
+# POSIX sh. No bashisms. No sudo. Honors $DBMD_INSTALL_DIR, $DBMD_VERSION,
+# $DBMD_REPO, and $DBMD_BASE_URL (point the downloader at a local mirror).
 #
 # Linux always installs the static musl build, so it runs on any glibc/musl
 # distro without a libc version dance.
@@ -27,7 +28,11 @@ set -eu
 # https://github.com/<repo>/releases/download/v<version>/<asset>, and the
 # latest version is resolved from the GitHub releases API.
 DBMD_REPO="${DBMD_REPO:-carloslfu/db.md}"
-DBMD_RELEASES="https://github.com/${DBMD_REPO}/releases/download"
+# Base URL the tarball + SHA256SUMS are fetched from. Per-version assets live at
+# $DBMD_BASE_URL/v<version>/<asset>. Defaults to the GitHub release-download base;
+# override $DBMD_BASE_URL to point at a local mirror (the release smoke test
+# serves the just-built tree over http://127.0.0.1:8099 and sets this).
+DBMD_BASE_URL="${DBMD_BASE_URL:-https://github.com/${DBMD_REPO}/releases/download}"
 # Where the binary lands. Default ~/.dbmd/bin (no sudo).
 DBMD_INSTALL_DIR="${DBMD_INSTALL_DIR:-$HOME/.dbmd/bin}"
 # Pinned version (without leading v). Empty => resolve "latest".
@@ -100,9 +105,13 @@ info "Installing dbmd v${version} for ${plat_os}/${plat_arch}..."
 # ── Download + verify ─────────────────────────────────────────────────────────
 tarball="dbmd-${version}-${asset_target}.tar.gz"
 workdir="$(mktemp -d)"
-trap 'rm -rf "$workdir"' EXIT
+# `staged` is the same-filesystem temp copy of the new binary (see install
+# below). Cleaned up alongside $workdir if we die before the atomic rename so a
+# crashed run never leaves a half-written sibling next to the live binary.
+staged=""
+trap 'rm -rf "$workdir"; [ -n "$staged" ] && rm -f "$staged"' EXIT
 
-base="$DBMD_RELEASES/v$version"
+base="$DBMD_BASE_URL/v$version"
 info "Downloading $tarball..."
 fetch "$base/$tarball" "$workdir/$tarball"
 
@@ -115,13 +124,28 @@ if have sha256sum; then sha_tool="sha256sum"; elif have shasum; then sha_tool="s
 ( cd "$workdir" && grep " ${tarball}\$" SHA256SUMS | $sha_tool -c - ) \
     || err "checksum verification failed for $tarball"
 
-# ── Unpack + install ──────────────────────────────────────────────────────────
+# ── Unpack + install (atomically) ─────────────────────────────────────────────
 info "Installing to $DBMD_INSTALL_DIR..."
 mkdir -p "$DBMD_INSTALL_DIR"
 tar -xzf "$workdir/$tarball" -C "$workdir"
 # Tarball layout: dbmd-<ver>-<target>/dbmd
-mv "$workdir/dbmd-${version}-${asset_target}/dbmd" "$DBMD_INSTALL_DIR/dbmd"
-chmod +x "$DBMD_INSTALL_DIR/dbmd"
+#
+# Install atomically: $workdir is usually on a different filesystem than
+# $DBMD_INSTALL_DIR (mktemp is on /tmp or a separate volume), so a direct
+# `mv $workdir/.../dbmd $DBMD_INSTALL_DIR/dbmd` is a cross-device copy+unlink
+# that rewrites the live binary IN PLACE — an interrupted upgrade (Ctrl-C, lost
+# ssh, ENOSPC) leaves a truncated, still-executable binary. Instead copy the new
+# binary to a temp sibling on the SAME filesystem as the destination, ready it,
+# then rename(2) over the destination — rename within one filesystem is atomic,
+# so an existing working `dbmd` is replaced whole or not at all.
+staged="$DBMD_INSTALL_DIR/.dbmd.tmp.$$"
+rm -f "$staged"
+cp "$workdir/dbmd-${version}-${asset_target}/dbmd" "$staged" \
+    || err "could not stage the new binary in $DBMD_INSTALL_DIR"
+chmod +x "$staged"
+mv "$staged" "$DBMD_INSTALL_DIR/dbmd" \
+    || err "could not install the new binary to $DBMD_INSTALL_DIR/dbmd"
+staged=""  # consumed by the rename; nothing left for the EXIT trap to remove
 
 # ── PATH hint ──────────────────────────────────────────────────────────────────
 info "Installed dbmd to $DBMD_INSTALL_DIR/dbmd"

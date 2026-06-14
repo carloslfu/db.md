@@ -56,7 +56,7 @@ pub fn run(ctx: &Context, args: &LinkArgs) -> CliResult {
 /// single separating blank line if the body has content and doesn't already end
 /// in a blank line.
 fn append_wiki_link(abs: &Path, target: &str) -> Result<(), CliError> {
-    let (fm, mut body) = dbmd_core::parser::read_file(abs).map_err(core_err)?;
+    let (mut fm, mut body) = dbmd_core::parser::read_file(abs).map_err(core_err)?;
 
     let link_line = format!("[[{target}]]\n");
     if body.is_empty() {
@@ -71,6 +71,13 @@ fn append_wiki_link(abs: &Path, target: &str) -> Result<(), CliError> {
         }
         body.push_str(&link_line);
     }
+
+    // `link` edits the file's content (it appends a wiki-link to the body), so
+    // re-stamp the auto-maintained `updated` timestamp the same way `write` sets
+    // it on create and `fm set` bumps it on edit. Without this, the type-folder
+    // `index.md` recency ordering and `dbmd search --updated-after` never reflect
+    // the edit (SPEC: `updated` is auto-maintained on content edits).
+    fm.updated = Some(dbmd_core::now());
 
     dbmd_core::parser::write_file(abs, &fm, &body).map_err(core_err)?;
     Ok(())

@@ -49,7 +49,7 @@
 //!   needs); `scope: type-folder` follows the conventions list, not the one
 //!   SPEC example that wrote `scope: folder`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -142,6 +142,17 @@ impl Index {
         for file_abs in walk_type_folder_files(&abs) {
             let rel_path =
                 rel_to_store(&store.root, &file_abs).expect("walked file is under the store root");
+            // Abort the build on a malformed file rather than skip it. A skipped
+            // file would still be a content member the validator requires to be
+            // catalogued (`validate::walk_content_files` enumerates by filename,
+            // not by parseability), so silently dropping it would leave the store
+            // in a permanently invalid state (`INDEX_MISSING_ENTRY` /
+            // `INDEX_JSONL_DESYNC` that no rebuild can clear) and would desync the
+            // rollups (`build_layer`/`build_root` count the raw `.md` files). The
+            // loud `?` is the right outcome: `cleanup` now preserves the prior
+            // canonical sidecars (`min_depth(2)`), so an aborted rebuild leaves
+            // the existing catalogs intact and the operator a clear error naming
+            // the file to fix — never a destroyed or silently-wrong index.
             records.push(record_from_file(&file_abs, rel_path)?);
         }
         sort_records(&mut records);
@@ -316,11 +327,23 @@ impl Index {
     /// the same end state.
     pub fn on_write(store: &Store, file: &Path) -> crate::Result<()> {
         let file_rel = normalize_rel(file);
+        // The generated catalog files are not content — never upsert one into
+        // itself. `build_type_folder`'s walk already excludes `index.md`
+        // (`walk_type_folder_files`); the loop path must apply the same
+        // exclusion or editing `index.md` via `fm set` inserts a phantom
+        // self-row, inflating every `(N)` count and breaking the
+        // write-through == rebuild byte-identity invariant.
+        if is_index_artifact(&file_rel) {
+            return Ok(());
+        }
         let file_abs = store.root.join(&file_rel);
         let folder = type_folder_of(&file_rel)
             .ok_or_else(|| bad_index(&file_rel, "file is not inside a layer/type-folder"))?;
         let record = record_from_file(&file_abs, file_rel.clone())?;
 
+        // Serialize the sidecar read-modify-write so concurrent sanctioned
+        // writes to this folder don't clobber each other's rows (lost update).
+        let _lock = FolderLock::acquire(&store.root.join(&folder));
         let mut records = read_jsonl_records(&store.root.join(&folder).join("index.jsonl"))?;
         records.retain(|r| r.path != record.path);
         records.push(record);
@@ -337,10 +360,21 @@ impl Index {
     pub fn on_rename(store: &Store, old: &Path, new: &Path) -> crate::Result<()> {
         let old_rel = normalize_rel(old);
         let new_rel = normalize_rel(new);
+        // Index artifacts are generated, not catalogued — a rename of/into one
+        // is not a content move (same reasoning as `on_write`). Skip rather than
+        // insert a phantom self-row.
+        if is_index_artifact(&old_rel) || is_index_artifact(&new_rel) {
+            return Ok(());
+        }
         let old_folder = type_folder_of(&old_rel)
             .ok_or_else(|| bad_index(&old_rel, "source is not inside a layer/type-folder"))?;
         let new_folder = type_folder_of(&new_rel)
             .ok_or_else(|| bad_index(&new_rel, "target is not inside a layer/type-folder"))?;
+
+        // Serialize the sidecar read-modify-write(s). For a cross-folder rename,
+        // lock BOTH folders, always in sorted order, so two renames touching the
+        // same pair can't deadlock. Held for the whole operation via RAII.
+        let _locks = lock_folders(store, &old_folder, &new_folder);
 
         // Drop from the old folder.
         let mut old_records =
@@ -382,8 +416,15 @@ impl Index {
     /// jsonl record set and re-renders into the md automatically.
     pub fn on_remove(store: &Store, file: &Path) -> crate::Result<()> {
         let file_rel = normalize_rel(file);
+        // Removing a generated catalog artifact is not a content removal; it has
+        // no row to drop (it was never catalogued). Skip, mirroring `on_write`.
+        if is_index_artifact(&file_rel) {
+            return Ok(());
+        }
         let folder = type_folder_of(&file_rel)
             .ok_or_else(|| bad_index(&file_rel, "file is not inside a layer/type-folder"))?;
+        // Serialize the sidecar read-modify-write (see `on_write`).
+        let _lock = FolderLock::acquire(&store.root.join(&folder));
         let mut records = read_jsonl_records(&store.root.join(&folder).join("index.jsonl"))?;
         let before = records.len();
         records.retain(|r| r.path != file_rel);
@@ -506,8 +547,22 @@ impl Index {
     }
 
     /// Cleanup pass (part of [`Index::rebuild_all`]): delete `index.md` /
-    /// `index.jsonl` in non-canonical folders (empty folders, or date-shards
-    /// that should carry none). Symmetric with index creation.
+    /// `index.jsonl` in non-canonical folders (date-shards that should carry
+    /// none). Symmetric with index creation.
+    ///
+    /// **Only deletes generated catalog artifacts, never user content.** Two
+    /// guards keep this from eating data:
+    /// - `min_depth(2)` so the walk starts *below* the type-folder root — the
+    ///   canonical `<type-folder>/index.md` + `index.jsonl` are never targeted
+    ///   here (they are rewritten by the per-folder builders, or removed only
+    ///   when the folder is genuinely empty, in the dedicated branch below). The
+    ///   old `min_depth(1)` deleted them up front, so a rebuild aborted by one
+    ///   malformed file left every type-folder catalog destroyed.
+    /// - [`is_deletable_catalog_artifact`] confirms a shard-level `index.md` is
+    ///   an actual generated catalog (or stale/garbage leftover), NOT a content
+    ///   file a user wrote at that name (e.g. `dbmd write …/index.md --type
+    ///   email`, plausible when mirroring a website/doc export). Matching by
+    ///   filename alone silently deleted such records on the next rebuild.
     pub fn cleanup(store: &Store) -> crate::Result<()> {
         for layer in Layer::all() {
             let layer_dir = store.root.join(layer_dir_name(layer));
@@ -516,21 +571,27 @@ impl Index {
             }
             for tf in type_folders_in_layer(store, layer) {
                 let tf_abs = store.root.join(&tf);
-                // Any index inside a shard (below the type-folder root) is
-                // non-canonical: delete it.
+                // Any generated index inside a shard (below the type-folder
+                // root) is non-canonical: delete it. Never touch a user content
+                // file that merely happens to be named index.md.
                 for entry in walkdir::WalkDir::new(&tf_abs)
-                    .min_depth(1)
+                    .min_depth(2)
                     .into_iter()
                     .filter_map(|e| e.ok())
                 {
                     let p = entry.path();
-                    if is_index_artifact(p) {
+                    if is_index_artifact(p) && is_deletable_catalog_artifact(p) {
                         remove_if_exists(p)?;
                     }
                 }
-                // Empty type-folder → no index at its root either.
+                // Empty type-folder → no index at its root either. Same content
+                // guard: an `index.md` here that is actually a user record (the
+                // only file in the folder) is preserved, not deleted.
                 if walk_type_folder_files(&tf_abs).is_empty() {
-                    remove_if_exists(&tf_abs.join("index.md"))?;
+                    let md = tf_abs.join("index.md");
+                    if is_deletable_catalog_artifact(&md) {
+                        remove_if_exists(&md)?;
+                    }
                     remove_if_exists(&tf_abs.join("index.jsonl"))?;
                 }
             }
@@ -570,53 +631,165 @@ fn write_type_folder_artifacts(
 }
 
 /// Re-render the layer + root rollups that sit above `folder` — the
-/// **loop path**, O(changed). Counts come from the type-folders' on-disk
-/// `index.jsonl` sidecars ([`child_counts_from_jsonl`]), NOT from a content-tree
-/// walk: a single write touches only the affected layer's sidecars (for the
-/// layer rollup) and one sidecar per type-folder (for the root rollup) — never
-/// the millions of files under the shards. `build_layer` / `build_root` (which
-/// *do* walk the content tree) are reserved for the from-scratch sweeps
-/// ([`Index::rebuild_all`], [`Index::write_level`], [`Index::render_dry_run`]).
-/// The result is byte-identical to those builders because in the loop — exactly
-/// as in `rebuild_all` — every touched folder's jsonl is rewritten before its
-/// parents are rolled up, so `jsonl_record_count == walk_type_folder_files.len()`
-/// for every folder read here.
+/// **loop path**, O(changed). Counts + previews come from the type-folders'
+/// on-disk `index.jsonl` sidecars ([`collect_child_stats`]), NOT from a
+/// content-tree walk: a single write reads one sidecar per type-folder (shared
+/// across the layer and root rollups) — never the millions of files under the
+/// shards. `build_layer` / `build_root` (which *do* walk the content tree) are
+/// reserved for the from-scratch sweeps ([`Index::rebuild_all`],
+/// [`Index::write_level`], [`Index::render_dry_run`]). The result is
+/// byte-identical to those builders because in the loop — exactly as in
+/// `rebuild_all` — every touched folder's jsonl is rewritten before its parents
+/// are rolled up, so the per-folder stat (`count` / `newest`) equals what a
+/// from-scratch walk would compute.
 fn update_parents(store: &Store, folder: &Path) -> crate::Result<()> {
+    // Read every relevant type-folder's sidecar EXACTLY ONCE into a stat cache
+    // (`count` + `newest` record), then render both rollups from the cache. The
+    // old path read each sidecar 2–3× per write — `child_counts_from_jsonl`
+    // (full parse just for a count) plus `render_layer_md_with_store` and
+    // `render_root_md_with_store` (each a full `read_jsonl_records` parse + sort
+    // just to take `.first()`). Because `index.jsonl` sidecars are uncapped and
+    // append-mostly, a single high-volume folder (months of ingested emails) made
+    // an UNRELATED tiny write reparse a multi-MB sidecar several times, turning
+    // the loop op into O(total store records) and violating the crate's O(changed)
+    // invariant (lib.rs). One streaming pass per sidecar, shared across both
+    // rollups, restores O(changed)-per-sidecar cost (and keeps the output
+    // byte-identical: `count` == `read_jsonl_records().len()` and `newest` is the
+    // same record `.first()` would yield).
+    let stats = collect_child_stats(store, &Layer::all())?;
+
     let layer = folder
         .components()
         .next()
         .and_then(|c| c.as_os_str().to_str())
         .and_then(layer_from_dir_name);
     if let Some(layer) = layer {
-        let idx = Index {
-            level: IndexLevel::Layer(layer),
-            records: Vec::new(),
-            child_counts: child_counts_from_jsonl(store, &[layer])?,
-        };
         let p = store.root.join(layer_dir_name(layer)).join("index.md");
-        if idx.child_counts.is_empty() {
-            remove_if_exists(&p)?;
+        if layer_has_children(&stats, layer) {
+            write_atomic(&p, render_layer_md_from_stats(layer, &stats))?;
         } else {
-            write_atomic(&p, render_layer_md_with_store(store, &idx))?;
+            remove_if_exists(&p)?;
         }
     }
-    let root = Index {
-        level: IndexLevel::Root,
-        records: Vec::new(),
-        child_counts: child_counts_from_jsonl(store, &Layer::all())?,
-    };
     let rp = store.root.join("index.md");
-    if root.child_counts.is_empty() {
-        remove_if_exists(&rp)?;
+    if stats.values().any(|s| s.count > 0) {
+        write_atomic(&rp, render_root_md_from_stats(&stats))?;
     } else {
-        write_atomic(&rp, render_root_md_with_store(store, &root))?;
+        remove_if_exists(&rp)?;
     }
     Ok(())
 }
 
+/// True if `layer` has at least one non-empty child type-folder in `stats`.
+fn layer_has_children(stats: &BTreeMap<PathBuf, FolderStat>, layer: Layer) -> bool {
+    let prefix = format!("{}/", layer_dir_name(layer));
+    stats
+        .iter()
+        .any(|(tf, s)| s.count > 0 && path_to_unix(tf).starts_with(&prefix))
+}
+
+/// Render a layer `index.md` from the prebuilt per-folder stat cache — each
+/// child's count + newest summary/updated come from its single cached sidecar
+/// read, so the rollup matches the folder artifacts exactly (write-through and
+/// rebuild alike) without re-reading any sidecar.
+fn render_layer_md_from_stats(layer: Layer, stats: &BTreeMap<PathBuf, FolderStat>) -> String {
+    let layer_dir = layer_dir_name(layer);
+    let prefix = format!("{layer_dir}/");
+    let mut max_upd: Option<DateTime<FixedOffset>> = None;
+    let mut entries = String::new();
+    for (tf, stat) in stats {
+        if stat.count == 0 || !path_to_unix(tf).starts_with(&prefix) {
+            continue;
+        }
+        let newest = stat.newest.as_ref();
+        if let Some(u) = newest.and_then(|r| r.updated) {
+            max_upd = Some(match max_upd {
+                Some(cur) if cur >= u => cur,
+                _ => u,
+            });
+        }
+        let tf_unix = path_to_unix(tf);
+        let display = capitalize(folder_basename(tf));
+        let preview = newest
+            .map(|r| truncate(&r.summary, 80))
+            .filter(|p| !p.is_empty() && p != MISSING_SUMMARY);
+        match preview {
+            Some(p) => entries.push_str(&format!(
+                "- [[{tf_unix}/index|{display}]] ({}) — {p}\n",
+                stat.count
+            )),
+            None => entries.push_str(&format!(
+                "- [[{tf_unix}/index|{display}]] ({})\n",
+                stat.count
+            )),
+        }
+    }
+    let mut s = String::new();
+    s.push_str("---\n");
+    s.push_str("type: index\n");
+    s.push_str("scope: layer\n");
+    s.push_str(&format!("folder: {layer_dir}\n"));
+    if let Some(ts) = max_upd {
+        s.push_str(&format!("updated: {}\n", fmt_ts(&ts)));
+    }
+    s.push_str("---\n\n");
+    s.push_str(&format!("# {layer_dir}\n\n"));
+    s.push_str(&entries);
+    s
+}
+
+/// Render the root `index.md` from the prebuilt per-folder stat cache.
+fn render_root_md_from_stats(stats: &BTreeMap<PathBuf, FolderStat>) -> String {
+    let mut max_upd: Option<DateTime<FixedOffset>> = None;
+    for stat in stats.values() {
+        if stat.count == 0 {
+            continue;
+        }
+        if let Some(u) = stat.newest.as_ref().and_then(|r| r.updated) {
+            max_upd = Some(match max_upd {
+                Some(cur) if cur >= u => cur,
+                _ => u,
+            });
+        }
+    }
+    let mut s = String::new();
+    s.push_str("---\n");
+    s.push_str("type: index\n");
+    s.push_str("scope: root\n");
+    if let Some(ts) = max_upd {
+        s.push_str(&format!("updated: {}\n", fmt_ts(&ts)));
+    }
+    s.push_str("---\n\n");
+    s.push_str(&format!("# {ROOT_TITLE}\n"));
+    for layer in Layer::all() {
+        let layer_dir = layer_dir_name(layer);
+        let prefix = format!("{layer_dir}/");
+        let children: Vec<(&PathBuf, usize)> = stats
+            .iter()
+            .filter(|(tf, s)| s.count > 0 && path_to_unix(tf).starts_with(&prefix))
+            .map(|(tf, s)| (tf, s.count))
+            .collect();
+        if children.is_empty() {
+            continue;
+        }
+        let total: usize = children.iter().map(|(_, n)| *n).sum();
+        s.push('\n');
+        s.push_str(&format!("## {} ({total})\n", capitalize(layer_dir)));
+        for (tf, n) in children {
+            let tf_unix = path_to_unix(tf);
+            let display = capitalize(folder_basename(tf));
+            s.push_str(&format!("- [[{tf_unix}/index|{display}]] ({n})\n"));
+        }
+    }
+    s
+}
+
 /// Render a layer `index.md`, reading each child's newest summary + max-updated
 /// straight from its on-disk `index.jsonl` (so the rollup matches the folder
-/// artifacts exactly, write-through and rebuild alike).
+/// artifacts exactly, write-through and rebuild alike). The **sweep-path**
+/// renderer used by [`Index::rebuild_all`] / [`Index::write_level`] /
+/// [`Index::render_dry_run`]; the loop path uses the cache-based
+/// [`render_layer_md_from_stats`] to avoid re-reading sidecars.
 fn render_layer_md_with_store(store: &Store, idx: &Index) -> String {
     let layer = match idx.level {
         IndexLevel::Layer(l) => l,
@@ -659,7 +832,8 @@ fn render_layer_md_with_store(store: &Store, idx: &Index) -> String {
 }
 
 /// Render the root `index.md`, taking each child's max-updated from its on-disk
-/// `index.jsonl`.
+/// `index.jsonl`. The **sweep-path** renderer (the loop path uses
+/// [`render_root_md_from_stats`]).
 fn render_root_md_with_store(store: &Store, idx: &Index) -> String {
     let mut max_upd: Option<DateTime<FixedOffset>> = None;
     for tf in idx.child_counts.keys() {
@@ -710,7 +884,17 @@ fn render_root_md_with_store(store: &Store, idx: &Index) -> String {
 /// `WIKI_LINK_HAS_EXTENSION`); the jsonl `path` keeps the real on-disk name.
 fn format_md_entry(rec: &IndexRecord) -> String {
     let path = wiki_target(&rec.path);
-    let mut line = format!("- [[{path}]] — {}", rec.summary);
+    // Collapse the summary to a single line before interpolating it into the
+    // one-line browse entry. A hand-written file may legally carry a YAML block
+    // scalar (`summary: |-`) whose value spans multiple lines; rendered verbatim
+    // those embedded newlines break the line-oriented `index.md` format and can
+    // forge a standalone catalog entry (`\n- [[…|Click me]] — injected`). The
+    // CLI writers already collapse whitespace; do the same here so the spec's
+    // primary write path (agents writing files directly) can't corrupt the
+    // catalog. Single-line normalization matches `truncate`'s rule (the
+    // layer/root rollups already single-line the same summary via `truncate`).
+    let summary = collapse_whitespace(&rec.summary);
+    let mut line = format!("- [[{path}]] — {summary}");
     if !rec.tags.is_empty() {
         let tags = rec
             .tags
@@ -734,15 +918,7 @@ fn more_footer(total: usize, type_: &str, layer: &str) -> String {
 /// by store-relative path ascending. A *total* order, so write-through and
 /// rebuild never disagree on #500 vs #501.
 fn sort_records(records: &mut [IndexRecord]) {
-    records.sort_by(|a, b| {
-        match (b.updated, a.updated) {
-            (Some(bu), Some(au)) => bu.cmp(&au),
-            (Some(_), None) => std::cmp::Ordering::Greater, // a is None → after b
-            (None, Some(_)) => std::cmp::Ordering::Less,    // b is None → after a
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-        .then_with(|| a.path.cmp(&b.path))
-    });
+    records.sort_by(record_recency_cmp);
 }
 
 impl IndexRecord {
@@ -792,9 +968,19 @@ struct FileMeta {
 /// Minimal frontmatter read: split the leading `---`…`---` block and parse it
 /// as YAML, extracting the typed fields and spilling the rest into `fields`.
 /// Self-contained (does not route through the `parser` module).
+///
+/// **Body bytes are never required to be UTF-8.** `sources/` is "preserved
+/// verbatim" per the SPEC and routinely carries non-UTF-8 imports (Latin-1
+/// emails dropped in by `rsync`/`mbsync`/`cp`); the body can hold any byte. We
+/// read the file as raw bytes and lossily decode *only* the leading frontmatter
+/// region, so a stray non-UTF-8 byte in the body can never abort the projection
+/// (the old `fs::read_to_string` failed on the first such byte anywhere in the
+/// file, taking a whole `rebuild_all` / write-through down with it). The
+/// frontmatter itself is expected to be UTF-8; if it isn't, `U+FFFD` markers
+/// surface in the parsed values rather than a hard abort.
 fn read_frontmatter(abs: &Path) -> crate::Result<FileMeta> {
-    let text = fs::read_to_string(abs)?;
-    let yaml = extract_frontmatter_block(&text).unwrap_or_default();
+    let bytes = fs::read(abs)?;
+    let yaml = extract_frontmatter_block_lossy(&bytes).unwrap_or_default();
     let map: serde_norway::Mapping = if yaml.trim().is_empty() {
         serde_norway::Mapping::new()
     } else {
@@ -820,8 +1006,17 @@ fn read_frontmatter(abs: &Path) -> crate::Result<FileMeta> {
             None => continue,
         };
         match key.as_str() {
-            "type" => type_ = v.as_str().map(str::to_string),
-            "summary" => summary = v.as_str().map(str::to_string),
+            // `type` and `summary` are coerced with the SAME scalar rule the
+            // validator applies (`validate::scalar_string`: String/Number/Bool →
+            // string). A bare `v.as_str()` returns `None` for an unquoted numeric
+            // or boolean scalar (`summary: 2026`, `type: true`), so the index
+            // would write the `(no summary)` / empty-type placeholder while
+            // `dbmd validate` reads the file as HAVING that summary/type —
+            // yielding a permanently-unfixable `INDEX_SUMMARY_MISMATCH` (every
+            // rebuild reproduces the same mismatched placeholder). Coercing here
+            // keeps the writer and the validator byte-for-byte in agreement.
+            "type" => type_ = scalar_string(&v),
+            "summary" => summary = scalar_string(&v),
             "tags" => tags = yaml_string_list(&v),
             "links" => links = yaml_string_list(&v),
             "created" => created = v.as_str().and_then(parse_ts),
@@ -845,6 +1040,34 @@ fn read_frontmatter(abs: &Path) -> crate::Result<FileMeta> {
         updated,
         fields,
     })
+}
+
+/// A YAML scalar (`String`/`Number`/`Bool`) rendered as a string; `None` for
+/// sequences/mappings/null. **Must stay identical to `validate::scalar_string`**
+/// so the index writer and the validator coerce `type`/`summary` the same way
+/// (see [`read_frontmatter`]); an unquoted `summary: 2026` becomes `"2026"` in
+/// both, not a placeholder here and a real value there.
+fn scalar_string(v: &serde_norway::Value) -> Option<String> {
+    match v {
+        serde_norway::Value::String(s) => Some(s.clone()),
+        serde_norway::Value::Number(n) => Some(n.to_string()),
+        serde_norway::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Lossily decode the leading frontmatter region of a file given its raw bytes,
+/// then pull the YAML between the opening `---` and the next `---`. Only the
+/// frontmatter region needs to be valid UTF-8 in practice; the body may carry
+/// arbitrary bytes (a verbatim `sources/` import). Returns `None` when the file
+/// has no frontmatter fence at its very start.
+fn extract_frontmatter_block_lossy(bytes: &[u8]) -> Option<String> {
+    // Decode lossily so a non-UTF-8 body byte never aborts the read. The
+    // frontmatter is at the very start of the file, so a lossy whole-file decode
+    // is correct for extracting it (and cheap relative to the YAML parse). A
+    // leading UTF-8 BOM is stripped by `extract_frontmatter_block`.
+    let text = String::from_utf8_lossy(bytes);
+    extract_frontmatter_block(&text)
 }
 
 /// Pull the YAML between a leading `---` line and the next `---` line. Returns
@@ -976,23 +1199,36 @@ fn read_jsonl_records(jsonl: &Path) -> crate::Result<Vec<IndexRecord>> {
     Ok(records)
 }
 
-/// Count the distinct content files a type-folder's `index.jsonl` catalogs —
-/// the **loop-path** count primitive, the rollup analogue of reading the
-/// per-folder sidecar. It reads only the one small sidecar (one line per file),
-/// never the content tree, so a rollup recompute over `K` type-folders is
-/// `O(K · folder)` sidecar reads — never `O(store files)` like
-/// [`walk_type_folder_files`]. Distinct-`path` (last-write-wins) so the count is
-/// byte-identical to [`read_jsonl_records`]`.len()` even on a half-compacted
-/// jsonl; a missing sidecar is `0`. Within the loop and within
-/// [`Index::rebuild_all`] the folder's jsonl is always rewritten before its
-/// parents are rolled up, so this equals `walk_type_folder_files(folder).len()`.
-fn jsonl_record_count(jsonl: &Path) -> crate::Result<usize> {
+/// The minimal rollup stat a parent index needs from one type-folder's
+/// `index.jsonl`: how many distinct files it catalogs (`count`) and the single
+/// newest record (`newest`, the recency-sorted `.first()` — its `updated` feeds
+/// the parent's derived `updated`, its `summary` the layer preview). Holding the
+/// newest record alone, rather than the whole sidecar, is what keeps a rollup
+/// recompute cheap regardless of how large the sidecar grows.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct FolderStat {
+    count: usize,
+    newest: Option<IndexRecord>,
+}
+
+/// Read a type-folder's `index.jsonl` ONCE and reduce it to a [`FolderStat`]:
+/// distinct-`path` count (last-write-wins) plus the recency-newest record. A
+/// missing sidecar is the default (`count: 0`, `newest: None`). This is the
+/// **loop-path** rollup primitive — one streaming pass per sidecar, never the
+/// content tree and never the 2–3× full reparse the old
+/// `jsonl_record_count` + `read_jsonl_records` pair did. `count` is
+/// byte-identical to [`read_jsonl_records`]`.len()` and `newest` to its
+/// `.first()`, so a rollup built from these stats matches the from-scratch
+/// builders byte-for-byte.
+fn read_folder_stat(jsonl: &Path) -> crate::Result<FolderStat> {
     let text = match fs::read_to_string(jsonl) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FolderStat::default()),
         Err(e) => return Err(e.into()),
     };
-    let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+    // Last-write-wins by path, exactly like `read_jsonl_records`, so count and
+    // newest are computed over the same compacted record set.
+    let mut by_path: BTreeMap<PathBuf, IndexRecord> = BTreeMap::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -1003,30 +1239,51 @@ fn jsonl_record_count(jsonl: &Path) -> crate::Result<usize> {
                 message: format!("line {}: {e}", i + 1),
             })
         })?;
-        paths.insert(rec.path);
+        by_path.insert(rec.path.clone(), rec);
     }
-    Ok(paths.len())
+    let count = by_path.len();
+    // The newest record is the minimum under `sort_records`' order (updated
+    // desc, None last, ties by path asc) — i.e. what `.first()` returns. Find it
+    // with a single min-scan instead of sorting the whole set.
+    let newest = by_path.into_values().min_by(record_recency_cmp);
+    Ok(FolderStat { count, newest })
 }
 
-/// Per-child rollup counts for `layers`, read from each type-folder's on-disk
-/// `index.jsonl` (via [`jsonl_record_count`]) rather than walked from the
+/// The total order [`sort_records`] imposes, as a comparator over two records:
+/// `updated` descending (None last), ties broken by store-relative path
+/// ascending. Kept in one place so `read_folder_stat`'s min-scan agrees with the
+/// sort byte-for-byte on which record is "newest".
+fn record_recency_cmp(a: &IndexRecord, b: &IndexRecord) -> std::cmp::Ordering {
+    match (b.updated, a.updated) {
+        (Some(bu), Some(au)) => bu.cmp(&au),
+        (Some(_), None) => std::cmp::Ordering::Greater, // a is None → after b
+        (None, Some(_)) => std::cmp::Ordering::Less,    // b is None → after a
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| a.path.cmp(&b.path))
+}
+
+/// Per-child rollup stats for `layers`, read from each type-folder's on-disk
+/// `index.jsonl` (one [`read_folder_stat`] pass each) rather than walked from the
 /// content tree. The **loop-path** counterpart to the from-scratch counting in
 /// [`Index::build_layer`] / [`Index::build_root`]: it keeps [`update_parents`]
-/// `O(type-folders)` so a single write never re-enumerates the whole store.
-fn child_counts_from_jsonl(
+/// `O(type-folders)` sidecar reads so a single write never re-enumerates the
+/// whole store, and reuses one read per sidecar across BOTH the layer and root
+/// rollups. Empty folders (`count == 0`) are kept out of the map.
+fn collect_child_stats(
     store: &Store,
     layers: &[Layer],
-) -> crate::Result<BTreeMap<PathBuf, usize>> {
-    let mut child_counts = BTreeMap::new();
+) -> crate::Result<BTreeMap<PathBuf, FolderStat>> {
+    let mut stats = BTreeMap::new();
     for &layer in layers {
         for tf in type_folders_in_layer(store, layer) {
-            let n = jsonl_record_count(&store.root.join(&tf).join("index.jsonl"))?;
-            if n > 0 {
-                child_counts.insert(tf, n);
+            let stat = read_folder_stat(&store.root.join(&tf).join("index.jsonl"))?;
+            if stat.count > 0 {
+                stats.insert(tf, stat);
             }
         }
     }
-    Ok(child_counts)
+    Ok(stats)
 }
 
 /// Walk a type-folder's `.md` content files, recursing through date-shards,
@@ -1114,6 +1371,32 @@ fn is_index_artifact(p: &Path) -> bool {
     )
 }
 
+/// True when a file named `index.md` / `index.jsonl` is safe for [`Index::cleanup`]
+/// to delete — i.e. it is a generated catalog artifact (or a stale/garbage
+/// leftover from a previous build), NOT a user content file that merely happens
+/// to be named `index.md`.
+///
+/// - `index.jsonl` is always a machine artifact (content files are `.md`), so it
+///   is always deletable.
+/// - `index.md` is deletable UNLESS it parses as a content file — frontmatter
+///   whose `type` is some real record type (anything other than `index`). A
+///   generated catalog carries `type: index`; a user record carries its own type
+///   (`email`, `note`, …) and must be preserved (deleting it is silent,
+///   unrecoverable data loss). A leftover with no/garbage frontmatter (e.g. a
+///   bare `stale\n`) is treated as a deletable stale artifact.
+fn is_deletable_catalog_artifact(p: &Path) -> bool {
+    match p.file_name().and_then(|n| n.to_str()) {
+        Some("index.jsonl") => true,
+        Some("index.md") => match read_frontmatter(p) {
+            // Real content file (non-`index` type) → preserve, never delete.
+            Ok(meta) => meta.type_.as_deref().is_none_or(|t| t == "index"),
+            // Unreadable / no frontmatter → a stale or garbage artifact, deletable.
+            Err(_) => true,
+        },
+        _ => false,
+    }
+}
+
 fn is_hidden(name: &std::ffi::OsStr) -> bool {
     name.to_str().map(|s| s.starts_with('.')).unwrap_or(false)
 }
@@ -1152,9 +1435,18 @@ fn wiki_target(p: &Path) -> String {
 
 /// Render a path with `/` separators regardless of host OS, so artifacts are
 /// identical on every platform.
+///
+/// A non-UTF-8 path component (reachable on Linux/ext4, db.md's primary
+/// deployment target, where `sources/` files arrive verbatim from Latin-1
+/// exports) is decoded **lossily** with `U+FFFD` markers rather than silently
+/// dropped. The old `filter_map(|c| c.as_os_str().to_str())` dropped any bad
+/// component entirely, so `sources/emails/caf\xe9.md` serialized as
+/// `sources/emails` — a path pointing at the *directory*, not the file, that
+/// also collapsed distinct files onto one `index.jsonl` key. Lossy decoding
+/// keeps the leaf present and visibly marked.
 fn path_to_unix(p: &Path) -> String {
     p.components()
-        .filter_map(|c| c.as_os_str().to_str())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -1187,9 +1479,17 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Collapse all runs of whitespace (including newlines) into single spaces and
+/// trim the ends — the single-line normalization both the `index.md` browse
+/// entry ([`format_md_entry`]) and the rollup preview ([`truncate`]) share, so a
+/// multi-line block-scalar summary can never inject a newline into either.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Truncate to at most `max` chars (char-boundary safe), single-line.
 fn truncate(s: &str, max: usize) -> String {
-    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let one_line = collapse_whitespace(s);
     if one_line.chars().count() <= max {
         one_line
     } else {
@@ -1228,6 +1528,105 @@ fn bad_index(path: &Path, msg: &str) -> crate::Error {
         path: path.to_path_buf(),
         message: msg.to_string(),
     })
+}
+
+/// Per-type-folder advisory lock for the write-through sidecar read-modify-write.
+///
+/// The write-through update of a folder's `index.jsonl`/`index.md` is a
+/// read-snapshot → modify → atomic-rename-over-whole-file sequence. The SPEC
+/// sanctions many-writer concurrency for `records/` (`dbmd write` is
+/// `create_new`-race-safe for the *content* file), but two concurrent writers to
+/// the SAME type-folder would each read the same sidecar snapshot, add only their
+/// own row, and rename their whole file over the other's — a classic lost update,
+/// dropping most rows until a manual `dbmd index rebuild`. This lock serializes
+/// the per-folder RMW (the content file is already serialized by `create_new`),
+/// so concurrent sanctioned writes each see the other's row.
+///
+/// Implementation: a hidden `<type-folder>/.index.lock` acquired via `create_new`
+/// (the same O_EXCL primitive `cmd/write.rs` uses), bounded-spin with a small
+/// sleep, and stale-lock breaking by mtime age so a crashed writer can't wedge
+/// the folder forever. The dotfile name keeps it out of the content walk
+/// (`walk_type_folder_files` skips hidden) and out of `cleanup`
+/// (`is_index_artifact` only matches `index.md`/`index.jsonl`). RAII: the lock is
+/// released (file removed) on drop, including on the error paths.
+struct FolderLock {
+    path: PathBuf,
+    held: bool,
+}
+
+impl FolderLock {
+    /// Acquire the lock for `folder_abs`. Spins (with a short sleep) up to a
+    /// bounded number of attempts, breaking a lock older than the staleness
+    /// window so a crash can't deadlock the folder. Best-effort: if the lock
+    /// genuinely can't be taken (extremely rare contention), it proceeds
+    /// unlocked rather than failing the write — degrading to the prior behavior
+    /// instead of erroring a sanctioned operation.
+    fn acquire(folder_abs: &Path) -> Self {
+        use std::time::{Duration, SystemTime};
+        const MAX_ATTEMPTS: u32 = 600; // ~6s at 10ms/attempt
+        const SPIN: Duration = Duration::from_millis(10);
+        const STALE_AFTER: Duration = Duration::from_secs(30);
+
+        let path = folder_abs.join(".index.lock");
+        // Ensure the folder exists so the lockfile create can succeed.
+        let _ = fs::create_dir_all(folder_abs);
+        for _ in 0..MAX_ATTEMPTS {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => {
+                    return FolderLock { path, held: true };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Break a stale lock left by a crashed writer.
+                    if let Ok(meta) = fs::metadata(&path) {
+                        if let Ok(modified) = meta.modified() {
+                            if SystemTime::now()
+                                .duration_since(modified)
+                                .map(|age| age > STALE_AFTER)
+                                .unwrap_or(false)
+                            {
+                                let _ = fs::remove_file(&path);
+                                continue;
+                            }
+                        }
+                    }
+                    std::thread::sleep(SPIN);
+                }
+                // Any other error (e.g. permissions): give up on locking and
+                // proceed unlocked rather than failing the write.
+                Err(_) => return FolderLock { path, held: false },
+            }
+        }
+        // Contention budget exhausted: proceed unlocked (best-effort).
+        FolderLock { path, held: false }
+    }
+}
+
+impl Drop for FolderLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Acquire the write-through lock for one or two type-folders. When `a == b`
+/// (same-folder rename) only one lock is taken. For two distinct folders the
+/// locks are always acquired in sorted order so a pair of concurrent renames
+/// touching the same two folders can't deadlock by grabbing them in opposite
+/// orders. Returns the guard(s); drop releases them.
+fn lock_folders(store: &Store, a: &Path, b: &Path) -> Vec<FolderLock> {
+    if a == b {
+        return vec![FolderLock::acquire(&store.root.join(a))];
+    }
+    let (first, second) = if a < b { (a, b) } else { (b, a) };
+    vec![
+        FolderLock::acquire(&store.root.join(first)),
+        FolderLock::acquire(&store.root.join(second)),
+    ]
 }
 
 // A tiny atomic-write helper. `tempfile` is a dev-dependency for tests; for
@@ -2481,6 +2880,415 @@ mod tests {
         assert!(
             !a.is_empty(),
             "the run must have produced at least one artifact"
+        );
+    }
+
+    // ── regressions: cleanup must not delete user content ─────────────────
+
+    /// CRITICAL regression: a user content file named `index.md` inside a date
+    /// shard (e.g. from a website/doc-export mirror) must SURVIVE `cleanup` /
+    /// `rebuild_all`. The old filename-only match silently deleted it.
+    #[test]
+    fn cleanup_preserves_user_content_named_index_md_in_shard() {
+        let (_d, store) = mk_store();
+        // A real content record that merely happens to be named index.md.
+        write_doc(
+            &store,
+            "sources/emails/2026/06/index.md",
+            "email",
+            Some("Important imported mail"),
+            Some("2026-06-11T04:23:25Z"),
+            "",
+        );
+        Index::cleanup(&store).unwrap();
+        assert!(
+            exists(&store, "sources/emails/2026/06/index.md"),
+            "cleanup must not delete a user content file named index.md"
+        );
+        // A full rebuild (which runs cleanup first) must also preserve it.
+        Index::rebuild_all(&store).unwrap();
+        assert!(
+            exists(&store, "sources/emails/2026/06/index.md"),
+            "rebuild_all must not delete a user content file named index.md"
+        );
+        let kept = read(&store, "sources/emails/2026/06/index.md");
+        assert!(
+            kept.contains("Important imported mail"),
+            "the user's record content must be intact"
+        );
+    }
+
+    /// HIGH regression: `cleanup` uses `min_depth(2)`, so the canonical
+    /// type-folder-root `index.md`/`index.jsonl` are NOT deleted up front. A
+    /// genuine generated catalog at the type-folder root survives a cleanup pass
+    /// (it is only ever rewritten, or removed when the folder is truly empty).
+    #[test]
+    fn cleanup_keeps_canonical_type_folder_root_sidecars() {
+        let (_d, store) = mk_store();
+        write_doc(
+            &store,
+            "records/contacts/alice.md",
+            "contact",
+            Some("Alice"),
+            Some("2026-05-01T00:00:00Z"),
+            "",
+        );
+        Index::write_level(&store, &IndexLevel::TypeFolder("records/contacts".into())).unwrap();
+        assert!(exists(&store, "records/contacts/index.md"));
+        assert!(exists(&store, "records/contacts/index.jsonl"));
+        Index::cleanup(&store).unwrap();
+        assert!(
+            exists(&store, "records/contacts/index.md"),
+            "cleanup must keep the canonical type-folder index.md (non-empty folder)"
+        );
+        assert!(
+            exists(&store, "records/contacts/index.jsonl"),
+            "cleanup must keep the canonical type-folder index.jsonl (non-empty folder)"
+        );
+    }
+
+    // ── regression: write-through must not catalog index artifacts ────────
+
+    /// HIGH regression: routing a generated `index.md` through `on_write` (as
+    /// `dbmd fm set records/contacts/index.md …` would) must NOT insert a phantom
+    /// self-row — counts and bytes stay equal to a rebuild.
+    #[test]
+    fn on_write_ignores_index_artifact_no_phantom_row() {
+        let (_d, store) = mk_store();
+        write_doc(
+            &store,
+            "records/contacts/alice.md",
+            "contact",
+            Some("Alice"),
+            Some("2026-05-01T00:00:00Z"),
+            "",
+        );
+        Index::on_write(&store, Path::new("records/contacts/alice.md")).unwrap();
+        let jsonl_before = read(&store, "records/contacts/index.jsonl");
+        assert_eq!(jsonl_before.lines().count(), 1);
+
+        // Tamper: route the catalog file itself through on_write.
+        Index::on_write(&store, Path::new("records/contacts/index.md")).unwrap();
+
+        let jsonl_after = read(&store, "records/contacts/index.jsonl");
+        assert_eq!(
+            jsonl_after.lines().count(),
+            1,
+            "on_write on index.md must not add a phantom self-row"
+        );
+        assert!(
+            !jsonl_after.contains("\"type\":\"index\""),
+            "the catalog artifact must never appear as a catalogued row"
+        );
+        // Root rollup count stays 1 (not inflated to 2).
+        let root = read(&store, "index.md");
+        assert!(
+            root.contains("[[records/contacts/index|Contacts]] (1)"),
+            "count must not inflate:\n{root}"
+        );
+    }
+
+    // ── regression: multi-line summary cannot inject a catalog line ───────
+
+    /// HIGH regression: a block-scalar summary spanning multiple lines must be
+    /// collapsed to one line in the browse entry, so it cannot forge a standalone
+    /// `- [[…]]` catalog line.
+    #[test]
+    fn multiline_summary_is_single_lined_in_index_md() {
+        let (_d, store) = mk_store();
+        // A YAML block scalar whose value embeds a forged-looking entry line.
+        write_raw(
+            &store,
+            "records/notes/evil.md",
+            "type: note\nupdated: 2026-06-10T00:00:00Z\nsummary: |-\n  legit first line\n  - [[records/secrets/fake|Click me]] — injected entry",
+            "\nbody\n",
+        );
+        let idx = Index::build_type_folder(&store, Path::new("records/notes")).unwrap();
+        let md = idx.to_markdown();
+        // Exactly one browse entry line, and no embedded newline forging a second.
+        let entry_lines = md.lines().filter(|l| l.starts_with("- [[")).count();
+        assert_eq!(
+            entry_lines, 1,
+            "a multi-line summary must not produce extra entry lines:\n{md}"
+        );
+        assert!(
+            md.contains(
+                "- [[records/notes/evil]] — legit first line - [[records/secrets/fake|Click me]] — injected entry\n"
+            ),
+            "summary newlines must collapse to spaces inline:\n{md}"
+        );
+    }
+
+    // ── regression: writer/validator scalar coercion agreement ────────────
+
+    /// HIGH regression: an unquoted non-string scalar `summary`/`type`
+    /// (`summary: 2026`, `type: true`) must be coerced to a string by the index
+    /// writer exactly as `validate::scalar_string` does — so the index entry holds
+    /// the real value (`2026`), not the `(no summary)` placeholder that produced a
+    /// permanently-unfixable INDEX_SUMMARY_MISMATCH.
+    #[test]
+    fn non_string_scalar_summary_and_type_are_coerced_like_validator() {
+        let (_d, store) = mk_store();
+        write_raw(
+            &store,
+            "records/contacts/a.md",
+            "type: contact\nupdated: 2026-05-01T00:00:00Z\nsummary: 2026",
+            "\nbody\n",
+        );
+        let rec = record_from_file(
+            &store.root.join("records/contacts/a.md"),
+            PathBuf::from("records/contacts/a.md"),
+        )
+        .unwrap();
+        // `summary: 2026` (YAML number) coerces to the string "2026", matching
+        // the validator's `scalar_string` (Number -> n.to_string()).
+        assert_eq!(rec.summary, "2026");
+        assert_eq!(rec.type_, "contact");
+
+        // And the rendered index entry quotes the real value, not the placeholder.
+        let idx = Index::build_type_folder(&store, Path::new("records/contacts")).unwrap();
+        let md = idx.to_markdown();
+        assert!(
+            md.contains("- [[records/contacts/a]] — 2026\n"),
+            "index entry must hold the coerced scalar, not the placeholder:\n{md}"
+        );
+
+        // A boolean scalar type coerces to "true" (mirrors scalar_string(Bool)).
+        write_raw(
+            &store,
+            "records/contacts/b.md",
+            "type: true\nupdated: 2026-05-02T00:00:00Z\nsummary: hi",
+            "\nbody\n",
+        );
+        let rec_b = record_from_file(
+            &store.root.join("records/contacts/b.md"),
+            PathBuf::from("records/contacts/b.md"),
+        )
+        .unwrap();
+        assert_eq!(rec_b.type_, "true");
+    }
+
+    // ── regression: non-UTF-8 body must not abort the projection ──────────
+
+    /// HIGH regression: a content file with valid-UTF-8 frontmatter but a
+    /// non-UTF-8 byte in the BODY (a verbatim Latin-1 `sources/` import) must
+    /// still project to an IndexRecord — `record_from_file` reads frontmatter
+    /// without requiring the whole file to be UTF-8, so a stray byte can't abort
+    /// `rebuild_all` / write-through for the entire store.
+    #[test]
+    fn non_utf8_body_does_not_abort_record_projection() {
+        let (_d, store) = mk_store();
+        let rel = "sources/emails/2026/06/x.md";
+        let abs = store.root.join(rel);
+        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        // Valid-UTF-8 frontmatter; a raw 0xE9 (Latin-1 'é') in the body.
+        let mut bytes: Vec<u8> =
+            b"---\ntype: email\nupdated: 2026-06-11T00:00:00Z\nsummary: An imported email\n---\n\nCaf"
+                .to_vec();
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b" meeting notes\n");
+        fs::write(&abs, bytes).unwrap();
+
+        let rec = record_from_file(&abs, PathBuf::from(rel))
+            .expect("non-UTF-8 body must not abort the frontmatter read");
+        assert_eq!(rec.summary, "An imported email");
+        assert_eq!(rec.type_, "email");
+
+        // The full sweep indexes the folder rather than aborting the whole store.
+        Index::rebuild_all(&store).unwrap();
+        assert!(
+            exists(&store, "sources/emails/index.jsonl"),
+            "rebuild must produce the catalog despite a non-UTF-8 body byte"
+        );
+        assert!(
+            read(&store, "sources/emails/index.jsonl").contains("An imported email"),
+            "the record must be catalogued"
+        );
+    }
+
+    /// HIGH regression: a single malformed-YAML file must abort the rebuild
+    /// loudly (not be silently skipped) — skipping it would leave the store in a
+    /// permanently invalid state (`INDEX_MISSING_ENTRY` / `INDEX_JSONL_DESYNC`
+    /// that no rebuild clears, since the validator enumerates members by
+    /// filename, not by parseability) and would desync the rollups. The abort is
+    /// safe because `cleanup` preserves the prior canonical catalogs
+    /// (`min_depth(2)`), so an aborted rebuild leaves the existing sidecars
+    /// intact and surfaces a clear error naming the file to fix.
+    #[test]
+    fn rebuild_aborts_on_malformed_file_and_keeps_prior_catalogs() {
+        let (_d, store) = mk_store();
+        write_doc(
+            &store,
+            "records/contacts/alice.md",
+            "contact",
+            Some("Alice"),
+            Some("2026-05-01T00:00:00Z"),
+            "",
+        );
+        write_doc(
+            &store,
+            "records/companies/acme.md",
+            "company",
+            Some("Acme"),
+            Some("2026-05-02T00:00:00Z"),
+            "",
+        );
+
+        // A clean first rebuild establishes the canonical catalogs.
+        Index::rebuild_all(&store).expect("clean rebuild succeeds");
+        assert!(exists(&store, "records/contacts/index.jsonl"));
+        assert!(exists(&store, "records/companies/index.jsonl"));
+
+        // Routine malformed file: unterminated quoted scalar.
+        let bad = store.root.join("records/contacts/broken.md");
+        fs::write(
+            &bad,
+            "---\ntype: contact\nsummary: \"unterminated\n---\nbody\n",
+        )
+        .unwrap();
+
+        // Must abort loudly — a silent skip leaves a file the validator requires
+        // to be catalogued out of the index forever.
+        Index::rebuild_all(&store)
+            .expect_err("rebuild must abort, not silently skip, on a malformed file");
+
+        // The prior canonical catalogs survive the aborted rebuild: `cleanup`'s
+        // `min_depth(2)` never deletes a type-folder's root-level sidecars, so a
+        // mid-sweep abort leaves the existing indexes intact rather than wiped.
+        assert!(
+            exists(&store, "records/companies/index.jsonl"),
+            "an aborted rebuild must not destroy a clean sibling folder's catalog"
+        );
+        assert!(
+            exists(&store, "records/contacts/index.jsonl"),
+            "an aborted rebuild must not destroy the affected folder's prior catalog"
+        );
+        let contacts_jsonl = read(&store, "records/contacts/index.jsonl");
+        assert!(contacts_jsonl.contains("records/contacts/alice.md"));
+    }
+
+    /// HIGH regression (problem B): `rebuild_all`'s rollup `(N)` counts must
+    /// equal the catalogued `index.jsonl` record counts — never a raw `.md` walk
+    /// that disagrees with the sidecar. The over-corrected skip-with-diagnostic
+    /// build excluded a malformed file from `index.jsonl` while `build_layer` /
+    /// `build_root` kept counting it via `walk_type_folder_files`, so a folder
+    /// would show `Contacts (2)` in the root/layer rollups while its `index.jsonl`
+    /// held only 1 record — and a single subsequent write-through (which derives
+    /// `(N)` from the jsonl) rewrote it to `Contacts (1)`, making `rebuild_all`
+    /// and write-through emit different bytes for the same state. With the loud
+    /// abort, the only successful-rebuild states are fully consistent: every
+    /// rollup `(N)` equals the catalogued record count AND equals what a
+    /// write-through over the same files produces.
+    #[test]
+    fn rebuild_rollup_counts_equal_jsonl_records_and_write_through() {
+        let (_d, store) = mk_store();
+        // Two well-formed contacts: the rollups must read (2), matching the two
+        // jsonl records — this is the count the skip-version inflated to a phantom
+        // extra when a malformed sibling was present-but-uncatalogued.
+        write_doc(
+            &store,
+            "records/contacts/alice.md",
+            "contact",
+            Some("Alice"),
+            Some("2026-05-01T00:00:00Z"),
+            "",
+        );
+        write_doc(
+            &store,
+            "records/contacts/bob.md",
+            "contact",
+            Some("Bob"),
+            Some("2026-05-02T00:00:00Z"),
+            "",
+        );
+        Index::rebuild_all(&store).expect("clean rebuild succeeds");
+
+        // The catalogued record set (index.jsonl) and the rollup (N) must agree.
+        let jsonl_lines = read(&store, "records/contacts/index.jsonl")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(jsonl_lines, 2, "two well-formed files ⇒ two jsonl records");
+        let layer_md = read(&store, "records/index.md");
+        let root_md = read(&store, "index.md");
+        assert!(
+            layer_md.contains("- [[records/contacts/index|Contacts]] (2)"),
+            "layer rollup (N) must equal the jsonl record count (2), not a raw .md walk:\n{layer_md}"
+        );
+        assert!(
+            root_md.contains("- [[records/contacts/index|Contacts]] (2)\n")
+                && root_md.contains("## Records (2)"),
+            "root rollup (N)/layer total must equal the jsonl record count (2):\n{root_md}"
+        );
+
+        // The decisive write-through == rebuild_all byte-identity check on the
+        // SAME end state: a single on_write must not rewrite the rollups to a
+        // different (N). Under the skip-version, rebuild_all's rollup walked the
+        // raw .md tree while on_write derived (N) from the jsonl, so the two
+        // diverged; the loud abort keeps both deriving (N) from the catalogued
+        // records, so the bytes match exactly.
+        let (_d2, wt) = mk_store();
+        write_doc(
+            &wt,
+            "records/contacts/alice.md",
+            "contact",
+            Some("Alice"),
+            Some("2026-05-01T00:00:00Z"),
+            "",
+        );
+        write_doc(
+            &wt,
+            "records/contacts/bob.md",
+            "contact",
+            Some("Bob"),
+            Some("2026-05-02T00:00:00Z"),
+            "",
+        );
+        Index::on_write(&wt, Path::new("records/contacts/alice.md")).unwrap();
+        Index::on_write(&wt, Path::new("records/contacts/bob.md")).unwrap();
+
+        let a = snapshot_artifacts(&wt);
+        let b = snapshot_artifacts(&store);
+        assert_eq!(
+            a.keys().collect::<BTreeSet<_>>(),
+            b.keys().collect::<BTreeSet<_>>(),
+            "write-through and rebuild_all must produce the same artifact set"
+        );
+        for (k, v) in &a {
+            assert_eq!(
+                v, &b[k],
+                "rollup bytes diverged between write-through and rebuild_all for {k} \
+                 (a skip-version inflates rebuild_all's (N) above the jsonl record \
+                 count, which write-through then rewrites):\n--- write-through ---\n{v}\n--- rebuild ---\n{}",
+                b[k]
+            );
+        }
+    }
+
+    /// MEDIUM regression: a non-UTF-8 path component must be lossily decoded
+    /// (kept, with U+FFFD), not silently dropped — so the index key points at the
+    /// file, not its parent directory. Unix-only (ext4 allows the filename; APFS
+    /// rejects it at the VFS layer).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_component_is_kept_not_dropped() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // sources/emails/caf\xE9.md — the leaf has a non-UTF-8 byte.
+        let mut leaf = b"caf".to_vec();
+        leaf.push(0xE9);
+        leaf.extend_from_slice(b".md");
+        let p = Path::new("sources/emails").join(OsStr::from_bytes(&leaf));
+        let unix = path_to_unix(&p);
+        // The leaf is preserved (lossy), so the path is NOT collapsed to the
+        // parent directory "sources/emails".
+        assert_ne!(
+            unix, "sources/emails",
+            "non-UTF-8 leaf must not be dropped, collapsing the path to its parent dir"
+        );
+        assert!(
+            unix.starts_with("sources/emails/caf"),
+            "the lossy leaf must remain under its folder: {unix}"
         );
     }
 }

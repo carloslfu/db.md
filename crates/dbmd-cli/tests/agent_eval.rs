@@ -98,12 +98,6 @@ fn build_release_dbmd() -> PathBuf {
     let exe = if cfg!(windows) { "dbmd.exe" } else { "dbmd" };
     let bin = repo_root.join("target").join("release").join(exe);
 
-    // Capture the prior artifact's mtime (if any) so we can *prove* the build
-    // ran and the on-disk binary is current with the sources cargo just saw —
-    // not merely that some file is present. This converts the silent
-    // stale-binary failure mode into a loud assertion.
-    let mtime_before = std::fs::metadata(&bin).and_then(|m| m.modified()).ok();
-
     // Build the CLI in release. `--release` is mandatory (the eval drives the
     // optimized artifact). Inherit stdio so a build failure is visible in the
     // test log rather than swallowed. Cargo no-ops when truly up to date and
@@ -121,29 +115,77 @@ fn build_release_dbmd() -> PathBuf {
         bin.display()
     );
 
-    // The build reported success, so the artifact must now exist. If cargo had
-    // to do work, its mtime must have advanced past what we saw before; if it
-    // no-op'd, the binary was already current with the sources cargo checked.
-    // Either way we are guaranteed to be driving code built from the *current*
-    // tree, never a stale leftover from an earlier commit.
-    let meta = std::fs::metadata(&bin).unwrap_or_else(|e| {
+    // The build reported success, so the artifact must now exist and — because
+    // cargo is the staleness oracle — is current with the sources cargo just
+    // saw: if anything in the dependency graph changed cargo rebuilt before
+    // returning, and if not the binary was already up to date. Either way we are
+    // driving code built from the *current* tree, never a stale leftover from an
+    // earlier commit. We assert presence (the loud form of "build produced the
+    // artifact"); we do NOT assert anything about the mtime moving forward — on
+    // macOS/APFS `cargo` uplifts a cached `target/release/deps/` artifact while
+    // *preserving its mtime*, so the uplifted binary's mtime legitimately moves
+    // BACKWARDS relative to a previously-linked one. A monotonic-mtime assertion
+    // is therefore false here and flakes intermittently; cargo's own up-to-date
+    // tracking is the correct (and sufficient) freshness guarantee.
+    let _ = std::fs::metadata(&bin).unwrap_or_else(|e| {
         panic!(
             "release binary absent after a successful `cargo build --release`: \
              {} ({e})",
             bin.display()
         )
     });
-    if let (Some(before), Ok(after)) = (mtime_before, meta.modified()) {
-        assert!(
-            after >= before,
-            "release binary at {} went backwards in time across a build \
-             (before {before:?}, after {after:?}) — refusing to drive a stale \
-             artifact",
-            bin.display()
-        );
-    }
 
     bin
+}
+
+/// Regression: the release-binary build helper must hand back an existing,
+/// executable artifact and must NOT flake on the artifact's mtime.
+///
+/// `build_release_dbmd` used to assert the binary's mtime never moved backwards
+/// across a build. That invariant is false: on macOS/APFS `cargo` uplifts a
+/// cached `target/release/deps/` artifact while preserving its mtime, so the
+/// on-disk binary's mtime legitimately moves backwards relative to a previously
+/// linked one, and the assertion failed intermittently. Driving the helper
+/// twice (the second call is a no-op rebuild — the regime that exposes the
+/// non-monotonic mtime) must succeed both times and return the same path; the
+/// only guarantees we keep are existence + executability, which cargo's own
+/// up-to-date tracking backs.
+#[test]
+fn release_dbmd_build_helper_is_mtime_flake_free() {
+    let first = build_release_dbmd();
+    assert!(
+        first.is_file(),
+        "build_release_dbmd must return an existing artifact: {}",
+        first.display()
+    );
+
+    // A second build (now guaranteed up to date — possibly served via an APFS
+    // mtime-preserving uplift) must still succeed and return the same path,
+    // never panicking on a non-monotonic mtime.
+    let second = build_release_dbmd();
+    assert_eq!(
+        first, second,
+        "build_release_dbmd must return a stable artifact path across calls"
+    );
+    assert!(
+        second.is_file(),
+        "the artifact must still exist after a no-op rebuild: {}",
+        second.display()
+    );
+
+    // The artifact is executable (Unix: at least one exec bit set).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&second)
+            .expect("metadata for the release binary")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "the release binary must be executable; mode = {mode:o}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

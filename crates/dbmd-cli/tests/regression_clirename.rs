@@ -78,6 +78,23 @@ impl Store {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
     }
+
+    /// `run` with `DBMD_NOW` pinned so any auto-maintained timestamp the command
+    /// stamps is byte-for-byte deterministic (the reproducibility hook in
+    /// `dbmd_core::time`). Used by the re-stamp regression below.
+    fn run_now(&self, now: &str, args: &[&str]) -> Output {
+        let mut cmd = Command::new(DBMD);
+        cmd.args(args)
+            .arg("--dir")
+            .arg(self.root())
+            .env("DBMD_NOW", now);
+        let out = cmd.output().expect("spawn dbmd");
+        Output {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
 }
 
 /// The captured result of one `dbmd` invocation.
@@ -289,5 +306,113 @@ fn regression_rename_rewrites_self_link_through_the_deferred_move() {
     assert!(
         !moved.contains("[[records/contacts/sarah]]"),
         "no stale self-link to the old path may remain; got: {moved}"
+    );
+}
+
+/// Finding fm.rs:79 (rename surface) — a rename IS an edit of the moved file, so
+/// its auto-maintained `updated` must be re-stamped to "now" (the same way
+/// `write` seeds it on create and `fm set` bumps it on edit). Without this the
+/// moved file keeps a stale `updated`, so `index.md` recency ordering and
+/// `dbmd search --updated-after` never reflect the move.
+///
+/// The companion guarantee is the *no-cascade* rule: rewriting a linker's
+/// `[[old]]` → `[[new]]` must NOT bump that linker's `updated`. A link target
+/// being renamed is not a fresh edit of every record that mentions it; cascading
+/// the bump would pollute recency ordering (every linking record would surface
+/// as just-edited). The linker's link text changes, its `updated` does not.
+///
+/// `DBMD_NOW` is pinned so the re-stamp is byte-for-byte assertable.
+#[test]
+fn regression_rename_restamps_moved_file_updated_but_not_linkers() {
+    let store = Store::new();
+    // The moved file carries an OLD `created` + `updated`. After the rename its
+    // `created` must survive and its `updated` must advance to the pinned now.
+    store.seed(
+        "records/contacts/sarah.md",
+        "---\ntype: contact\ncreated: 2026-01-01T00:00:00+00:00\nupdated: 2026-01-01T00:00:00+00:00\nsummary: x\n---\n# Sarah\n",
+    );
+    // A linker whose `updated` is OLD and must stay old: rewriting its link text
+    // is not an edit of the linker for recency purposes.
+    store.seed(
+        "wiki/topics/clean.md",
+        "---\ntype: wiki-page\ncreated: 2026-01-01T00:00:00+00:00\nupdated: 2026-01-01T00:00:00+00:00\nsummary: s\n---\nSee [[records/contacts/sarah]].\n",
+    );
+
+    let now = "2026-05-29T18:00:00Z";
+    let out = store.run_now(
+        now,
+        &[
+            "rename",
+            "records/contacts/sarah.md",
+            "records/contacts/sarah-chen.md",
+        ],
+    );
+    assert_eq!(
+        out.code,
+        Some(0),
+        "rename must succeed; stderr: {}",
+        out.stderr
+    );
+
+    // The moved file's `updated` is re-stamped to the pinned now; `created` is
+    // preserved (a move is not a creation).
+    let moved = std::fs::read_to_string(store.abs("records/contacts/sarah-chen.md")).unwrap();
+    assert!(
+        moved.contains("created: 2026-01-01T00:00:00+00:00"),
+        "the moved file's `created` must be preserved; got: {moved}"
+    );
+    assert!(
+        moved.contains("updated: 2026-05-29T18:00:00+00:00"),
+        "the moved file's `updated` must be re-stamped to now; got: {moved}"
+    );
+    assert!(
+        !moved.contains("updated: 2026-01-01T00:00:00+00:00"),
+        "the stale `updated` must be gone from the moved file; got: {moved}"
+    );
+
+    // The linker's link text was rewritten, but its `updated` must NOT be bumped:
+    // a renamed link target is not a fresh edit of the linking record.
+    let clean = std::fs::read_to_string(store.abs("wiki/topics/clean.md")).unwrap();
+    assert!(
+        clean.contains("[[records/contacts/sarah-chen]]"),
+        "the linker's link text must be retargeted; got: {clean}"
+    );
+    assert!(
+        clean.contains("updated: 2026-01-01T00:00:00+00:00"),
+        "the linker's `updated` must NOT be cascaded by the rename; got: {clean}"
+    );
+}
+
+/// Finding fm.rs:79 (rename surface) — the re-stamp must degrade gracefully when
+/// the moved file has no parseable frontmatter. A bare file (no `---` block) is
+/// a legal rename source; `read_file` errors on it, and the handler skips the
+/// re-stamp rather than failing the rename. The file must still move, and its
+/// bytes must survive verbatim (no frontmatter is invented).
+#[test]
+fn regression_rename_moved_file_without_frontmatter_is_not_restamped() {
+    let store = Store::new();
+    let raw = "no frontmatter here, just text\n";
+    store.seed("records/notes/plain.md", raw);
+
+    let out = store.run_now(
+        "2026-05-29T18:00:00Z",
+        &[
+            "rename",
+            "records/notes/plain.md",
+            "records/notes/plain2.md",
+        ],
+    );
+    assert_eq!(
+        out.code,
+        Some(0),
+        "rename of a frontmatter-less file must still succeed; stderr: {}",
+        out.stderr
+    );
+
+    assert!(!store.abs("records/notes/plain.md").exists());
+    let moved = std::fs::read_to_string(store.abs("records/notes/plain2.md")).unwrap();
+    assert_eq!(
+        moved, raw,
+        "a frontmatter-less moved file must survive byte-for-byte (no re-stamp)"
     );
 }

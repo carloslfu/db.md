@@ -60,7 +60,7 @@ fn regression_outline_reads_single_file_without_a_store() {
 }
 
 /// The `--json` view must also work outside a store and carry the structured
-/// `{file, sections:[{heading, level, line}]}` shape with body-relative lines.
+/// `{file, sections:[{heading, level, line}]}` shape with source-relative lines.
 #[test]
 fn regression_outline_json_works_without_a_store() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -77,14 +77,14 @@ fn regression_outline_json_works_without_a_store() {
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON object");
     let sections = parsed.get("sections").and_then(|s| s.as_array()).unwrap();
-    // Body-relative 1-based lines: body starts after the closing fence on a
-    // blank line, so `## Timeline` is body line 6 — matching `dbmd sections`.
+    // Source-relative 1-based lines: the 4-line frontmatter precedes the body,
+    // so `## Timeline` is source line 10 — matching `dbmd sections`.
     assert_eq!(
         sections,
         &serde_json::json!([
-            { "heading": "Timeline", "level": 2, "line": 6 },
-            { "heading": "Sub-detail", "level": 3, "line": 10 },
-            { "heading": "Commercials", "level": 2, "line": 14 },
+            { "heading": "Timeline", "level": 2, "line": 10 },
+            { "heading": "Sub-detail", "level": 3, "line": 14 },
+            { "heading": "Commercials", "level": 2, "line": 18 },
         ])
         .as_array()
         .unwrap()

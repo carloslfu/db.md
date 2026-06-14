@@ -1,28 +1,33 @@
 //! `dbmd sections <file>` — list the `##` sections in a file.
 //!
-//! Thin wrapper: parse [`SectionsArgs`], read the file via the
-//! `dbmd_core::parser` read path, run the section extractor, and print each
-//! `##`+ heading (text: `<indent><heading>  (L<line>)`) or a structured array
-//! (`--json`). All logic — frontmatter split, fenced-code-aware heading scan —
-//! lives in `dbmd_core::parser::extract_sections`; this body only formats.
+//! Thin wrapper: parse [`SectionsArgs`], read the raw file text, run the
+//! whole-file section extractor, and print each `##`+ heading (text:
+//! `<indent><heading>  (L<line>)`) or a structured array (`--json`). All logic —
+//! frontmatter offset, fenced-code-aware heading scan — lives in
+//! `dbmd_core::parser::extract_sections_in_file`, which numbers `Section::line`
+//! against the source file (1-based) so an agent can jump straight to it; this
+//! body only reads the file and formats.
 
 use std::path::Path;
 
-use dbmd_core::parser::{extract_sections, read_file, Section};
+use dbmd_core::parser::{extract_sections_in_file, Section};
 
 use crate::cli::SectionsArgs;
 use crate::context::Context;
-use crate::error::{CliError, CliResult};
+use crate::error::{CliError, CliResult, ExitCode};
 
 /// Run `dbmd sections`.
 pub fn run(ctx: &Context, args: &SectionsArgs) -> CliResult {
     let path = Path::new(&args.file);
 
-    // The parser read path returns (frontmatter, verbatim body); sections are a
-    // property of the body. A read / frontmatter error bubbles as a runtime
-    // error via the `ParseError -> dbmd_core::Error -> CliError` chain.
-    let (_frontmatter, body) = read_file(path).map_err(|e| map_parse_error(e, &args.file))?;
-    let sections = extract_sections(&body);
+    // Read the raw file text; a missing / unreadable path is a runtime error
+    // (exit 1), mirroring `dbmd outline`. Sections are then extracted with
+    // source-relative line numbers (frontmatter offset applied in the parser).
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        CliError::new(ExitCode::Runtime, "IO_ERROR", e.to_string())
+            .with_hint(format!("could not read sections from `{}`", args.file))
+    })?;
+    let sections = extract_sections_in_file(&text);
 
     if ctx.json {
         print!("{}", sections_json(&sections));
@@ -64,12 +69,4 @@ fn sections_json(sections: &[Section]) -> String {
         .unwrap_or_else(|_| "[]".to_string());
     s.push('\n');
     s
-}
-
-/// Map a parser error to a CLI error. A missing file or unreadable path is a
-/// runtime failure; the `From<ParseError>` path on `dbmd_core::Error` already
-/// gives the right exit code, so we route through it and annotate the file.
-fn map_parse_error(err: dbmd_core::ParseError, file: &str) -> CliError {
-    let core: dbmd_core::Error = err.into();
-    CliError::from(core).with_hint(format!("could not read sections from `{file}`"))
 }

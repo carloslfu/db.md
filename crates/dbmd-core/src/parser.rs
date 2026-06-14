@@ -144,9 +144,17 @@ impl Frontmatter {
         for (k, v) in map {
             let key = match k.as_str() {
                 Some(s) => s.to_string(),
-                // Non-string keys are unusual; stringify defensively and keep
-                // them in `extra` so nothing is silently dropped.
-                None => format!("{k:?}"),
+                // Non-string keys (`2026:`, `true:`, `3.14:`) are unusual but
+                // valid YAML; per SPEC § "Unknown fields pass through" they must
+                // not be corrupted on re-emit. Stringify them through the YAML
+                // scalar emitter — `2026`, `true`, `3.14` — NOT the Rust `Debug`
+                // formatter (which produced `Number(2026)`, `Bool(true)`, …), so
+                // the key text survives. `extra` is `String`-keyed, so on the
+                // write side the key re-emits as a quoted-string key carrying that
+                // text (e.g. `'2026':`) — the type narrows from number to string,
+                // but the data is no longer destroyed and ordinary string keys are
+                // wholly unaffected.
+                None => yaml_scalar_key(&k),
             };
             match key.as_str() {
                 // Coerce scalar values rather than `v.as_str()` (which is None
@@ -159,13 +167,52 @@ impl Frontmatter {
                 // the coercion `validate`/`store` already apply to these fields,
                 // so a numeric/bool-looking scalar is preserved as its string
                 // form and round-trips instead of being destroyed.
-                "type" => fm.type_ = scalar_string(&v),
-                "id" => fm.id = scalar_string(&v),
+                //
+                // A sequence/mapping value on a universal key (`status: [a, b]`,
+                // a nested-mapping `summary:`) is NOT a valid scalar; rather than
+                // let the matched arm consume-and-drop it (silent data loss on
+                // the next re-emit), `scalar_string` returns None and we fall
+                // through to preserving the raw value in `extra` so `to_yaml`
+                // re-emits it verbatim. The universal accessors stay None (the
+                // value was never a valid scalar for that field), but the
+                // operator's bytes are never destroyed.
+                "type" => match scalar_string(&v) {
+                    Some(s) => fm.type_ = Some(s),
+                    None => {
+                        fm.extra.insert(key, v);
+                    }
+                },
+                "id" => match scalar_string(&v) {
+                    Some(s) => fm.id = Some(s),
+                    None => {
+                        fm.extra.insert(key, v);
+                    }
+                },
                 "created" => fm.created = parse_timestamp(&v, "created", file)?,
                 "updated" => fm.updated = parse_timestamp(&v, "updated", file)?,
-                "summary" => fm.summary = scalar_string(&v),
-                "status" => fm.status = scalar_string(&v),
-                "tags" => fm.tags = parse_tags(&v),
+                "summary" => match scalar_string(&v) {
+                    Some(s) => fm.summary = Some(s),
+                    None => {
+                        fm.extra.insert(key, v);
+                    }
+                },
+                "status" => match scalar_string(&v) {
+                    Some(s) => fm.status = Some(s),
+                    None => {
+                        fm.extra.insert(key, v);
+                    }
+                },
+                "tags" => match parse_tags_preserving(&v) {
+                    Ok(tags) => fm.tags = tags,
+                    // A `tags` value with a non-scalar item (`tags: [[vip]]`,
+                    // `tags: [a, [b]]`) is preserved verbatim in `extra` rather
+                    // than silently filtered down / erased on re-emit. The typed
+                    // `tags` vec stays empty (no valid scalar list was present),
+                    // so `to_yaml` won't ALSO emit a `tags:` from the vec.
+                    Err(raw) => {
+                        fm.extra.insert(key, raw);
+                    }
+                },
                 _ => {
                     fm.extra.insert(key, v);
                 }
@@ -456,7 +503,18 @@ impl Config {
         let want = normalize_frozen_path(target);
         self.frozen_pages
             .iter()
-            .find(|frozen| normalize_frozen_path(frozen) == want)
+            .find(|frozen| {
+                let pat = normalize_frozen_path(frozen);
+                // A literal entry matches by exact normalized equality; an entry
+                // carrying a `*`/`**` glob matches by segment-wise glob so a
+                // pattern like `records/decisions/*` actually protects the
+                // concrete files under it instead of silently failing open.
+                if pat.contains('*') {
+                    frozen_glob_matches(&pat, &want)
+                } else {
+                    pat == want
+                }
+            })
             .cloned()
     }
 
@@ -467,18 +525,100 @@ impl Config {
     }
 }
 
-/// Normalize a path for frozen-page comparison: `/` separators, a single
-/// leading `./` dropped, and a trailing `.md` dropped. Both the policy entry
-/// and the write target pass through this before equality, so the match is
-/// separator-, `./`-, and `.md`-insensitive.
+/// Normalize a path for frozen-page comparison: `/` separators, a leading `./`
+/// or `/` dropped, and a trailing `.md` dropped. Both the policy entry and the
+/// write target pass through this before equality/glob, so the match is
+/// separator-, `./`-, leading-`/`-, and `.md`-insensitive. Without the leading
+/// `/` drop, an operator who wrote `/records/decisions/q1.md` normalized to a
+/// path that never equals the target's `records/decisions/q1`, silently failing
+/// the freeze OPEN.
 fn normalize_frozen_path(p: &Path) -> String {
+    use std::path::Component;
+    // Keep only the `Normal` path segments, dropping `RootDir`/`Prefix` (a
+    // leading `/` or drive prefix) and `CurDir` (`.`). This is what makes a
+    // leading-slash entry (`/records/decisions/q1.md`) normalize to the same
+    // `records/decisions/q1` as the store-relative target, instead of the
+    // doubled-`//` prefix `Path::components` + naive join produced — which never
+    // equalled the target and silently failed the freeze OPEN.
     let unix: String = p
         .components()
-        .filter_map(|c| c.as_os_str().to_str())
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
         .collect::<Vec<_>>()
         .join("/");
-    let no_dot = unix.strip_prefix("./").unwrap_or(&unix);
-    no_dot.strip_suffix(".md").unwrap_or(no_dot).to_string()
+    unix.strip_suffix(".md").unwrap_or(&unix).to_string()
+}
+
+/// Match a normalized frozen-page glob `pat` against a normalized target `path`,
+/// segment by segment. `*` matches any run of characters *within a single path
+/// segment* (never crossing `/`); `**` as a whole segment matches zero or more
+/// whole segments. Both sides are already `normalize_frozen_path`-normalized, so
+/// this only deals with `/`-joined segment text. Keeps the substrate dependency-
+/// free (no glob crate) while making `records/decisions/*` actually freeze the
+/// files beneath it instead of failing open.
+fn frozen_glob_matches(pat: &str, path: &str) -> bool {
+    let pat_segs: Vec<&str> = pat.split('/').collect();
+    let path_segs: Vec<&str> = path.split('/').collect();
+    glob_segments(&pat_segs, &path_segs)
+}
+
+/// Recursive segment matcher for [`frozen_glob_matches`]. `**` consumes any
+/// number of path segments; every other pattern segment must match exactly one
+/// path segment (with `*` wildcards inside it).
+fn glob_segments(pat: &[&str], path: &[&str]) -> bool {
+    match pat.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest_pat)) => {
+            // `**` matches zero segments here, or one-or-more by consuming a path
+            // segment and recursing on the same `**`.
+            if glob_segments(rest_pat, path) {
+                return true;
+            }
+            !path.is_empty() && glob_segments(pat, &path[1..])
+        }
+        Some((&first_pat, rest_pat)) => match path.split_first() {
+            Some((&first_path, rest_path)) => {
+                glob_segment_text(first_pat, first_path) && glob_segments(rest_pat, rest_path)
+            }
+            None => false,
+        },
+    }
+}
+
+/// Match a single glob segment against a single path segment. `*` matches any
+/// run of characters within the segment; all other characters are literal.
+fn glob_segment_text(pat: &str, seg: &str) -> bool {
+    if !pat.contains('*') {
+        return pat == seg;
+    }
+    // Split on `*` into literal fragments. The first fragment must be a prefix,
+    // the last a suffix, and the middle fragments must appear in order.
+    let parts: Vec<&str> = pat.split('*').collect();
+    let mut pos = 0usize;
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if idx == 0 {
+            // Leading literal must be a prefix.
+            if !seg[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if idx == parts.len() - 1 {
+            // Trailing literal must be a suffix at or after the current cursor.
+            return seg[pos..].ends_with(part);
+        } else {
+            // Interior literal: find it at or after the cursor.
+            match seg[pos..].find(part) {
+                Some(off) => pos += off + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// A user-declared type schema parsed from a `DB.md` `### <type>` sub-section.
@@ -582,11 +722,19 @@ pub fn split_frontmatter(text: &str, file: &Path) -> Result<ParsedFile, ParseErr
     // it forward.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
 
-    // The opening fence must be the very first line: `---` (optionally with a
-    // trailing CR), no leading whitespace, nothing before it.
+    // The opening fence must be the very first line: `---`, no leading
+    // whitespace, nothing before it. Trailing whitespace on the fence line is
+    // tolerated via `trim_end()` (which strips spaces/tabs as well as CR/LF) so
+    // this matches `index::extract_frontmatter_block` and
+    // `validate::split_frontmatter`, both of which use `trim_end()`. Without this
+    // agreement a fence written `--- ` (a single trailing space — invisible in an
+    // editor, easily produced by hand edits or exporters) was indexed and
+    // validated clean by those scanners yet hard-failed every write/edit surface
+    // routed through `read_file` (`fm get/set`, `format`, `link`, `write`) — the
+    // same cross-scanner drift class already fixed for the UTF-8 BOM above.
     let mut lines = text.split_inclusive('\n');
     let first = lines.next().unwrap_or("");
-    if first.trim_end_matches(['\r', '\n']) != "---" {
+    if first.trim_end() != "---" {
         return Err(ParseError::MissingFrontmatter {
             file: file.to_path_buf(),
         });
@@ -598,7 +746,7 @@ pub fn split_frontmatter(text: &str, file: &Path) -> Result<ParsedFile, ParseErr
     let opening_len = first.len();
     let mut offset = opening_len;
     for line in lines {
-        if line.trim_end_matches(['\r', '\n']) == "---" {
+        if line.trim_end() == "---" {
             let yaml = &text[opening_len..offset];
             let body_start = offset + line.len();
             let body = &text[body_start..];
@@ -832,6 +980,62 @@ pub fn extract_sections(body: &str) -> Vec<Section> {
     sections
 }
 
+/// Extract the `##`/`###` sections of a **whole file** (frontmatter + body),
+/// returning each [`Section`] with `line` numbered against the *source file*,
+/// not the body.
+///
+/// [`extract_sections`] numbers headings 1-based within the body it is handed —
+/// the right frame for callers that already track the frontmatter offset
+/// (`validate` adds `fm_end_line`). But the single-file views (`dbmd sections`,
+/// `dbmd outline`) present `Section::line` as a source line an agent can jump to;
+/// because every db.md file opens with a frontmatter block, the body-relative
+/// number is off by the block's length (`opening fence + frontmatter lines +
+/// closing fence`) for every file. This helper does the offset once, in the
+/// parser, so those surfaces report true file lines. A file with no leading
+/// frontmatter block is treated as all-body (offset 0), so the function never
+/// fails just because a file lacks frontmatter.
+pub fn extract_sections_in_file(text: &str) -> Vec<Section> {
+    // Tolerate a leading BOM the same way `split_frontmatter` does, so the line
+    // count and the body slice agree with the read path.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
+    // Find the body and how many source lines precede it. The body begins right
+    // after the closing fence; the number of lines consumed by the frontmatter
+    // block (both fences + the YAML between) is the offset to add to each
+    // body-relative heading line.
+    let (body, offset) = match split_frontmatter(text, Path::new("<sections>")) {
+        Ok(parsed) => {
+            // Lines before the body = total lines in `text` minus lines in body.
+            let total_lines = count_lines(text);
+            let body_lines = count_lines(&parsed.body);
+            (parsed.body, total_lines.saturating_sub(body_lines))
+        }
+        // No frontmatter block: the whole text is body, no offset.
+        Err(_) => (text.to_string(), 0),
+    };
+
+    let mut sections = extract_sections(&body);
+    for s in &mut sections {
+        s.line += offset;
+    }
+    sections
+}
+
+/// Count the number of lines a string spans for line-number offsetting: one line
+/// per `\n`, plus one more for a final line with no trailing newline. An empty
+/// string is zero lines.
+fn count_lines(s: &str) -> u32 {
+    if s.is_empty() {
+        return 0;
+    }
+    let newlines = s.bytes().filter(|&b| b == b'\n').count() as u32;
+    if s.ends_with('\n') {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
 /// Parse a store's `DB.md` file into a [`Config`]: the `## Agent instructions`
 /// prose, `## Policies` (`### Frozen pages` + `### Ignored types`), and
 /// `## Schemas` (`### <type>` field-bullet blocks). Unrecognized sections are
@@ -985,19 +1189,38 @@ pub fn parse_field_spec(bullet_line: &str) -> FieldSpec {
         .unwrap_or(line)
         .trim();
 
-    // Split `<name> (<modifiers>)`. A bullet without parens is a free-form
-    // optional field of any shape — name only, no modifiers.
-    let (name, modifiers) = match line.find('(') {
-        Some(open) => {
-            let name = line[..open].trim().to_string();
-            let after = &line[open + 1..];
-            let mods = match after.rfind(')') {
-                Some(close) => &after[..close],
-                None => after, // tolerate a missing close paren
-            };
-            (name, mods.trim())
-        }
-        None => (line.to_string(), ""),
+    // Split `<name> (<modifiers>)` — the canonical paren form — OR the natural
+    // mis-spelling `<name>: <modifiers>` (colon instead of parens). The two
+    // delimiters are interchangeable for the field head; whichever appears FIRST
+    // wins, so a paren form whose modifiers contain a colon (`status (enum: a,
+    // b)`) still parses by parens (the `(` precedes the `:`), while a bare
+    // `title: string, required` parses by colon instead of being swallowed whole
+    // into the field name with every modifier silently dropped.
+    let paren = line.find('(');
+    let colon = line.find(':');
+    // Choose the head delimiter. The paren form wins when its `(` precedes any
+    // `:` (so `status (enum: a, b)` parses by parens, the colon being inside the
+    // modifiers); otherwise a `:` before the paren — or with no paren at all —
+    // selects the colon form `<name>: <modifiers>`, the natural mis-spelling that
+    // must NOT be swallowed whole into the field name with every modifier lost.
+    let use_paren = matches!((paren, colon), (Some(p), c) if c.is_none_or(|c| p < c));
+    let (name, modifiers) = if use_paren {
+        let open = paren.expect("use_paren implies a paren");
+        let name = line[..open].trim().to_string();
+        let after = &line[open + 1..];
+        let mods = match after.rfind(')') {
+            Some(close) => &after[..close],
+            None => after, // tolerate a missing close paren
+        };
+        (name, mods.trim())
+    } else if let Some(c) = colon {
+        // Colon form: everything after the first colon is the modifier list,
+        // parsed identically to the parenthesized modifiers below.
+        let name = line[..c].trim().to_string();
+        (name, line[c + 1..].trim())
+    } else {
+        // Neither delimiter: a free-form optional field of any shape — name only.
+        (line.to_string(), "")
     };
 
     let mut spec = FieldSpec {
@@ -1009,8 +1232,12 @@ pub fn parse_field_spec(bullet_line: &str) -> FieldSpec {
         return spec;
     }
 
-    // Modifiers are comma-separated. `enum:` is special: because its own value
-    // list contains commas, it must be last and swallows the remainder.
+    // Modifiers are comma-separated. `enum` and `default` are special: their own
+    // values may contain commas, so each is a *greedy* clause that runs from its
+    // keyword to the start of the next recognized greedy clause (or end of line).
+    // This lets `default North America, EMEA fallback` keep its comma and lets a
+    // `default …` written after an `enum …` still be recognized, instead of the
+    // value being truncated at the first comma or absorbed into the enum list.
     let raw: Vec<&str> = modifiers.split(',').collect();
     let mut i = 0;
     while i < raw.len() {
@@ -1023,48 +1250,59 @@ pub fn parse_field_spec(bullet_line: &str) -> FieldSpec {
 
         if lower == "required" {
             spec.required = true;
+            i += 1;
         } else if let Some(shape) = shape_from_str(&lower) {
             spec.shape = Some(shape);
+            i += 1;
         } else if let Some(rest) = lower.strip_prefix("link to ") {
             // The trailing slash is required in the source; store the prefix
             // without it so `Path::starts_with` comparisons are clean.
             let prefix = token["link to ".len()..].trim().trim_end_matches('/');
             let _ = rest; // lowercase form only used for the keyword match
             spec.link_prefix = Some(PathBuf::from(prefix));
-        } else if let Some(_rest) = lower.strip_prefix("default ") {
-            // Value is everything after the keyword on this comma-token,
-            // preserving original case.
-            let value = token["default ".len()..].trim().to_string();
-            spec.default = Some(Value::String(value));
-        } else if lower == "enum" {
-            // Bare `enum` keyword (`enum, open, closed`): the values are the
-            // REMAINING tokens — the keyword itself must not leak in as a value.
-            let values: Vec<String> = raw[i + 1..]
-                .iter()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .collect();
-            spec.enum_values = Some(values);
-            break; // enum consumed the rest of the line
-        } else if lower.starts_with("enum:") {
-            // `enum: open, closed` form: rejoin this token and the rest, then
-            // drop everything up to and including the `:`.
-            let mut joined = raw[i..].join(",");
-            if let Some(colon) = joined.find(':') {
-                joined = joined[colon + 1..].to_string();
+            i += 1;
+        } else if token.len() >= "default ".len() && lower.starts_with("default ") {
+            // Greedy `default <value>`: the value is this token (after the
+            // keyword) plus every following comma-token up to the next greedy
+            // clause, rejoined with the commas the split removed — so a comma
+            // inside the default value is preserved. Original case is kept.
+            let end = next_greedy_clause(&raw, i + 1);
+            let mut value = token["default ".len()..].to_string();
+            for tok in &raw[i + 1..end] {
+                value.push(',');
+                value.push_str(tok);
             }
-            let values: Vec<String> = joined
+            spec.default = Some(Value::String(value.trim().to_string()));
+            i = end;
+        } else if lower == "enum" || lower.starts_with("enum:") {
+            // Greedy `enum` (bare `enum, a, b` or `enum: a, b`): the values run
+            // from here to the next greedy clause (e.g. a trailing `default …`),
+            // NOT unconditionally to end-of-line — so a `default` after `enum` is
+            // parsed instead of swallowed as a bogus enum member.
+            let end = next_greedy_clause(&raw, i + 1);
+            // Rejoin this clause's tokens (trimmed so the `enum` head sits at the
+            // start), drop the leading `enum`/`enum:` head, then re-split the
+            // remainder into values.
+            let joined = raw[i..end].join(",");
+            let joined = joined.trim();
+            let after_kw = match joined.find(':') {
+                // `enum: a, b` — values follow the colon.
+                Some(colon) => &joined[colon + 1..],
+                // bare `enum, a, b` — values follow the keyword itself.
+                None => joined.get("enum".len()..).unwrap_or(""),
+            };
+            let values: Vec<String> = after_kw
                 .split(',')
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
                 .collect();
             spec.enum_values = Some(values);
-            break; // enum consumed the rest of the line
+            i = end;
         } else {
             // Unrecognized modifier — captured verbatim, surfaced as Info.
             spec.unknown_modifiers.push(token.to_string());
+            i += 1;
         }
-        i += 1;
     }
 
     spec
@@ -1131,6 +1369,59 @@ fn parse_tags(value: &Value) -> Vec<String> {
             .collect(),
         Value::String(s) => vec![s.clone()],
         _ => Vec::new(),
+    }
+}
+
+/// Read a `tags` value into a flat `Vec<String>` **without losing data**: a
+/// sequence of clean scalars (the canonical form) or a single scalar coerce to a
+/// string list. Any other shape — a sequence with a non-scalar item
+/// (`tags: [[vip]]` → `Seq[Seq[String]]`, `tags: [a, [b]]`), or a mapping — is
+/// rejected as `Err(value.clone())` so the caller preserves the raw value in
+/// `extra` rather than silently filtering items out / erasing the field on the
+/// next re-emit. This is the `tags` analog of routing a non-scalar universal
+/// value to pass-through instead of the destroy path.
+fn parse_tags_preserving(value: &Value) -> Result<Vec<String>, Value> {
+    match value {
+        Value::Sequence(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    Value::Number(n) => out.push(n.to_string()),
+                    Value::Bool(b) => out.push(b.to_string()),
+                    // A non-scalar item (nested sequence/mapping/null) means this
+                    // is not a clean tag list; preserve the whole value verbatim.
+                    _ => return Err(value.clone()),
+                }
+            }
+            Ok(out)
+        }
+        Value::String(s) => Ok(vec![s.clone()]),
+        Value::Number(n) => Ok(vec![n.to_string()]),
+        Value::Bool(b) => Ok(vec![b.to_string()]),
+        // A mapping / null `tags` value is not a list; preserve it verbatim.
+        _ => Err(value.clone()),
+    }
+}
+
+/// Render a non-string YAML mapping key as the scalar text YAML would emit for
+/// it (`2026`, `true`, `3.14`, …), so a numeric/bool/float frontmatter key
+/// preserves its key *text* on round-trip instead of being rewritten to its Rust
+/// `Debug` form (`Number(2026)`, `Bool(true)`, `'Null'`). The key re-emits as a
+/// string-typed key carrying the original text (`'2026':`) — the type narrows to
+/// string, but the operator's data is no longer corrupted, and ordinary string
+/// keys are wholly unaffected. Falls back to `Debug` only for a key shape that
+/// cannot be a scalar (a sequence/mapping key — not expressible in our
+/// `String`-keyed `extra`), which never occurs in practice.
+fn yaml_scalar_key(key: &Value) -> String {
+    match key {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+        // Non-scalar key: not representable as a plain `extra` string key; keep
+        // the defensive Debug form so nothing panics (unreachable in practice).
+        other => format!("{other:?}"),
     }
 }
 
@@ -1390,14 +1681,24 @@ fn link_from_flow_list_item(item: &Value) -> Option<WikiLink> {
         Value::String(s) => parse_wiki_link_str(s),
         Value::Sequence(inner) => {
             // Unquoted list item `[[x]]` → `Seq[ Seq[String(x)] ]`: peel the lone
-            // wrapper to expose the inline-link shape.
+            // wrapper to expose the inline-link shape `Seq[String(x)]`.
+            //
+            // Only this triple-nested shape is a wiki-link. We deliberately do
+            // NOT fall back to `unquoted_inline_link(item)` on the bare double
+            // nesting `Seq[String(x)]` (a plain one-element string list `[x]`):
+            // that fallback fabricated a wiki-link out of an ordinary nested
+            // string list — `groups: [[alpha], [beta]]` (data `[["alpha"],
+            // ["beta"]]`) was rewritten to `- '[[alpha]]'` / `- '[[beta]]'`,
+            // silently changing the field's type and manufacturing short-form
+            // links the tool then flags as `WIKI_LINK_SHORT_FORM`. An unknown
+            // nested string list must pass through verbatim (SPEC § "Unknown
+            // fields pass through").
             if inner.len() == 1 {
                 if let Some(link) = unquoted_inline_link(&inner[0]) {
                     return Some(link);
                 }
             }
-            // Defensive: also accept the inline-link shape directly.
-            unquoted_inline_link(item)
+            None
         }
         _ => None,
     }
@@ -1423,6 +1724,23 @@ fn target_has_md_extension(target: &str) -> bool {
 /// 1-based character (Unicode scalar) column of `byte_offset` within `line`.
 fn char_column(line: &str, byte_offset: usize) -> u32 {
     (line[..byte_offset].chars().count() as u32) + 1
+}
+
+/// Index of the first comma-token in `raw[from..]` that *starts a greedy
+/// modifier clause* (`enum`, `enum:…`, or `default …`), or `raw.len()` when none
+/// remain. Used to bound a greedy `default`/`enum` value so it stops at the next
+/// such clause instead of either truncating at the first comma or swallowing a
+/// following greedy clause whole.
+fn next_greedy_clause(raw: &[&str], from: usize) -> usize {
+    let mut j = from;
+    while j < raw.len() {
+        let lower = raw[j].trim().to_ascii_lowercase();
+        if lower == "enum" || lower.starts_with("enum:") || lower.starts_with("default ") {
+            return j;
+        }
+        j += 1;
+    }
+    raw.len()
 }
 
 /// Map a lowercase shape keyword to its [`Shape`].
@@ -1460,17 +1778,36 @@ fn heading_level(line: &str) -> u8 {
     }
 }
 
-/// The heading text after the `#` run, trimmed, with any trailing ATX closing
-/// `#` sequence removed (`## Title ##` → `Title`).
+/// The heading text after the `#` run, trimmed, with a trailing ATX *closing*
+/// `#` sequence removed per CommonMark (`## Title ##` → `Title`).
+///
+/// CommonMark only treats a trailing run of `#` as a closing sequence when it is
+/// **preceded by a space or tab** (or the content is empty). A `#` that abuts the
+/// preceding word is literal heading text: `## C#` → `C#`, `## F#` → `F#`,
+/// `## issue-123#` → `issue-123#`. The old unconditional `trim_end_matches('#')`
+/// stripped those, corrupting `dbmd sections`/`outline` heading text and — via
+/// `parse_db_md` using the heading verbatim as the schema type key — silently
+/// binding a `### c#` schema to `type: c` instead of `type: c#`.
 fn heading_text(line: &str, level: u8) -> String {
     let indent = line.len() - line.trim_start_matches(' ').len();
     let after_hashes = &line[indent + level as usize..];
     let trimmed = after_hashes.trim();
-    let no_trailing = trimmed.trim_end_matches('#');
-    if no_trailing.len() == trimmed.len() {
-        trimmed.to_string()
+
+    // Peel a trailing run of `#`. It is a closing sequence only if what precedes
+    // it (within `trimmed`) is empty or ends in a space/tab; otherwise the `#`s
+    // are literal content.
+    let without_hashes = trimmed.trim_end_matches('#');
+    if without_hashes.len() == trimmed.len() {
+        // No trailing `#` at all.
+        return trimmed.to_string();
+    }
+    if without_hashes.is_empty() || without_hashes.ends_with([' ', '\t']) {
+        // A genuine closing sequence (`## Title ##`, `## ##`): drop it and the
+        // whitespace before it.
+        without_hashes.trim_end().to_string()
     } else {
-        no_trailing.trim_end().to_string()
+        // The `#` run abuts content (`## C#`): keep it as literal heading text.
+        trimmed.to_string()
     }
 }
 
@@ -1532,11 +1869,17 @@ fn bullet_lines(section_body: &str) -> Vec<String> {
         .collect()
 }
 
-/// Cut a bullet's content at the first ` — ` / ` -- ` comment separator,
-/// returning only the meaningful prefix.
+/// Cut a bullet's content at the first comment separator, returning only the
+/// meaningful prefix. Recognizes the em-dash (` — `), en-dash (` – `), double-
+/// hyphen (` -- `), and the plain single-ASCII-hyphen (` - `) spellings an
+/// operator naturally types — without the single-hyphen form, a comment like
+/// `records/decisions/q3.md - finalized` left the whole line (comment included)
+/// as the frozen path, so the entry never matched and the freeze failed OPEN.
+/// A store-relative path never contains a ` - ` (paths are `/`-joined, spaceless),
+/// so this does not truncate legitimate path text.
 fn strip_bullet_comment(content: &str) -> &str {
     let mut cut = content.len();
-    for sep in [" — ", " -- ", " – "] {
+    for sep in [" — ", " -- ", " – ", " - "] {
         if let Some(idx) = content.find(sep) {
             cut = cut.min(idx);
         }
@@ -2795,6 +3138,339 @@ mod tests {
         assert_eq!(
             fm.extra.get("note"),
             Some(&Value::String("[draft, wip]".into()))
+        );
+    }
+
+    // ── Regression: non-string YAML keys round-trip (no Rust Debug corruption) ─
+
+    #[test]
+    fn regression_non_string_yaml_keys_keep_their_text_on_round_trip() {
+        // A numeric/bool/null/float frontmatter key is valid YAML and must NOT be
+        // rewritten to its Rust `Debug` form (`Number(2026)`, `Bool(true)`,
+        // `'Null'`). After the fix the key text survives (the key narrows to a
+        // string-typed key, but the operator's data is no longer corrupted).
+        let yaml = "type: note\n2026: planning notes\ntrue: yes-key\n3.14: f\n";
+        let fm = Frontmatter::parse(yaml, Path::new("x.md")).unwrap();
+        // Keys are stored as their scalar text, not the Debug string.
+        assert!(fm.extra.contains_key("2026"), "numeric key text lost");
+        assert!(fm.extra.contains_key("true"), "bool key text lost");
+        assert!(fm.extra.contains_key("3.14"), "float key text lost");
+        assert!(!fm.extra.keys().any(|k| k.starts_with("Number(")));
+        assert!(!fm.extra.keys().any(|k| k.starts_with("Bool(")));
+
+        // And a re-emit never produces the Debug forms on disk.
+        let out = fm.to_yaml();
+        assert!(!out.contains("Number("), "Debug-form key emitted:\n{out}");
+        assert!(!out.contains("Bool("), "Debug-form key emitted:\n{out}");
+        // The key text is still present (quoted, since it now reads as a string).
+        assert!(out.contains("2026"), "numeric key dropped:\n{out}");
+        assert!(out.contains("planning notes"), "value dropped:\n{out}");
+    }
+
+    // ── Regression: universal-key sequence/mapping values are preserved (#2) ───
+
+    #[test]
+    fn regression_universal_key_non_scalar_value_is_preserved_not_deleted() {
+        // A universal key carrying a sequence/mapping (`status: [active, draft]`)
+        // is not a valid scalar for that field. Before the fix, the matched arm
+        // consumed-and-dropped it (scalar_string -> None) and `to_yaml` then
+        // omitted the field — `dbmd format` silently DELETED it. It must now pass
+        // through `extra` and re-emit verbatim.
+        let yaml = "type: note\nstatus:\n  - active\n  - draft\nsummary:\n  a: 1\n  b: 2\n";
+        let fm = Frontmatter::parse(yaml, Path::new("x.md")).unwrap();
+        // The typed accessors stay None (no valid scalar), but the data lives in
+        // extra so nothing is lost.
+        assert!(fm.status.is_none());
+        assert!(fm.summary.is_none());
+        assert!(fm.extra.contains_key("status"), "status value destroyed");
+        assert!(fm.extra.contains_key("summary"), "summary value destroyed");
+
+        // A re-emit keeps both fields' data on disk.
+        let out = fm.to_yaml();
+        assert!(out.contains("status"), "status deleted on re-emit:\n{out}");
+        assert!(out.contains("active"), "status items deleted:\n{out}");
+        assert!(
+            out.contains("summary"),
+            "summary deleted on re-emit:\n{out}"
+        );
+
+        // Round-trips as a fixed point — repeated curator-loop writes don't lose
+        // the data.
+        let reparsed = Frontmatter::parse(&out, Path::new("x.md")).unwrap();
+        assert!(reparsed.extra.contains_key("status"));
+        assert!(reparsed.extra.contains_key("summary"));
+    }
+
+    // ── Regression: non-scalar tags items don't erase the tags field (#5) ──────
+
+    #[test]
+    fn regression_non_scalar_tags_value_is_preserved_not_erased() {
+        // `tags: [[vip]]` (an authoring slip — wiki-link brackets around a tag)
+        // parses to a nested sequence; before the fix `parse_tags` filtered the
+        // non-scalar item out and `to_yaml` then omitted the now-empty tags vec,
+        // silently DELETING the tags line. It must now survive the re-emit (the
+        // key data is preserved; the field is never dropped).
+        let yaml = "type: note\ntags: [[vip]]\n";
+        let fm = Frontmatter::parse(yaml, Path::new("x.md")).unwrap();
+        // The typed tags vec is empty (no clean scalar list), but the raw value
+        // is preserved in extra so nothing is destroyed.
+        assert!(fm.tags.is_empty());
+        assert!(fm.extra.contains_key("tags"), "tags value destroyed");
+
+        let out = fm.to_yaml();
+        assert!(out.contains("tags"), "tags deleted on re-emit:\n{out}");
+        // The `vip` text survives on disk in some form (never erased).
+        assert!(out.contains("vip"), "tag content erased:\n{out}");
+
+        // A clean tag list still parses to the typed vec (not regressed).
+        let clean =
+            Frontmatter::parse("type: note\ntags: [vip, renewal]\n", Path::new("x.md")).unwrap();
+        assert_eq!(clean.tags, vec!["vip".to_string(), "renewal".to_string()]);
+        assert!(!clean.extra.contains_key("tags"));
+    }
+
+    // ── Regression: plain nested string lists are NOT fabricated into links (#3) ─
+
+    #[test]
+    fn regression_plain_nested_string_list_is_not_turned_into_wiki_links() {
+        // `groups: [[alpha], [beta]]` is the data [["alpha"],["beta"]] — an
+        // unknown nested string list that must pass through verbatim. Before the
+        // fix, canonicalize_extra_value fabricated `- '[[alpha]]'` / `- '[[beta]]'`
+        // (short-form links the tool then flagged), changing the field's type.
+        let yaml = "type: note\ngroups: [[alpha], [beta]]\n";
+        let fm = Frontmatter::parse(yaml, Path::new("x.md")).unwrap();
+        let before = fm.extra.get("groups").cloned();
+
+        let out = fm.to_yaml();
+        // No fabricated wiki-link brackets in the emitted YAML.
+        assert!(!out.contains("[[alpha]]"), "fabricated a wiki-link:\n{out}");
+        assert!(!out.contains("[[beta]]"), "fabricated a wiki-link:\n{out}");
+
+        // The value is unchanged across the canonical re-emit.
+        let reparsed = Frontmatter::parse(&out, Path::new("x.md")).unwrap();
+        assert_eq!(
+            reparsed.extra.get("groups"),
+            before.as_ref(),
+            "nested string list mutated by canonicalize_extra_value"
+        );
+        // And it surfaces no links.
+        assert!(reparsed.link_fields().is_empty());
+    }
+
+    // ── Regression: fence-line trailing whitespace is tolerated (#4) ───────────
+
+    #[test]
+    fn regression_split_frontmatter_tolerates_trailing_whitespace_on_fences() {
+        // A fence written `--- ` (trailing space — invisible in editors) is
+        // indexed/validated clean by index.rs/validate.rs (both use `trim_end()`)
+        // but, before the fix, hard-failed every read/edit surface routed through
+        // `split_frontmatter`. All three must now agree.
+        let text = "--- \ntype: note\nsummary: x\n---\t\nbody\n";
+        let parsed = split_frontmatter(text, Path::new("f.md")).unwrap();
+        assert_eq!(parsed.frontmatter_yaml, "type: note\nsummary: x\n");
+        assert_eq!(parsed.body, "body\n");
+
+        // End to end through read_file's parse.
+        let fm = Frontmatter::parse(&parsed.frontmatter_yaml, Path::new("f.md")).unwrap();
+        assert_eq!(fm.type_.as_deref(), Some("note"));
+    }
+
+    // ── Regression: CommonMark trailing-'#' heading rule (#6) ──────────────────
+
+    #[test]
+    fn regression_heading_text_keeps_abutting_hash_drops_closing_sequence() {
+        // `## C#` → `C#` (the `#` abuts content, not a closing sequence).
+        assert_eq!(heading_text("## C#", 2), "C#");
+        assert_eq!(heading_text("## F#", 2), "F#");
+        assert_eq!(heading_text("## issue-123#", 2), "issue-123#");
+        // A genuine ATX closing sequence (space before the `#` run) is dropped.
+        assert_eq!(heading_text("## Title ##", 2), "Title");
+        assert_eq!(heading_text("## Title #", 2), "Title");
+        // All-hashes content collapses to empty.
+        assert_eq!(heading_text("## ##", 2), "");
+        // No trailing hashes — unchanged.
+        assert_eq!(heading_text("## Plain", 2), "Plain");
+    }
+
+    #[test]
+    fn regression_extract_sections_keeps_csharp_heading_and_schema_type_binds() {
+        // `dbmd sections` must report `C#`, not `C`.
+        let secs = extract_sections("## C#\nbody\n");
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].heading, "C#");
+
+        // And a `### c#` schema must register under `c#`, not `c`.
+        let db = "---\ntype: db-md\n---\n\n## Schemas\n\n### c#\n- name (required)\n";
+        let config = parse_db_md(db, Path::new("DB.md")).unwrap();
+        assert!(
+            config.schemas.contains_key("c#"),
+            "schema bound to wrong key"
+        );
+        assert!(!config.schemas.contains_key("c"));
+    }
+
+    // ── Regression: section line numbers offset by the frontmatter block (#7) ──
+
+    #[test]
+    fn regression_extract_sections_in_file_reports_source_line_numbers() {
+        // A heading on file line 6 (after a 4-line frontmatter block + 1 body
+        // line) must be reported as L6, not the body-relative L2.
+        let text = "---\ntype: note\nsummary: x\n---\nbody line\n## Heading\nmore\n";
+        let secs = extract_sections_in_file(text);
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].heading, "Heading");
+        assert_eq!(secs[0].line, 6, "section line not offset by frontmatter");
+
+        // The body-relative helper is unchanged (validate relies on that frame).
+        let body_secs = extract_sections("body line\n## Heading\nmore\n");
+        assert_eq!(body_secs[0].line, 2);
+
+        // No frontmatter: whole text is body, no offset.
+        let plain = extract_sections_in_file("## Top\nx\n## Next\n");
+        assert_eq!(plain[0].line, 1);
+        assert_eq!(plain[1].line, 3);
+    }
+
+    // ── Regression: colon-form schema field bullet parses modifiers (#8) ───────
+
+    #[test]
+    fn regression_colon_form_field_bullet_parses_modifiers() {
+        // `- title: string, required` is the natural mis-spelling of
+        // `- title (string, required)`; before the fix the whole text became the
+        // field name and every modifier was silently lost.
+        let f = parse_field_spec("- title: string, required");
+        assert_eq!(f.name, "title");
+        assert!(f.required, "required modifier lost on colon-form");
+        assert_eq!(f.shape, Some(Shape::String));
+
+        // Through the schema-bullet classifier (the real path), it is a Field.
+        match parse_schema_bullet("- title: string, required") {
+            SchemaBullet::Field(f) => {
+                assert_eq!(f.name, "title");
+                assert!(f.required);
+                assert_eq!(f.shape, Some(Shape::String));
+            }
+            other => panic!("expected Field, got {other:?}"),
+        }
+
+        // A paren form whose modifiers contain a colon still parses by parens.
+        let g = parse_field_spec("- status (enum: open, closed)");
+        assert_eq!(g.name, "status");
+        assert_eq!(
+            g.enum_values,
+            Some(vec!["open".to_string(), "closed".to_string()])
+        );
+    }
+
+    // ── Regression: comma inside a `default` value is preserved (#9) ───────────
+
+    #[test]
+    fn regression_default_value_preserves_internal_commas() {
+        let f = parse_field_spec("- title (default Director, Operations)");
+        assert_eq!(
+            f.default,
+            Some(Value::String("Director, Operations".into())),
+            "comma-bearing default truncated"
+        );
+
+        let g = parse_field_spec("- region (default North America, EMEA fallback)");
+        assert_eq!(
+            g.default,
+            Some(Value::String("North America, EMEA fallback".into()))
+        );
+
+        // A single-token default still works (no regression).
+        let h = parse_field_spec("- currency (default USD)");
+        assert_eq!(h.default, Some(Value::String("USD".into())));
+    }
+
+    // ── Regression: a `default` after `enum` is parsed, not swallowed (#10) ────
+
+    #[test]
+    fn regression_default_after_enum_is_parsed_not_an_enum_member() {
+        let f = parse_field_spec("- status (enum: open, closed, default open)");
+        assert_eq!(
+            f.enum_values,
+            Some(vec!["open".to_string(), "closed".to_string()]),
+            "`default open` leaked into the enum list"
+        );
+        assert_eq!(
+            f.default,
+            Some(Value::String("open".into())),
+            "default after enum was dropped"
+        );
+
+        // The bare `enum` keyword form, with a trailing default.
+        let g = parse_field_spec("- status (enum, open, closed, default open)");
+        assert_eq!(
+            g.enum_values,
+            Some(vec!["open".to_string(), "closed".to_string()])
+        );
+        assert_eq!(g.default, Some(Value::String("open".into())));
+    }
+
+    // ── Regression: frozen-page policy does not fail open (#11) ────────────────
+
+    #[test]
+    fn regression_frozen_match_handles_leading_slash() {
+        let cfg = Config {
+            frozen_pages: vec![PathBuf::from("/records/decisions/q1.md")],
+            ..Config::default()
+        };
+        assert!(
+            cfg.is_frozen(Path::new("records/decisions/q1.md")),
+            "leading-slash entry failed open"
+        );
+        assert!(cfg.is_frozen(Path::new("records/decisions/q1")));
+    }
+
+    #[test]
+    fn regression_frozen_match_supports_globs() {
+        let cfg = Config {
+            frozen_pages: vec![PathBuf::from("records/decisions/*")],
+            ..Config::default()
+        };
+        assert!(
+            cfg.is_frozen(Path::new("records/decisions/q1.md")),
+            "glob entry failed to protect a concrete file"
+        );
+        assert!(cfg.is_frozen(Path::new("records/decisions/q2.md")));
+        // The glob does not cross a `/` segment.
+        assert!(!cfg.is_frozen(Path::new("records/decisions/sub/q1.md")));
+        // `**` crosses segments.
+        let deep = Config {
+            frozen_pages: vec![PathBuf::from("records/**")],
+            ..Config::default()
+        };
+        assert!(deep.is_frozen(Path::new("records/decisions/sub/q1.md")));
+        assert!(deep.is_frozen(Path::new("records/x.md")));
+        assert!(!deep.is_frozen(Path::new("wiki/x.md")));
+        // A `*.md`-style intra-segment glob.
+        let suffix = Config {
+            frozen_pages: vec![PathBuf::from("records/decisions/q*")],
+            ..Config::default()
+        };
+        assert!(suffix.is_frozen(Path::new("records/decisions/q1.md")));
+        assert!(!suffix.is_frozen(Path::new("records/decisions/draft.md")));
+    }
+
+    #[test]
+    fn regression_frozen_entry_single_hyphen_comment_is_stripped() {
+        // `records/decisions/q3.md - finalized` (single ASCII hyphen comment, no
+        // backticks): the comment must be stripped so the entry is just the path.
+        let path = extract_path_bullet("- records/decisions/q3.md - finalized");
+        assert_eq!(path, "records/decisions/q3.md");
+
+        // End to end: such a bullet freezes the file.
+        let cfg = Config {
+            frozen_pages: vec![PathBuf::from(extract_path_bullet(
+                "- records/decisions/q3.md - finalized",
+            ))],
+            ..Config::default()
+        };
+        assert!(
+            cfg.is_frozen(Path::new("records/decisions/q3.md")),
+            "single-hyphen-comment entry failed open"
         );
     }
 }

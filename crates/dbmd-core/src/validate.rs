@@ -11,10 +11,20 @@
 //! The changed set and the per-file checks are O(changed); the incoming linkers
 //! are found by a *single* embedded-ripgrep pass over the store for the whole
 //! changed set at once ([`Store::find_links_to_any`], one scan — not a full read
-//! per changed object, and not the parse-the-tree walk `--all` does). It never
-//! calls [`Store::walk`] and never builds the global cross-file state.
-//! [`validate_all`] is the full SWEEP: it adds the checks that need that global
-//! state — entity-dedup `DUP_*`, every-index sync, and `log.md` ordering.
+//! per changed object, and not the parse-the-tree walk `--all` does). On this
+//! changed-set path it never builds the global cross-file state.
+//!
+//! The **one** exception is the vacuous-pass guard: when the change log records
+//! no objects since the cutoff and no explicit `--since` was given (a fresh
+//! store, a missing/empty `log.md`, or external edits never logged), the default
+//! call falls back to a single per-file content sweep ([`Store::walk`]) so an
+//! externally edited or freshly copied store cannot pass validation vacuously.
+//! That fallback is O(store) by design; the O(changed) guarantee is about the
+//! normal post-write path, not this safety net.
+//!
+//! [`validate_all`] is the full SWEEP: it adds the checks that need the global
+//! cross-file state — entity-dedup `DUP_*`, every-index sync, and `log.md`
+//! ordering.
 //!
 //! ## Why this module is self-contained
 //!
@@ -92,12 +102,17 @@ pub mod codes {
     pub const DB_MD_MISSING_FIELD: &str = "DB_MD_MISSING_FIELD";
     /// `DB.md` has an `##` section other than the three recognized ones.
     pub const DB_MD_UNKNOWN_SECTION: &str = "DB_MD_UNKNOWN_SECTION";
+    /// a `DB.md ## Schemas` field declaration is malformed (empty or duplicate
+    /// field name) or carries an unrecognized modifier.
+    pub const DB_MD_SCHEMA_FIELD: &str = "DB_MD_SCHEMA_FIELD";
     /// content file has no `type:`.
     pub const FM_MISSING_TYPE: &str = "FM_MISSING_TYPE";
     /// content file has no `created:`.
     pub const FM_MISSING_CREATED: &str = "FM_MISSING_CREATED";
     /// content file has no `updated:`.
     pub const FM_MISSING_UPDATED: &str = "FM_MISSING_UPDATED";
+    /// content file can't be read (not valid UTF-8, or an I/O error).
+    pub const FM_UNREADABLE: &str = "FM_UNREADABLE";
     /// frontmatter block isn't valid YAML.
     pub const FM_MALFORMED_YAML: &str = "FM_MALFORMED_YAML";
     /// `created` or `updated` isn't ISO-8601.
@@ -348,7 +363,35 @@ fn check_content_file(
 ) -> Option<Parsed> {
     let text = match std::fs::read_to_string(abs) {
         Ok(t) => t,
-        Err(_) => return None,
+        Err(e) => {
+            // The file exists in the walk but can't be read as UTF-8 text
+            // (invalid bytes) or hit an I/O error. Returning `None` silently
+            // here let a store whose only content file was binary garbage pass
+            // `dbmd validate` with exit 0 — the exact vacuous-pass the fallback
+            // sweep exists to prevent. Report it so the agent gets an actionable
+            // diagnostic naming the unreadable file (and `index rebuild`, which
+            // hard-fails on the same file, isn't the only signal).
+            let detail = if e.kind() == std::io::ErrorKind::InvalidData {
+                "file is not valid UTF-8 text".to_string()
+            } else {
+                format!("file could not be read: {e}")
+            };
+            push(
+                issues,
+                Severity::Error,
+                codes::FM_UNREADABLE,
+                rel,
+                None,
+                None,
+                format!("content file is unreadable: {detail}"),
+                Some(
+                    "save the file as UTF-8 text, or remove it if it isn't a db.md content file"
+                        .into(),
+                ),
+                vec![],
+            );
+            return None;
+        }
     };
 
     let is_content = is_content_file(rel);
@@ -432,9 +475,20 @@ fn check_content_file(
         check_frontmatter(store, rel, map, &fm_yaml, basenames, issues, is_content);
     }
 
-    // Wiki-link doctrine checks run on the body of every content file (and
-    // also on index/log meta files, whose entries are wiki-links too).
-    check_body_wiki_links(store, rel, &body, fm_end_line, basenames, issues);
+    // Wiki-link doctrine checks run on the body of content files (and on
+    // `index.md` files, whose entries are wiki-links too). They are NOT run on
+    // the root append-only meta files `log.md`/`DB.md`: those reach this
+    // function only via the working-set incoming-linker scan (`walk_all_md`
+    // includes them), and `validate --all` never link-checks their bodies
+    // (`walk_content_files` skips them; `check_log`/`check_db_md` do no body
+    // link checks). Without this guard the two scopes disagree — a historical
+    // `[[deleted-page]]` mention in a `log.md` note, or a `[[…]]` in DB.md's
+    // `## Agent instructions`, is flagged `WIKI_LINK_BROKEN` by the default
+    // working set but is clean under `--all`. The log is append-only by spec, so
+    // the suggested "fix the link" remedy can't even be applied.
+    if !is_root_meta_file(rel) {
+        check_body_wiki_links(store, rel, &body, fm_end_line, basenames, issues);
+    }
 
     Some(Parsed { fm, fm_yaml })
 }
@@ -472,28 +526,42 @@ fn check_frontmatter(
     }
 
     // ── timestamps: created / updated ─────────────────────────────────────────
-    for (key, missing_code) in [
-        ("created", codes::FM_MISSING_CREATED),
-        ("updated", codes::FM_MISSING_UPDATED),
-    ] {
-        if is_content && !fm.contains_key(key) {
-            push(
-                issues,
-                Severity::Error,
-                missing_code,
-                rel,
-                fm_key_line_or_top(fm_yaml, key),
-                Some(key.into()),
-                format!("content file has no `{key}:` timestamp"),
-                Some(format!(
-                    "set `{key}` to an RFC3339 timestamp, e.g. 2026-05-27T08:00:00-07:00"
-                )),
-                vec![],
-            );
-        } else if let Some(v) = fm.get(key) {
-            if let Some(s) = scalar_string(v) {
-                if !is_iso8601(&s) {
-                    push(
+    // The `created`/`updated` contract is content-file-only; meta files
+    // (`DB.md`, `log.md`, index twins) legitimately carry no such timestamps.
+    if is_content {
+        for (key, missing_code) in [
+            ("created", codes::FM_MISSING_CREATED),
+            ("updated", codes::FM_MISSING_UPDATED),
+        ] {
+            // A key that is absent, or present-but-`null`, has *no* timestamp →
+            // `FM_MISSING_*`. The toolkit's parser also treats a null value as
+            // "no timestamp", so a null `created:` must read as missing, not
+            // silently pass.
+            let value = fm.get(key);
+            let missing = value.is_none() || value.is_some_and(Value::is_null);
+            if missing {
+                push(
+                    issues,
+                    Severity::Error,
+                    missing_code,
+                    rel,
+                    fm_key_line_or_top(fm_yaml, key),
+                    Some(key.into()),
+                    format!("content file has no `{key}:` timestamp"),
+                    Some(format!(
+                        "set `{key}` to an RFC3339 timestamp, e.g. 2026-05-27T08:00:00-07:00"
+                    )),
+                    vec![],
+                );
+            } else if let Some(v) = value {
+                // Present and non-null. A scalar is checked for ISO-8601; a
+                // sequence/mapping is not a timestamp string at all and so
+                // cannot be ISO-8601 → `FM_BAD_TIMESTAMP` (it must not slip
+                // through the way it did when `scalar_string` returned `None`
+                // and the branch silently no-oped).
+                match scalar_string(v) {
+                    Some(s) if is_iso8601(&s) => {}
+                    Some(s) => push(
                         issues,
                         Severity::Error,
                         codes::FM_BAD_TIMESTAMP,
@@ -503,7 +571,20 @@ fn check_frontmatter(
                         format!("`{key}` is not ISO-8601: {s:?}"),
                         Some("use RFC3339, e.g. 2026-05-27T08:00:00-07:00".into()),
                         vec![],
-                    );
+                    ),
+                    None => push(
+                        issues,
+                        Severity::Error,
+                        codes::FM_BAD_TIMESTAMP,
+                        rel,
+                        fm_key_line(fm_yaml, key),
+                        Some(key.into()),
+                        format!(
+                            "`{key}` is not ISO-8601: expected a timestamp string, found a list or mapping"
+                        ),
+                        Some("use RFC3339, e.g. 2026-05-27T08:00:00-07:00".into()),
+                        vec![],
+                    ),
                 }
             }
         }
@@ -811,25 +892,13 @@ fn check_wiki_link(
         );
     }
 
-    let Some(target_rel) = safe_md_target_rel(bare) else {
-        push(
-            issues,
-            Severity::Error,
-            codes::WIKI_LINK_BROKEN,
-            rel,
-            line,
-            key.map(str::to_string),
-            format!("wiki-link target `{bare}` is not a safe store-relative path"),
-            Some("use a full store-relative path under sources/, records/, or wiki/".into()),
-            vec![],
-        );
-        return;
-    };
-
-    // Broken: target file doesn't exist (O(1) stat).
-    let target_abs = store.root.join(target_rel);
-    if !target_abs.is_file() {
-        push(
+    // Broken: target file doesn't exist (O(1) stat). Resolve the target the
+    // same way the graph engine does — the literal path first (so a link to a
+    // raw `.eml`/`.pdf` source kept verbatim under `sources/` resolves), then
+    // the `.md`-appended path.
+    match resolve_wiki_target(store, bare) {
+        TargetResolution::Exists => {}
+        TargetResolution::Missing => push(
             issues,
             Severity::Error,
             codes::WIKI_LINK_BROKEN,
@@ -841,7 +910,18 @@ fn check_wiki_link(
                 "create `{bare}.md`, or point the link at an existing file"
             )),
             vec![],
-        );
+        ),
+        TargetResolution::Unsafe => push(
+            issues,
+            Severity::Error,
+            codes::WIKI_LINK_BROKEN,
+            rel,
+            line,
+            key.map(str::to_string),
+            format!("wiki-link target `{bare}` is not a safe store-relative path"),
+            Some("use a full store-relative path under sources/, records/, or wiki/".into()),
+            vec![],
+        ),
     }
 }
 
@@ -872,12 +952,16 @@ fn check_schema(
         let present = fm.get(&spec.name);
         let line = fm_key_line(fm_yaml, &spec.name);
 
-        // Required.
+        // Required. "Empty" means: the key is absent, or its value carries no
+        // content — a YAML `null` (`name:`), an empty list (`name: []`), an
+        // empty mapping (`name: {}`), or a blank/whitespace-only scalar
+        // (`name: ""`). `scalar_string` returns `None` for null/list/mapping, so
+        // a bare `.unwrap_or(false)` wrongly treated those as non-empty and let
+        // a required field with a null or empty-collection value pass silently;
+        // route them through `is_empty_value` instead.
         let is_empty = match present {
             None => true,
-            Some(v) => scalar_string(v)
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(false),
+            Some(v) => is_empty_value(v),
         };
         if spec.required && is_empty {
             push(
@@ -1041,27 +1125,13 @@ fn check_schema_link(
                 vec![],
             );
         } else {
-            let Some(target_rel) = safe_md_target_rel(bare) else {
-                push(
-                    issues,
-                    Severity::Error,
-                    codes::WIKI_LINK_BROKEN,
-                    rel,
-                    line,
-                    Some(field.to_string()),
-                    format!("wiki-link target `{bare}` is not a safe store-relative path"),
-                    Some(
-                        "use a full store-relative path under sources/, records/, or wiki/".into(),
-                    ),
-                    vec![],
-                );
-                continue;
-            };
             // Correct prefix — still surface a broken target so the agent sees
-            // one consistent vocabulary.
-            let target_abs = store.root.join(target_rel);
-            if !target_abs.is_file() {
-                push(
+            // one consistent vocabulary. Resolve like the graph engine (literal
+            // path first, then `.md`) so a `link to sources/` field pointing at a
+            // raw `.eml`/`.pdf` source isn't wrongly flagged broken.
+            match resolve_wiki_target(store, bare) {
+                TargetResolution::Exists => {}
+                TargetResolution::Missing => push(
                     issues,
                     Severity::Error,
                     codes::WIKI_LINK_BROKEN,
@@ -1073,7 +1143,20 @@ fn check_schema_link(
                         "create `{bare}.md`, or point the link at an existing file"
                     )),
                     vec![],
-                );
+                ),
+                TargetResolution::Unsafe => push(
+                    issues,
+                    Severity::Error,
+                    codes::WIKI_LINK_BROKEN,
+                    rel,
+                    line,
+                    Some(field.to_string()),
+                    format!("wiki-link target `{bare}` is not a safe store-relative path"),
+                    Some(
+                        "use a full store-relative path under sources/, records/, or wiki/".into(),
+                    ),
+                    vec![],
+                ),
             }
         }
     }
@@ -1491,37 +1574,42 @@ fn check_type_folder_index_md(
     // Stale entries + summary mismatch.
     for entry in &entries {
         let bare = entry.target.trim_end_matches(".md");
-        let Some(target_rel) = safe_md_target_rel(bare) else {
-            push(
-                issues,
-                Severity::Error,
-                codes::INDEX_STALE_ENTRY,
-                index_rel,
-                Some(entry.line),
-                None,
-                format!("index entry `[[{bare}]]` is not a safe store-relative path"),
-                Some("run `dbmd index rebuild`".into()),
-                vec![],
-            );
-            continue;
+        // Resolve like the graph engine (literal path first, then `.md`) so an
+        // index entry naming a raw `.eml`/`.pdf` source isn't reported stale.
+        let target_abs = match resolved_target_abs(store, bare) {
+            Some(abs) => abs,
+            None => {
+                if matches!(resolve_wiki_target(store, bare), TargetResolution::Unsafe) {
+                    push(
+                        issues,
+                        Severity::Error,
+                        codes::INDEX_STALE_ENTRY,
+                        index_rel,
+                        Some(entry.line),
+                        None,
+                        format!("index entry `[[{bare}]]` is not a safe store-relative path"),
+                        Some("run `dbmd index rebuild`".into()),
+                        vec![],
+                    );
+                } else {
+                    push(
+                        issues,
+                        Severity::Error,
+                        codes::INDEX_STALE_ENTRY,
+                        index_rel,
+                        Some(entry.line),
+                        None,
+                        format!("index entry `[[{bare}]]` points at a missing file"),
+                        Some("run `dbmd index rebuild`".into()),
+                        // The stale target the entry names (the file that no
+                        // longer exists) — so the agent can locate the dangling
+                        // reference.
+                        vec![PathBuf::from(format!("{bare}.md"))],
+                    );
+                }
+                continue;
+            }
         };
-        let target_abs = store.root.join(target_rel);
-        if !target_abs.is_file() {
-            push(
-                issues,
-                Severity::Error,
-                codes::INDEX_STALE_ENTRY,
-                index_rel,
-                Some(entry.line),
-                None,
-                format!("index entry `[[{bare}]]` points at a missing file"),
-                Some("run `dbmd index rebuild`".into()),
-                // The stale target the entry names (the file that no longer
-                // exists) — so the agent can locate the dangling reference.
-                vec![PathBuf::from(format!("{bare}.md"))],
-            );
-            continue;
-        }
         // Summary mismatch: the entry text must equal the file's `summary`. A
         // bare `- [[path]]` entry (no `— <text>`) when the file HAS a non-empty
         // summary is also a mismatch — the SPEC requires every type-folder index
@@ -1821,15 +1909,71 @@ fn check_index_scope(
 //  Cross-file: log.md well-formedness + ordering (validate_all only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `LOG_*` checks: bad timestamps, unknown kinds, out-of-order entries.
+/// `LOG_*` checks: bad timestamps, unknown kinds, out-of-order entries — across
+/// the active `log.md` AND the rotated `log/<YYYY-MM>.md` archives.
+///
+/// [`Log::append`] rolls strictly-prior-month entries into `log/<YYYY-MM>.md`,
+/// and `Log::tail`/`Log::since` deliberately read those archives back. If the
+/// LOG_* checks read only the active file, an entry `validate --all` flagged
+/// while it lived in `log.md` would stop being flagged the moment a newer-month
+/// append rotated it into an archive — even though the log readers still surface
+/// that exact entry to the curator. Scanning the archives too keeps validate and
+/// the readers in agreement after a rotation.
+///
+/// Order: archives oldest-month first, then the active `log.md` last — the true
+/// chronological timeline — so the out-of-order check threads `prev` across the
+/// rotation boundary the same way it does within a single file.
 fn check_log(store: &Store, issues: &mut Vec<Issue>) {
-    let log_rel = Path::new("log.md");
+    let mut prev: Option<DateTime<FixedOffset>> = None;
+    for rel in log_files_chronological(store) {
+        check_log_file(store, &rel, &mut prev, issues);
+    }
+}
+
+/// The log files to scan, in chronological order: every `log/<YYYY-MM>.md`
+/// archive oldest-month first, then the active `log.md` last. Missing files are
+/// simply absent from the list.
+fn log_files_chronological(store: &Store) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let archive_dir = store.root.join("log");
+    if let Ok(entries) = std::fs::read_dir(&archive_dir) {
+        let mut archives: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|s| s.to_str())
+                        .and_then(|n| n.strip_suffix(".md"))
+                        .is_some_and(is_year_month_archive)
+            })
+            .filter_map(|p| p.strip_prefix(&store.root).ok().map(Path::to_path_buf))
+            .collect();
+        // `YYYY-MM` stems sort lexically == chronologically; oldest first.
+        archives.sort();
+        files.extend(archives);
+    }
+    // The active file holds the current month — newest, so it comes last.
+    if store.root.join("log.md").is_file() {
+        files.push(PathBuf::from("log.md"));
+    }
+    files
+}
+
+/// Scan one log file's entry headers, threading the running `prev` timestamp so
+/// the out-of-order check spans file (rotation) boundaries. Issues anchor to the
+/// given store-relative path so an archived entry points at its archive file.
+fn check_log_file(
+    store: &Store,
+    log_rel: &Path,
+    prev: &mut Option<DateTime<FixedOffset>>,
+    issues: &mut Vec<Issue>,
+) {
     let abs = store.root.join(log_rel);
     let Ok(text) = std::fs::read_to_string(&abs) else {
         return;
     };
 
-    let mut prev: Option<DateTime<FixedOffset>> = None;
     for (i, line) in text.lines().enumerate() {
         if !line.starts_with("## [") {
             continue;
@@ -1861,7 +2005,7 @@ fn check_log(store: &Store, issues: &mut Vec<Issue>) {
                         vec![],
                     );
                 }
-                if let Some(p) = prev {
+                if let Some(p) = *prev {
                     if ts < p {
                         push(
                             issues,
@@ -1876,7 +2020,7 @@ fn check_log(store: &Store, issues: &mut Vec<Issue>) {
                         );
                     }
                 }
-                prev = Some(ts);
+                *prev = Some(ts);
             }
         }
     }
@@ -1887,6 +2031,7 @@ fn check_log(store: &Store, issues: &mut Vec<Issue>) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A minimal wiki-link found in a body: target, optional display, 1-based line.
+#[derive(Debug)]
 struct Link {
     target: String,
     line: u32,
@@ -2083,6 +2228,125 @@ fn check_db_md(store: &Store, issues: &mut Vec<Issue>) {
             vec![],
         );
     }
+
+    // ── `## Schemas` field-declaration lint ──────────────────────────────────
+    // Without this, every schema misparse is silent: the operator/agent gets no
+    // signal that DB.md is interpreting their schema differently from what they
+    // wrote, and downstream records are validated against the degraded schema.
+    check_db_md_schemas(store, rel, &body, fm_end_line, issues);
+}
+
+/// Lint the parsed `## Schemas` field declarations: an empty field name, a
+/// duplicate field name within a type, or an unrecognized modifier all parse
+/// "successfully" into a degraded [`Schema`] today, so a bad declaration never
+/// surfaces. The parsed schemas live in `store.config.schemas` (directives
+/// already separated out); this pass reports the suspicious *field* shapes,
+/// anchored to the `### <type>` heading line so the agent can find the block.
+fn check_db_md_schemas(
+    store: &Store,
+    rel: &Path,
+    body: &str,
+    fm_end_line: u32,
+    issues: &mut Vec<Issue>,
+) {
+    if store.config.schemas.is_empty() {
+        return;
+    }
+
+    // Map each `### <type>` heading (under `## Schemas`) to its file line, so a
+    // per-type issue can anchor to the declaration block. `extract_sections`
+    // returns a flat list with 1-based body lines; the body starts at file line
+    // `fm_end_line + 1`.
+    let mut type_line: BTreeMap<String, u32> = BTreeMap::new();
+    let mut current_h2: Option<String> = None;
+    for section in crate::parser::extract_sections(body) {
+        match section.level {
+            2 => current_h2 = Some(section.heading.trim().to_ascii_lowercase()),
+            3 if current_h2.as_deref() == Some("schemas") => {
+                // The H3 heading text (as written) is the type name — the same
+                // key `parse_db_md` inserts into `config.schemas`.
+                type_line
+                    .entry(section.heading.trim().to_string())
+                    .or_insert(fm_end_line + section.line);
+            }
+            _ => {}
+        }
+    }
+
+    for (type_name, schema) in &store.config.schemas {
+        let line = type_line.get(type_name).copied();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for field in &schema.fields {
+            let name = field.name.trim();
+
+            // Empty field name: a `- (string)` / bare `- ` bullet parses to a
+            // nameless field that can never match a frontmatter key, so its
+            // required/shape/enum constraints silently never apply.
+            if name.is_empty() {
+                push(
+                    issues,
+                    Severity::Warning,
+                    codes::DB_MD_SCHEMA_FIELD,
+                    rel,
+                    line,
+                    None,
+                    format!("`### {type_name}` has a schema field bullet with no field name"),
+                    Some(
+                        "write each field as `- <name> (<modifiers>)`, e.g. `- email (required, email)`"
+                            .into(),
+                    ),
+                    vec![],
+                );
+                continue;
+            }
+
+            // Duplicate field name within a type: the second declaration's
+            // constraints are interpreted independently of the first, so the
+            // author's intent is ambiguous and likely wrong.
+            if !seen.insert(name.to_string()) {
+                push(
+                    issues,
+                    Severity::Warning,
+                    codes::DB_MD_SCHEMA_FIELD,
+                    rel,
+                    line,
+                    Some(name.to_string()),
+                    format!("`### {type_name}` declares field `{name}` more than once"),
+                    Some(
+                        "remove the duplicate field bullet, or merge the modifiers onto one".into(),
+                    ),
+                    vec![],
+                );
+            }
+
+            // Unrecognized modifiers: the parser stashes anything outside the
+            // known vocabulary (`required` / a shape / `link to …` / `default …`
+            // / `enum: …`) in `unknown_modifiers`. Surface them as Info so a
+            // typo'd modifier (`requierd`, `unqiue`) doesn't silently do nothing.
+            for modifier in &field.unknown_modifiers {
+                let modifier = modifier.trim();
+                if modifier.is_empty() {
+                    continue;
+                }
+                push(
+                    issues,
+                    Severity::Info,
+                    codes::DB_MD_SCHEMA_FIELD,
+                    rel,
+                    line,
+                    Some(name.to_string()),
+                    format!(
+                        "`### {type_name}` field `{name}` has an unrecognized modifier `{modifier}`"
+                    ),
+                    Some(
+                        "recognized modifiers are `required`, a shape (`string`/`int`/`bool`/`date`/`email`/`currency`/`url`), `link to <prefix>/`, `default <value>`, `enum: <v1>, <v2>, …`"
+                            .into(),
+                    ),
+                    vec![],
+                );
+            }
+        }
+    }
 }
 
 /// The `NOT_A_STORE` issue for a root with no `DB.md`.
@@ -2118,6 +2382,23 @@ fn is_content_file(rel: &Path) -> bool {
         return false;
     }
     name.ends_with(".md")
+}
+
+/// True for the store's ROOT append-only meta files (`DB.md` / `log.md`): a
+/// single-component store-relative path whose name is one of those two. An
+/// in-layer `records/docs/log.md` is real content (multiple components), not a
+/// root meta file. These reach `check_content_file` only via the working-set
+/// incoming-linker scan; their bodies are deliberately not link-checked there
+/// because `validate --all` doesn't link-check them either.
+fn is_root_meta_file(rel: &Path) -> bool {
+    let mut comps = rel.components();
+    let Some(Component::Normal(only)) = comps.next() else {
+        return false;
+    };
+    if comps.next().is_some() {
+        return false; // has a parent dir → not a root file
+    }
+    matches!(only.to_str(), Some("DB.md") | Some("log.md"))
 }
 
 /// Split a file into `(frontmatter_yaml, body, closing_fence_line)`. The block
@@ -2190,6 +2471,23 @@ fn scalar_string(v: &Value) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
+    }
+}
+
+/// True if a frontmatter value carries no content for a *required*-field check:
+/// a YAML `null` (`name:`), an empty sequence (`name: []`), an empty mapping
+/// (`name: {}`), or a blank/whitespace-only scalar (`name: ""`). A non-empty
+/// list or mapping is NOT treated as empty here — a structurally-wrong value on
+/// a shape/enum field is caught by the later non-scalar shape check, not by the
+/// required-presence check.
+fn is_empty_value(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Sequence(items) => items.is_empty(),
+        Value::Mapping(map) => map.is_empty(),
+        other => scalar_string(other)
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true),
     }
 }
 
@@ -2338,18 +2636,32 @@ fn collect_line_links(s: &str, file_line: u32, links: &mut Vec<Link>) {
 }
 
 /// Extract every `[[...]]` wiki-link from a body, with 1-based line numbers.
-/// Skips fenced code blocks (```), so example links in docs don't trip the
-/// validator.
+/// Skips fenced code blocks, so example links in docs don't trip the validator.
+///
+/// Fence tracking matches the toolkit's parser ([`crate::parser`]'s
+/// `extract_sections`): an open fence is `(fence char, run length)` and closes
+/// only on a line that is the **same** fence character with a run **at least as
+/// long**. A naive "toggle a bool on any ``` or ~~~ line" inverts the state when
+/// a `~~~` block legally contains a ```` ``` ```` line (the standard way to
+/// document a backtick fence) — the inner backtick line would flip `in_fence`
+/// off and the demo `[[…]]` inside the code block would be checked as a live
+/// link, falsely flagging a legal store.
 fn extract_wiki_links(body: &str) -> Vec<Link> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    let mut fence: Option<(u8, usize)> = None;
     for (idx, line) in body.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        let content = line.trim_end_matches('\r');
+        if let Some(f) = fence {
+            // Inside a fence: the only thing that matters is whether THIS line
+            // closes it (matching char, run ≥ the opening run). Everything else
+            // is opaque code — no link extraction.
+            if fence_closes(content, f) {
+                fence = None;
+            }
             continue;
         }
-        if in_fence {
+        if let Some(opened) = fence_opens(content) {
+            fence = Some(opened);
             continue;
         }
         let line_no = (idx + 1) as u32;
@@ -2383,24 +2695,104 @@ fn extract_wiki_links(body: &str) -> Vec<Link> {
     out
 }
 
-/// Detect the frontmatter wiki-link-list mis-encoding: a YAML flow-sequence
-/// whose items are themselves sequences (`attendees: [[[a]], [[b]]]`). Returns
-/// the offending keys. The canonical block-sequence form is not flagged.
+/// If `line` opens a fenced code block, return `(fence byte, run length)`. A
+/// local mirror of the parser's `opening_fence` so the validator's fence
+/// tracking matches the rest of the toolkit: a fence is ``` ``` ``` or `~~~`
+/// (run ≥ 3) at ≤ 3 spaces of indent, and a backtick fence's info string may
+/// not itself contain a backtick.
+fn fence_opens(line: &str) -> Option<(u8, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let byte = rest.bytes().next()?;
+    if byte != b'`' && byte != b'~' {
+        return None;
+    }
+    let run = rest.len() - rest.trim_start_matches(byte as char).len();
+    if run < 3 {
+        return None;
+    }
+    // A backtick fence's info string may not itself contain a backtick.
+    if byte == b'`' && rest[run..].contains('`') {
+        return None;
+    }
+    Some((byte, run))
+}
+
+/// True if `line` closes the currently open `fence`: same char, run at least as
+/// long, nothing but trailing whitespace after. Local mirror of the parser's
+/// `is_closing_fence` — so an inner fence of the *other* character (a ``` ``` ```
+/// line inside a `~~~` block) does NOT close the outer fence.
+fn fence_closes(line: &str, fence: (u8, usize)) -> bool {
+    let (byte, open_len) = fence;
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let run = rest.len() - rest.trim_start_matches(byte as char).len();
+    if run < open_len {
+        return false;
+    }
+    rest[run..].trim().is_empty()
+}
+
+/// Detect the frontmatter INLINE flow-form wiki-link-list mis-encoding —
+/// `attendees: [[[a]], [[b]]]` — and return the offending keys.
+///
+/// **Scoped to the inline value on the key line.** The SPEC's canonical
+/// list-of-links form is the *unquoted YAML block sequence* (`- [[a]]` per
+/// indented line), which is explicitly correct (SPEC § Linking) and MUST NOT be
+/// flagged — even though, parsed whole, it nests the same way the rejected
+/// inline flow form does. So this check looks only at the value written *inline*
+/// after the colon: if it opens a flow sequence (`[…]`) whose parsed shape is a
+/// nested sequence (a list whose items are themselves lists — the wiki-link-list
+/// mis-encoding), it is flagged. A key with no inline value (the block form,
+/// whose items live on continuation lines) is never inspected here.
+///
+/// Parsing the inline value (rather than a literal `starts_with("[[[")` text
+/// test) is what catches the whitespace variant `attendees: [ [[a]] ]`, which
+/// encodes the identical nested sequence but evaded the old prefix match.
 fn detect_flow_form_link_lists(fm_yaml: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in fm_yaml.lines() {
+        // Top-level key lines only (no indentation, not a comment or list dash).
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
         let Some((key, rest)) = line.split_once(':') else {
             continue;
         };
         let key = key.trim();
-        if key.is_empty() || key.starts_with('#') || key.starts_with('-') {
+        if key.is_empty()
+            || key.starts_with('#')
+            || key.starts_with('-')
+            || !key
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
             continue;
         }
         let rest = rest.trim();
-        // Flow sequence whose first element is itself a `[` (i.e. `[[[`) — a
-        // nested flow list, which is the wiki-link-list mis-encoding.
-        if rest.starts_with("[[[") {
-            out.push(key.to_string());
+        // Only an inline flow sequence (`[…]`) on the key line is a candidate;
+        // the unquoted block form has an empty inline value and is never flagged.
+        if !rest.starts_with('[') {
+            continue;
+        }
+        // Parse just the inline value and test its shape: a list whose items are
+        // themselves lists is the wiki-link-list mis-encoding (`[[[a]]]` parses
+        // to `Seq[Seq[Seq[String]]]`; the scalar inline link `[[a]]` is only
+        // `Seq[Seq[String]]` and is NOT flagged).
+        if let Ok(Value::Sequence(items)) = serde_norway::from_str::<Value>(rest) {
+            let nested = items.iter().any(|item| match item {
+                Value::Sequence(inner) => inner.iter().any(|x| matches!(x, Value::Sequence(_))),
+                _ => false,
+            });
+            if nested {
+                out.push(key.to_string());
+            }
         }
     }
     out
@@ -2438,6 +2830,60 @@ fn safe_md_target_rel(bare: &str) -> Option<PathBuf> {
     Some(PathBuf::from(format!("{bare}.md")))
 }
 
+/// How a wiki-link / index-entry target resolves on disk.
+enum TargetResolution {
+    /// The target exists (either as the literal path or with a `.md` suffix).
+    Exists,
+    /// The target is a safe store-relative path but no file exists for it.
+    Missing,
+    /// The target escapes the store (absolute, `..`, prefix) — never probe it.
+    Unsafe,
+}
+
+/// Resolve a bare wiki-link / index-entry target the way the graph engine does
+/// ([`crate::graph`]'s `resolve_existing`): try the path **as written** first
+/// (so a link to a raw non-`.md` source file kept verbatim under `sources/` —
+/// `[[sources/emails/x.eml]]`, `[[sources/contracts/y.pdf]]` — resolves to the
+/// real file), then the `.md`-appended path (the common case for content
+/// pages). Without trying the literal path first, a legal link to a raw source
+/// file is wrongly flagged `WIKI_LINK_BROKEN` even though `graph backlinks`
+/// resolves it.
+fn resolve_wiki_target(store: &Store, bare: &str) -> TargetResolution {
+    // The literal path and the `.md`-appended path share the same safety check
+    // (`safe_md_target_rel` only differs by appending `.md`), so an unsafe bare
+    // target is unsafe in both forms.
+    if !is_safe_store_relative_path(Path::new(bare)) {
+        return TargetResolution::Unsafe;
+    }
+    match resolved_target_abs(store, bare) {
+        Some(_) => TargetResolution::Exists,
+        None => TargetResolution::Missing,
+    }
+}
+
+/// The absolute on-disk path a bare wiki-link / index-entry target resolves to,
+/// trying the literal path first, then `.md`-appended — mirroring the graph
+/// engine. `None` when neither exists, or when the bare target escapes the store
+/// (callers that need to distinguish unsafe from merely-missing use
+/// [`resolve_wiki_target`]).
+fn resolved_target_abs(store: &Store, bare: &str) -> Option<PathBuf> {
+    if !is_safe_store_relative_path(Path::new(bare)) {
+        return None;
+    }
+    // The literal path, as written (e.g. an `.eml`/`.pdf` source file kept
+    // verbatim under `sources/`).
+    let literal = store.root.join(bare);
+    if literal.is_file() {
+        return Some(literal);
+    }
+    // The `.md`-appended path (a content page referenced without its extension).
+    let with_md = store.root.join(format!("{bare}.md"));
+    if with_md.is_file() {
+        return Some(with_md);
+    }
+    None
+}
+
 /// True if a bare target path is under `prefix` (both `.md`-stripped).
 fn path_under_prefix(bare: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
@@ -2459,11 +2905,19 @@ fn type_folder_of(rel: &Path) -> Option<PathBuf> {
 }
 
 /// **SWEEP.** Walk every `.md` content file under `sources/`/`records/`/`wiki/`,
-/// returning store-relative paths to be parsed in full. Skips hidden dirs,
-/// `log/`, and the index twin (`index.jsonl`). Used only by `validate_all`; the
-/// working-set incoming-linker scan rides the embedded-ripgrep
-/// `Store::find_links_to_any` (a single presence-only pass), so the loop default
-/// never walks-and-*parses* the whole content tree.
+/// returning store-relative paths to be parsed in full. Skips hidden dirs and
+/// the index twin (`index.jsonl`). Used only by `validate_all`; the working-set
+/// incoming-linker scan rides the embedded-ripgrep `Store::find_links_to_any`
+/// (a single presence-only pass), so the loop default never walks-and-*parses*
+/// the whole content tree.
+///
+/// **`log/` is NOT pruned here.** Only the *root-level* `log/` rotation archive
+/// is reserved (`Store::is_in_log_dir` checks only the first path component);
+/// the walk roots are the three layers, so the root archive is already out of
+/// scope. A `log`-named folder *inside* a layer (e.g. `records/log/` — a
+/// decision log) is real content (see `is_content_file`), so pruning every
+/// `name == "log"` made `--all` silently skip those files — reporting fewer
+/// errors than the default working-set scope on the same store.
 fn walk_content_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for layer in ["sources", "records", "wiki"] {
@@ -2475,7 +2929,7 @@ fn walk_content_files(root: &Path) -> Vec<PathBuf> {
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_str().unwrap_or("");
-                !name.starts_with('.') && name != "log"
+                !name.starts_with('.')
             })
             .flatten()
         {
@@ -2495,7 +2949,11 @@ fn walk_content_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Every `index.md` under the store (root + layers + type-folders), as
-/// store-relative paths. Used to detect orphan indexes.
+/// store-relative paths. Used to detect orphan indexes. Like
+/// [`walk_content_files`], a `log`-named folder *inside* a layer is real content
+/// and its `index.md` is not pruned (only the root-level `log/` archive is
+/// reserved, and the walk roots are the three layers, so it is already
+/// out of scope).
 fn walk_index_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if root.join("index.md").is_file() {
@@ -2510,7 +2968,7 @@ fn walk_index_files(root: &Path) -> Vec<PathBuf> {
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_str().unwrap_or("");
-                !name.starts_with('.') && name != "log"
+                !name.starts_with('.')
             })
             .flatten()
         {
@@ -2599,17 +3057,21 @@ fn extract_index_entry_summary(after: &str) -> Option<String> {
     if s.is_empty() {
         return None;
     }
-    // Strip a trailing `  ·  #tag #tag` tag suffix — but ONLY when the segment
-    // after the `·` separator is a genuine tag block (whitespace-separated
-    // `#`-prefixed tokens), the exact shape the renderer emits
-    // (`crate::index::format_md_entry`: `  ·  #tag #tag`, dot omitted when there
-    // are no tags). A bare `·` inside the summary text itself (e.g. a free-text
-    // `Acme · Q2 renewal`) is NOT a tag separator and must be preserved, or the
-    // index-summary comparison spuriously reports `INDEX_SUMMARY_MISMATCH` on a
-    // clean store. Match from the right (`rsplit_once`) so only the real trailing
-    // tag block is considered, and accept either the renderer's double-spaced
-    // delimiter or a single-spaced one as long as the suffix is all tags.
-    let s = match s.rsplit_once(" · ") {
+    // Strip a trailing tag block — but ONLY when it matches the EXACT delimiter
+    // the renderer emits: `  ·  #tag #tag` (a *double*-spaced middot, per
+    // `crate::index::format_md_entry`'s `format!("  ·  {tags}")`), dropped when
+    // the file has no tags. The previous code also accepted a *single*-spaced
+    // ` · ` separator, which collided with a legal summary whose own text ends
+    // in a single-spaced middot-plus-hashtag tail — e.g. a tagless file with
+    // `summary: "Standup notes · #standup"`. The renderer round-trips that
+    // summary verbatim (no tag block, since there are no tags), but the loose
+    // strip mistook the ` · #standup` for the renderer's tag suffix, compared
+    // `"Standup notes"` against the file's full summary, and emitted a spurious
+    // `INDEX_SUMMARY_MISMATCH` that `dbmd index rebuild` could never fix
+    // (rebuild regenerates the identical line). Matching the renderer's exact
+    // double-spaced delimiter makes the comparison round-trip. `rsplit_once`
+    // matches from the right so only the real trailing tag block is considered.
+    let s = match s.rsplit_once("  ·  ") {
         Some((summary, tags)) if is_tag_suffix(tags) => summary.trim(),
         _ => s,
     };
@@ -2884,12 +3346,16 @@ fn is_iso8601_date_or_datetime(s: &str) -> bool {
 }
 
 /// True for `<local>@<domain>` with a non-empty local part and a dotted domain.
+/// There must be exactly one `@`: a domain that still contains an `@` after the
+/// split (the common double-`@` typo `sarah@@acme.com`, or `a@b@c.com`) is
+/// rejected — without this the domain `@acme.com` passed every other check.
 fn is_email(s: &str) -> bool {
     let s = s.trim();
     let Some((local, domain)) = s.split_once('@') else {
         return false;
     };
     !local.is_empty()
+        && !domain.contains('@')
         && domain.contains('.')
         && !domain.starts_with('.')
         && !domain.ends_with('.')
@@ -2942,10 +3408,19 @@ fn is_plain_amount(s: &str) -> bool {
     }
 }
 
-/// True for an http(s) URL.
+/// True for an http(s) URL: a recognized scheme prefix with at least one
+/// character after it. The length guard uses the *matched* scheme's own length,
+/// so a single-character host on the shorter `http://` scheme (`http://x`, 8
+/// bytes — e.g. an intranet/container hostname) is accepted; a bare scheme with
+/// nothing after it (`http://`, `https://`) is rejected.
 fn is_url(s: &str) -> bool {
     let s = s.trim();
-    (s.starts_with("http://") || s.starts_with("https://")) && s.len() > "https://".len()
+    for scheme in ["http://", "https://"] {
+        if let Some(rest) = s.strip_prefix(scheme) {
+            return !rest.is_empty();
+        }
+    }
+    false
 }
 
 /// A short, deterministic suggestion for a `SCHEMA_SHAPE_MISMATCH`.
@@ -4460,16 +4935,48 @@ mod tests {
             "records/index.md",
             "---\ntype: index\nscope: layer\nfolder: records\n---\n# r\n",
         );
-        // Entry carries a ` · #tag` suffix which must be stripped before compare.
+        // Entry carries the renderer's `  ·  #tag` suffix (the EXACT double-spaced
+        // delimiter `crate::index::format_md_entry` emits for a tagged file),
+        // which must be stripped before comparing against the file's summary.
         fx.write(
             "records/contacts/index.md",
-            "---\ntype: index\nscope: type-folder\nfolder: records/contacts\n---\n\n- [[records/contacts/a]] — clean summary · #customer\n",
+            "---\ntype: index\nscope: type-folder\nfolder: records/contacts\n---\n\n- [[records/contacts/a]] — clean summary  ·  #customer\n",
         );
         fx.write("records/contacts/index.jsonl", "{\"path\":\"records/contacts/a.md\",\"type\":\"contact\",\"summary\":\"clean summary\"}\n");
         let issues = fx.store_all();
         assert!(
             !has(&issues, codes::INDEX_SUMMARY_MISMATCH),
             "tag suffix should be stripped: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn index_entry_single_spaced_middot_tail_is_part_of_summary() {
+        // Regression (the finding): a tagless file whose `summary` legitimately
+        // ends in a single-spaced ` · #word` tail round-trips through `index
+        // rebuild` verbatim (the renderer appends NO `  ·  #tag` block, since the
+        // file has no tags). The validator must NOT mistake that single-spaced
+        // tail for the renderer's tag suffix, or it reports a spurious — and
+        // unfixable — INDEX_SUMMARY_MISMATCH on a freshly rebuilt store.
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/a.md",
+            &valid_contact("Standup notes · #standup"),
+        );
+        fx.write("index.md", "---\ntype: index\nscope: root\n---\n\n## Records\n- [[records/contacts/index|C]] (1 files)\n");
+        fx.write(
+            "records/index.md",
+            "---\ntype: index\nscope: layer\nfolder: records\n---\n# r\n",
+        );
+        fx.write(
+            "records/contacts/index.md",
+            "---\ntype: index\nscope: type-folder\nfolder: records/contacts\n---\n\n- [[records/contacts/a]] — Standup notes · #standup\n",
+        );
+        fx.write("records/contacts/index.jsonl", "{\"path\":\"records/contacts/a.md\",\"type\":\"contact\",\"summary\":\"Standup notes · #standup\"}\n");
+        let issues = fx.store_all();
+        assert!(
+            !has(&issues, codes::INDEX_SUMMARY_MISMATCH),
+            "a single-spaced middot tail is part of the summary, not a tag block: {issues:#?}"
         );
     }
 
@@ -5154,6 +5661,283 @@ mod tests {
             broken_lines.len(),
             2,
             "two distinct broken-link lines: {issues:#?}"
+        );
+    }
+
+    // ── Regression: null / non-scalar created/updated ────────────────────────
+
+    #[test]
+    fn null_created_is_missing_not_silently_passed() {
+        // Regression: a present-but-`null` `created:` previously slipped past
+        // both FM_MISSING_CREATED (only `!contains_key` was checked) and
+        // FM_BAD_TIMESTAMP (`scalar_string(null)` is None → branch no-oped).
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/a.md",
+            "---\ntype: contact\ncreated:\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\n# A\n",
+        );
+        let issues = fx.store_all();
+        assert!(
+            has(&issues, codes::FM_MISSING_CREATED),
+            "null `created:` must read as missing: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn sequence_created_is_bad_timestamp() {
+        // A non-scalar `created: [2026]` is not a timestamp string → FM_BAD_TIMESTAMP.
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/a.md",
+            "---\ntype: contact\ncreated: [2026]\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\n# A\n",
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.code == codes::FM_BAD_TIMESTAMP && i.key.as_deref() == Some("created")),
+            "a sequence `created:` must be FM_BAD_TIMESTAMP: {issues:#?}"
+        );
+    }
+
+    // ── Regression: schema required null / empty-collection ──────────────────
+
+    #[test]
+    fn required_field_null_or_empty_collection_is_missing() {
+        // Regression: a plain required field (no shape/enum) holding YAML null
+        // (`name:`), an empty list (`name: []`), or an empty mapping (`name: {}`)
+        // previously validated with 0 issues — `scalar_string` returned None and
+        // `.unwrap_or(false)` treated the value as non-empty.
+        for value in ["", " []", " {}"] {
+            let mut fx = Fixture::new();
+            fx.config.schemas.insert(
+                "contact".into(),
+                Schema {
+                    fields: vec![FieldSpec {
+                        name: "name".into(),
+                        required: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            fx.write(
+                "records/contacts/a.md",
+                &format!(
+                    "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname:{value}\n---\n\n# A\n"
+                ),
+            );
+            let issues = fx.store_all();
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.code == codes::SCHEMA_MISSING_REQUIRED
+                        && i.key.as_deref() == Some("name")),
+                "required `name:{value}` must be SCHEMA_MISSING_REQUIRED: {issues:#?}"
+            );
+        }
+    }
+
+    // ── Regression: WIKI_LINK_BROKEN on raw source files ─────────────────────
+
+    #[test]
+    fn wiki_link_to_raw_source_file_resolves() {
+        // Regression: a body link to a raw `.eml`/`.pdf` source kept verbatim
+        // under `sources/` was flagged WIKI_LINK_BROKEN because the existence
+        // probe only ever stat'd `{bare}.md`. It must resolve the literal path.
+        let fx = Fixture::new();
+        fx.write("sources/emails/2026-05-22-elena.eml", "raw email bytes\n");
+        fx.write(
+            "records/contacts/a.md",
+            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\nSee [[sources/emails/2026-05-22-elena.eml]] for context.\n",
+        );
+        let issues = fx.store_all();
+        assert!(
+            !issues.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
+            "a link to an existing raw source file must not be broken: {issues:#?}"
+        );
+    }
+
+    // ── Regression: unreadable (non-UTF-8) content file ──────────────────────
+
+    #[test]
+    fn non_utf8_content_file_is_reported() {
+        // Regression: a content file with invalid UTF-8 bytes made
+        // check_content_file return None silently, so the store passed with exit
+        // 0. It must surface FM_UNREADABLE instead of passing vacuously.
+        let fx = Fixture::new();
+        let abs = fx.dir.path().join("records/notes/corrupt.md");
+        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        fs::write(&abs, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+        let issues = validate_working_set(&fx.store(), None).unwrap();
+        assert!(
+            has(&issues, codes::FM_UNREADABLE),
+            "an unreadable content file must be reported, not silently skipped: {issues:#?}"
+        );
+    }
+
+    // ── Regression: code-fence char/run tracking ─────────────────────────────
+
+    #[test]
+    fn tilde_fence_containing_backtick_fence_does_not_invert() {
+        // Regression: a `~~~` block legally contains ``` lines (documenting a
+        // backtick fence); a naive toggle inverted `in_fence` and checked the
+        // demo `[[fake]]` inside the code block as a live link. The link inside
+        // BOTH fences must be skipped.
+        let body = "~~~markdown\n```\n[[fake-link]]\n```\n~~~\n";
+        let links = extract_wiki_links(body);
+        assert!(
+            links.is_empty(),
+            "wiki-link inside a nested code fence must be skipped: {links:?}"
+        );
+    }
+
+    // ── Regression: --all skips in-layer `log/` folder ───────────────────────
+
+    #[test]
+    fn all_sweep_visits_in_layer_log_folder() {
+        // Regression: `validate --all` pruned every dir named `log`, so a real
+        // content folder like `records/log/` was invisible to the full sweep —
+        // reporting FEWER errors than the default scope. A frontmatter-less file
+        // there must still surface FM_MISSING_TYPE under --all.
+        let fx = Fixture::new();
+        fx.write("records/log/2026-06-01-pricing.md", "no frontmatter here\n");
+        let issues = fx.store_all();
+        assert!(
+            has(&issues, codes::FM_MISSING_TYPE),
+            "--all must validate files under an in-layer `log/` folder: {issues:#?}"
+        );
+    }
+
+    // ── Regression: flow-form list with whitespace ───────────────────────────
+
+    #[test]
+    fn flow_form_link_list_with_spaces_is_flagged() {
+        // Regression: `attendees: [ [[a]] ]` parses to the same nested-sequence
+        // mis-encoding as `[[[a]]]` but evaded the literal `starts_with("[[[")`
+        // text test. The value-based detector must catch the whitespace variant.
+        let keys = detect_flow_form_link_lists("attendees: [ [[records/contacts/elena]] ]\n");
+        assert!(
+            keys.iter().any(|k| k == "attendees"),
+            "spaced flow-form list must be detected: {keys:?}"
+        );
+    }
+
+    // ── Regression: INDEX_SUMMARY_MISMATCH middot tail ───────────────────────
+
+    #[test]
+    fn middot_hashtag_summary_tail_round_trips() {
+        // Regression: a tagless summary that legitimately ends in a single-spaced
+        // ` · #word` tail round-trips through the renderer verbatim, but the loose
+        // ` · ` strip mistook it for the tag block and reported a spurious,
+        // unfixable INDEX_SUMMARY_MISMATCH. The strip must use the renderer's
+        // exact double-spaced `  ·  ` delimiter.
+        assert_eq!(
+            extract_index_entry_summary("— Standup notes · #standup").as_deref(),
+            Some("Standup notes · #standup"),
+            "a single-spaced middot tail is part of the summary, not a tag block"
+        );
+        // The renderer's real double-spaced tag suffix IS still stripped.
+        assert_eq!(
+            extract_index_entry_summary("— Renewal champion  ·  #renewal #acme").as_deref(),
+            Some("Renewal champion"),
+            "the renderer's double-spaced `  ·  #tag` suffix is stripped"
+        );
+    }
+
+    // ── Regression: shape Url / Email edge cases ─────────────────────────────
+
+    #[test]
+    fn url_shape_accepts_short_http_and_rejects_bare_scheme() {
+        assert!(is_url("http://x"), "an 8-char http URL is valid");
+        assert!(is_url("https://x"), "a 9-char https URL is valid");
+        assert!(!is_url("http://"), "a bare scheme with no host is rejected");
+        assert!(!is_url("https://"), "a bare https scheme is rejected");
+    }
+
+    #[test]
+    fn email_shape_rejects_double_at() {
+        assert!(!is_email("sarah@@acme.com"), "double-@ domain is rejected");
+        assert!(!is_email("a@b@c.com"), "two @ signs are rejected");
+        assert!(is_email("sarah@acme.com"), "a normal address still passes");
+    }
+
+    // ── Regression: working-set vs --all agree on log.md links ───────────────
+
+    #[test]
+    fn working_set_does_not_flag_log_md_body_links() {
+        // Regression: the working-set incoming-linker scan runs root `log.md`
+        // through the body wiki-link check, flagging a historical `[[deleted]]`
+        // mention as WIKI_LINK_BROKEN — an error `--all` never reports and that
+        // the append-only log can't have "fixed". The root meta files must be
+        // excluded from the body link check, matching --all.
+        let fx = Fixture::new();
+        fx.write("records/contacts/a.md", &valid_contact("A"));
+        fx.write(
+            "log.md",
+            "---\ntype: log\n---\n\n## [2026-06-01 10:00] delete | records/contacts/ghost\n\nRemoved [[records/contacts/ghost]] per cleanup.\n",
+        );
+        let issues = validate_working_set(&fx.store(), None).unwrap();
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.code == codes::WIKI_LINK_BROKEN
+                    && i.file == std::path::Path::new("log.md")),
+            "a broken wiki-link inside append-only log.md must not be flagged: {issues:#?}"
+        );
+    }
+
+    // ── Regression: DB.md schema field lint ──────────────────────────────────
+
+    #[test]
+    fn schema_duplicate_field_name_is_flagged() {
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "contact".into(),
+            Schema {
+                fields: vec![
+                    FieldSpec {
+                        name: "name".into(),
+                        required: true,
+                        ..Default::default()
+                    },
+                    FieldSpec {
+                        name: "name".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.code == codes::DB_MD_SCHEMA_FIELD && i.key.as_deref() == Some("name")),
+            "a duplicate schema field name must be flagged: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn schema_unknown_modifier_is_info() {
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "contact".into(),
+            Schema {
+                fields: vec![FieldSpec {
+                    name: "name".into(),
+                    unknown_modifiers: vec!["requierd".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues.iter().any(|i| i.code == codes::DB_MD_SCHEMA_FIELD
+                && i.severity == Severity::Info
+                && i.key.as_deref() == Some("name")),
+            "an unrecognized schema modifier must surface as Info: {issues:#?}"
         );
     }
 

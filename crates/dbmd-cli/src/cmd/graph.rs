@@ -87,6 +87,18 @@ pub fn run_forwardlinks(ctx: &Context, args: &GraphTargetArgs) -> CliResult {
 /// enough that ordinary context hydration returns in full.
 const DEFAULT_NEIGHBORHOOD_CAP: usize = 200;
 
+/// Convert the `usize`-parsed `--hops` value into the core BFS's `u32` *without
+/// wrapping*. `--hops` accepts any 64-bit value (so an agent can pass a "very
+/// large = effectively unbounded" number to ask for the whole reachable
+/// component), but a plain `as u32` cast wraps modulo 2^32 — `--hops 4294967296`
+/// (2^32) would silently become `0` and return an empty neighborhood, the
+/// opposite of the intent. Saturate to `u32::MAX` instead; the BFS is already
+/// bounded by the node cap (`--limit` / [`DEFAULT_NEIGHBORHOOD_CAP`]) and by the
+/// frontier emptying, so a huge hops value safely walks the full component.
+fn saturating_hops(hops: usize) -> u32 {
+    u32::try_from(hops).unwrap_or(u32::MAX)
+}
+
 /// `dbmd graph neighborhood <seed>` — bounded BFS hydration: each reached node,
 /// its `summary`, and how it connects back toward the seed.
 pub fn run_neighborhood(ctx: &Context, args: &NeighborhoodArgs) -> CliResult {
@@ -105,7 +117,7 @@ pub fn run_neighborhood(ctx: &Context, args: &NeighborhoodArgs) -> CliResult {
     let slice = graph::neighborhood_capped(
         &store,
         Path::new(&args.seed),
-        args.hops as u32,
+        saturating_hops(args.hops),
         &types,
         Direction::Both,
         Some(cap),
@@ -251,5 +263,39 @@ fn parse_layer(value: Option<&str>) -> Result<Option<Layer>, CliError> {
                 format!("unknown layer `{name}` (expected sources, records, or wiki)"),
             )
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturating_hops_does_not_wrap_past_u32() {
+        // Small values pass through unchanged.
+        assert_eq!(saturating_hops(0), 0);
+        assert_eq!(saturating_hops(2), 2);
+        assert_eq!(saturating_hops(u32::MAX as usize), u32::MAX);
+
+        // The repro values: a plain `as u32` cast would wrap these to 0 / 1 / 2
+        // (modulo 2^32). The saturating conversion must instead clamp to u32::MAX
+        // so a "very large = unbounded" hops request never collapses to an empty
+        // (hops=0) neighborhood.
+        let two_pow_32: usize = 1usize << 32;
+        assert_eq!(
+            saturating_hops(two_pow_32),
+            u32::MAX,
+            "2^32 must saturate, not wrap to 0"
+        );
+        assert_eq!(
+            saturating_hops(two_pow_32 + 1),
+            u32::MAX,
+            "2^32+1 must saturate, not wrap to 1"
+        );
+        assert_eq!(
+            saturating_hops(usize::MAX),
+            u32::MAX,
+            "usize::MAX must saturate to u32::MAX"
+        );
     }
 }

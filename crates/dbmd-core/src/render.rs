@@ -97,15 +97,20 @@ pub fn tree(store: &Store, layer: Option<Layer>, type_: Option<&str>) -> Result<
 
         let mut type_folders = Vec::new();
         for type_name in type_dir_names {
-            if let Some(want) = type_ {
-                if type_name != want {
-                    continue;
-                }
-            }
-
             let type_abs = layer_abs.join(&type_name);
             let mut files: Vec<PathBuf> = Vec::new();
             collect_content_files(&store.root, &type_abs, &mut files)?;
+
+            // `--type` restricts to a single frontmatter `type` (matching every
+            // other `--type` flag in the binary), NOT the folder directory
+            // name. Canonical folders are pluralized (`contact` lives under
+            // `records/contacts/`), so a folder-name match would make
+            // `--type contact` empty on a canonical store; reading each file's
+            // frontmatter `type` is what the flag's help text promises.
+            if let Some(want) = type_ {
+                files.retain(|rel| file_type_matches(&store.root, rel, want));
+            }
+
             if files.is_empty() {
                 continue;
             }
@@ -179,6 +184,58 @@ fn collect_content_files(
         }
     }
     Ok(())
+}
+
+/// True if the content file at store-relative `rel` declares the frontmatter
+/// `type` `want`. Lenient by design: a file that can't be read, has no
+/// frontmatter, or has no `type:` key simply doesn't match (it is not an error)
+/// — a `--type` filter never fails the whole tree over one unreadable file.
+///
+/// Self-contained (does not route through the crate's parser, which would error
+/// on malformed frontmatter): split off the leading `---` block and read the
+/// `type` key as a string, mirroring `stats`'s frontmatter-type reader.
+fn file_type_matches(store_root: &Path, rel: &Path, want: &str) -> bool {
+    let abs = store_root.join(rel);
+    let text = match std::fs::read_to_string(&abs) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    frontmatter_type(&text).as_deref() == Some(want)
+}
+
+/// Read the `type:` value from a file's leading YAML frontmatter block, if any.
+/// Returns `None` when there's no frontmatter or no `type` key. Tolerant of a
+/// leading BOM; requires `---` as the first line and a closing `---`.
+fn frontmatter_type(text: &str) -> Option<String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut lines = text.lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    let mut yaml = String::new();
+    let mut closed = false;
+    for line in lines {
+        if line.trim_end() == "---" {
+            closed = true;
+            break;
+        }
+        yaml.push_str(line);
+        yaml.push('\n');
+    }
+    if !closed {
+        return None;
+    }
+    let value: serde_norway::Value = serde_norway::from_str(&yaml).ok()?;
+    let s = value
+        .as_mapping()?
+        .get(serde_norway::Value::String("type".to_string()))?
+        .as_str()?
+        .trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// Build the [`Outline`] of a single file from its `##` (and deeper) sections.
@@ -340,17 +397,29 @@ fn heading_level(line: &str) -> u8 {
 
 /// The heading text of a heading line: the content after the `#` run, trimmed,
 /// with any trailing closing `#` sequence removed (ATX closing fence).
+///
+/// Per CommonMark, an ATX *closing* sequence of `#` is only a closing fence when
+/// it is preceded by a space or tab (or is the whole content): `## Title ##`
+/// yields `Title`, but `## C#` yields `C#` — the `#` there is part of the
+/// heading text, not a closing fence. So the trailing `#` run is stripped only
+/// when it is preceded by whitespace (or is the entire trimmed content).
 fn heading_text(line: &str, level: u8) -> String {
     let indent = line.len() - line.trim_start_matches(' ').len();
     let after_hashes = &line[indent + level as usize..];
     let trimmed = after_hashes.trim();
-    // Strip an optional trailing run of `#` (ATX closing sequence), e.g.
-    // `## Title ##`.
-    let no_trailing = trimmed.trim_end_matches('#');
-    if no_trailing.len() == trimmed.len() {
-        trimmed.to_string()
+    // Length of the trailing run of `#`.
+    let trailing_hashes = trimmed.len() - trimmed.trim_end_matches('#').len();
+    if trailing_hashes == 0 {
+        return trimmed.to_string();
+    }
+    let before_run = &trimmed[..trimmed.len() - trailing_hashes];
+    // A trailing `#` run is an ATX closing fence only when preceded by
+    // whitespace or when it is the entire content (`## ##` -> empty heading).
+    // Otherwise it belongs to the heading text (`## C#`).
+    if before_run.is_empty() || before_run.ends_with([' ', '\t']) {
+        before_run.trim_end().to_string()
     } else {
-        no_trailing.trim_end().to_string()
+        trimmed.to_string()
     }
 }
 
@@ -665,25 +734,107 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tree_type_filter_keeps_only_matching_folder_name_across_layers() {
-        let fx = Fixture::new();
-        // Same folder name `notes` under two layers; a sibling folder to exclude.
-        fx.write("sources/notes/s.md", &doc("source note"));
-        fx.write("wiki/notes/w.md", &doc("wiki note"));
-        fx.write("records/contacts/c.md", &doc("contact"));
+    /// A content file body with an explicit frontmatter `type`.
+    fn typed(type_: &str, summary: &str) -> String {
+        format!("---\ntype: {type_}\nsummary: {summary}\n---\n\nbody\n")
+    }
 
-        let tree = tree(&fx.store, None, Some("notes")).expect("tree");
-        let folders: Vec<String> = tree
+    #[test]
+    fn tree_type_filter_matches_frontmatter_type_across_layers() {
+        let fx = Fixture::new();
+        // Same `note` type filed under two layers (in folders whose names are
+        // NOT the type), plus a contact to exclude.
+        fx.write("sources/inbox/s.md", &typed("note", "source note"));
+        fx.write("wiki/scratch/w.md", &typed("note", "wiki note"));
+        fx.write("records/contacts/c.md", &typed("contact", "contact"));
+
+        let tree = tree(&fx.store, None, Some("note")).expect("tree");
+        let files: Vec<String> = tree
             .layers
             .iter()
             .flat_map(|l| &l.type_folders)
-            .map(|tf| tf.path.to_string_lossy().into_owned())
+            .flat_map(|tf| &tf.files)
+            .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            folders,
-            vec!["sources/notes".to_string(), "wiki/notes".to_string()],
-            "type filter matches the folder name in every layer, excludes other folders"
+            files,
+            vec![
+                "sources/inbox/s.md".to_string(),
+                "wiki/scratch/w.md".to_string()
+            ],
+            "type filter matches the frontmatter type across layers, regardless of folder name"
+        );
+    }
+
+    #[test]
+    fn tree_type_filter_uses_frontmatter_type_not_folder_name() {
+        // Regression (finding #43): `--type contact` must list a record whose
+        // frontmatter `type: contact` lives in the canonical, pluralized folder
+        // `records/contacts/`. Pre-fix the filter compared the folder NAME
+        // (`contacts`) to the requested type (`contact`) and returned nothing.
+        let fx = Fixture::new();
+        fx.write("records/contacts/sarah.md", &typed("contact", "sarah"));
+        fx.write("wiki/people/sarah.md", &typed("wiki-page", "sarah bio"));
+
+        // The documented frontmatter type matches.
+        let by_type = tree(&fx.store, None, Some("contact")).expect("tree");
+        let files: Vec<String> = by_type
+            .layers
+            .iter()
+            .flat_map(|l| &l.type_folders)
+            .flat_map(|tf| &tf.files)
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["records/contacts/sarah.md".to_string()],
+            "--type contact lists the contact in the pluralized canonical folder"
+        );
+
+        // The folder name (`contacts`) no longer matches — it is not a type.
+        let by_folder_name = tree(&fx.store, None, Some("contacts")).expect("tree");
+        assert!(
+            by_folder_name.layers.is_empty(),
+            "the folder directory name is not the frontmatter type and must not match"
+        );
+
+        // `wiki-page` records, filed under topic folders, are now reachable.
+        let wiki = tree(&fx.store, None, Some("wiki-page")).expect("tree");
+        let wiki_files: Vec<String> = wiki
+            .layers
+            .iter()
+            .flat_map(|l| &l.type_folders)
+            .flat_map(|tf| &tf.files)
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            wiki_files,
+            vec!["wiki/people/sarah.md".to_string()],
+            "--type wiki-page matches the frontmatter type under a topic folder"
+        );
+    }
+
+    #[test]
+    fn tree_type_filter_skips_untyped_and_unmatched_files() {
+        // A file with no frontmatter type, and one with a different type, are
+        // both excluded by a `--type` filter without erroring the tree.
+        let fx = Fixture::new();
+        fx.write("records/contacts/sarah.md", &typed("contact", "sarah"));
+        fx.write("records/contacts/no-type.md", "no frontmatter at all\n");
+        fx.write("records/contacts/other.md", &typed("company", "acme"));
+
+        let tree = tree(&fx.store, None, Some("contact")).expect("tree");
+        let files: Vec<String> = tree
+            .layers
+            .iter()
+            .flat_map(|l| &l.type_folders)
+            .flat_map(|tf| &tf.files)
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["records/contacts/sarah.md".to_string()],
+            "only the file whose frontmatter type matches survives; untyped/other are skipped"
         );
     }
 
@@ -886,6 +1037,30 @@ mod tests {
 
         let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
         assert_eq!(o.sections[0].heading, "Title");
+    }
+
+    #[test]
+    fn outline_keeps_unspaced_trailing_hash_in_heading_text() {
+        // Regression (finding #46): a trailing `#` with no preceding space is
+        // part of the heading text, not an ATX closing fence (`## C#` -> "C#").
+        // `## Ada ##` (space before the run) is still a closing fence -> "Ada",
+        // and a bare `## ##` is an empty heading.
+        let fx = Fixture::new();
+        let file = "---\nx: 1\n---\n## C#\n## F#\n## Ada ##\n## ##\n";
+        fx.write("wiki/notes/langs.md", file);
+
+        let o = outline(&fx.store, Path::new("wiki/notes/langs.md")).expect("outline");
+        let texts: Vec<String> = o.sections.iter().map(|s| s.heading.clone()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "C#".to_string(),
+                "F#".to_string(),
+                "Ada".to_string(),
+                "".to_string(),
+            ],
+            "unspaced trailing # stays; a space-preceded # run is a closing fence"
+        );
     }
 
     #[test]

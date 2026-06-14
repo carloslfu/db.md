@@ -14,6 +14,13 @@
 /tests/corpora/corpus-d-scale/
 /tests/corpora/corpus-d-scale-1m/
 
+# Transient advisory lock for log-append concurrency. Created at a store root
+# at runtime and removed after; db.md stores are version-controlled, so this
+# must never be tracked, at the repo's own db/ store, examples, or any nested
+# store root.
+log.md.lock
+**/log.md.lock
+
 # Stray compile artifact (an anonymous `rustc` / doctest binary lands here)
 /rust_out
 

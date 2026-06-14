@@ -1,15 +1,15 @@
 //! `dbmd outline <file>` — section + sub-section outline of one file.
 //!
-//! Thin wrapper: read the single file directly, strip a leading YAML
-//! frontmatter block, extract its `##`+ sections, and print the nested outline
-//! (text) or the structured outline (`--json`). Like its twin `dbmd sections`,
-//! this is a **single-file read** — it does NOT require a db.md store. All
-//! section parsing lives in `dbmd_core::parser::extract_sections`; this body
-//! only reads the file and formats.
+//! Thin wrapper: read the single file directly, extract its `##`+ sections, and
+//! print the nested outline (text) or the structured outline (`--json`). Like
+//! its twin `dbmd sections`, this is a **single-file read** — it does NOT
+//! require a db.md store. All section parsing (frontmatter offset included)
+//! lives in `dbmd_core::parser::extract_sections_in_file`, which numbers
+//! `Section::line` against the source file; this body only reads and formats.
 
 use std::path::{Path, PathBuf};
 
-use dbmd_core::parser::{extract_sections, Section};
+use dbmd_core::parser::{extract_sections_in_file, Section};
 
 use crate::cli::OutlineArgs;
 use crate::context::Context;
@@ -49,8 +49,7 @@ pub fn run(ctx: &Context, args: &OutlineArgs) -> CliResult {
         CliError::new(ExitCode::Runtime, "IO_ERROR", e.to_string())
             .with_hint(format!("could not read `{}`", args.file))
     })?;
-    let body = strip_frontmatter(&text);
-    let sections = extract_sections(body);
+    let sections = extract_sections_in_file(&text);
 
     let outline = Outline {
         file: display,
@@ -63,54 +62,6 @@ pub fn run(ctx: &Context, args: &OutlineArgs) -> CliResult {
         emit_text(&outline);
     }
     Ok(())
-}
-
-/// Return the file body with a leading YAML frontmatter block removed, so
-/// section line numbers count from the first body line (matching the parser's
-/// body frame). If the text does not open with a `---` fence, it is all body.
-///
-/// Lenient by design — an outline never fails just because a file is missing
-/// frontmatter (mirrors `dbmd_core::render::outline`'s former body frame, which
-/// is why this strip is duplicated here rather than routed through the strict
-/// `parser::read_file`, which errors on missing frontmatter).
-fn strip_frontmatter(text: &str) -> &str {
-    // The opening fence must be the very first line, exactly `---`.
-    let after_open = match text.strip_prefix("---\n") {
-        Some(rest) => rest,
-        None => match text.strip_prefix("---\r\n") {
-            Some(rest) => rest,
-            None => return text,
-        },
-    };
-
-    // Find the closing `---` line; the body is everything after it.
-    let mut search_from = 0usize;
-    while let Some(rel_idx) = after_open[search_from..].find("---") {
-        let idx = search_from + rel_idx;
-        let at_line_start = idx == 0 || after_open.as_bytes()[idx - 1] == b'\n';
-        let after = &after_open[idx + 3..];
-        let line_ends = after.is_empty()
-            || after.starts_with('\n')
-            || after.starts_with("\r\n")
-            || after.starts_with('\r');
-        if at_line_start && line_ends {
-            // Skip past the closing fence's own line terminator.
-            if let Some(stripped) = after.strip_prefix("\r\n") {
-                return stripped;
-            }
-            if let Some(stripped) = after.strip_prefix('\n') {
-                return stripped;
-            }
-            if let Some(stripped) = after.strip_prefix('\r') {
-                return stripped;
-            }
-            return after; // closing fence is the last line, no trailing body
-        }
-        search_from = idx + 3;
-    }
-
-    // Unterminated frontmatter: treat the whole thing as body rather than error.
-    text
 }
 
 /// Nested text outline: each `##`+ heading, indented by `(level - 2) * 2`

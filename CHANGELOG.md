@@ -8,7 +8,79 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.8**.
+  `Cargo.toml`, currently **v0.3.9**.
+
+## [0.3.9] — 2026-06-14
+
+A launch-readiness correctness and security release. An adversarial code
+review of the toolkit surfaced reproduced defects across the codebase; this
+release fixes all of them, plus the issues a follow-up adversarial review of
+the fixes themselves found. The format is unchanged (still v0.2), and the
+public `dbmd-core` API stays backward-compatible (only additive helpers).
+
+### Fixed
+
+**Silent data loss (critical):**
+
+- `dbmd write` to a type-folder `index.md` / `index.jsonl` no longer lets the
+  write-through catalog destroy the just-written record; reserved catalog
+  filenames are refused at the write surface, at any folder depth.
+- `dbmd index rebuild` no longer deletes user content files named `index.md`
+  inside date shards, and an abort on one malformed file no longer destroys
+  existing catalogs or leaves the store in a permanently unfixable validation
+  state.
+- A `dbmd log` note whose line looks like an entry header
+  (`## [<date>] <kind> | <obj>`) can no longer fabricate phantom entries or
+  corrupt the append-only log on rotation — fixed both at the write path
+  (escaping) and in the reverse reader (a block-boundary header-scan bug).
+
+**Store→host security boundary:**
+
+- `dbmd search --type` / `--where` no longer reads files outside the store via
+  a crafted `index.jsonl` sidecar path (path traversal / exfiltration).
+- `dbmd write` and `dbmd extract --out` no longer write outside the store
+  through a symlinked directory anywhere in the path (parent included).
+- Graph traversal and `dbmd stats` no longer dereference `..` wiki-link
+  targets outside the store root.
+
+**Frontmatter integrity:**
+
+- Sequence/mapping values on universal keys (`summary`, `status`, `type`,
+  `tags`) and non-string YAML keys now round-trip verbatim on rewrite instead
+  of being silently deleted or rewritten to debug form; nested plain string
+  lists are no longer fabricated into wiki-links; a fence written with a
+  trailing space is read consistently across every surface.
+
+**Validation correctness:**
+
+- Null / non-scalar `created`, `updated`, and schema `required` values are now
+  caught instead of bypassing checks; unreadable (non-UTF-8) files are
+  reported rather than silently passing; wiki-links inside fenced code are no
+  longer flagged; `validate --all` no longer skips in-layer `log/` folders;
+  links to existing non-`.md` source files are no longer false-flagged as
+  broken; `Shape::Url` / `Shape::Email` edge cases corrected.
+
+**Graph / index / extraction / query / render:**
+
+- Link-edge detection now agrees across graph, `stats`, `rename`, and
+  `validate` on fenced code, letter case, and surrounding whitespace, so
+  `rename` no longer rewrites fenced documentation examples or misses real
+  links, and backlinks no longer over- or under-report.
+- Index rollup `(N)` counts stay consistent between full rebuild and
+  write-through; multi-line summaries no longer corrupt `index.md`.
+- docx / EPUB / spreadsheet extraction preserves XML entities, percent-encoded
+  hrefs, spreadsheet dates, and literal bracketed / `#` text.
+- `query --type`, `tree --type`, default-summary heading detection, and
+  `sections` / `outline` source-relative line numbers corrected.
+- `updated` is now auto-maintained on `fm set`, `link`, and `rename`.
+
+**Filesystem / packaging:**
+
+- `write_atomic` preserves destination file permissions instead of resetting
+  them; `install.sh` upgrades atomically (no truncated binary on a
+  cross-filesystem move) and honors `DBMD_BASE_URL`; a flaky macOS
+  test-harness mtime guard was removed; the runtime `log.md.lock` advisory
+  lock is git-ignored.
 
 ## [0.3.8] — 2026-06-13
 

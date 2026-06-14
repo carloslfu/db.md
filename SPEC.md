@@ -739,8 +739,8 @@ user's choice. **db.md ships no LLM runtime and no API keys.**
 7. **Refreshes `summary` whenever the content meaningfully changes**
    — e.g. if a contact's role changes, the agent updates both the
    `role` field and the `summary` field. Stale summaries are an
-   anti-pattern; `dbmd validate` warns on suspiciously old summaries
-   relative to the file's body.
+   anti-pattern the curator keeps in check by re-reading and
+   refreshing the `summary` alongside any substantive body edit.
 8. **Maintains cross-references** (a wiki page about a person links
    to the contact record, the company record, and meeting records).
 9. **Flags contradictions** (two sources disagree on a contact's
@@ -916,9 +916,11 @@ see; grouped by category):
 | `DB_MD_BAD_TYPE` | error | the store's `DB.md` is not `type: db-md` |
 | `DB_MD_MISSING_FIELD` | error | the store's `DB.md` frontmatter lacks `scope` or `owner` |
 | `DB_MD_UNKNOWN_SECTION` | warning | `DB.md` has an `##` section other than `Agent instructions` / `Policies` / `Schemas` |
+| `DB_MD_SCHEMA_FIELD` | warning / info | a `DB.md ## Schemas` field declaration is malformed (empty or duplicate field name → warning) or carries an unrecognized modifier (→ info) |
 | `FM_MISSING_TYPE` | error | content file has no `type:` |
 | `FM_MISSING_CREATED` | error | content file has no `created:` timestamp — run `dbmd fm init` or set RFC3339 manually |
 | `FM_MISSING_UPDATED` | error | content file has no `updated:` timestamp — run `dbmd fm init` or set RFC3339 manually |
+| `FM_UNREADABLE` | error | content file can't be read (not valid UTF-8, or an I/O error) |
 | `FM_MALFORMED_YAML` | error | frontmatter block isn't valid YAML |
 | `FM_BAD_TIMESTAMP` | error | `created` or `updated` isn't ISO-8601 |
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |

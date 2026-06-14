@@ -123,7 +123,11 @@ pub struct LogEntry {
 impl LogEntry {
     /// Render this entry as it appears on disk: the `## [...]` header line,
     /// then the note body, then a trailing blank line so successive entries are
-    /// separated. The note is emitted verbatim (trailing whitespace trimmed).
+    /// separated. The note is emitted with header-shaped continuation lines
+    /// **escaped** (see [`escape_note_line`]) so a note line that happens to
+    /// match the entry-header shape (`## [YYYY-MM-DD HH:MM] <kind> | <obj>`) can
+    /// never be mistaken for a real entry header on readback or on the next
+    /// rotation. The escape round-trips exactly through [`unescape_note_line`].
     fn render(&self) -> String {
         let ts = self.timestamp.format(TS_FORMAT);
         let mut out = String::new();
@@ -135,9 +139,24 @@ impl LogEntry {
                 out.push_str(&format!("## [{}] {}\n", ts, self.kind.as_str()));
             }
         }
-        let note = self.note.trim_end_matches(['\n', '\r', ' ', '\t']);
+        // Trim only the structural line terminators (`\n`/`\r`) — the trailing
+        // blank line separating entries is appended below, so a note's own
+        // trailing newlines would otherwise stack up and shift on every
+        // re-render. Spaces and tabs are legitimate note *content* and must be
+        // preserved verbatim, so the round-trip is exact: readback
+        // (`parse_entries`) trims the same `['\n', '\r']` set and no more, and a
+        // note ending in a space (`"note 0 "`) must reconstruct unchanged.
+        let note = self.note.trim_end_matches(['\n', '\r']);
         if !note.is_empty() {
-            out.push_str(note);
+            // Escape per line: a note line that parses as an entry header is
+            // prefixed so it is no longer at column 0 as `## [` — it stays note
+            // body on readback and on rotation, never a fabricated entry.
+            for (i, line) in note.split('\n').enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(&escape_note_line(line));
+            }
             out.push('\n');
         }
         out.push('\n');
@@ -162,8 +181,26 @@ impl Log {
     /// `type: log` frontmatter) if absent. **If the active log holds entries
     /// from a prior month, roll those older months into `log/<YYYY-MM>.md`
     /// first** (atomic move), keeping the active file to the current month.
+    ///
+    /// **Concurrency.** `append` is a read-modify-write of the whole active file
+    /// (`write_atomic` is atomic at the file level, but the read→render→write
+    /// window is not). Two concurrent appenders — the manager and a cron-driven
+    /// background system, say — would otherwise both read the same N-entry
+    /// snapshot and each write N+1 entries, the second rename clobbering the
+    /// first and silently dropping an audit entry. We serialize the whole
+    /// read-modify-write under an advisory file lock (`flock`, held for the
+    /// duration) so concurrent appends queue instead of racing. The lock is
+    /// advisory and process-scoped; it guards the toolkit's own appends, which is
+    /// the realistic contention path.
     pub fn append(store: &Store, entry: &LogEntry) -> crate::Result<()> {
         let active = active_log_path(store);
+
+        // Serialize concurrent appends for the whole read-modify-write. Held
+        // until `_lock` drops at function exit (covering both the rotation and
+        // the plain-append paths). A lock failure is non-fatal: we proceed
+        // unlocked rather than refuse to log (best-effort, same posture as the
+        // pre-fix behaviour on platforms without advisory locks).
+        let _lock = AppendLock::acquire(&active);
 
         // Read the active file's current contents (if any). The "current month"
         // is the month of the entry being appended (the newest in the timeline);
@@ -260,12 +297,19 @@ impl Log {
         // within-file early stop: out-of-order entries mean a newer entry can
         // sit physically before an older one, so each file is read fully.
         let mut window = NewestWindow::new(n);
+        // Cross-file identity dedup (see `since`): an interrupted rotation can
+        // leave the same entry in both the untrimmed active file and the
+        // archive; without this the duplicate would occupy two window slots and
+        // surface twice. The active copy (scanned first) is the one kept.
+        let mut seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
         // Active file: scan fully (current-month-bounded by rotation).
         let active = active_log_path(store);
         if active.exists() {
             reverse_collect(&active, |e| {
-                window.consider(e);
+                if seen.insert(entry_key(&e)) {
+                    window.consider(e);
+                }
                 false
             })?;
         }
@@ -285,7 +329,9 @@ impl Log {
                 }
             }
             reverse_collect(&archive, |e| {
-                window.consider(e);
+                if seen.insert(entry_key(&e)) {
+                    window.consider(e);
+                }
                 false
             })?;
         }
@@ -317,12 +363,19 @@ impl Log {
     /// month is entirely at or before `time`'s.
     pub fn since(store: &Store, time: DateTime<FixedOffset>) -> crate::Result<Vec<LogEntry>> {
         let mut collected: Vec<LogEntry> = Vec::new();
+        // Cross-file identity dedup. An interrupted rotation (archive write
+        // committed, active rewrite not) leaves the same entries in BOTH the
+        // untrimmed active file and the archive; without dedup every such entry
+        // comes back twice. Keyed on the full entry identity, so only a
+        // byte-identical duplicate is suppressed (the active copy, scanned first,
+        // is the one kept); two genuinely-distinct entries never collide.
+        let mut seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
         // Active file: scan fully, no early stop (out-of-order safe).
         let active = active_log_path(store);
         if active.exists() {
             reverse_collect(&active, |e| {
-                if e.timestamp > time {
+                if e.timestamp > time && seen.insert(entry_key(&e)) {
                     collected.push(e);
                 }
                 false
@@ -352,7 +405,7 @@ impl Log {
             // Scan this archive fully — within a month, entries may still be
             // out of order, so no within-file early stop.
             reverse_collect(&archive, |e| {
-                if e.timestamp > time {
+                if e.timestamp > time && seen.insert(entry_key(&e)) {
                     collected.push(e);
                 }
                 false
@@ -566,6 +619,109 @@ impl PartialOrd for WindowItem {
     }
 }
 
+/// An advisory, exclusive lock serializing concurrent [`Log::append`] calls.
+///
+/// Held on a dedicated sibling lock file (`<active>.lock`) rather than on
+/// `log.md` itself: `write_atomic` replaces the active file by `rename`, so the
+/// active inode changes under us and a lock on its fd would not cover the new
+/// file. The lock file is stable, so the lock spans the whole read-modify-write.
+///
+/// On Unix this is `flock(LOCK_EX)`, released on drop (or implicitly when the
+/// process exits / the fd closes, so a crash never strands the lock). The
+/// lock file is created if absent and intentionally left on disk between runs
+/// (locking it does not depend on its contents). On non-Unix targets the lock
+/// is a no-op — db.md's append surface is Unix-targeted, and a missing advisory
+/// lock degrades to the pre-fix last-writer-wins, never to incorrectness of a
+/// single writer.
+struct AppendLock {
+    #[cfg(unix)]
+    file: Option<File>,
+}
+
+impl AppendLock {
+    /// Acquire the exclusive append lock for the store whose active log is
+    /// `active`. Best-effort: any failure to open or lock the lock file yields
+    /// an unlocked guard (we log rather than refuse to log). Blocks until the
+    /// lock is granted when another appender holds it.
+    fn acquire(active: &Path) -> AppendLock {
+        #[cfg(unix)]
+        {
+            let file = Self::open_and_lock(active);
+            AppendLock { file }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = active;
+            AppendLock {}
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_and_lock(active: &Path) -> Option<File> {
+        use std::os::unix::io::AsRawFd;
+
+        // The lock file lives beside the active log; ensure its parent exists
+        // (the fresh-log path may run before `log.md`'s directory is created).
+        if let Some(parent) = active.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let lock_path = lock_path_for(active);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+
+        // Blocking exclusive advisory lock. `flock` is in libc, which every Rust
+        // binary links, so the bare `extern "C"` declaration needs no crate dep.
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        if rc != 0 {
+            // Could not lock (e.g. a filesystem without flock support): proceed
+            // unlocked rather than fail the append.
+            return None;
+        }
+        Some(file)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AppendLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        if let Some(file) = &self.file {
+            // Release explicitly; the fd close on drop would also release it.
+            unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+        }
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+/// `flock` operation: exclusive lock (`LOCK_EX`), blocking.
+#[cfg(unix)]
+const LOCK_EX: std::os::raw::c_int = 2;
+/// `flock` operation: unlock (`LOCK_UN`).
+#[cfg(unix)]
+const LOCK_UN: std::os::raw::c_int = 8;
+
+/// The advisory-lock sibling path for an active log file (`<name>.lock`).
+#[cfg(unix)]
+fn lock_path_for(active: &Path) -> PathBuf {
+    let mut name = active
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("log.md"));
+    name.push(".lock");
+    match active.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// The active `log.md` path under the store root.
 fn active_log_path(store: &Store) -> PathBuf {
     store.root.join("log.md")
@@ -613,6 +769,47 @@ fn find_first_header(content: &str) -> Option<usize> {
     content.match_indices("\n## [").next().map(|(i, _)| i + 1)
 }
 
+/// Whether `line` is a note line that — left unescaped — could be mistaken for
+/// an entry header. It is *header-ambiguous* when it is a (possibly empty) run
+/// of leading backslashes followed by a string that [`Log::parse_header`]
+/// accepts. The escape (one leading backslash) and only the escape is added to,
+/// or stripped from, such lines, so the transform is fully reversible:
+/// `## [..]` (a real header shape in note text) ⇄ `\## [..]`, and a literal
+/// `\## [..]` a note already contains ⇄ `\\## [..]`.
+fn is_header_ambiguous(line: &str) -> bool {
+    let stripped = line.trim_start_matches('\\');
+    // Only treat it as ambiguous if some backslashes were the *only* prefix and
+    // the remainder is a valid header — a backslash run that does not lead into
+    // a header (e.g. `\not a header`) is ordinary note text, left untouched.
+    Log::parse_header(stripped).is_some()
+}
+
+/// Escape one note line for on-disk emission so it can never be parsed as an
+/// entry header (the [write-path fix] for header-shaped notes corrupting the
+/// append-only log). A header-ambiguous line is prefixed with a single
+/// backslash, moving its `## [` off column 0; every other line is emitted
+/// verbatim. Reversed exactly by [`unescape_note_line`].
+fn escape_note_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if is_header_ambiguous(line) {
+        std::borrow::Cow::Owned(format!("\\{line}"))
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    }
+}
+
+/// Reverse [`escape_note_line`]: strip exactly one leading backslash from a
+/// header-ambiguous on-disk note line, restoring the literal the author wrote.
+/// A line that is not header-ambiguous (including a genuine `\not a header`) is
+/// returned untouched, so the round-trip is lossless for arbitrary note text.
+fn unescape_note_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = line.strip_prefix('\\') {
+        if is_header_ambiguous(line) {
+            return std::borrow::Cow::Borrowed(rest);
+        }
+    }
+    std::borrow::Cow::Borrowed(line)
+}
+
 /// Parse every entry in a slice that begins at (or before, header-block
 /// included) a sequence of `## [` headers. Headers that fail to parse are
 /// skipped (their body folds into the previous valid entry's note is avoided —
@@ -626,7 +823,13 @@ fn parse_entries(text: &str) -> Vec<LogEntry> {
                  header: &mut Option<(DateTime<FixedOffset>, LogKind, Option<String>)>,
                  note: &mut Vec<&str>| {
         if let Some((timestamp, kind, object)) = header.take() {
-            let joined = note.join("\n");
+            // Reverse the per-line header escape `render` applies so an escaped
+            // header-shaped note line round-trips back to its literal form.
+            let joined = note
+                .iter()
+                .map(|line| unescape_note_line(line))
+                .collect::<Vec<_>>()
+                .join("\n");
             let note_str = joined.trim_matches(['\n', '\r']).to_string();
             entries.push(LogEntry {
                 timestamp,
@@ -833,14 +1036,27 @@ where
     //
     // `buf` holds the file's bytes from absolute offset `start` (growing
     // leftward toward 0) to EOF. `emitted_abs` records the absolute offsets of
-    // headers already handed to `take`, so re-deriving headers each block never
-    // double-emits.
+    // headers already handed to `take`, so re-visiting a header in a later block
+    // never double-emits.
     let mut buf: Vec<u8> = Vec::new();
     let mut start = len;
-    // O(1) membership: a `Vec` + `.contains()` here is O(E^2) across a large
-    // single-month file (every header re-scanned against all prior emissions).
+    // O(1) membership: a `Vec` + `.contains()` here would be O(E²) across a large
+    // single-month file (every header re-checked against all prior emissions).
     let mut emitted_abs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Every header's absolute offset found so far, ascending. Built
+    // *incrementally*: each block contributes only the markers whose `#` starts
+    // inside it (all strictly smaller than any already-known offset, so they
+    // prepend in order). This is the fix for the accidental O(file²) scan — the
+    // old code re-ran `header_offsets` over the whole accumulated buffer on every
+    // block (O(file²/block) byte comparisons on the default no-early-stop
+    // tail/since path); now each byte is scanned for a header exactly once.
+    let mut headers: Vec<u64> = Vec::new();
     let mut stop = false;
+    // The first backward block has no already-scanned region to its right, so it
+    // scans exactly `[0, block)`; every later block scans one byte further
+    // (`block + 1`) to re-classify the prior block's deferred left-edge candidate
+    // now that its left neighbour is buffered (see the scan call below).
+    let mut first = true;
 
     while start > 0 && !stop {
         let block = std::cmp::min(REVERSE_BLOCK as u64, start);
@@ -852,9 +1068,29 @@ where
         buf = chunk;
         start = new_start;
 
-        // Find absolute offsets of every header line-start in the current
-        // buffer.
-        let headers = header_offsets(&buf, start);
+        // Scan the freshly-prepended block (buffer indices `[0, block)`) for new
+        // header markers. A marker straddling the block boundary has its `#` in
+        // this window and so is still caught (see `header_offsets_range`).
+        //
+        // One subtlety the scan must respect: a `## [` whose `#` sits at the
+        // block's LEFT edge (buffer index 0, absolute offset `start`) cannot have
+        // its line-start confirmed yet when `start > 0` — the byte at `start - 1`
+        // is not buffered. Treating index 0 as a line start there fabricates an
+        // entry from a mid-line `## [` fragment that happens to align with a block
+        // boundary. So `header_offsets_range` DEFERS the leftmost candidate when
+        // `base` is not the true file start, and we re-scan one byte further
+        // right next time: after the first block the buffer carries the previous
+        // block's left-edge byte at index `block` with its left neighbour now in
+        // hand, so extending the window to `block + 1` re-classifies that exactly
+        // once. `first` guards the first block (nothing to re-check on its right).
+        let base_is_file_start = start == 0;
+        let scan_hi = if first { block } else { block + 1 } as usize;
+        let mut new_headers = header_offsets_range(&buf, start, 0, scan_hi, base_is_file_start);
+        first = false;
+        if !new_headers.is_empty() {
+            new_headers.extend_from_slice(&headers);
+            headers = new_headers;
+        }
 
         // Process newest (largest offset) → oldest (smallest), emitting any
         // header not yet emitted. Hold back only the buffer's *leftmost* header
@@ -888,9 +1124,9 @@ where
 
     // Reached file start (or stopped). If we stopped, done. If we reached
     // start, emit any held-back oldest header(s) now (start == 0 means the
-    // buffer's first header is genuinely the oldest).
+    // buffer's first header is genuinely the oldest). `headers` already holds
+    // every offset (the loop scanned down to start == 0), so reuse it.
     if !stop && start == 0 {
-        let headers = header_offsets(&buf, start);
         for i in (0..headers.len()).rev() {
             let abs = headers[i];
             if emitted_abs.contains(&abs) {
@@ -923,14 +1159,68 @@ where
 /// restriction), truncating the note and dropping the carved pseudo-entry, so
 /// `tail`/`since`/`last_validate_at` would return a note diverging from the
 /// intact on-disk bytes.
+///
+/// Whole-buffer convenience wrapper over [`header_offsets_range`]. The runtime
+/// reverse reader now always scans incrementally (one freshly-prepended window
+/// per backward block), so this whole-buffer form is retained only as the
+/// oracle the range-scan tests check the incremental scan against.
+#[cfg(test)]
 fn header_offsets(buf: &[u8], base: u64) -> Vec<u64> {
+    // The whole-buffer oracle treats `base` as the file start iff it is 0, so a
+    // `## [` at buffer index 0 is a real line-start there.
+    header_offsets_range(buf, base, 0, buf.len(), base == 0)
+}
+
+/// Like [`header_offsets`] but only reports header *markers whose `#` starts in*
+/// `buf[scan_lo..scan_hi)`, while still consulting bytes outside that window —
+/// to the left for the line-start (`buf[i-1] == b'\n'`) check and to the right
+/// for the header line's content. This is the incremental scan
+/// [`reverse_collect`] uses: each backward block searches only the freshly-
+/// prepended region for *new* markers, so total header-scan work is linear in
+/// the file size, not the O(file²) of re-scanning the whole growing buffer on
+/// every block.
+///
+/// A `## [` marker that *straddles* the boundary (its `#` in the new block, its
+/// `[` or trailing bytes in the already-scanned region) is still detected here:
+/// its `#` index is `< scan_hi`, so it falls in this window, and it was never
+/// reported by an earlier scan (whose window was `[block, …)`, strictly to the
+/// right of this one) — so each marker is reported exactly once across all
+/// blocks.
+///
+/// **Left-edge line-start safety.** A `## [` whose `#` is at buffer index 0 has
+/// no buffered left neighbour, so its line-start cannot be confirmed unless
+/// index 0 really is the file start. `base_is_file_start` says so: when it is
+/// `false`, an index-0 candidate is DEFERRED (not reported) rather than assumed
+/// to be at a line start — otherwise a mid-line `## […]` fragment that happens
+/// to align with a block's left edge would be fabricated into an entry,
+/// truncating the real entry's note and (after rotation) corrupting the
+/// append-only archive. The caller re-scans that byte on the next block, once
+/// its left neighbour is buffered, so a genuine boundary header is still found
+/// exactly once.
+fn header_offsets_range(
+    buf: &[u8],
+    base: u64,
+    scan_lo: usize,
+    scan_hi: usize,
+    base_is_file_start: bool,
+) -> Vec<u64> {
     const PAT: &[u8] = b"## [";
     let mut out = Vec::new();
     let n = buf.len();
-    let mut i = 0;
-    while i + PAT.len() <= n {
+    let hi = scan_hi.min(n);
+    let mut i = scan_lo;
+    // A marker's `#` must start strictly before `hi`; the pattern/line content
+    // may read past `hi` into `buf` (the right neighbour is already buffered).
+    while i < hi && i + PAT.len() <= n {
         if &buf[i..i + PAT.len()] == PAT {
-            let at_line_start = i == 0 || buf[i - 1] == b'\n';
+            // Index 0 is a line start only when it is the genuine file start;
+            // otherwise its left neighbour is unbuffered and the candidate is
+            // deferred to the next block (see the doc comment).
+            let at_line_start = if i == 0 {
+                base_is_file_start
+            } else {
+                buf[i - 1] == b'\n'
+            };
             if at_line_start && is_valid_header_line(buf, i) {
                 out.push(base + i as u64);
                 // skip ahead past this marker
@@ -2172,6 +2462,321 @@ Second.
                 .collect(),
             "since(non-UTC cutoff near a month boundary) must include the April \
              archive entry newer than the cutoff instant; got {got:?}"
+        );
+    }
+
+    // ── regression: header-shaped note line corrupts the append-only log (#critical)
+
+    #[test]
+    fn note_line_shaped_like_a_header_is_escaped_and_round_trips() {
+        // A `contradiction` note quoting an earlier entry header is the
+        // demonstrated corruption: the verbatim `## [2020-01-01 00:00] delete |
+        // …` line was parsed as a REAL entry on readback (fabricated entry, real
+        // note truncated). With write-path escaping it stays note body.
+        let (_d, store) = temp_store();
+        let note = "quoting earlier entry:\n## [2020-01-01 00:00] delete | records/contacts/jane.md\nend of quote";
+        let e = entry(
+            2026,
+            6,
+            11,
+            4,
+            41,
+            LogKind::Contradiction,
+            Some("records/contacts/jane.md"),
+            note,
+        );
+        Log::append(&store, &e).unwrap();
+
+        // On disk: the header-shaped note line must NOT sit at column 0 as a
+        // `## [` header — `grep "^## \["` must see exactly the one real header.
+        let raw = fs::read_to_string(store.root.join("log.md")).unwrap();
+        let header_lines = raw.lines().filter(|l| l.starts_with("## [")).count();
+        assert_eq!(
+            header_lines, 1,
+            "exactly one real entry header may sit at column 0; got:\n{raw}"
+        );
+
+        // Readback returns ONE entry, with the full note intact (no fabricated
+        // 2020 entry, no truncation).
+        let got = Log::tail(&store, 10).unwrap();
+        assert_eq!(got.len(), 1, "exactly one entry; got {got:?}");
+        assert_eq!(got[0].note, note, "note must round-trip verbatim");
+        assert_eq!(got[0], e);
+        let since = Log::since(&store, ts(2026, 1, 1, 0, 0)).unwrap();
+        assert_eq!(since, vec![e.clone()]);
+    }
+
+    #[test]
+    fn header_shaped_note_survives_a_later_rotation_uncorrupted() {
+        // Physical corruption: pre-fix, the fabricated past-dated pseudo-entry
+        // (year 2020 < current) was rolled into an archive on the NEXT append,
+        // splitting the real note. With escaping the line is note text, so a
+        // later append never sees a phantom prior-month entry to roll out.
+        let (_d, store) = temp_store();
+        let note = "see\n## [2020-01-01 00:00] delete | records/x.md\nbelow";
+        let first = entry(
+            2026,
+            6,
+            11,
+            4,
+            41,
+            LogKind::Contradiction,
+            Some("records/x.md"),
+            note,
+        );
+        Log::append(&store, &first).unwrap();
+
+        // Append another current-month entry — the path that re-parses + may
+        // rotate. No 2020 archive must be created and the first note stays whole.
+        let second = entry(
+            2026,
+            6,
+            11,
+            5,
+            0,
+            LogKind::Update,
+            Some("records/y.md"),
+            "y",
+        );
+        Log::append(&store, &second).unwrap();
+
+        assert!(
+            !store.root.join("log").join("2020-01.md").exists(),
+            "a header-shaped note line must not fabricate a 2020 archive"
+        );
+        let got = Log::tail(&store, 10).unwrap();
+        assert_eq!(got.len(), 2, "two real entries only; got {got:?}");
+        let first_back = got
+            .iter()
+            .find(|e| e.object.as_deref() == Some("records/x.md"));
+        assert_eq!(
+            first_back.map(|e| e.note.as_str()),
+            Some(note),
+            "the header-shaped note must survive the rotation pass intact"
+        );
+    }
+
+    #[test]
+    fn escape_unescape_note_line_round_trips_including_literal_backslash() {
+        // The escape must be lossless for arbitrary note lines, including a line
+        // the author genuinely wrote starting with `\` before a header shape.
+        let valid_header = "## [2020-01-01 00:00] delete | x";
+        // A real header shape: escaped on write, restored on read.
+        assert_eq!(
+            &*escape_note_line(valid_header),
+            &format!("\\{valid_header}")
+        );
+        let escaped = escape_note_line(valid_header).into_owned();
+        assert_eq!(&*unescape_note_line(&escaped), valid_header);
+        // An already-`\`-prefixed header-shape line escapes to two backslashes
+        // and restores to one (never collapses to a bare header).
+        let pre = format!("\\{valid_header}");
+        assert_eq!(&*escape_note_line(&pre), &format!("\\{pre}"));
+        let pre_escaped = escape_note_line(&pre).into_owned();
+        assert_eq!(&*unescape_note_line(&pre_escaped), &pre);
+        // Ordinary text (including a `\` that does NOT lead into a header) is
+        // untouched both ways.
+        for plain in ["plain note", "## [not a header]", "\\not a header", ""] {
+            assert_eq!(&*escape_note_line(plain), plain);
+            assert_eq!(&*unescape_note_line(plain), plain);
+        }
+    }
+
+    // ── regression: reverse reader scans each block once (no O(file²)) (#perf) ──
+
+    #[test]
+    fn reverse_read_correct_with_header_straddling_a_block_boundary() {
+        // The incremental per-block header scan must still catch a `## [` marker
+        // whose `#` falls in one block but whose bytes extend into the already-
+        // scanned region. Build a log whose total size crosses several blocks and
+        // verify a full read reconstructs every entry — the straddle case is hit
+        // by construction across the many block boundaries.
+        let (_d, store) = temp_store();
+        let n = 600usize;
+        let mut expected: Vec<LogEntry> = Vec::new();
+        for i in 0..n {
+            let total_min = (i as u32) * 2;
+            let day = 1 + total_min / (24 * 60);
+            let hour = (total_min / 60) % 24;
+            let min = total_min % 60;
+            // Vary note length so headers land at many offsets relative to the
+            // fixed 8 KiB block grid, exercising boundary straddles.
+            let note = format!("note {i} {}", "y".repeat(i % 97));
+            let e = entry(
+                2026,
+                6,
+                day,
+                hour,
+                min,
+                LogKind::Update,
+                Some(&format!("records/item-{i:05}")),
+                &note,
+            );
+            Log::append(&store, &e).unwrap();
+            expected.push(e);
+        }
+        let size = fs::metadata(store.root.join("log.md")).unwrap().len();
+        assert!(
+            size > (REVERSE_BLOCK as u64) * 3,
+            "test log not large enough ({size} bytes) to cross several blocks"
+        );
+        let all = Log::tail(&store, n + 10).unwrap();
+        assert_eq!(all, expected, "every entry must reconstruct across blocks");
+        // A small tail must also be exact (the n-newest by timestamp).
+        assert_eq!(Log::tail(&store, 7).unwrap(), expected[n - 7..].to_vec());
+    }
+
+    #[test]
+    fn header_offsets_range_finds_boundary_straddling_marker_once() {
+        // Two headers; `header_offsets` (whole-buffer) finds both. The range
+        // scan with a window that splits the buffer between them must report the
+        // one in its window exactly once, consulting the left neighbour for the
+        // line-start check.
+        let buf =
+            b"## [2026-06-01 00:00] update | a\nnote a\n## [2026-06-01 00:01] update | b\nnote b\n";
+        let full = header_offsets(buf, 0);
+        assert_eq!(full.len(), 2, "both headers found over the whole buffer");
+        let second = full[1] as usize;
+        // A window covering only the SECOND header's `#` reports just it. Its `#`
+        // is not at index 0, so `base_is_file_start` is irrelevant here.
+        let only_second = header_offsets_range(buf, 0, second, second + 1, false);
+        assert_eq!(only_second, vec![full[1]]);
+        // A window covering only the FIRST reports just it (right content read
+        // past the window into the buffer). `base == 0` is the true file start,
+        // so the index-0 candidate is a real line start.
+        let only_first = header_offsets_range(buf, 0, 0, 1, true);
+        assert_eq!(only_first, vec![full[0]]);
+        // Disjoint windows partition the markers with no double-count.
+        let mut combined = header_offsets_range(buf, 0, 0, second, true);
+        combined.extend(header_offsets_range(buf, 0, second, buf.len(), false));
+        assert_eq!(combined, full);
+    }
+
+    /// CRITICAL regression: a MID-LINE `## [<valid header>]` fragment inside a
+    /// real entry's note that happens to align with a reverse-read block boundary
+    /// must NOT be fabricated into an entry. The incremental backward scan reads
+    /// each block's left edge before its left neighbour is buffered; treating
+    /// buffer index 0 as a line start there would carve a phantom entry from the
+    /// fragment and truncate the real entry's note. The fix defers the left-edge
+    /// candidate until its neighbour is read, so the fragment is correctly seen
+    /// as note body (its `#` is not at a line start).
+    #[test]
+    fn reverse_read_does_not_fabricate_entry_from_midline_header_at_block_boundary() {
+        let (_d, store) = temp_store();
+
+        // A single real entry. Its note carries a mid-line `## [` fragment that
+        // is a *valid* header shape but is NOT at column 0 (so the writer's
+        // column-0 escape correctly leaves it verbatim — it is the trigger).
+        let fragment = "see ## [2020-01-01 00:00] delete | records/x.md";
+        let hash_in_fragment = fragment.find("##").expect("fragment has `##`");
+
+        // Build the raw active log by hand so the fragment's `#` lands at the
+        // FIRST backward block's left edge: the reverse reader anchors its blocks
+        // at EOF (`new_start = len - REVERSE_BLOCK` on the first block), so the
+        // `#` must sit exactly `REVERSE_BLOCK` bytes before EOF. We append note
+        // padding AFTER the fragment to push EOF out to that distance.
+        //
+        // Layout (one entry):
+        //   <frontmatter>\n## [<header>] | records/real.md\nlead\n<fragment><tail>\n\n
+        let header_line = "## [2026-06-14 10:00] update | records/real.md\n";
+        let mut head = String::from(LOG_FRONTMATTER);
+        head.push('\n');
+        head.push_str(header_line);
+        head.push_str("lead\n");
+        head.push_str(fragment); // fragment opens the second note line
+
+        // Absolute offset of the fragment's `#`.
+        let hash_off = head.len() - fragment.len() + hash_in_fragment;
+        // We append `<tail>\n\n`. Bytes after `#` = (head.len() - hash_off) +
+        // tail_len + 2. Need that == REVERSE_BLOCK so `#` is at `len -
+        // REVERSE_BLOCK` (the first block's left edge).
+        let after_hash_in_head = head.len() - hash_off;
+        let tail_len = REVERSE_BLOCK
+            .checked_sub(after_hash_in_head + 2)
+            .expect("REVERSE_BLOCK comfortably exceeds the post-`#` head bytes");
+        let mut body = head;
+        body.push_str(&"z".repeat(tail_len)); // valid note bytes on the fragment line
+        body.push('\n');
+        body.push('\n');
+        fs::write(store.root.join("log.md"), &body).unwrap();
+
+        // The file must be large enough to cross at least one block boundary.
+        assert!(
+            body.len() as u64 > REVERSE_BLOCK as u64,
+            "test log must span >1 block (len {})",
+            body.len()
+        );
+        // And the fragment's `#` sits exactly at the first block's left edge.
+        let real_hash_off = body.find("see ##").unwrap() + hash_in_fragment;
+        assert_eq!(
+            real_hash_off,
+            body.len() - REVERSE_BLOCK,
+            "fragment `#` must land on the first backward block's left edge to exercise the bug"
+        );
+
+        // Reverse read must return EXACTLY ONE entry — the real one — and never a
+        // fabricated `2020-01-01 delete records/x.md` carved from the fragment.
+        let got = Log::tail(&store, 10).unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "exactly the one real entry; got {} (a fabricated entry means the boundary `#` was mis-read as a header): {got:#?}",
+            got.len()
+        );
+        let only = &got[0];
+        assert_eq!(only.object.as_deref(), Some("records/real.md"));
+        assert_eq!(only.timestamp, ts(2026, 6, 14, 10, 0));
+        // The note is intact end-to-end (not truncated at the fragment): both the
+        // lead and the verbatim fragment survive.
+        assert!(
+            only.note.contains("lead"),
+            "note keeps its lead; got {:?}",
+            only.note
+        );
+        assert!(
+            only.note.contains(fragment),
+            "note keeps the verbatim mid-line fragment (not truncated); got {:?}",
+            only.note
+        );
+    }
+
+    // ── regression: tail/since dedup across active+archive on interrupted rotation
+
+    #[test]
+    fn tail_and_since_dedup_entries_present_in_both_active_and_archive() {
+        // Reconstructs the finding's crash window: the archive write committed
+        // but the active rewrite never trimmed, so the same April entries live in
+        // BOTH the untrimmed active file and `log/2026-04.md`. Readers must
+        // return each entry ONCE, not twice.
+        let (_d, store) = temp_store();
+        let apr_a = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("apr-a"), "apr one");
+        let apr_b = entry(2026, 4, 20, 9, 0, LogKind::Create, Some("apr-b"), "apr two");
+
+        // Active file still holds both April entries (the un-trimmed state).
+        write_raw_log(&store, &[apr_a.clone(), apr_b.clone()]);
+        // The committed step-1 archive holds the same two entries.
+        let dir = archive_dir(&store);
+        fs::create_dir_all(&dir).unwrap();
+        let mut arch = String::from(LOG_FRONTMATTER);
+        arch.push('\n');
+        arch.push_str(&apr_a.render());
+        arch.push_str(&apr_b.render());
+        fs::write(archive_path(&store, 2026, 4), arch).unwrap();
+
+        // `since` must return each April entry exactly once.
+        let since = Log::since(&store, ts(2026, 4, 1, 0, 0)).unwrap();
+        assert_eq!(
+            since,
+            vec![apr_a.clone(), apr_b.clone()],
+            "since must dedup the doubly-present entries; got {since:?}"
+        );
+
+        // `tail` must too — no duplicate window slots.
+        let tail = Log::tail(&store, 10).unwrap();
+        assert_eq!(
+            tail,
+            vec![apr_a, apr_b],
+            "tail must dedup the doubly-present entries; got {tail:?}"
         );
     }
 }

@@ -12,7 +12,7 @@
 //! type-folder index current write-through (`dbmd_core::index::Index::on_write`).
 //! All real logic lives in `dbmd-core`; this is arg-parse + format glue.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_norway::Value as YamlValue;
 
@@ -68,7 +68,7 @@ pub fn run_get(ctx: &Context, args: &FmGetArgs) -> CliResult {
 pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     let (key, value) = split_assignment(&args.assignment)?;
 
-    let store = open_store(".")?;
+    let store = locate_store_from_cwd()?;
     let rel = require_store_relative(&store, &args.file)?;
     let file = store.abs_path(&rel);
 
@@ -77,6 +77,12 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
 
     let (mut fm, body) = into_cli(parser::read_file(&file))?;
     into_cli(fm.set(key, value))?;
+    // Auto-maintain `updated`: any edit to an existing content file re-stamps
+    // `updated` to now (SPEC: `updated` is auto-maintained), so the type-folder
+    // index recency ordering and `--updated-after` queries reflect the edit.
+    // An explicit `fm set updated=…` already set the field via `fm.set` above;
+    // don't clobber that operator-chosen value with `now`.
+    bump_updated_unless_explicit(&mut fm, key);
     into_cli(parser::write_file(&file, &fm, &body))?;
 
     // Write-through: re-derive the record from the now-updated file and re-sort
@@ -132,7 +138,7 @@ pub fn run_query(ctx: &Context, args: &FmQueryArgs) -> CliResult {
 /// `summary` (overridable with `--summary`), then fold the file into its index
 /// write-through. Refuses on a `DB.md` frozen page before mutating.
 pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
-    let store = open_store(".")?;
+    let store = locate_store_from_cwd()?;
     let rel = require_store_relative(&store, &args.file)?;
     let file = store.abs_path(&rel);
 
@@ -304,6 +310,72 @@ fn enforce_not_frozen(store: &Store, rel: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Re-stamp `fm.updated` to now (`dbmd_core::now()`, honoring `DBMD_NOW`) so the
+/// type-folder index recency ordering and `--updated-after` queries reflect the
+/// edit — SPEC declares `updated` auto-maintained on every content-file mutation.
+///
+/// The one exception is an explicit `dbmd fm set updated=…`: when the agent set
+/// `updated` itself, `fm.set` already wrote the operator-chosen value, so a
+/// `now` bump here would clobber it. `mutated_key` is the key the caller just
+/// `fm.set`; skip the bump when it is `updated`.
+fn bump_updated_unless_explicit(fm: &mut parser::Frontmatter, mutated_key: &str) {
+    if mutated_key != "updated" {
+        fm.updated = Some(dbmd_core::now());
+    }
+}
+
+/// Locate the db.md store the agent is operating in by walking UP from the
+/// current working directory to the **outermost** ancestor carrying a `DB.md`
+/// marker, then open it. This is what makes `fm set` / `fm init` work from any
+/// subdirectory of a store, not only from the exact root — matching the
+/// ancestor-walk `dbmd format` does, while keeping the store anchored on the
+/// operating context (CWD) so the downstream `require_store_relative`
+/// containment check still rejects a file *outside* this store with
+/// `PATH_OUTSIDE_STORE` rather than silently retargeting a different store.
+///
+/// Anchoring to the outermost (shallowest) store, rather than the first `DB.md`
+/// found walking up, keeps an interior content file that merely happens to be
+/// named `DB.md` (a store state the spec blesses as ordinary content) from
+/// hijacking discovery. When no ancestor is a store, the error carries an
+/// actionable hint (run from inside a store / author a `DB.md`) instead of the
+/// central generic "pass the store path" hint, which is unactionable here:
+/// `fm set` / `fm init` take no `--dir`.
+fn locate_store_from_cwd() -> Result<Store, CliError> {
+    let start = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+
+    match outermost_store_root(&start) {
+        Some(root) => Store::open_strict(&root).map_err(CliError::from),
+        None => Err(CliError::new(
+            ExitCode::NotAStore,
+            "NOT_A_STORE",
+            format!(
+                "not a db.md store: no DB.md found at or above {}",
+                start.display()
+            ),
+        )
+        .with_hint(
+            "run from inside a db.md store (any directory at or under a DB.md), or author a DB.md at the store root first",
+        )),
+    }
+}
+
+/// Walk `start` and every ancestor, returning the **outermost** (shallowest)
+/// directory that is a db.md store root, or `None` when no ancestor is a store.
+/// Choosing the outermost match — not the first one found walking up — is what
+/// stops an interior content file named `DB.md` from shadowing the real store
+/// root.
+fn outermost_store_root(start: &Path) -> Option<PathBuf> {
+    let mut outermost: Option<&Path> = None;
+    let mut dir: Option<&Path> = Some(start);
+    while let Some(d) = dir {
+        if Store::is_db_md_store(d) {
+            outermost = Some(d);
+        }
+        dir = d.parent();
+    }
+    outermost.map(|p| p.to_path_buf())
+}
+
 /// Parse a `--in <layer>` value into a [`Layer`], or a usage error.
 pub(crate) fn parse_layer(layer: &str) -> Result<Layer, CliError> {
     Layer::from_dir_name(layer).ok_or_else(|| {
@@ -349,4 +421,116 @@ fn path_str(p: &Path) -> String {
         .filter_map(|c| c.as_os_str().to_str())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `fm set status=active` on a content file must re-stamp `updated` (SPEC:
+    /// auto-maintained), so a file edited long after creation no longer keeps a
+    /// stale `updated` and the index recency / `--updated-after` queries reflect
+    /// the edit.
+    #[test]
+    fn bump_updated_restamps_non_updated_edits() {
+        let old = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap();
+        let mut fm = parser::Frontmatter {
+            updated: Some(old),
+            ..Default::default()
+        };
+
+        bump_updated_unless_explicit(&mut fm, "status");
+
+        let bumped = fm.updated.expect("updated must remain set");
+        assert!(
+            bumped > old,
+            "editing a non-`updated` field must advance `updated` past its stale value ({old} -> {bumped})"
+        );
+    }
+
+    /// An explicit `fm set updated=…` is the operator's chosen value; the
+    /// auto-bump must NOT clobber it with `now`.
+    #[test]
+    fn bump_updated_preserves_explicit_updated_assignment() {
+        // `fm.set("updated", …)` already wrote the operator value before the
+        // bump runs; model that here, then assert the bump leaves it untouched.
+        let chosen = chrono::DateTime::parse_from_rfc3339("2030-06-01T12:00:00Z").unwrap();
+        let mut fm = parser::Frontmatter {
+            updated: Some(chosen),
+            ..Default::default()
+        };
+
+        bump_updated_unless_explicit(&mut fm, "updated");
+
+        assert_eq!(
+            fm.updated,
+            Some(chosen),
+            "an explicit `fm set updated=…` must not be overwritten by the auto-bump"
+        );
+    }
+
+    /// Store discovery must walk UP from a subdirectory to the store root — the
+    /// same ancestor-walk `dbmd format` uses — so `fm set` / `fm init` work from
+    /// any subdirectory of a store, and an interior content file named `DB.md`
+    /// must not shadow the real outermost store root.
+    #[test]
+    fn outermost_store_root_walks_up_past_interior_db_md() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n# Store\n").unwrap();
+
+        // A nested type-folder that also holds an interior content `DB.md` (the
+        // shadowing trap), plus a deeper subdir to start the walk from.
+        let docs = root.join("sources").join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("DB.md"),
+            "---\ntype: pdf-source\nsummary: ingested doc named DB.md\n---\n# Doc\n",
+        )
+        .unwrap();
+
+        // Starting from the subdirectory that itself carries an interior DB.md,
+        // discovery must still land on the OUTERMOST store, never `sources/docs`.
+        let found = outermost_store_root(&docs).expect("a store must be found above");
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(root).unwrap(),
+            "interior DB.md must not become the store root"
+        );
+
+        // Starting from a plain subdirectory of the store resolves the same root.
+        let records = root.join("records");
+        std::fs::create_dir_all(&records).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(outermost_store_root(&records).unwrap()).unwrap(),
+            std::fs::canonicalize(root).unwrap(),
+            "fm set / fm init must work from a subdirectory of the store"
+        );
+    }
+
+    /// A directory with no store anywhere above it resolves to `None`, and the
+    /// `locate_store_from_cwd` hint must be actionable for `fm set` / `fm init`
+    /// (which take no `--dir`) — not the central generic "pass the store path".
+    #[test]
+    fn outermost_store_root_is_none_outside_any_store_and_hint_is_actionable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A bare tempdir with no DB.md at or above it (within the temp tree).
+        assert!(
+            outermost_store_root(dir.path()).is_none(),
+            "no DB.md above this dir → no store root"
+        );
+
+        // The error this maps to must not suggest the impossible remedy. Build
+        // the same CliError shape `locate_store_from_cwd` emits and assert its
+        // hint is actionable for a `--dir`-less command.
+        let err = CliError::new(ExitCode::NotAStore, "NOT_A_STORE", "x").with_hint(
+            "run from inside a db.md store (any directory at or under a DB.md), or author a DB.md at the store root first",
+        );
+        assert_eq!(err.code, "NOT_A_STORE");
+        assert_eq!(err.exit, ExitCode::NotAStore);
+        assert!(
+            !err.hint.unwrap().contains("pass the store path"),
+            "hint must not suggest the impossible `--dir`/store-path remedy"
+        );
+    }
 }

@@ -66,31 +66,46 @@ impl Query {
     /// sidecar(s) and return the matching [`IndexRecord`]s — complete, one
     /// sequential read per type-folder, no whole-store walk.
     ///
-    /// The candidate set comes from the most selective frozen sidecar reader:
-    /// [`Store::find_by_type`] when a `type` is set (one type-folder's
-    /// sidecars), otherwise [`Store::find_by_where_in`] on the first `where`
-    /// clause — and that reader is **layer-scoped** when [`with_layer`] is set,
-    /// so a `--where`-only query reads only the named layer's sidecars instead
-    /// of the whole store (O(entities-in-layer), the interactive-loop contract).
-    /// The layer scope and every remaining predicate are then applied in memory
-    /// over the returned records — no extra sidecar reads, no walk.
+    /// The candidate set comes from the most selective frozen sidecar reader,
+    /// always **layer-scoped** when [`with_layer`] is set, so an `--in <layer>`
+    /// scope confines the sidecar walk to that layer's subtree
+    /// (O(entities-in-layer), the interactive-loop contract):
+    ///
+    /// - a `type` predicate reads the sidecars across the named layer (or the
+    ///   whole store when unscoped) and filters by the frontmatter `type`. The
+    ///   folder layout is convention, not enforcement (SPEC), so a record whose
+    ///   `type` is filed outside that type's canonical layer — a `contact` in
+    ///   `sources/`, a custom `screenshot` that only ever lives in `sources/` —
+    ///   is still found, and `--type X --in <other-layer>` returns exactly the
+    ///   records of that type filed under the other layer rather than always
+    ///   being empty;
+    /// - otherwise the first `where` clause picks the sidecars and pre-filters,
+    ///   scoped to the layer when set;
+    /// - otherwise (a layer scope but no `type`/`where`) the layer's own
+    ///   sidecar records are the candidate set, so `--in <layer>` on its own
+    ///   enumerates that layer instead of silently returning empty.
+    ///
+    /// Every remaining predicate is then applied in memory over the returned
+    /// records — no extra sidecar reads, no walk.
     ///
     /// [`with_layer`]: Query::with_layer
     ///
-    /// A query that constrains neither `type` nor any `where` clause selects no
-    /// sidecar (a bare or layer-only query has no walk-free candidate set under
-    /// the sidecar API) and returns an empty result; the CLI always supplies a
-    /// `--type` or a `--where`.
+    /// A fully bare query (no `type`, no `where`, no layer) constrains nothing
+    /// and has no selective candidate set, so it returns an empty result.
     pub fn execute(&self, store: &Store) -> Result<Vec<IndexRecord>, StoreError> {
         // Pick the candidate set from the cheapest frozen sidecar reader, and
         // remember which predicates that reader has already satisfied so the
         // in-memory pass doesn't re-test them.
-        let (candidates, type_done, where_done) = if let Some(type_) = &self.type_ {
-            // `find_by_type` reads the sidecars of just that type's layer —
-            // never the whole store — and filters by `type`, so the result is
-            // complete across every folder the type is filed under within its
-            // layer; every record it returns already has the right `type`.
-            (store.find_by_type(type_)?, true, 0)
+        let (candidates, type_done, where_done) = if self.type_.is_some() {
+            // A `type` predicate resolves over the named layer's sidecars (or
+            // the whole store when unscoped), filtering by the frontmatter
+            // `type` rather than guessing a single canonical type-folder. This
+            // keeps the result complete across every folder — and every layer —
+            // the type is filed under, so a record filed outside the type's
+            // canonical layer is still returned and `--type X --in <layer>`
+            // resolves correctly. The in-memory pass below applies the `type`
+            // (and layer, when scoped via `--in`) predicate.
+            (store.sidecar_records(self.layer)?, false, 0)
         } else if let Some((key, value)) = self.wheres.first() {
             // No type to scope on: let the first `where` clause pick the
             // sidecars and pre-filter. `self.layer` (when set) confines the
@@ -99,6 +114,11 @@ impl Query {
             // layer filter below then becomes a no-op for this path. The
             // remaining clauses AND in memory.
             (store.find_by_where_in(key, value, self.layer)?, false, 1)
+        } else if let Some(layer) = self.layer {
+            // Layer-only (`--in <layer>` with no type/where): enumerate that
+            // layer's sidecar records. The in-memory layer filter below is a
+            // no-op for this path (the read is already layer-scoped).
+            (store.sidecar_records(Some(layer))?, false, 0)
         } else {
             // Nothing selects a sidecar: no walk-free candidate set exists.
             return Ok(Vec::new());
@@ -109,9 +129,9 @@ impl Query {
 
     /// Apply the in-memory predicate pass over a candidate set returned by a
     /// sidecar reader: the `type` predicate (unless `type_already_applied`,
-    /// because [`Store::find_by_type`] guarantees it), the [`with_layer`] scope,
-    /// and every remaining `where` clause (skipping the first
-    /// `wheres_already_applied`, which [`Store::find_by_where`] pre-filtered).
+    /// when a reader has already guaranteed it), the [`with_layer`] scope, and
+    /// every remaining `where` clause (skipping the first
+    /// `wheres_already_applied`, which [`Store::find_by_where_in`] pre-filtered).
     /// All surviving predicates AND together.
     ///
     /// Split out from [`Query::execute`] so the composition is exercisable over
@@ -620,9 +640,10 @@ mod tests {
     }
 
     #[test]
-    fn execute_empty_query_selects_no_sidecar() {
-        // A query with neither a type nor a where clause has no walk-free
-        // candidate set and must return empty WITHOUT touching the store walk.
+    fn execute_bare_query_selects_no_sidecar() {
+        // A fully bare query (no type, no where, no layer) constrains nothing
+        // and has no selective candidate set, so it returns empty WITHOUT
+        // resolving to every record in the store.
         let contacts = [rec("records/contacts/sarah.md", "contact", &[])];
         let (_dir, store) = store_with_sidecars(&[("records/contacts", &contacts)]);
 
@@ -631,14 +652,99 @@ mod tests {
             got.is_empty(),
             "an unconstrained query resolves to empty, not to every record"
         );
+    }
 
-        // A layer-only query likewise selects no sidecar (no type/where to pick
-        // one), so it is empty too — even though records exist in that layer.
-        let layer_only = Query::new()
+    #[test]
+    fn execute_layer_only_enumerates_that_layer() {
+        // Regression (finding #47): a layer-only query (`--in <layer>` with no
+        // type/where) must enumerate that layer's records, not silently return
+        // []. Records live in two layers; the scope keeps only the named one.
+        let contacts = [rec("records/contacts/sarah.md", "contact", &[])];
+        let emails = [rec("sources/emails/e.md", "email", &[])];
+        let (_dir, store) =
+            store_with_sidecars(&[("records/contacts", &contacts), ("sources/emails", &emails)]);
+
+        let records = Query::new()
             .with_layer(Layer::Records)
             .execute(&store)
             .unwrap();
-        assert!(layer_only.is_empty());
+        assert_eq!(
+            paths(&records),
+            path_set(&["records/contacts/sarah.md"]),
+            "a layer-only query enumerates that layer, excluding other layers"
+        );
+
+        let sources = Query::new()
+            .with_layer(Layer::Sources)
+            .execute(&store)
+            .unwrap();
+        assert_eq!(
+            paths(&sources),
+            path_set(&["sources/emails/e.md"]),
+            "the sources-layer scope returns the sources records"
+        );
+    }
+
+    #[test]
+    fn execute_type_finds_records_filed_outside_canonical_layer() {
+        // Regression (finding #42): the folder layout is convention, not
+        // enforcement (SPEC). A `contact` filed under sources/ and a custom
+        // `screenshot` that only ever lives under sources/ must both be found
+        // by `--type`, which filters on the frontmatter type — not the type's
+        // canonical layer.
+        let source_contacts = [rec("sources/foo/jane.md", "contact", &[])];
+        let record_contacts = [rec("records/contacts/sarah.md", "contact", &[])];
+        let screenshots = [rec("sources/screenshots/shot1.md", "screenshot", &[])];
+        let (_dir, store) = store_with_sidecars(&[
+            ("sources/foo", &source_contacts),
+            ("records/contacts", &record_contacts),
+            ("sources/screenshots", &screenshots),
+        ]);
+
+        // `--type contact` returns BOTH the canonical and the non-canonical-
+        // layer record (jane under sources/, sarah under records/).
+        let contacts = Query::new().with_type("contact").execute(&store).unwrap();
+        assert_eq!(
+            paths(&contacts),
+            path_set(&["records/contacts/sarah.md", "sources/foo/jane.md"]),
+            "a type query spans every layer the type is filed under"
+        );
+
+        // A custom type that only ever lives under sources/ is still found.
+        let shots = Query::new()
+            .with_type("screenshot")
+            .execute(&store)
+            .unwrap();
+        assert_eq!(
+            paths(&shots),
+            path_set(&["sources/screenshots/shot1.md"]),
+            "a type filed entirely under sources/ is visible to --type"
+        );
+
+        // `--type contact --in sources` resolves to the sources-layer contact,
+        // not [] (the previously-dead --type/--in combination).
+        let in_sources = Query::new()
+            .with_type("contact")
+            .with_layer(Layer::Sources)
+            .execute(&store)
+            .unwrap();
+        assert_eq!(
+            paths(&in_sources),
+            path_set(&["sources/foo/jane.md"]),
+            "--type X --in <layer> returns the records of that type under the layer"
+        );
+
+        // And `--type contact --in records` keeps only the records-layer one.
+        let in_records = Query::new()
+            .with_type("contact")
+            .with_layer(Layer::Records)
+            .execute(&store)
+            .unwrap();
+        assert_eq!(
+            paths(&in_records),
+            path_set(&["records/contacts/sarah.md"]),
+            "the layer scope confines a type query to the named layer"
+        );
     }
 
     #[test]

@@ -61,10 +61,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
-use regex::Regex;
 
 use crate::index::IndexRecord;
-use crate::store::{layer_for_type, Layer, Store, StoreError};
+use crate::store::{
+    canonical_link_target, ensure_path_within_store, extract_edge_targets, fence_closes,
+    fence_opens, layer_for_type, link_edge_key, Layer, Store, StoreError,
+};
 
 /// Which edge directions a traversal follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,10 +170,11 @@ pub fn backlinks_filtered(
     if target.is_empty() {
         return Ok(Vec::new());
     }
+    let target_key = edge_key(&target);
 
-    // Unscoped: one embedded-ripgrep pass over the store (O(store) scan with
-    // early-exit per file), not a per-candidate read of every content file.
-    // `find_links_to` returns every `.md` carrying the link text (incl. catalog
+    // Unscoped: one content pass over the store (O(store) scan with early-exit
+    // per file), not a per-candidate read of every content file. `find_links_to`
+    // returns every `.md` carrying an edge to the target (incl. catalog
     // `index.md`); narrow to content files and canonicalize to the bare target
     // form `backlinks` emits, dropping the seed's self-link.
     if types.is_empty() && layer.is_none() {
@@ -181,8 +184,9 @@ pub fn backlinks_filtered(
                 continue;
             }
             let linker = normalize_target(&rel);
-            if linker.is_empty() || linker == target {
-                // A file never counts as its own backlink.
+            if linker.is_empty() || edge_key(&linker) == target_key {
+                // A file never counts as its own backlink (case-folded so a
+                // case-variant self-link is still excluded).
                 continue;
             }
             hits.insert(PathBuf::from(linker));
@@ -197,7 +201,7 @@ pub fn backlinks_filtered(
     for candidate in candidate_records(store, types, layer)? {
         let rel = &candidate.path;
         let candidate_target = normalize_target(rel);
-        if candidate_target.is_empty() || candidate_target == target {
+        if candidate_target.is_empty() || edge_key(&candidate_target) == target_key {
             // A file never counts as its own backlink.
             continue;
         }
@@ -221,7 +225,7 @@ pub fn backlinks_filtered(
 /// dangling seed has no outgoing edges to report — broken-link detection is
 /// [`crate::validate`]'s job).
 pub fn forwardlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreError> {
-    let self_target = normalize_target(path);
+    let self_key = edge_key(&normalize_target(path));
     let abs = match resolve_existing(store, path) {
         Some(a) => a,
         None => return Ok(Vec::new()),
@@ -236,7 +240,9 @@ pub fn forwardlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreErr
 
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for target in extract_link_targets(&body) {
-        if target.is_empty() || target == self_target {
+        // Self-link drop is case-folded so a case-variant self-reference is also
+        // excluded on a case-insensitive filesystem.
+        if target.is_empty() || edge_key(&target) == self_key {
             continue;
         }
         out.insert(PathBuf::from(target));
@@ -306,7 +312,13 @@ fn candidate_records(
 /// compared directly. A missing/binary file links to nothing.
 fn file_links_to(store: &Store, rel: &Path, target: &str) -> Result<bool, StoreError> {
     let edges = forwardlinks(store, rel)?;
-    Ok(edges.iter().any(|e| e.as_os_str() == target))
+    let target_key = edge_key(target);
+    // Compare on the case-folded edge key so a case-variant link (e.g.
+    // `[[records/contacts/Sarah-Chen]]` to `sarah-chen.md`) is confirmed on a
+    // case-insensitive filesystem, agreeing with the unscoped scan and validate.
+    Ok(edges
+        .iter()
+        .any(|e| edge_key(&e.to_string_lossy()) == target_key))
 }
 
 /// **Context hydration.** Bounded BFS from `seed` over backlinks + forwardlinks
@@ -462,7 +474,15 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
     // file — the SWEEP cost.
     let all = walk_content_files(store)?;
 
-    let mut linked_to: HashSet<PathBuf> = HashSet::new();
+    // `linked_to` holds case-folded edge KEYS (not raw paths): the link text may
+    // spell a target with different casing than the on-disk file (e.g.
+    // `[[records/contacts/Sarah-Chen]]` → `sarah-chen.md`), and on a
+    // case-insensitive filesystem that is a real incoming edge. Keying on
+    // `edge_key` so the incoming-edge lookup case-folds is what stops the
+    // false-positive orphan (a file with a live case-variant link reported as
+    // orphaned) — and matches validate, which resolves the same link via the
+    // case-insensitive filesystem.
+    let mut linked_to: HashSet<String> = HashSet::new();
     let mut has_outgoing: HashMap<PathBuf, bool> = HashMap::new();
 
     for abs in &all {
@@ -470,7 +490,7 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
             Some(r) => r,
             None => continue,
         };
-        let self_target = normalize_target(&rel);
+        let self_key = edge_key(&normalize_target(&rel));
 
         let body = match std::fs::read_to_string(abs) {
             Ok(b) => b,
@@ -480,14 +500,14 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
 
         let mut outgoing = false;
         for target in extract_link_targets(&body) {
-            if target.is_empty() || target == self_target {
+            if target.is_empty() || edge_key(&target) == self_key {
                 continue;
             }
             if resolve_existing(store, Path::new(&target)).is_none() {
                 continue;
             }
             outgoing = true;
-            linked_to.insert(PathBuf::from(target));
+            linked_to.insert(edge_key(&target));
         }
         has_outgoing.insert(rel, outgoing);
     }
@@ -504,7 +524,7 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
             }
         }
         let outgoing = has_outgoing.get(&rel).copied().unwrap_or(false);
-        let incoming = linked_to.contains(&PathBuf::from(normalize_target(&rel)));
+        let incoming = linked_to.contains(&edge_key(&normalize_target(&rel)));
         if !outgoing && !incoming {
             out.insert(rel);
         }
@@ -528,8 +548,15 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
 /// short-form links never match. Returns the rewritten text (identical to the
 /// input when nothing matched), so the caller can cheaply detect a no-op.
 ///
-/// Operates on the raw bytes (not a parser round-trip) so a link in frontmatter
-/// or body is retargeted uniformly and nothing else is reflowed.
+/// Operates on the raw text (not a parser round-trip) so a link in frontmatter
+/// or body is retargeted uniformly and nothing else is reflowed — **except** a
+/// `[[...]]` inside a ``` fenced code block, which is a documentation example,
+/// not an edge: `rename` must NOT mutate fenced verbatim content (validate
+/// treats fenced links as non-edges, so rewriting them silently corrupts the
+/// example and makes rename disagree with validate). Matching is fence-aware,
+/// whitespace-trimmed, and case-folded to the filesystem, the exact edge notion
+/// [`backlinks`]/[`forwardlinks`] use — so rename retargets precisely the edges
+/// those report and nothing else.
 pub fn rewrite_links_to(text: &str, old: &Path, new: &Path) -> String {
     let old_target = normalize_target(old);
     let new_target = normalize_target(new);
@@ -537,106 +564,176 @@ pub fn rewrite_links_to(text: &str, old: &Path, new: &Path) -> String {
         // No target to match → never rewrite anything.
         return text.to_string();
     }
+    let old_key = edge_key(&old_target);
 
-    let re = rewrite_link_re();
     let mut out = String::with_capacity(text.len());
-    let mut last = 0usize;
-    for caps in re.captures_iter(text) {
-        let whole = caps.get(0).expect("group 0 always present");
-        let raw_target = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        // Match on the SAME normalized key the read side uses, so `[[old]]`,
-        // `[[old.md]]`, and `[[./old]]` all retarget and a prefix like
-        // `[[old-jr]]` never does.
-        if normalize_target(Path::new(raw_target)) != old_target {
+    // Track the fence as a `(char, run length)` exactly like validate and
+    // `extract_edge_targets` (NOT a bool toggled on any ``` / ~~~ line). The
+    // naive toggle flips mid-block on a nested/indented/long-run fence, so a
+    // fenced example link would be rewritten — corrupting documentation and
+    // making rename disagree with validate's edge notion.
+    let mut fence: Option<(u8, usize)> = None;
+    // `split_inclusive` keeps each line's trailing `\n`, so copying a chunk
+    // verbatim preserves the original line endings exactly.
+    for line in text.split_inclusive('\n') {
+        // The fence rules key on line content without trailing `\r`/`\n`; the
+        // full chunk (line endings intact) is what we copy verbatim.
+        let content = line.trim_end_matches('\n').trim_end_matches('\r');
+        if let Some(f) = fence {
+            // Inside a fenced code block: copy verbatim, never rewrite. Only a
+            // matching closing fence ends the block.
+            if fence_closes(content, f) {
+                fence = None;
+            }
+            out.push_str(line);
             continue;
         }
-        // Copy the gap since the previous rewrite verbatim, then the rebuilt
-        // link: canonical bare new target + the original display, if any.
-        out.push_str(&text[last..whole.start()]);
-        out.push_str("[[");
-        out.push_str(&new_target);
-        if let Some(display) = caps.get(2) {
-            out.push('|');
-            out.push_str(display.as_str());
+        if let Some(opened) = fence_opens(content) {
+            fence = Some(opened);
+            out.push_str(line);
+            continue;
         }
-        out.push_str("]]");
-        last = whole.end();
+        rewrite_links_in_line(line, &old_key, &new_target, &mut out);
     }
-    out.push_str(&text[last..]);
     out
+}
+
+/// Rewrite every `[[...]]` on a single (non-fenced) line whose target matches
+/// `old_key`, appending the result to `out`. Preserves any `|display` override
+/// verbatim and emits the canonical bare `new_target`. A `[[...]]` whose target
+/// does not match (a prefix sibling, the short form, an unrelated target) is
+/// copied through untouched.
+fn rewrite_links_in_line(line: &str, old_key: &str, new_target: &str, out: &mut String) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut last = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(close) = line[i + 2..].find("]]") {
+                let inner = &line[i + 2..i + 2 + close];
+                // An embedded newline means this isn't a single-line link.
+                if !inner.contains('\n') {
+                    let (raw_target, display) = match inner.split_once('|') {
+                        Some((t, d)) => (t, Some(d)),
+                        None => (inner, None),
+                    };
+                    let raw_target = raw_target.trim();
+                    // Match on the SAME edge key the read side uses, so `[[old]]`,
+                    // `[[old.md]]`, `[[ ./old ]]`, and (case-insensitive FS)
+                    // `[[Old]]` all retarget while `[[old-jr]]` never does.
+                    if !raw_target.is_empty()
+                        && !raw_target.starts_with('[')
+                        && edge_key(&canonical_link_target(raw_target)) == old_key
+                    {
+                        out.push_str(&line[last..i]);
+                        out.push_str("[[");
+                        out.push_str(new_target);
+                        if let Some(display) = display {
+                            out.push('|');
+                            out.push_str(display);
+                        }
+                        out.push_str("]]");
+                        i = i + 2 + close + 2;
+                        last = i;
+                        continue;
+                    }
+                }
+                // Not a matching link: skip past this `]]` so an inner `[[`
+                // isn't re-scanned, but leave the text for the verbatim copy.
+                i = i + 2 + close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&line[last..]);
 }
 
 // ── Private helpers ─────────────────────────────────────────────────────────
 
-/// The wiki-link regex used by the **write side** ([`rewrite_links_to`]):
-/// captures the target (group 1) AND the optional `|display` (group 2) so a
-/// rewrite can re-emit the display verbatim. The target/display character
-/// classes match [`wiki_link_re`] exactly, so the write side recognizes a link
-/// iff the read side does — the two never disagree on what a `[[…]]` is.
-///
-/// Compiled once for the process via [`OnceLock`] — `rewrite_links_to` runs on
-/// the rename/link write path, so recompiling per call would be wasteful.
-fn rewrite_link_re() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\[\[([^\]\|\n]+?)(?:\|([^\]\n]*))?\]\]")
-            .expect("static wiki-link rewrite regex compiles")
-    })
-}
-
 /// Normalize a store-relative path into the canonical wiki-link target form:
 /// forward slashes, no leading `./` or `/`, and no trailing `.md`. This is the
-/// single key that incoming/outgoing edges are compared on, so the `.md` and
-/// bare forms of a target unify.
+/// canonical (case-PRESERVING) identity used for output and rewrites; edge
+/// *comparisons* go through [`edge_key`] so the `.md`/bare forms AND (on a
+/// case-insensitive filesystem) case-variant spellings of a target unify. The
+/// shared [`canonical_link_target`] is the single definition every db.md
+/// link op keys on.
 fn normalize_target(path: &Path) -> String {
-    let mut s = path.to_string_lossy().replace('\\', "/");
-    while let Some(rest) = s.strip_prefix("./") {
-        s = rest.to_string();
-    }
-    let s = s.trim_start_matches('/');
-    let s = s.strip_suffix(".md").unwrap_or(s);
-    s.trim().to_string()
+    canonical_link_target(&path.to_string_lossy())
 }
 
-/// The wiki-link regex: `[[target]]` / `[[target|display]]`. Captures the raw
-/// target (group 1). Compiled once for the process via [`OnceLock`] —
-/// `extract_link_targets` runs on the O(changed) loop path (backlinks /
-/// forwardlinks / neighborhood), so the compile must not repeat per call.
-fn wiki_link_re() -> &'static Regex {
-    // target = anything up to the first `|` or `]`. display (optional) is
-    // discarded. Matches across a single line/body slice.
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\[\[([^\]\|\n]+?)(?:\|[^\]\n]*)?\]\]")
-            .expect("static wiki-link regex compiles")
-    })
+/// The comparison key for an edge: the canonical target case-folded to the
+/// filesystem (identity on a case-sensitive FS, lowercased on macOS/Windows), so
+/// the string-keyed graph compares agree with the filesystem's case-insensitive
+/// `is_file()` resolution. `[[records/contacts/Sarah-Chen]]` and the on-disk
+/// `sarah-chen.md` must be the same edge on a case-insensitive filesystem or
+/// backlinks/orphans/rename silently disagree with validate.
+fn edge_key(canonical_target: &str) -> String {
+    link_edge_key(canonical_target)
 }
 
 /// Extract every wiki-link target from a body, normalized to the canonical
-/// store-relative form. Order-preserving; duplicates kept (callers dedup).
+/// store-relative form. Fence-aware and whitespace-trimmed via the shared
+/// [`extract_edge_targets`] — a `[[...]]` inside a ``` fenced code block is a
+/// documentation example, NOT an edge (matching validate), and `[[ x ]]`
+/// padding resolves identically to `[[x]]`. A target that would escape the store
+/// root (a `..` component) is dropped here too, so an escaping `[[../outside/x]]`
+/// is never reported as a forward edge and never seeds a [`neighborhood`]
+/// traversal out of the store (the disclosure vector validate flags as an
+/// error). Order-preserving; duplicates kept (callers dedup).
 fn extract_link_targets(body: &str) -> Vec<String> {
-    let re = wiki_link_re();
-    re.captures_iter(body)
-        .filter_map(|c| c.get(1))
-        .map(|m| normalize_target(Path::new(m.as_str().trim())))
-        .filter(|t| !t.is_empty())
+    extract_edge_targets(body)
+        .into_iter()
+        .filter(|t| is_within_store_target(t))
         .collect()
 }
 
+/// True if a canonical target stays inside the store: it has no `..`
+/// (`ParentDir`) component. The canonical form has already stripped any leading
+/// `./` or `/`, so a `Normal`-only path is a safe store-relative key; a `..`
+/// component is an escape and is rejected, mirroring validate's safe-path guard.
+fn is_within_store_target(target: &str) -> bool {
+    Path::new(target)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 /// Resolve the store root + a store-relative path to the absolute on-disk file,
-/// trying the path as written and then with a `.md` extension. `None` if
-/// neither exists.
+/// trying the path as written and then with a `.md` extension. `None` if neither
+/// exists **or if the target resolves outside the store root** — a `..`-laden or
+/// symlink-escaping wiki-link must never turn a graph read/traversal into a read
+/// of an arbitrary file outside the store (the `dbmd graph neighborhood`
+/// disclosure vector). Containment is enforced via the shared
+/// [`ensure_path_within_store`] gate, matching validate's safe-path guard.
 fn resolve_existing(store: &Store, store_relative: &Path) -> Option<PathBuf> {
     let direct = store.root.join(store_relative);
-    if direct.is_file() {
+    if direct.is_file() && resolves_within_store(store, store_relative, &direct) {
         return Some(direct);
     }
     let normalized = normalize_target(store_relative);
     let with_md = store.root.join(format!("{normalized}.md"));
-    if with_md.is_file() {
+    if with_md.is_file() && resolves_within_store(store, Path::new(&normalized), &with_md) {
         return Some(with_md);
     }
     None
+}
+
+/// Containment check for a candidate on-disk path, with a cheap fast path. A
+/// store-relative path made of only `Normal` components (no `..`, no absolute /
+/// platform prefix) is trivially inside the root, so the common case avoids the
+/// `canonicalize` syscalls entirely. Anything with a `..`/absolute/prefix
+/// component falls through to the authoritative [`ensure_path_within_store`]
+/// gate (symlink-resolving), which is the only thing that can prove an escaping
+/// or symlink-redirected path actually stays inside the store.
+fn resolves_within_store(store: &Store, store_relative: &Path, abs: &Path) -> bool {
+    let plain_relative = !store_relative.is_absolute()
+        && store_relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if plain_relative {
+        return true;
+    }
+    ensure_path_within_store(&store.root, abs).is_ok()
 }
 
 /// Convert an absolute path under the store root into its store-relative form.
@@ -687,13 +784,26 @@ fn walk_content_files(store: &Store) -> Result<Vec<PathBuf>, StoreError> {
             .git_ignore(true)
             .git_global(false)
             .require_git(false)
+            // Follow symlinks so a symlinked `.md` content file or a symlinked
+            // type folder is walked like any other content (consistent with the
+            // store SWEEP walker), rather than silently vanishing from orphans.
+            .follow_links(true)
             .build();
         for result in walker {
             let entry = result.map_err(|e| StoreError::Search {
                 root: store.root.clone(),
                 message: format!("walk failed: {e}"),
             })?;
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            // A followed symlink entry reports its own type as `is_symlink()`, so
+            // also accept a symlink whose target is a regular file.
+            let is_file = match entry.file_type() {
+                Some(ft) if ft.is_file() => true,
+                Some(ft) if ft.is_symlink() => std::fs::metadata(entry.path())
+                    .map(|m| m.is_file())
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !is_file {
                 continue;
             }
             let abs = entry.into_path();
@@ -1026,6 +1136,50 @@ mod tests {
         let input = "no links, [external](https://x), and [[wiki/topics/y]]";
         let got = rewrite_links_to(input, Path::new("records/x"), Path::new("records/z"));
         assert_eq!(got, input);
+    }
+
+    #[test]
+    fn rewrite_does_not_corrupt_links_in_nested_or_long_run_fences() {
+        // Regression for the naive `starts_with("```")/("~~~")` toggle in the
+        // rewriter: a fenced example documenting wiki-link syntax must be copied
+        // VERBATIM, never retargeted — matching validate's edge notion. The
+        // standard nested-fence convention (a ````-run block wrapping a ```
+        // example) used to flip the bool mid-block, so the example link was
+        // rewritten (silent documentation corruption).
+        let body = "\
+Here is how to write a link:
+
+````
+```
+[[records/contacts/bob]]
+```
+still fenced [[records/contacts/bob]]
+````
+
+Real link: [[records/contacts/bob]].
+";
+        let got = rewrite_links_to(
+            body,
+            Path::new("records/contacts/bob"),
+            Path::new("records/contacts/robert"),
+        );
+        // The two fenced examples are untouched; only the real link retargets.
+        let expected = "\
+Here is how to write a link:
+
+````
+```
+[[records/contacts/bob]]
+```
+still fenced [[records/contacts/bob]]
+````
+
+Real link: [[records/contacts/robert]].
+";
+        assert_eq!(
+            got, expected,
+            "fenced example links must survive a rename verbatim; only live edges retarget"
+        );
     }
 
     // ── forwardlinks ─────────────────────────────────────────────────────────
@@ -2003,6 +2157,230 @@ mod tests {
             frontmatter_block(text),
             Some("type: contact\nsummary: hi\n"),
             "a leading BOM must not hide frontmatter from the graph layer"
+        );
+    }
+
+    // ── shared edge notion: whitespace / fence / case / containment ──────────
+
+    /// Padded `[[ x ]]` must be a forward edge AND (after reindex) a backward
+    /// edge — the two views agreeing on the same edge in a clean store.
+    #[test]
+    fn padded_link_is_both_a_forward_and_backward_edge() {
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/sarah.md",
+            "contact",
+            "Sarah",
+            "the contact",
+        );
+        fx.write(
+            "wiki/people/a.md",
+            "wiki-page",
+            "A",
+            "See [[ records/contacts/sarah ]] today.",
+        );
+        fx.reindex();
+
+        assert_eq!(
+            paths(&forwardlinks(&fx.store, Path::new("wiki/people/a.md")).unwrap()),
+            vec!["records/contacts/sarah"],
+            "padded link is a forward edge"
+        );
+        assert_eq!(
+            paths(&backlinks(&fx.store, Path::new("records/contacts/sarah.md")).unwrap()),
+            vec!["wiki/people/a"],
+            "padded link is the SAME backward edge (forward and backward agree)"
+        );
+    }
+
+    /// A `[[...]]` only inside a fenced code block is a documentation example,
+    /// not an edge: no forward edge, no backward edge, and the source page is an
+    /// orphan (no real links). Matches validate's fence-aware extractor.
+    #[test]
+    fn fenced_link_is_not_an_edge_and_page_is_orphan() {
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/sarah.md",
+            "contact",
+            "Sarah",
+            "the contact",
+        );
+        fx.write(
+            "wiki/topics/howto.md",
+            "wiki-page",
+            "Howto",
+            "```markdown\n[[records/contacts/sarah]] is how you link.\n```",
+        );
+        fx.reindex();
+
+        assert!(
+            forwardlinks(&fx.store, Path::new("wiki/topics/howto.md"))
+                .unwrap()
+                .is_empty(),
+            "a fenced example is not a forward edge"
+        );
+        assert!(
+            backlinks(&fx.store, Path::new("records/contacts/sarah.md"))
+                .unwrap()
+                .is_empty(),
+            "a fenced example is not a backward edge"
+        );
+        let orphan_set = paths(&orphans(&fx.store, None).unwrap());
+        assert!(
+            orphan_set.contains(&"wiki/topics/howto.md".to_string()),
+            "a page whose only link is fenced has no real edges => orphan: {orphan_set:?}"
+        );
+    }
+
+    /// `rename` must NOT rewrite a `[[...]]` inside a fenced code block (it is
+    /// verbatim documentation, not an edge), while still rewriting a real link.
+    #[test]
+    fn rewrite_links_to_leaves_fenced_examples_untouched() {
+        let input = "\
+Real [[records/contacts/sarah]] link.
+
+```markdown
+Example: [[records/contacts/sarah]] inside a fence.
+```
+
+Trailing [[records/contacts/sarah]].
+";
+        let got = rewrite_links_to(
+            input,
+            Path::new("records/contacts/sarah"),
+            Path::new("records/contacts/sarah-chen"),
+        );
+        // The two non-fenced links retarget; the fenced one is verbatim.
+        assert!(
+            got.contains("Real [[records/contacts/sarah-chen]] link."),
+            "real link before the fence must retarget"
+        );
+        assert!(
+            got.contains("Trailing [[records/contacts/sarah-chen]]."),
+            "real link after the fence must retarget"
+        );
+        assert!(
+            got.contains("Example: [[records/contacts/sarah]] inside a fence."),
+            "fenced example must stay verbatim, got:\n{got}"
+        );
+    }
+
+    /// `rewrite_links_to` matches a padded link and preserves the display.
+    #[test]
+    fn rewrite_links_to_matches_padded_link() {
+        let got = rewrite_links_to(
+            "See [[ records/contacts/sarah |Sarah]] today.",
+            Path::new("records/contacts/sarah"),
+            Path::new("records/contacts/sarah-chen"),
+        );
+        assert_eq!(got, "See [[records/contacts/sarah-chen|Sarah]] today.");
+    }
+
+    /// On a case-insensitive filesystem a case-variant link is the same edge:
+    /// backlinks finds it, orphans does NOT falsely orphan the target, and
+    /// rename rewrites it. On a case-sensitive FS the link is genuinely a
+    /// different target, so the test is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn case_variant_link_is_one_edge_on_case_insensitive_fs() {
+        // Probe the filesystem the same way the production code does
+        // (`link_edge_key` is imported at module scope).
+        if link_edge_key("A") != link_edge_key("a") {
+            // case-sensitive filesystem: the case-variant link is a different
+            // target, so this scenario doesn't apply.
+            return;
+        }
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/sarah-chen.md",
+            "contact",
+            "Sarah",
+            "the contact",
+        );
+        fx.write(
+            "wiki/people/bio.md",
+            "wiki-page",
+            "Bio",
+            "See [[records/contacts/Sarah-Chen]].",
+        );
+        fx.reindex();
+
+        assert_eq!(
+            paths(&backlinks(&fx.store, Path::new("records/contacts/sarah-chen.md")).unwrap()),
+            vec!["wiki/people/bio"],
+            "case-variant incoming link must be a backward edge"
+        );
+        let orphan_set = paths(&orphans(&fx.store, None).unwrap());
+        assert!(
+            !orphan_set.contains(&"records/contacts/sarah-chen.md".to_string()),
+            "a target with a live case-variant incoming link must NOT be orphaned: {orphan_set:?}"
+        );
+
+        let rewritten = rewrite_links_to(
+            "See [[records/contacts/Sarah-Chen]].",
+            Path::new("records/contacts/sarah-chen"),
+            Path::new("records/contacts/sarah"),
+        );
+        assert_eq!(
+            rewritten, "See [[records/contacts/sarah]].",
+            "rename must rewrite the case-variant link on a case-insensitive FS"
+        );
+    }
+
+    /// A `[[../outside/x]]` escaping wiki-link is never a forward edge, and a
+    /// `neighborhood` from the escaping page never reads or traverses through the
+    /// external file — closing the disclosure vector.
+    #[cfg(unix)]
+    #[test]
+    fn escaping_link_is_not_an_edge_and_neighborhood_does_not_escape() {
+        let fx = Fixture::new();
+        // An external file OUTSIDE the store root, with its own in-store link.
+        let outside_dir = fx.store.root.parent().unwrap().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(
+            outside_dir.join("secret.md"),
+            "---\ntype: note\nsummary: TOPSECRET\n---\nLinks [[records/contacts/sarah]].\n",
+        )
+        .unwrap();
+        fx.write(
+            "records/contacts/sarah.md",
+            "contact",
+            "Sarah",
+            "the contact",
+        );
+        fx.write(
+            "wiki/topics/traversal.md",
+            "wiki-page",
+            "Traversal",
+            "See [[../outside/secret]].",
+        );
+        fx.reindex();
+
+        // The escaping target is not a forward edge.
+        assert!(
+            forwardlinks(&fx.store, Path::new("wiki/topics/traversal.md"))
+                .unwrap()
+                .is_empty(),
+            "an escaping `[[../outside/secret]]` must not be a forward edge"
+        );
+
+        // Neighborhood from the escaping page reaches nothing through the
+        // external file (the external file is never read/traversed).
+        let slice = neighborhood(
+            &fx.store,
+            Path::new("wiki/topics/traversal.md"),
+            2,
+            &[],
+            Direction::Outgoing,
+        )
+        .unwrap();
+        assert!(
+            slice
+                .nodes
+                .iter()
+                .all(|n| !n.path.to_string_lossy().contains("outside")),
+            "neighborhood must not read/traverse the external file: {:?}",
+            slice.nodes
         );
     }
 }

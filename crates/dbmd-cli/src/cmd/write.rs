@@ -102,6 +102,22 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     let resolved_disp = path_to_unix(&resolved);
     let abs = store.abs_path(&resolved);
 
+    // ── containment: the resolved target must stay inside the store ──────────
+    // `ensure_safe_store_relative` only rejects `..`/root/prefix components
+    // LEXICALLY; it never resolves symlinks. A path like
+    // `records/linkdir/pwned.md` where `records/linkdir` is a symlink to a
+    // directory outside the store passes that lexical gate (all `Normal`
+    // components) and the durable writer's `create_dir_all` + `create_new`
+    // would follow the symlink and land the file (plus the type-folder
+    // `index.md`/`index.jsonl`) OUTSIDE the store root. Resolve the target's
+    // parent chain (canonicalizing every symlink) and require the result to
+    // stay under the canonical store root before any disk write. The store
+    // explicitly anticipates externally-dropped content (rsync/mbsync into
+    // `sources/`), which can carry symlinks, so this gate is load-bearing.
+    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &abs) {
+        return Err(path_escapes_store_error(&resolved_disp, &e));
+    }
+
     // ── policy: also refuse on the resolved path (sharded destination) ───────
     enforce_frozen(&store, &resolved)?;
 
@@ -245,7 +261,27 @@ fn ensure_safe_store_relative(rel: &Path, raw: &str) -> Result<(), CliError> {
     if !saw_component {
         return Err(path_outside_store_error(raw));
     }
+    // Refuse a dot-prefixed leaf name. The store walkers run with `.hidden(true)`,
+    // so a record written to a dot-named file (e.g. `records/notes/.draft.md`) is
+    // accepted and write-through-indexed here, then silently dropped by the next
+    // `index rebuild` and never validated — a record that exists on disk but is
+    // invisible to every sweep. Reject it at the write surface so the conflict
+    // can never arise (intermediate dot-dirs are caught the same way).
+    if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
+        if name.starts_with('.') {
+            return Err(dotfile_name_error(raw));
+        }
+    }
     Ok(())
+}
+
+fn dotfile_name_error(raw: &str) -> CliError {
+    CliError::new(
+        ExitCode::Runtime,
+        "DOTFILE_NOT_ALLOWED",
+        format!("path `{raw}` names a hidden (dot-prefixed) file, which the store sweep skips"),
+    )
+    .with_hint("choose a record filename that does not start with `.`")
 }
 
 fn path_outside_store_error(raw: &str) -> CliError {
@@ -255,6 +291,20 @@ fn path_outside_store_error(raw: &str) -> CliError {
         format!("path `{raw}` is not inside the db.md store"),
     )
     .with_hint("use a store-relative path, or an absolute path that resolves under the store root")
+}
+
+/// The refusal for a resolved write target that escapes the store root once
+/// symlinks are resolved (exit `1`). The lexical `ensure_safe_store_relative`
+/// gate cannot see a symlinked parent directory; this is the post-resolution
+/// containment failure. `resolved` is the store-relative path as the agent's
+/// spelling produced it; `cause` is the containment helper's diagnostic.
+fn path_escapes_store_error(resolved: &str, cause: &std::io::Error) -> CliError {
+    CliError::new(
+        ExitCode::Runtime,
+        "PATH_OUTSIDE_STORE",
+        format!("write refused: `{resolved}` resolves outside the db.md store ({cause})"),
+    )
+    .with_hint("a parent directory is a symlink leaving the store; write to a real in-store path")
 }
 
 /// Enforce the `DB.md` `### Frozen pages` policy: refuse a write to a frozen
@@ -327,6 +377,25 @@ fn resolve_write_path(
         CliError::runtime(format!("write path `{raw_path}` has no filename component"))
     })?;
 
+    // Refuse the reserved index-catalog filenames at the write surface. The
+    // index machinery owns `index.md` and `index.jsonl` at every type-folder
+    // root: write-through (`Index::on_write` → `write_type_folder_artifacts`)
+    // rewrites `<folder>/index.md` and `<folder>/index.jsonl` unconditionally
+    // after this `write` lands. A content file written to either name is
+    // therefore destroyed in the same command — the just-written file is
+    // overwritten by the generated catalog and the catalog's own row points at
+    // itself, with `dbmd validate` reporting 0 issues (silent primary-data
+    // loss). Reject before any disk write so no content can land on a catalog
+    // path. `ensure_md_extension` (in `shard_path_in`) appends `.md` to a name
+    // that lacks it, so `index` and `index.md` both resolve to the `index.md`
+    // catalog and are equally reserved; `index.jsonl` is the literal jsonl
+    // catalog name. We check the caller-supplied name, not the post-shard
+    // path, so the refusal is keyed on the reserved spelling regardless of how
+    // sharding would relocate it.
+    if is_reserved_index_name(name) {
+        return Err(reserved_index_name_error(name));
+    }
+
     // Honour an agent-supplied **conforming** type-folder. When the path names a
     // `<layer>/<sub-folder>/…/<file>` whose layer matches the type's canonical
     // layer, the agent's `<layer>/<sub-folder>` is the type-folder — this is the
@@ -365,6 +434,30 @@ fn explicit_type_folder(rel: &Path, type_: &str) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(comps[0]).join(comps[1]))
+}
+
+/// True for a caller-supplied filename that the index machinery reserves at the
+/// type-folder root: the human catalog `index.md` and the machine catalog
+/// `index.jsonl`. `shard_path_in` runs `ensure_md_extension`, which appends
+/// `.md` to a name without it, so a bare `index` would also resolve to the
+/// `index.md` catalog — treat it as reserved too. The comparison is on the file
+/// name only (the folder is rebuilt by the sharder).
+fn is_reserved_index_name(name: &str) -> bool {
+    matches!(name, "index" | "index.md" | "index.jsonl")
+}
+
+/// The refusal for a write that targets a reserved index-catalog filename (exit
+/// `1`). Names the reserved file and why it is off-limits so the agent renames
+/// rather than silently losing the content.
+fn reserved_index_name_error(name: &str) -> CliError {
+    CliError::new(
+        ExitCode::Runtime,
+        "RESERVED_INDEX_NAME",
+        format!(
+            "`{name}` is a reserved index-catalog filename; a content file written here would be overwritten by the generated type-folder catalog"
+        ),
+    )
+    .with_hint("choose a different filename (index.md / index.jsonl are owned by `dbmd index`)")
 }
 
 /// Build the structured collision error (exit `5`) carrying the existing file's
@@ -663,6 +756,91 @@ mod tests {
         let outside_file = outside.path().join("elsewhere.md");
         std::fs::write(&outside_file, "x").unwrap();
         assert_eq!(canonical_store_relative(&store, &outside_file), None);
+    }
+
+    #[test]
+    fn is_reserved_index_name_covers_catalog_spellings() {
+        // The index machinery owns these at the type-folder root; `index` (no
+        // ext) resolves to `index.md` via `ensure_md_extension`, so it is
+        // reserved too. Anything else is a free content filename.
+        assert!(is_reserved_index_name("index"));
+        assert!(is_reserved_index_name("index.md"));
+        assert!(is_reserved_index_name("index.jsonl"));
+        assert!(!is_reserved_index_name("indexed.md"));
+        assert!(!is_reserved_index_name("index.jsonl.md"));
+        assert!(!is_reserved_index_name("contact.md"));
+        assert!(!is_reserved_index_name("my-index.md"));
+    }
+
+    #[test]
+    fn resolve_write_path_refuses_reserved_index_filenames() {
+        // `dbmd write records/contacts/index.md` must be refused at the write
+        // surface: write-through would otherwise overwrite the just-written
+        // content with the generated catalog (silent primary-data loss). The
+        // refusal carries the `RESERVED_INDEX_NAME` code so the agent can branch.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("DB.md"), "---\ntype: db-md\n---\n# s\n").unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let fm = Frontmatter::default();
+
+        for raw in [
+            "records/contacts/index.md",
+            "records/contacts/index.jsonl",
+            "records/contacts/index", // → index.md after ensure_md_extension
+        ] {
+            let err = resolve_write_path(&store, "contact", &fm, raw).unwrap_err();
+            assert_eq!(
+                err.code, "RESERVED_INDEX_NAME",
+                "`{raw}` must be refused as a reserved catalog filename"
+            );
+            assert_eq!(err.exit, ExitCode::Runtime);
+        }
+
+        // A normal filename in the same folder resolves fine (no false positive).
+        let ok = resolve_write_path(&store, "contact", &fm, "records/contacts/carol.md")
+            .expect("a non-reserved filename must resolve");
+        assert_eq!(ok, PathBuf::from("records/contacts/carol.md"));
+    }
+
+    #[test]
+    fn symlinked_parent_is_rejected_by_containment_gate() {
+        // The lexical `ensure_safe_store_relative` gate passes a path through a
+        // symlinked in-store directory (all `Normal` components); the
+        // post-resolution containment gate `run` calls must catch the escape.
+        // This pins the exact wiring `run` uses:
+        //   ensure_path_within_store(&store.root, &store.abs_path(resolved)).
+        let outside = tempfile::TempDir::new().unwrap();
+        let store_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            store_dir.path().join("DB.md"),
+            "---\ntype: db-md\n---\n# s\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(store_dir.path().join("records")).unwrap();
+        // `records/linkdir` → an external directory.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), store_dir.path().join("records/linkdir"))
+            .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), store_dir.path().join("records/linkdir"))
+            .unwrap();
+
+        let store = Store::open(store_dir.path()).unwrap();
+        let resolved = PathBuf::from("records/linkdir/pwned.md");
+        let abs = store.abs_path(&resolved);
+
+        // The escaping target is rejected by the containment helper.
+        assert!(
+            dbmd_core::store::ensure_path_within_store(&store.root, &abs).is_err(),
+            "a write through a symlinked-out directory must be refused"
+        );
+
+        // A genuinely in-store target still passes the same gate.
+        let safe = store.abs_path(Path::new("records/contacts/carol.md"));
+        assert!(
+            dbmd_core::store::ensure_path_within_store(&store.root, &safe).is_ok(),
+            "a real in-store target must pass containment"
+        );
     }
 
     #[test]

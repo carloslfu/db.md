@@ -95,7 +95,34 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
     let mut matches: Vec<Match> = Vec::new();
     let mut searcher = build_searcher();
     'outer: for rel in &candidates {
+        // Containment gate, part 1 — structural. A candidate path may have come
+        // verbatim from a type-folder `index.jsonl` sidecar, which is an
+        // attacker-influenceable artifact (db.md stores are shared/cloned/
+        // received). The sidecar `path` must name a real content file under one
+        // of the three layers; anything else — a top-level file inside the store
+        // root (`<root>/outside-secret.txt`), a non-`.md` extension, an
+        // `index.md` twin — is not a searchable content body and is skipped
+        // before it is ever opened. This is the gate that catches an in-root but
+        // non-layer poisoned path, which `ensure_path_within_store` alone would
+        // pass (it lives under the root). The no-filter walk only ever produces
+        // content paths, so this is a no-op there and a hard gate on the
+        // sidecar/link paths.
+        if !is_content_file(rel) {
+            continue 'outer;
+        }
         let abs = store.abs_path(rel);
+        // Containment gate, part 2 — symlink-stable. Even a layer-prefixed path
+        // can escape via a `..` component or a symlink in its parent chain
+        // (`records/contacts/../../outside/secret`, or `records` itself a
+        // symlink out of the store). Resolve every candidate through the single
+        // within-store containment helper before opening it; a path that
+        // resolves outside the store root is silently skipped, exactly like a
+        // stale/missing candidate below — a poisoned entry yields no results,
+        // never an out-of-store read.
+        let abs = match dbmd_core::store::ensure_path_within_store(&store.root, &abs) {
+            Ok(resolved) => resolved,
+            Err(_) => continue 'outer,
+        };
         let rel_str = path_to_str(rel);
         let scan = searcher.search_path(
             &matcher,
@@ -406,16 +433,36 @@ impl TimeWindows {
 fn emit(ctx: &Context, matches: &[Match]) -> CliResult {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    if ctx.json {
+    let written = if ctx.json {
         let rendered = serde_json::to_string_pretty(matches)
             .map_err(|e| CliError::new(ExitCode::Runtime, "JSON_ENCODE_FAILED", e.to_string()))?;
-        writeln!(out, "{rendered}")?;
+        writeln!(out, "{rendered}")
     } else {
+        // Stop on the first write error so a closed reader is detected promptly
+        // (no point formatting the rest of a huge result set into a dead pipe).
+        let mut res = Ok(());
         for m in matches {
-            writeln!(out, "{}:{}:{}", m.file, m.line, m.text)?;
+            res = writeln!(out, "{}:{}:{}", m.file, m.line, m.text);
+            if res.is_err() {
+                break;
+            }
         }
+        res
+    };
+    // A broken pipe (downstream `head` / `grep -q` closed the read end before we
+    // finished) is a benign truncation, not a failure — `dbmd search X | head` /
+    // `| grep -q Y` must exit 0, the same contract the panic hook gives the
+    // `print!`-based commands (`dbmd spec | head`) and that `cmd/extract.rs`
+    // already honors on its `--out`-to-stdout path. Without this, the `?`-style
+    // propagation turns `BrokenPipe` into a generic IO_ERROR exit 1 (and a
+    // spurious `{"error":{"code":"IO_ERROR",…}}` envelope under `--json`), so an
+    // agent branching on the exit code sees a phantom failure though the matches
+    // were produced correctly. Every other write error stays a real IO_ERROR.
+    match written {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(CliError::from(e)),
     }
-    Ok(())
 }
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
@@ -1097,5 +1144,81 @@ mod tests {
         assert!(!yaml.contains("body"));
         // No leading fence → None.
         assert!(frontmatter_block("no frontmatter\n").is_none());
+    }
+
+    // ── Security: poisoned sidecar paths cannot escape the store ──────────────
+
+    /// A `--type` filter whose `index.jsonl` sidecar names a candidate file
+    /// OUTSIDE the store (absolute path or `..`-traversal) must never scan or
+    /// return the contents of that out-of-store file. The containment gate in
+    /// `collect_matches` skips any candidate that resolves outside the store
+    /// root, so a poisoned sidecar yields no results instead of exfiltrating a
+    /// host file (`/etc/passwd`, an SSH key, another tenant's data).
+    #[test]
+    fn poisoned_sidecar_path_cannot_escape_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n\n# Store\n").unwrap();
+
+        // A secret file living OUTSIDE the store root (a sibling of the store).
+        let outside = tmp.path().join("outside-secret.txt");
+        std::fs::write(&outside, "SECRET_API_KEY=sk-rootpassword-12345\n").unwrap();
+
+        // Poison the contacts sidecar with an absolute out-of-store candidate and
+        // a `..`-traversal candidate. Both `created`/`updated` are present (as
+        // null) so the line deserializes as a valid IndexRecord.
+        let contacts = root.join("records").join("contacts");
+        std::fs::create_dir_all(&contacts).unwrap();
+        let abs = path_to_str(&outside);
+        let body = format!(
+            "{{\"path\":\"{abs}\",\"type\":\"contact\",\"summary\":\"x\",\"created\":null,\"updated\":null}}\n\
+             {{\"path\":\"../outside-secret.txt\",\"type\":\"contact\",\"summary\":\"x\",\"created\":null,\"updated\":null}}\n"
+        );
+        std::fs::write(contacts.join("index.jsonl"), body).unwrap();
+
+        let store = Store::open(root).expect("open poisoned store");
+        let a = with_flags(args("SECRET"), &["--type", "contact"]);
+        let a = SearchArgs {
+            dir: root.to_string_lossy().into_owned(),
+            ..a
+        };
+        let matches = collect_matches(&store, &a).expect("search must succeed, not error");
+
+        // Nothing from outside the store may appear in the results.
+        assert!(
+            matches.is_empty(),
+            "out-of-store sidecar paths must be skipped, got {matches:?}"
+        );
+        for m in &matches {
+            assert!(
+                !m.text.contains("SECRET_API_KEY") && !m.file.contains("outside-secret"),
+                "leaked out-of-store content: {m:?}"
+            );
+        }
+    }
+
+    /// A broken pipe from the result writer is a clean exit (Ok), not an
+    /// IO_ERROR — `dbmd search X | head` / `| grep -q Y` must not see a phantom
+    /// failure. We can't easily close a real pipe in-process, so assert the
+    /// branch directly: an `io::Error` of kind `BrokenPipe` maps to `Ok(())`
+    /// while any other write error stays an error.
+    #[test]
+    fn broken_pipe_maps_to_clean_exit() {
+        let broken = io::Error::new(io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)");
+        let mapped: CliResult = match broken {
+            e if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            e => Err(CliError::from(e)),
+        };
+        assert!(mapped.is_ok(), "broken pipe must be a clean exit");
+
+        let other = io::Error::other("disk full");
+        let mapped_other: CliResult = match other {
+            e if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            e => Err(CliError::from(e)),
+        };
+        assert!(
+            mapped_other.is_err(),
+            "a non-pipe write error stays an error"
+        );
     }
 }

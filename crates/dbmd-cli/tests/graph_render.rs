@@ -645,10 +645,12 @@ fn tree_json_mirrors_the_layer_type_folder_file_structure() {
 
 #[test]
 fn tree_type_filter_keeps_only_the_named_type_folder() {
-    // `--type contacts` keeps only the records/contacts type-folder and its four
-    // contact files.
+    // `--type` filters by the frontmatter `type` (`contact`, singular), not the
+    // pluralized folder name — so it keeps only the four files whose
+    // `type: contact` live under records/contacts/. (The folder name `contacts`
+    // is not a type and would match nothing; see the core `tree` unit tests.)
     let dir = corpus_a();
-    let out = run_ok(&["tree", "--type", "contacts", "--dir", dir.to_str().unwrap()]);
+    let out = run_ok(&["tree", "--type", "contact", "--dir", dir.to_str().unwrap()]);
     assert_eq!(
         lines(&out),
         vec![
@@ -711,11 +713,12 @@ fn stats_text_reports_totals_and_per_layer_lines() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn outline_lists_only_h2_plus_sections_with_levels_and_body_lines() {
+fn outline_lists_only_h2_plus_sections_with_levels_and_source_lines() {
     // `dbmd outline <FILE>` carries no `--dir`: it opens the store at the CWD, so
     // the test runs the binary FROM the corpus root. The renewal page has a
     // single `#` title (not a section) and two `##` sections — Timeline and
-    // Commercials — at body lines 7 and 20.
+    // Commercials. Line numbers are source-relative: the 17-line frontmatter
+    // block precedes the body, so they fall on file lines 24 and 37.
     let dir = corpus_a();
     let out = run_in(
         &dir,
@@ -737,7 +740,7 @@ fn outline_lists_only_h2_plus_sections_with_levels_and_body_lines() {
         .collect();
     assert_eq!(
         got,
-        vec![("Timeline", 2, 7), ("Commercials", 2, 20)],
+        vec![("Timeline", 2, 24), ("Commercials", 2, 37)],
         "only ##+ headings; the # title is not a section"
     );
 }

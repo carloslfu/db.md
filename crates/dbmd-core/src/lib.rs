@@ -20,8 +20,11 @@
 //!   driving `dbmd` is the semantic layer; `dbmd` is a deterministic tool.
 //! - **The interactive loop is O(changed), never O(store).** Loop ops
 //!   ([`graph::backlinks`], [`validate::validate_working_set`],
-//!   [`index::Index::on_write`], …) never call [`store::Store::walk`]. Whole-
-//!   store walks belong only to SWEEP ops ([`validate::validate_all`],
+//!   [`index::Index::on_write`], …) never call [`store::Store::walk`] on a
+//!   non-empty changed set. The one documented exception is
+//!   [`validate::validate_working_set`], which falls back to a full sweep only
+//!   when handed an empty changed set (the vacuous-pass guard). Whole-store
+//!   walks otherwise belong only to SWEEP ops ([`validate::validate_all`],
 //!   [`index::Index::rebuild_all`], [`stats`]).
 //! - **Wiki-links are full store-relative paths.** A short-form wiki-link is a
 //!   validation error ([`validate`] code `WIKI_LINK_SHORT_FORM`).

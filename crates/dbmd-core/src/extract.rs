@@ -416,10 +416,26 @@ fn wordprocessing_text(xml: &str, format: &'static str) -> Result<String> {
                     _ => {}
                 }
             }
-            // quick-xml 0.40 yields already-unescaped text in `Event::Text`.
+            // quick-xml 0.40 surfaces text verbatim in `Event::Text` but routes
+            // every entity reference to a separate `Event::GeneralRef` and CDATA
+            // to `Event::CData` — all three carry run content.
             Ok(Event::Text(t)) => {
                 if in_text_run {
                     out.push_str(&String::from_utf8_lossy(&t.into_inner()));
+                }
+            }
+            // `Smith &amp; Co` arrives as Text("Smith ") + GeneralRef("amp") +
+            // Text(" Co"); resolve the ref so `&`/`<`/`>`/numeric chars survive.
+            Ok(Event::GeneralRef(r)) => {
+                if in_text_run {
+                    out.push_str(&resolve_entity_ref(&r));
+                }
+            }
+            // CDATA inside a `<w:t>` run is valid WordprocessingML; its payload
+            // is literal text and must be appended like `Event::Text`.
+            Ok(Event::CData(c)) => {
+                if in_text_run {
+                    out.push_str(&String::from_utf8_lossy(&c.into_inner()));
                 }
             }
             Ok(Event::Eof) => break,
@@ -444,6 +460,33 @@ fn local_name(qname: &[u8]) -> &[u8] {
     match qname.iter().rposition(|&b| b == b':') {
         Some(i) => &qname[i + 1..],
         None => qname,
+    }
+}
+
+/// Resolve a `quick_xml` general-entity / character reference to its literal
+/// text. quick-xml 0.40 does NOT inline-resolve entity references inside
+/// `Event::Text`; instead it surfaces each `&name;` / `&#nnn;` as a separate
+/// `Event::GeneralRef`. Routing those to a `_ => {}` arm silently drops `&`,
+/// `<`, `>`, numeric refs, etc. from extracted text — corrupting any title,
+/// company name, or amount that contains them. This resolves the five
+/// XML-predefined named entities and any numeric character reference; an
+/// unknown named entity falls back to its bare name (best-effort, never a
+/// panic), matching the "recover what we can" stance of `sources/` extraction.
+fn resolve_entity_ref(reference: &quick_xml::events::BytesRef<'_>) -> String {
+    // Numeric character reference (`&#8212;`, `&#x2014;`): resolve to the char.
+    if let Ok(Some(ch)) = reference.resolve_char_ref() {
+        return ch.to_string();
+    }
+    // Named entity: map the five XML-predefined names; fall back to the bare
+    // name for anything else (custom DTD entities are out of scope here).
+    match reference.decode().as_deref() {
+        Ok("amp") => "&".to_string(),
+        Ok("lt") => "<".to_string(),
+        Ok("gt") => ">".to_string(),
+        Ok("quot") => "\"".to_string(),
+        Ok("apos") => "'".to_string(),
+        Ok(other) => other.to_string(),
+        Err(_) => String::new(),
     }
 }
 
@@ -642,10 +685,33 @@ fn render_cell(cell: &calamine::Data) -> String {
                 "FALSE".to_string()
             }
         }
-        Data::DateTime(dt) => dt.to_string(),
+        // A date/datetime cell is an Excel SERIAL number (days since the 1900
+        // epoch, fractional part = time of day). `ExcelDateTime`'s `Display`
+        // writes the raw serial (`46188`, `46143.5`), which is meaningless to an
+        // agent filing the value into a record, so render the calendar date
+        // instead. `to_ymd_hms_milli` is available without the `chrono` feature.
+        Data::DateTime(dt) => render_excel_datetime(dt),
         Data::DateTimeIso(s) => s.clone(),
         Data::DurationIso(s) => s.clone(),
         Data::Error(e) => format!("{e:?}"),
+    }
+}
+
+/// Render an Excel serial date/datetime to an ISO calendar string. A pure date
+/// (midnight, no sub-day component) renders `YYYY-MM-DD`; a datetime with a time
+/// component renders `YYYY-MM-DD HH:MM:SS`. A duration (Excel `[hh]:mm:ss`
+/// elapsed-time format) is not a calendar date, so it keeps its raw serial form
+/// (the prior behavior) rather than being misrendered as a date.
+fn render_excel_datetime(dt: &calamine::ExcelDateTime) -> String {
+    if dt.is_duration() {
+        // Elapsed-time value, not a point on the calendar — leave as the serial.
+        return dt.as_f64().to_string();
+    }
+    let (y, mo, d, h, mi, s, _ms) = dt.to_ymd_hms_milli();
+    if h == 0 && mi == 0 && s == 0 {
+        format!("{y:04}-{mo:02}-{d:02}")
+    } else {
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
     }
 }
 
@@ -765,11 +831,16 @@ fn parse_opf(opf_xml: &str) -> Result<OpfParsed> {
     let mut manifest = BTreeMap::new();
     let mut spine = Vec::new();
     let mut title: Option<String> = None;
+    // Whether we are inside the FIRST `<dc:title>` element, and the text we have
+    // accumulated for it. We accumulate across every Text/GeneralRef/CData event
+    // until the matching End so an entity, comment, or nested element inside the
+    // title does not truncate it.
     let mut in_title = false;
+    let mut title_buf = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+            Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
                 b"item" => {
                     if let (Some(id), Some(href)) = (attr_value(&e, b"id"), attr_value(&e, b"href"))
                     {
@@ -781,20 +852,54 @@ fn parse_opf(opf_xml: &str) -> Result<OpfParsed> {
                         spine.push(idref);
                     }
                 }
-                b"title" => in_title = true,
+                // Only a Start (not a self-closing Empty) opens the title: an
+                // Empty `<dc:title/>` has no content and produces no End event,
+                // so latching `in_title` on it would wrongly capture the next
+                // text node (e.g. the author) as the title.
+                b"title" if title.is_none() => in_title = true,
+                _ => {}
+            },
+            // Self-closing manifest/spine entries are Empty events; the title is
+            // never captured from Empty (see the Start arm's note).
+            Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+                b"item" => {
+                    if let (Some(id), Some(href)) = (attr_value(&e, b"id"), attr_value(&e, b"href"))
+                    {
+                        manifest.insert(id, href);
+                    }
+                }
+                b"itemref" => {
+                    if let Some(idref) = attr_value(&e, b"idref") {
+                        spine.push(idref);
+                    }
+                }
                 _ => {}
             },
             Ok(Event::End(e)) => {
-                if local_name(e.name().as_ref()) == b"title" {
+                if in_title && local_name(e.name().as_ref()) == b"title" {
                     in_title = false;
+                    let s = title_buf.trim();
+                    if !s.is_empty() {
+                        title = Some(s.to_string());
+                    }
                 }
             }
             Ok(Event::Text(t)) => {
-                if in_title && title.is_none() {
-                    let s = String::from_utf8_lossy(&t.into_inner()).trim().to_string();
-                    if !s.is_empty() {
-                        title = Some(s);
-                    }
+                if in_title {
+                    title_buf.push_str(&String::from_utf8_lossy(&t.into_inner()));
+                }
+            }
+            // An entity (`&amp;`) or numeric ref inside the title resolves into
+            // the accumulated value rather than truncating it.
+            Ok(Event::GeneralRef(r)) => {
+                if in_title {
+                    title_buf.push_str(&resolve_entity_ref(&r));
+                }
+            }
+            // CDATA inside `<dc:title>` is literal title text.
+            Ok(Event::CData(c)) => {
+                if in_title {
+                    title_buf.push_str(&String::from_utf8_lossy(&c.into_inner()));
                 }
             }
             Ok(Event::Eof) => break,
@@ -828,13 +933,63 @@ fn opf_base_dir(opf_path: &str) -> String {
 
 /// Join an OPF base dir with a (possibly `./`-prefixed) manifest href into a zip
 /// entry name. Forward-slash only — zip paths are always `/`-separated.
+///
+/// OPF manifest hrefs are URLs: the EPUB spec requires reserved characters
+/// (spaces, non-ASCII) to be percent-encoded, but zip entry NAMES are raw. So an
+/// href `my%20chapter.xhtml` must be percent-decoded to `my chapter.xhtml`
+/// before it can match the zip entry, or the chapter is silently dropped. We
+/// percent-decode the href and then normalize `.`/`..` segments so a relative
+/// href like `../text/ch1.xhtml` resolves against the OPF's directory.
 fn join_zip_path(base: &str, href: &str) -> String {
-    let href = href.trim_start_matches("./");
-    if base.is_empty() {
-        href.to_string()
+    let decoded = percent_decode(href);
+    let combined = if base.is_empty() {
+        decoded
     } else {
-        format!("{base}/{href}")
+        format!("{base}/{decoded}")
+    };
+    normalize_zip_path(&combined)
+}
+
+/// Percent-decode a URL path component (`%20` → space, `%C3%A9` → `é`).
+/// Decodes byte-by-byte then UTF-8-lossy-reinterprets, so a multi-byte
+/// percent-encoded codepoint (`%C3%A9`) round-trips. A stray `%` not followed by
+/// two hex digits is emitted verbatim (best-effort, never a panic).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Resolve `.` and `..` segments in a `/`-separated zip path so a manifest href
+/// like `../text/ch1.xhtml` (relative to the OPF's directory) maps to the real
+/// entry name. A leading `..` that would escape the archive root is dropped
+/// (zip entries have no parent of the root).
+fn normalize_zip_path(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out.join("/")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -850,25 +1005,101 @@ fn extract_html(path: &Path) -> Result<Extracted> {
 
 /// Flatten an HTML/XHTML byte stream to clean plain text.
 ///
-/// Uses `html2text`'s non-decorating plain renderer (which already drops
-/// `<script>`/`<style>`/comments and flattens lists), then strips the two
-/// markdown-ish decorations that renderer still emits — leading `#` heading
-/// markers and `[text]` link brackets — so headings and link text read as plain
-/// prose. Unordered list items keep their `*` marker and ordered items their
-/// `N.` marker (those are content-faithful and match the corpus convention).
+/// Renders with [`PlainContentDecorator`] — `html2text`'s plain renderer driven
+/// by a decorator that emits **no** link brackets and **no** `#` heading
+/// markers, while keeping list-item markers (`*` / `N.`). This removes the two
+/// decorations at the source instead of post-stripping them: the previous
+/// approach blindly deleted every `[bracketed]` substring and every leading `#`
+/// run from the rendered text, which also destroyed *literal* content —
+/// citation markers (`[1]`, `[sic]`), code subscripts (`x[i]`), and ranking
+/// prose (`#1 in sales`). The renderer knows which `[`/`#` it produced; literal
+/// brackets and hashes in the source now survive untouched.
 ///
 /// A very wide wrap width (10_000) is used so paragraphs are not hard-wrapped by
 /// the renderer; paragraph structure comes from the source's block elements, and
 /// final layout is canonicalized by [`normalize_text`].
 fn html_to_text(html: &[u8]) -> Result<String> {
-    let rendered = html2text::config::plain_no_decorate()
+    html2text::config::with_decorator(PlainContentDecorator)
         .string_from_read(html, 10_000)
         .map_err(|e| ExtractError::Parse {
             format: "html",
             message: e.to_string(),
-        })?;
+        })
+}
 
-    Ok(strip_markdown_decorations(&rendered))
+/// A `html2text` decorator that flattens HTML to plain text WITHOUT emitting the
+/// markup that would otherwise have to be post-stripped: no `[`/`]` around link
+/// text, no `#` heading prefix, no `^{…}` superscript braces. List-item markers
+/// (`* ` for unordered, `N. ` for ordered) ARE emitted — they are content-
+/// faithful and match the corpus convention. Quote prefixes are kept as in the
+/// stock plain decorator. This is the fix for the literal-content corruption the
+/// old `strip_markdown_decorations`/`unwrap_brackets` post-pass caused.
+#[derive(Clone, Debug)]
+struct PlainContentDecorator;
+
+impl html2text::render::TextDecorator for PlainContentDecorator {
+    type Annotation = ();
+
+    fn decorate_link_start(&mut self, _url: &str) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_link_end(&mut self) -> String {
+        String::new()
+    }
+    fn decorate_em_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_em_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_strong_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_strong_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_strikeout_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_strikeout_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_code_start(&self) -> (String, Self::Annotation) {
+        (String::new(), ())
+    }
+    fn decorate_code_end(&self) -> String {
+        String::new()
+    }
+    fn decorate_preformat_first(&self) -> Self::Annotation {}
+    fn decorate_preformat_cont(&self) -> Self::Annotation {}
+    fn decorate_image(&mut self, _src: &str, title: &str) -> (String, Self::Annotation) {
+        // Alt/title text only — no surrounding brackets (the stock plain
+        // decorator wraps it in `[...]`, which would read as literal content).
+        (title.to_string(), ())
+    }
+    fn header_prefix(&self, _level: usize) -> String {
+        // No `#` heading marker — heading text reads as plain prose.
+        String::new()
+    }
+    fn quote_prefix(&self) -> String {
+        "> ".to_string()
+    }
+    fn unordered_item_prefix(&self) -> String {
+        "* ".to_string()
+    }
+    fn ordered_item_prefix(&self, i: i64) -> String {
+        format!("{i}. ")
+    }
+    fn decorate_superscript_start(&self) -> (String, Self::Annotation) {
+        // Plain text: no `^{…}` braces (which would corrupt literal content).
+        (String::new(), ())
+    }
+    fn decorate_superscript_end(&self) -> String {
+        String::new()
+    }
+    fn make_subblock_decorator(&self) -> Self {
+        PlainContentDecorator
+    }
 }
 
 /// Strip the residual markdown decorations `html2text`'s plain renderer emits:
@@ -876,6 +1107,11 @@ fn html_to_text(html: &[u8]) -> Result<String> {
 /// brackets around link/anchor text (the reference-style `[n]` suffix is already
 /// gone under `plain_no_decorate`). Bullet (`*`) and ordered (`N.`) markers are
 /// left intact — they are content, not decoration.
+///
+/// No longer used by [`html_to_text`] (the [`PlainContentDecorator`] now removes
+/// these decorations at the source so literal `[brackets]`/`#hashes` survive);
+/// retained only for its unit test documenting the old renderer's behavior.
+#[allow(dead_code)]
 fn strip_markdown_decorations(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
@@ -897,6 +1133,10 @@ fn strip_markdown_decorations(text: &str) -> String {
 /// Replace every `[inner]` with `inner` (one pass, non-nested). `html2text`'s
 /// plain renderer wraps link/anchor text in single brackets; unwrapping yields
 /// the bare text. Escaped or unmatched brackets are left as-is.
+///
+/// No longer used by [`html_to_text`] (see [`strip_markdown_decorations`]);
+/// retained only for its unit test.
+#[allow(dead_code)]
 fn unwrap_brackets(line: &str) -> String {
     if !line.contains('[') {
         return line.to_string();
@@ -1337,5 +1577,293 @@ mod tests {
         let got = extract(&fixture("sample.xlsx")).unwrap();
         assert_eq!(got.metadata["sheets"], MetaValue::Num(1));
         assert!(!got.text.is_empty());
+    }
+
+    // ── regression: entity-ref / CDATA fidelity (findings #34, #1011) ──────────
+
+    /// Build a minimal valid `.docx` whose `word/document.xml` body is the given
+    /// run XML, written to `dest`. Only the three OOXML members `extract_docx`
+    /// touches need to be real; the rest of a Word package is optional for text
+    /// extraction.
+    fn write_docx(dest: &Path, body_runs: &str) {
+        use std::io::Write;
+        let document = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:body>{body_runs}</w:body></w:document>"
+        );
+        let file = std::fs::File::create(dest).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("word/document.xml", opts).unwrap();
+        writer.write_all(document.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn regression_docx_resolves_entity_refs() {
+        // quick-xml 0.40 surfaces `&amp;`/`&lt;`/`&gt;`/`&#8212;` as separate
+        // GeneralRef events; pre-fix they were routed to `_ => {}` and dropped,
+        // corrupting `Smith & Co invoice <final> total — 100`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("entity.docx");
+        write_docx(
+            &f,
+            "<w:p><w:r><w:t>Smith &amp; Co invoice &lt;final&gt; total &#8212; 100</w:t></w:r></w:p>",
+        );
+        let got = extract(&f).unwrap();
+        assert_eq!(got.text, "Smith & Co invoice <final> total — 100\n");
+    }
+
+    #[test]
+    fn regression_docx_preserves_cdata_run_text() {
+        // CDATA inside `<w:t>` is valid and literal; pre-fix it fell through the
+        // wildcard arm and the payload vanished.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("cdata.docx");
+        write_docx(
+            &f,
+            "<w:p><w:r><w:t>Line A.</w:t></w:r></w:p>\
+<w:p><w:r><w:t><![CDATA[IMPORTANT CDATA CONTENT]]></w:t></w:r></w:p>\
+<w:p><w:r><w:t>Line C.</w:t></w:r></w:p>",
+        );
+        let got = extract(&f).unwrap();
+        assert_eq!(got.text, "Line A.\nIMPORTANT CDATA CONTENT\nLine C.\n");
+    }
+
+    #[test]
+    fn resolve_entity_ref_maps_named_and_numeric() {
+        use quick_xml::events::BytesRef;
+        let r = |s: &'static str| resolve_entity_ref(&BytesRef::new(s));
+        assert_eq!(r("amp"), "&");
+        assert_eq!(r("lt"), "<");
+        assert_eq!(r("gt"), ">");
+        assert_eq!(r("quot"), "\"");
+        assert_eq!(r("apos"), "'");
+        assert_eq!(r("#8212"), "—");
+        assert_eq!(r("#x2014"), "—");
+        // Unknown named entity → bare name (best-effort, never a panic).
+        assert_eq!(r("nbsp"), "nbsp");
+    }
+
+    // ── regression: EPUB OPF parsing (findings #35, #37, #1012) ────────────────
+
+    /// Build a minimal valid EPUB at `dest`. `opf_metadata` is spliced verbatim
+    /// inside `<metadata>`; `manifest_href` is the chapter item's href; the
+    /// chapter XHTML is stored under the literal zip entry `chapter_entry`. The
+    /// mimetype member is written first and stored (per the EPUB OCF spec).
+    fn write_epub(dest: &Path, opf_metadata: &str, manifest_href: &str, chapter_entry: &str) {
+        use std::io::Write;
+        let container = "<?xml version=\"1.0\"?>\
+<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\
+<rootfiles><rootfile full-path=\"OEBPS/content.opf\" \
+media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
+        let opf = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"id\">\
+<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">{opf_metadata}</metadata>\
+<manifest><item id=\"c1\" href=\"{manifest_href}\" media-type=\"application/xhtml+xml\"/></manifest>\
+<spine><itemref idref=\"c1\"/></spine></package>"
+        );
+        let chapter = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>\
+<p>Hello world body text.</p></body></html>";
+
+        let file = std::fs::File::create(dest).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // mimetype must be the first member and stored uncompressed.
+        writer.start_file("mimetype", stored).unwrap();
+        writer.write_all(b"application/epub+zip").unwrap();
+        writer.start_file("META-INF/container.xml", stored).unwrap();
+        writer.write_all(container.as_bytes()).unwrap();
+        writer.start_file("OEBPS/content.opf", stored).unwrap();
+        writer.write_all(opf.as_bytes()).unwrap();
+        writer.start_file(chapter_entry, stored).unwrap();
+        writer.write_all(chapter.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn regression_epub_title_accumulates_entities_and_nested_events() {
+        // Pre-fix the title was cut at the first Text node, so an entity or a
+        // comment inside `<dc:title>` truncated it.
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let f1 = tmp.path().join("entity.epub");
+        write_epub(
+            &f1,
+            "<dc:title>Smith &amp; Jones: A &lt;Tale&gt;</dc:title>",
+            "chapter.xhtml",
+            "OEBPS/chapter.xhtml",
+        );
+        let got = extract(&f1).unwrap();
+        assert_eq!(
+            got.metadata["title"],
+            MetaValue::Str("Smith & Jones: A <Tale>".into())
+        );
+
+        let f2 = tmp.path().join("comment.epub");
+        write_epub(
+            &f2,
+            "<dc:title>Part One<!-- editorial --> and Part Two</dc:title>",
+            "chapter.xhtml",
+            "OEBPS/chapter.xhtml",
+        );
+        let got = extract(&f2).unwrap();
+        assert_eq!(
+            got.metadata["title"],
+            MetaValue::Str("Part One and Part Two".into())
+        );
+    }
+
+    #[test]
+    fn regression_epub_self_closing_title_does_not_capture_author() {
+        // A self-closing `<dc:title/>` (an untitled book) must NOT latch the next
+        // text node (the author) as the title.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("empty-title.epub");
+        write_epub(
+            &f,
+            "<dc:title/><dc:creator>John Doe</dc:creator>",
+            "chapter.xhtml",
+            "OEBPS/chapter.xhtml",
+        );
+        let got = extract(&f).unwrap();
+        // No (or empty) title — never the author. `put_str` omits empty values.
+        assert!(
+            !got.metadata.contains_key("title"),
+            "self-closing title must not capture the author, got {:?}",
+            got.metadata.get("title")
+        );
+        // The chapter still extracts.
+        assert_eq!(got.metadata["chapters"], MetaValue::Num(1));
+    }
+
+    #[test]
+    fn regression_epub_percent_encoded_href_resolves() {
+        // An href `my%20chapter.xhtml` must match the zip entry
+        // `OEBPS/my chapter.xhtml`; pre-fix the lookup failed and the chapter was
+        // silently dropped (empty text, 0 chapters).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("spaced.epub");
+        write_epub(
+            &f,
+            "<dc:title>Spaced</dc:title>",
+            "my%20chapter.xhtml",
+            "OEBPS/my chapter.xhtml",
+        );
+        let got = extract(&f).unwrap();
+        assert_eq!(got.metadata["chapters"], MetaValue::Num(1));
+        assert!(
+            got.text.contains("Hello world body text."),
+            "percent-encoded-href chapter must extract, got {:?}",
+            got.text
+        );
+    }
+
+    #[test]
+    fn percent_decode_handles_spaces_and_unicode_and_stray_percent() {
+        assert_eq!(percent_decode("my%20chapter.xhtml"), "my chapter.xhtml");
+        // `%C3%A9` is UTF-8 for `é`.
+        assert_eq!(percent_decode("caf%C3%A9.xhtml"), "café.xhtml");
+        // A stray `%` not followed by two hex digits is emitted verbatim.
+        assert_eq!(percent_decode("100%done"), "100%done");
+        assert_eq!(percent_decode("plain.xhtml"), "plain.xhtml");
+    }
+
+    #[test]
+    fn normalize_zip_path_resolves_dot_segments() {
+        assert_eq!(
+            normalize_zip_path("OEBPS/../text/ch1.xhtml"),
+            "text/ch1.xhtml"
+        );
+        assert_eq!(normalize_zip_path("OEBPS/./ch1.xhtml"), "OEBPS/ch1.xhtml");
+        assert_eq!(normalize_zip_path("OEBPS/ch1.xhtml"), "OEBPS/ch1.xhtml");
+    }
+
+    // ── regression: spreadsheet date rendering (finding #1013) ─────────────────
+
+    #[test]
+    fn render_excel_datetime_renders_iso_not_serial() {
+        use calamine::{ExcelDateTime, ExcelDateTimeType};
+        // 46188 → 2026-06-15 (date only, midnight → no time component).
+        let date = ExcelDateTime::new(46188.0, ExcelDateTimeType::DateTime, false);
+        assert_eq!(render_excel_datetime(&date), "2026-06-15");
+        // 46143.5 → 2026-05-01 12:00:00 (has a time component).
+        let dt = ExcelDateTime::new(46143.5, ExcelDateTimeType::DateTime, false);
+        assert_eq!(render_excel_datetime(&dt), "2026-05-01 12:00:00");
+        // A duration is elapsed time, not a calendar date → keep the serial form.
+        let dur = ExcelDateTime::new(1.5, ExcelDateTimeType::TimeDelta, false);
+        assert_eq!(render_excel_datetime(&dur), "1.5");
+    }
+
+    #[test]
+    fn render_cell_dates_are_iso() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+        assert_eq!(
+            render_cell(&Data::DateTime(ExcelDateTime::new(
+                46188.0,
+                ExcelDateTimeType::DateTime,
+                false
+            ))),
+            "2026-06-15"
+        );
+        // The integer/float/string paths are unchanged by the date fix.
+        assert_eq!(render_cell(&Data::Float(3450.0)), "3450");
+        assert_eq!(render_cell(&Data::Int(7)), "7");
+    }
+
+    // ── regression: HTML/EPUB literal-content fidelity (finding #36) ───────────
+
+    /// Render an HTML body string through the production extract path.
+    fn html_text(body: &str) -> String {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("doc.html");
+        std::fs::write(&f, format!("<html><body>{body}</body></html>")).unwrap();
+        extract(&f).unwrap().text
+    }
+
+    #[test]
+    fn regression_html_keeps_literal_brackets_and_hashes() {
+        // Pre-fix every `[bracketed]` substring and every leading-`#` run was
+        // stripped from real prose, fusing `total[net]` into `totalnet` and
+        // deleting the `#` from `#1 in sales`.
+        let out = html_text(
+            "<p>#1 in sales this quarter</p>\
+<p>see chart[3] for data, array[0] = total[net]</p>",
+        );
+        assert!(out.contains("#1 in sales this quarter"), "got {out:?}");
+        assert!(
+            out.contains("see chart[3] for data, array[0] = total[net]"),
+            "got {out:?}"
+        );
+
+        // Citation markers and subscripts survive intact.
+        let out = html_text("<p>See note [1] and [sic] here.</p><p>x[i] + y[j]</p>");
+        assert!(out.contains("See note [1] and [sic] here."), "got {out:?}");
+        assert!(out.contains("x[i] + y[j]"), "got {out:?}");
+    }
+
+    #[test]
+    fn html_headings_render_as_plain_prose_no_hash() {
+        // A real `<h1>` heading still renders WITHOUT a `#` marker (the renderer
+        // emits no heading prefix now), so headings read as prose.
+        let out = html_text("<h1>Launch Plan</h1><p>Body prose.</p>");
+        assert!(out.contains("Launch Plan"), "got {out:?}");
+        assert!(
+            !out.contains('#'),
+            "no heading marker expected, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn html_links_render_as_bare_text_no_brackets() {
+        // Link display text renders bare; the surrounding `[...]` the stock plain
+        // decorator would add is gone.
+        let out = html_text("<p>See the <a href=\"https://x.example\">handbook</a>.</p>");
+        assert!(out.contains("See the handbook."), "got {out:?}");
     }
 }

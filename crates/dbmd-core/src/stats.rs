@@ -116,6 +116,12 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
             }
             if existing_nodes.contains(target) {
                 linked_to.insert(target.clone());
+            } else if target_resolves_on_disk(&store.root, target) {
+                // A link to an existing non-`.md` source artifact (a `.eml`,
+                // `.pdf`, …) is a live edge, not a broken one — `sources/` holds
+                // such files by design and `graph` resolves them on disk. The
+                // target has no `.md` node, so it can't be `linked_to` (no `.md`
+                // file is un-orphaned by it), but it must NOT be counted broken.
             } else {
                 // Broken links count occurrences, not distinct targets.
                 stats.broken_link_count += 1;
@@ -134,9 +140,10 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
             *stats.type_distribution.entry(t.clone()).or_insert(0) += 1;
         }
 
-        let has_outgoing = file
-            .resolvable_targets()
-            .any(|t| t != &file.node_id && existing_nodes.contains(t));
+        let has_outgoing = file.resolvable_targets().any(|t| {
+            t != &file.node_id
+                && (existing_nodes.contains(t) || target_resolves_on_disk(&store.root, t))
+        });
         let has_incoming = linked_to.contains(&file.node_id);
         if !has_outgoing && !has_incoming {
             stats.orphan_count += 1;
@@ -159,9 +166,17 @@ fn layer_dir_name(layer: Layer) -> &'static str {
 }
 
 /// Recursively collect the `.md` **content** files under one layer root,
-/// skipping hidden entries (`.git`, dotfiles), the `log/` archive tree, and the
-/// `index.md` catalog meta files. Returns absolute paths. A missing layer root
-/// yields an empty list (a store need not have all three layers).
+/// skipping hidden entries (`.git`, dotfiles), the layer's immediate `log/`
+/// archive directory, and the `index.md` catalog meta files. Returns absolute
+/// paths. A missing layer root yields an empty list (a store need not have all
+/// three layers).
+///
+/// Only an immediate child of the layer named `log` (`sources/log/`) is the
+/// rotation-archive directory and skipped — matching `render::tree`, which
+/// skips `log` only as an immediate layer child, and the indexer, which indexes
+/// `log` dirs nested deeper. A directory named `log` nested under a type-folder
+/// (`sources/emails/log/`) is ordinary content and is counted, so stats agrees
+/// with `tree` / `index` / `query` instead of making the subtree invisible.
 fn walk_layer_content_files(layer_root: &Path) -> crate::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     if !layer_root.is_dir() {
@@ -170,12 +185,13 @@ fn walk_layer_content_files(layer_root: &Path) -> crate::Result<Vec<PathBuf>> {
     let walker = walkdir::WalkDir::new(layer_root)
         .into_iter()
         .filter_entry(|e| {
-            // Skip hidden dirs/files and any `log` directory wholesale.
+            // Skip hidden dirs/files. `depth()` is relative to the layer root
+            // (root = 0), so the layer's immediate `log/` archive is depth 1.
             let name = e.file_name().to_string_lossy();
             if name.starts_with('.') {
                 return false;
             }
-            if e.file_type().is_dir() && name == "log" {
+            if e.file_type().is_dir() && name == "log" && e.depth() == 1 {
                 return false;
             }
             true
@@ -222,14 +238,23 @@ fn wiki_link_regex() -> Regex {
 /// dropping the frontmatter links stats deliberately counts as edges.)
 fn extract_link_targets(text: &str, re: &Regex) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    // Track the open fence as `(fence byte, run length)`, not a single boolean:
+    // an inner fence of the *other* character (a `~~~` line inside an open ```
+    // block, or vice versa) — or a shorter run — is content, and must NOT close
+    // the block. A naive toggle inverts the fence state on such a line and then
+    // mis-classifies every link for the rest of the file. Mirrors `render`'s
+    // `opening_fence` / `is_closing_fence`.
+    let mut fence: Option<(u8, usize)> = None;
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        let content = line.trim_end_matches(['\n', '\r']);
+        if let Some(f) = fence {
+            if is_closing_fence(content, f) {
+                fence = None;
+            }
             continue;
         }
-        if in_fence {
+        if let Some(opened) = opening_fence(content) {
+            fence = Some(opened);
             continue;
         }
         for cap in re.captures_iter(line) {
@@ -240,6 +265,47 @@ fn extract_link_targets(text: &str, re: &Regex) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// If `line` opens a fenced code block, return its `(fence byte, run length)`.
+/// A fence is at least three backticks or tildes, with up to three leading
+/// spaces of indentation. Mirrors `render::opening_fence`.
+fn opening_fence(line: &str) -> Option<(u8, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let byte = rest.bytes().next()?;
+    if byte != b'`' && byte != b'~' {
+        return None;
+    }
+    let run = rest.len() - rest.trim_start_matches(byte as char).len();
+    if run < 3 {
+        return None;
+    }
+    // A backtick fence's info string may not itself contain a backtick.
+    if byte == b'`' && rest[run..].contains('`') {
+        return None;
+    }
+    Some((byte, run))
+}
+
+/// True if `line` closes the currently open fence `(byte, len)`: same fence
+/// char, a run at least as long, and nothing else but trailing whitespace.
+/// Mirrors `render::is_closing_fence`.
+fn is_closing_fence(line: &str, fence: (u8, usize)) -> bool {
+    let (byte, open_len) = fence;
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let run = rest.len() - rest.trim_start_matches(byte as char).len();
+    if run < open_len {
+        return false;
+    }
+    rest[run..].trim().is_empty()
 }
 
 /// Drop a trailing `.md` from a path, leaving everything else intact.
@@ -270,6 +336,93 @@ fn is_full_path(target: &Path) -> bool {
     };
     let has_rest = parts.next().is_some();
     matches!(first.as_ref(), "sources" | "records" | "wiki") && has_rest
+}
+
+/// True if `target` stays inside the store: every component is `Normal` (a
+/// `CurDir` `.` is harmless and allowed), with no `..` (`ParentDir`), absolute
+/// (`RootDir`), or platform-prefix component. Mirrors
+/// `graph::is_within_store_target` and validate's `is_safe_store_relative_path`,
+/// so the containment decision is identical across the three surfaces. Used to
+/// gate any on-disk probe in [`target_resolves_on_disk`] before a `join`.
+fn is_within_store_target(target: &Path) -> bool {
+    target.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    })
+}
+
+/// True if a full-path wiki-link `target` (already `.md`-stripped, store-
+/// relative) resolves to a real **non-`.md`** file on disk — a source artifact
+/// like a `.eml` or `.pdf` under `sources/`. Called only after the `.md` node
+/// set has already been checked, so this exists to reconcile stats with `graph`
+/// (which resolves on disk) and `validate`: a link to an existing source file
+/// is a live edge, never a broken link or an orphan-maker.
+///
+/// Two on-disk shapes are recognized, mirroring `graph::resolve_existing` plus
+/// the bare-stem case sources use:
+///
+/// - the target as written is itself a real file (`[[sources/emails/msg.eml]]`
+///   → `sources/emails/msg.eml`);
+/// - the target is a bare stem and a sibling file shares that stem with a
+///   non-`.md` extension (`[[sources/emails/msg]]` → `sources/emails/msg.eml`).
+///
+/// A bare `.md` target is *not* handled here (an existing `.md` file is already
+/// a node in `existing_nodes`); this is strictly the non-`.md` source case.
+///
+/// **Containment gate.** A target that escapes the store root (any `..`,
+/// absolute, or platform-prefix component) is never probed: it returns `false`
+/// before any `join`/`is_file`/`read_dir`, so `[[sources/../../secret]]` can
+/// never reach the filesystem as a live edge or existence oracle outside the
+/// store. This mirrors `graph::is_within_store_target` and validate's
+/// `is_safe_store_relative_path` (which reject `..` before any probe), keeping
+/// the broken-link surface in agreement: an escaping target is counted broken
+/// (validate's `WIKI_LINK_BROKEN`), never silently treated as resolved.
+fn target_resolves_on_disk(store_root: &Path, target: &Path) -> bool {
+    // Reject any non-`Normal` component (`..`, RootDir, Prefix) up front — never
+    // let a wiki-link turn a stats probe into a filesystem escape.
+    if !is_within_store_target(target) {
+        return false;
+    }
+    // The target as written points at a real file (e.g. an explicit `.eml`).
+    let literal = store_root.join(target);
+    if literal.is_file() {
+        return true;
+    }
+    // Bare-stem case: look for a sibling `<stem>.<ext>` with a non-`.md`
+    // extension in the target's parent directory. Restricted to the bare form
+    // (no extension on the target) so an explicit but missing `.pdf` link still
+    // reads as broken rather than silently matching a different file.
+    if target.extension().is_some() {
+        return false;
+    }
+    let stem = match target.file_name() {
+        Some(name) => name,
+        None => return false,
+    };
+    let parent_abs = store_root.join(match target.parent() {
+        Some(p) => p,
+        None => return false,
+    });
+    let entries = match std::fs::read_dir(&parent_abs) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Same stem, and an extension that is present and not `.md`.
+        if path.file_stem() == Some(stem) {
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("md") | None => continue,
+                Some(_) => return true,
+            }
+        }
+    }
+    false
 }
 
 /// Read the `type:` value from a file's leading YAML frontmatter block, if the
@@ -338,6 +491,25 @@ mod tests {
         fs::write(dir.path().join("DB.md"), "---\ntype: db-md\n---\n").expect("write DB.md");
         let store = Store {
             root: dir.path().to_path_buf(),
+            config: Config::default(),
+        };
+        (dir, store)
+    }
+
+    /// Like [`temp_store`], but roots the store one level *inside* the tempdir
+    /// (`<tempdir>/store`) so `store.root.parent()` is the test's own private
+    /// tempdir rather than the shared OS temp root. Tests that plant a file
+    /// "above the store root" must use this — writing into `store.root.parent()`
+    /// of a top-level `TempDir` lands in `$TMPDIR`, which is shared across every
+    /// parallel test (and across test binaries under `cargo test --workspace`),
+    /// so two such tests collide on the same path and race.
+    fn temp_store_nested() -> (TempDir, Store) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("store");
+        fs::create_dir_all(&root).expect("create store root");
+        fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").expect("write DB.md");
+        let store = Store {
+            root,
             config: Config::default(),
         };
         (dir, store)
@@ -761,5 +933,240 @@ mod tests {
         let s = compute(&store).expect("compute");
         assert_eq!(s.broken_link_count, 0);
         assert_eq!(s.orphan_count, 0, "both endpoints are wired");
+    }
+
+    #[test]
+    fn regression_tilde_line_inside_backtick_fence_does_not_invert_state() {
+        // Finding #44/#11: a `~~~` line inside an open ``` fence (or any inner
+        // fence of the other char / a shorter run) must NOT close the block.
+        // Pre-fix a single boolean toggled on it, inverting fence state so the
+        // fenced ghost link counted broken and the real link after the fence
+        // was dropped. With (byte, run-length) tracking the block only closes on
+        // a matching ``` fence.
+        let (_d, store) = temp_store();
+        write_rel(&store, "wiki/people/bob.md", &doc("wiki-page", "bob"));
+        // ```text … ~~~ x (inner tilde line) … [[ghost]] … ``` then a real link.
+        write_rel(
+            &store,
+            "wiki/pages/howto.md",
+            "---\ntype: wiki-page\nsummary: howto\n---\n\
+             \n```text\n~~~ x\n[[wiki/people/ghost]]\n```\n\
+             \nReal: [[wiki/people/bob]]\n",
+        );
+
+        let s = compute(&store).expect("compute");
+        assert_eq!(
+            s.broken_link_count, 0,
+            "the fenced ghost link is inside the unbroken ``` block, not broken: {s:?}"
+        );
+        // bob is linked from howto (a real edge after the fence closes), and
+        // howto links out — neither is an orphan.
+        assert_eq!(
+            s.orphan_count, 0,
+            "the real post-fence link wires both files: {s:?}"
+        );
+    }
+
+    #[test]
+    fn regression_nested_log_directory_is_counted_not_skipped() {
+        // Finding #45: only the layer's IMMEDIATE `log/` archive is skipped. A
+        // directory named `log` nested under a type-folder is ordinary content
+        // and must be counted, matching tree/index/query. Pre-fix any `log` dir
+        // at any depth was pruned, making the whole subtree invisible to stats.
+        let (_d, store) = temp_store();
+        write_rel(
+            &store,
+            "sources/emails/log/maillog.md",
+            &doc(
+                "email",
+                "an archived mail log entry under a log subdirectory",
+            ),
+        );
+        // The layer-immediate `log/` archive is still skipped.
+        write_rel(&store, "sources/log/2026-04.md", &doc("email", "rotated"));
+
+        let s = compute(&store).expect("compute");
+        assert_eq!(
+            s.total_files, 1,
+            "the nested sources/emails/log file counts; the layer-immediate sources/log is skipped: {s:?}"
+        );
+        assert_eq!(s.files_per_layer.get(&Layer::Sources), Some(&1));
+        assert_eq!(s.type_distribution.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn regression_link_to_existing_non_md_source_is_a_live_edge() {
+        // Finding (high): a record that wiki-links to an existing non-`.md`
+        // source artifact (a `.eml`) must read as a LIVE edge, not broken, and
+        // the record is not an orphan. `sources/` holds such files by design.
+        let (_d, store) = temp_store();
+        // A real .eml source file (not a .md content file).
+        write_rel(
+            &store,
+            "sources/emails/msg.eml",
+            "From: someone@example.com\nSubject: Renewal\n\nBody text.\n",
+        );
+        // A record with the SPEC-canonical bare link to that source.
+        write_rel(
+            &store,
+            "records/contacts/sarah.md",
+            "---\ntype: contact\nsummary: s\n---\n\nLinked source: [[sources/emails/msg]]\n",
+        );
+
+        let s = compute(&store).expect("compute");
+        assert_eq!(
+            s.broken_link_count, 0,
+            "a link to an existing .eml source is live, not broken: {s:?}"
+        );
+        assert_eq!(
+            s.orphan_count, 0,
+            "the linking record has a resolvable outgoing edge to the source: {s:?}"
+        );
+        // The explicit-extension form resolves the same way.
+        write_rel(
+            &store,
+            "records/contacts/sarah.md",
+            "---\ntype: contact\nsummary: s\n---\n\nLinked source: [[sources/emails/msg.eml]]\n",
+        );
+        let s2 = compute(&store).expect("compute");
+        assert_eq!(s2.broken_link_count, 0, "explicit .eml target resolves too");
+        assert_eq!(s2.orphan_count, 0);
+    }
+
+    #[test]
+    fn regression_traversal_target_is_broken_not_a_filesystem_escape() {
+        // SECURITY regression: a `..`-laden wiki-link target must never turn a
+        // stats probe into a read of a file OUTSIDE the store. Pre-fix
+        // `target_resolves_on_disk` joined the raw target onto the store root and
+        // probed `is_file` / `read_dir` with no containment check, so
+        // `[[sources/../../outside-secret]]` reached a file above the store and
+        // was silently counted as a LIVE edge (un-orphaning the linker and never
+        // counted broken) — diverging from validate (which flags it
+        // WIKI_LINK_BROKEN) and graph (which drops it). The gate now rejects any
+        // non-`Normal` component before any join, so it counts broken.
+        // Nested store: `store.root.parent()` is this test's private tempdir,
+        // never the shared `$TMPDIR` (which the sibling traversal test would also
+        // write into, racing on the same filename under `--workspace`).
+        let (_d, store) = temp_store_nested();
+        // Every store has a `sources/` dir; the traversal needs its first
+        // component to be a recognized layer to pass `is_full_path`.
+        fs::create_dir_all(store.root.join("sources/emails")).unwrap();
+        // Plant a secret ABOVE the store root (the parent of the store dir).
+        let outside_dir = store.root.parent().expect("store has a parent");
+        fs::write(outside_dir.join("outside-secret.txt"), "TOP SECRET\n").unwrap();
+
+        // Bare-stem traversal (would hit the `read_dir` parent branch) and the
+        // explicit-extension traversal (would hit the `is_file` literal branch).
+        for target in [
+            "sources/../../outside-secret",
+            "sources/../../outside-secret.txt",
+        ] {
+            write_rel(
+                &store,
+                "records/contacts/a.md",
+                &format!("---\ntype: contact\nsummary: s\n---\n\nEscape: [[{target}]]\n"),
+            );
+            let s = compute(&store).expect("compute");
+            assert_eq!(
+                s.broken_link_count, 1,
+                "a `..` target escaping the store must be broken, not a live edge ({target}): {s:?}"
+            );
+            assert_eq!(
+                s.orphan_count, 1,
+                "an escaping link must NOT wire the linker out of orphan status ({target}): {s:?}"
+            );
+        }
+        // The secret outside the store is untouched (we never followed the link).
+        assert_eq!(
+            fs::read_to_string(outside_dir.join("outside-secret.txt")).unwrap(),
+            "TOP SECRET\n"
+        );
+    }
+
+    #[test]
+    fn regression_target_resolves_on_disk_rejects_traversal_before_any_probe() {
+        // SECURITY regression at the helper level: `target_resolves_on_disk`
+        // must return `false` for any `..`-laden / absolute / prefix target
+        // BEFORE it joins, `is_file`s, or `read_dir`s — so a wiki-link can never
+        // turn a stats existence-probe into a read of a file OUTSIDE the store.
+        // Pre-fix the helper joined the raw target onto the store root with no
+        // containment gate, so a real file above the store made it return
+        // `true`. This asserts the gate directly on the helper (the end-to-end
+        // `compute()` path is covered separately above), exercising BOTH on-disk
+        // branches: the literal `is_file` branch (explicit extension) and the
+        // bare-stem `read_dir` branch.
+        // Nested store: `store.root.parent()` is this test's private tempdir, so
+        // the "above the store" files below never land in the shared `$TMPDIR`
+        // and can never collide with the sibling traversal test's identically
+        // named planted files when both run in parallel.
+        let (_d, store) = temp_store_nested();
+        // A real `sources/` tree exists (the literal/parent joins would have
+        // something to land near), matching a real store.
+        fs::create_dir_all(store.root.join("sources/emails")).unwrap();
+        // Plant matching files ABOVE the store root: one with the exact name the
+        // explicit-extension target points at, and one whose stem the bare-stem
+        // target would discover via `read_dir` of the (escaped) parent dir.
+        let outside_dir = store.root.parent().expect("store has a parent");
+        fs::write(outside_dir.join("outside-secret.txt"), "TOP SECRET\n").unwrap();
+        fs::write(outside_dir.join("outside-secret.eml"), "secret mail\n").unwrap();
+
+        // Explicit-extension traversal -> would hit the literal `is_file` branch.
+        assert!(
+            !target_resolves_on_disk(
+                &store.root,
+                &strip_md(Path::new("sources/../../outside-secret.txt"))
+            ),
+            "an explicit-extension `..` target escaping the store must not resolve on disk"
+        );
+        // Bare-stem traversal -> would hit the `read_dir(parent)` branch, where a
+        // sibling `outside-secret.eml` (non-`.md`) sits beside the escaped parent.
+        assert!(
+            !target_resolves_on_disk(
+                &store.root,
+                &strip_md(Path::new("sources/../../outside-secret"))
+            ),
+            "a bare-stem `..` target escaping the store must not resolve on disk"
+        );
+        // A `..` that stays nominally under a layer prefix is still an escape and
+        // is rejected before any probe.
+        assert!(
+            !target_resolves_on_disk(&store.root, Path::new("records/../wiki/secret")),
+            "any `..` component is rejected before a probe, even one re-entering a layer"
+        );
+
+        // Sanity: a legitimate in-store non-`.md` source DOES still resolve, so
+        // the gate did not over-reject and break the finding #117 behavior.
+        write_rel(
+            &store,
+            "sources/emails/msg.eml",
+            "From: a@b.com\nSubject: x\n\nbody\n",
+        );
+        assert!(
+            target_resolves_on_disk(&store.root, Path::new("sources/emails/msg")),
+            "a legitimate in-store bare-stem source link still resolves on disk"
+        );
+
+        // The secrets outside the store are untouched (we never followed a link).
+        assert_eq!(
+            fs::read_to_string(outside_dir.join("outside-secret.txt")).unwrap(),
+            "TOP SECRET\n"
+        );
+    }
+
+    #[test]
+    fn regression_link_to_truly_missing_source_is_still_broken() {
+        // Guard the source-resolution fix doesn't over-resolve: a bare link
+        // whose target has NO file of any extension on disk is still broken.
+        let (_d, store) = temp_store();
+        write_rel(
+            &store,
+            "records/contacts/sarah.md",
+            "---\ntype: contact\nsummary: s\n---\n\nLinked: [[sources/emails/missing]]\n",
+        );
+        let s = compute(&store).expect("compute");
+        assert_eq!(
+            s.broken_link_count, 1,
+            "a target with no on-disk file in any form is broken: {s:?}"
+        );
     }
 }

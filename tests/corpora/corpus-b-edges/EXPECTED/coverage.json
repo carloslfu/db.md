@@ -1,10 +1,12 @@
 {
-  "_comment": "Coverage map. Maps each SEEDED SPEC.md § Validation code to the EXPECTED fixture(s) that fire it. The SPEC table has 40 codes (v0.2 plus the additive timestamp-missing codes); this corpus seeds 38 and explicitly leaves FM_MISSING_CREATED / FM_MISSING_UPDATED uncovered because the designed malformed files exercise bad timestamps and missing type/summary instead. The e2e_corpus_b.rs test asserts (1) coverage keys are a subset of the SPEC table (no invented codes) and (2) `uncovered_spec_codes` exactly equals SPEC-codes minus seeded-codes (both directions), so this file cannot drift out of sync with the SPEC table. The three DB_MD_* codes are seeded by the bad-db-md/ sub-store (EXPECTED/bad-db-md.json). DUP_UNIQUE_KEY is seeded by the six dup-pair fixtures via this store's DB.md `unique:` directives; v0.2 replaced the six type-specific DUP_* codes and LAYER_TYPE_MISMATCH with it. INDEX_JSONL_DESYNC is grouped under plan_extensions for provenance but counts as a seeded SPEC code in the coverage math.",
-  "spec_code_count": 40,
+  "_comment": "Coverage map. Maps each SEEDED SPEC.md § Validation code to the EXPECTED fixture(s) that fire it. The SPEC table has 42 codes (v0.2 plus the additive timestamp-missing codes, plus DB_MD_SCHEMA_FIELD for malformed `## Schemas` field declarations and FM_UNREADABLE for unreadable content files); this corpus seeds 38 and explicitly leaves FM_MISSING_CREATED / FM_MISSING_UPDATED / DB_MD_SCHEMA_FIELD / FM_UNREADABLE uncovered because the designed malformed files exercise bad timestamps and missing type/summary instead, and the bad-db-md/ sub-store exercises bad-type / missing-field / unknown-section rather than a malformed schema field. The e2e_corpus_b.rs test asserts (1) coverage keys are a subset of the SPEC table (no invented codes) and (2) `uncovered_spec_codes` exactly equals SPEC-codes minus seeded-codes (both directions), so this file cannot drift out of sync with the SPEC table. The three DB_MD_* (non-schema) codes are seeded by the bad-db-md/ sub-store (EXPECTED/bad-db-md.json). DUP_UNIQUE_KEY is seeded by the six dup-pair fixtures via this store's DB.md `unique:` directives; v0.2 replaced the six type-specific DUP_* codes and LAYER_TYPE_MISMATCH with it. INDEX_JSONL_DESYNC is grouped under plan_extensions for provenance but counts as a seeded SPEC code in the coverage math.",
+  "spec_code_count": 42,
   "all_spec_codes_covered": false,
   "uncovered_spec_codes": [
+    "DB_MD_SCHEMA_FIELD",
     "FM_MISSING_CREATED",
-    "FM_MISSING_UPDATED"
+    "FM_MISSING_UPDATED",
+    "FM_UNREADABLE"
   ],
   "coverage": {
     "DB_MD_BAD_TYPE": [
