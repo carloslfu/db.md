@@ -412,6 +412,17 @@ mkdir -p mystore/{sources,records,wiki}
 #   ---
 ```
 
+**The store is version-controlled by default.** This is a design choice, not a
+preference: a db.md store is plain files whose value is that Git or a sync
+service can save, version, audit, and carry them, so a store defaults to a save
+boundary and never to a bare, unversioned path. Inside a git repo whose data
+this is, the store lives in the repo (`<repo>/db/`) and rides its history; with
+no repo, the store is its own git repo (`git init`) or lives in a synced folder.
+A machine-global alias like `~/db` is fine as a symlink to the real, versioned
+store, not as the store's bare home. An agent sets this up by default; the
+operator opts out explicitly for a throwaway store. Do not move repo-owned data
+out to an external location without the operator's explicit confirmation.
+
 The file carries identity in frontmatter and optional per-store overrides in
 sections. **Required frontmatter: `type: db-md`, `scope`, and `owner`** — a
 store missing `scope` or `owner` fails `dbmd validate` with

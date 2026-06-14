@@ -299,13 +299,20 @@ Claude Code, Codex, or any agent with a shell:
 ```text
 Read https://raw.githubusercontent.com/carloslfu/db.md/main/llms.txt and set
 up db.md on this machine: install dbmd, run `dbmd spec` to load the standard,
-and set up a store at ~/db, or the folder I point you at. If I already have
-notes, documents, exports, or a knowledge base to bring in (a folder of
-files, an Obsidian vault, a Notion export, anything), evaluate it first and
-show me a migration plan that maps it into the store's sources, records, and
-wiki with frontmatter and links. Once I am happy with the plan, migrate all
-of it. If I am starting fresh, just scaffold the store. Ask me where my data
-lives if it is not obvious.
+then create a store. By default the store is version-controlled, never a bare
+folder at a global path. That is the design, not a preference: the store is
+plain files whose whole point is that Git or a sync service can save, version,
+and carry them. So version-control it by default. If this is a git repo and the
+data I want in the store already lives here, create the store inside the repo
+(for example ./db/) so it rides this repo's history, and do not move repo-owned
+files out without asking me. If there is no repo, git init the store itself and
+offer to wire a remote (a folder I already sync is also fine). Only skip version
+control if I explicitly tell you I want a throwaway, unversioned store. If I
+already have notes, exports, or a knowledge base to bring in (a folder of files,
+an Obsidian vault, a Notion export, anything), evaluate it first and show me a
+migration plan that maps it into the store's sources, records, and wiki with
+frontmatter and links, then migrate it once I approve. Confirm where the store
+lives and how it is backed up before you scaffold.
 ```
 
 The agent reads [llms.txt](llms.txt), installs the binary, and loads the

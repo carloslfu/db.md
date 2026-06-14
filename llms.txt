@@ -81,6 +81,19 @@ Read with `dbmd search` / `dbmd query` / `dbmd graph`; write with `dbmd write` /
 `dbmd log`. Every command takes `--json`. Read the store's `DB.md` (identity,
 policies, schemas) before writing.
 
+## Where a new store lives
+
+By default a db.md store is version-controlled, never a bare folder at a global
+path. This is the design, not a preference: the store is plain files whose point
+is that Git or a sync service saves, versions, and carries them. So set it up
+under version control by default. If you are in a git repo whose data this is,
+put the store in the repo (`<repo>/db/`) so it rides that repo's history;
+otherwise `git init` the store or place it in a synced folder. Only skip version
+control if the operator explicitly asks for a throwaway store. Never move
+repo-owned data out to an external path without the operator's say-so. A global
+alias like `~/db` is fine only as a symlink to the real, versioned store. See
+`dbmd spec` for the store contract.
+
 ## Links
 
 - SPEC (the contract): run `dbmd spec`, or https://github.com/carloslfu/db.md/blob/main/SPEC.md

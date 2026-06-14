@@ -8,7 +8,24 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.7**.
+  `Cargo.toml`, currently **v0.3.8**.
+
+## [0.3.8] — 2026-06-13
+
+A docs-in-binary release. No code behavior changes.
+
+### Changed
+
+- Setup guidance now makes a store **version-controlled by default**. The
+  README quick-start prompt, `llms.txt`, and `dbmd spec` (embedded SPEC §
+  "Creating a store") tell an agent to create the store inside the current
+  repo when its data lives there, otherwise `git init` the store or use a
+  synced folder — never to drop it at a bare, unversioned global path, and
+  never to move repo-owned data out without the operator's say-so. A
+  machine-global `~/db` is positioned as a symlink to the real, versioned
+  store, not as the store's bare home. This is a design default, not a
+  preference; the operator opts out explicitly for a throwaway store. The
+  format is unchanged (still v0.2).
 
 ## [0.3.7] — 2026-06-11
 
