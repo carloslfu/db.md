@@ -91,7 +91,10 @@ fn scan_is_idempotent_no_change_on_second_run() {
         .assert()
         .success();
     let v = json_stdout(assert.get_output());
-    assert_eq!(v["wrote"], false, "a no-op rescan must not rewrite the manifest");
+    assert_eq!(
+        v["wrote"], false,
+        "a no-op rescan must not rewrite the manifest"
+    );
 }
 
 #[test]
