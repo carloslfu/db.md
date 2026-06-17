@@ -33,6 +33,7 @@
 //!   Structured loop reads ([`graph::backlinks`], [`query::Query`]) ride the
 //!   `index.jsonl` sidecars instead, never a frontmatter tree scan.
 
+pub mod assets;
 pub mod extract;
 pub mod fsx;
 pub mod graph;
@@ -51,6 +52,7 @@ pub mod validate;
 //
 // These are the locked interface every other crate and module builds against.
 
+pub use assets::{AssetRecord, Declaration, ScanReport, StatusReport, VerifyReport};
 pub use extract::{ExtractError, Extracted, Format, MetaValue};
 pub use fsx::{write_atomic, write_atomic_new};
 pub use graph::ContextSlice;

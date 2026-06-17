@@ -146,6 +146,12 @@ pub enum Command {
     /// Updates both affected type-folder indexes write-through.
     Rename(RenameArgs),
 
+    // ── Assets: the heavy-binary manifest ────────────────────────────────────
+    /// Catalog, verify, and report raw binary assets (PDFs, recordings, large
+    /// exports) a wrapper references but Git should not carry. Maintains the
+    /// root `assets.jsonl` manifest; never transports bytes, never runs git.
+    Assets(AssetsArgs),
+
     // ── Agent bootstrap ──────────────────────────────────────────────────────
     /// Print the bundled canonical SPEC.md (compiled in at build time). The
     /// installation point: `dbmd spec` loads the standard into an agent's
@@ -819,6 +825,88 @@ pub struct SpecArgs {
     /// `DBMD_SPEC` env var).
     #[arg(long, value_name = "PATH")]
     pub spec: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// assets (scan / verify / status / paths)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd assets <sub>` — the heavy-binary asset manifest.
+#[derive(Debug, Args)]
+pub struct AssetsArgs {
+    /// Which asset operation to run.
+    #[command(subcommand)]
+    pub command: AssetsCommand,
+}
+
+/// The `dbmd assets` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum AssetsCommand {
+    /// Scan content files' `asset`/`assets` frontmatter, hash present files, and
+    /// (re)write the canonical `assets.jsonl`. The manifest is a pure projection
+    /// of the declarations; a path no longer declared drops out.
+    Scan(AssetsScanArgs),
+
+    /// Verify every required asset is present locally and matches the manifest.
+    /// `--quick` checks presence+size only; the default deep mode re-hashes.
+    /// Exits non-zero when anything is missing or corrupt. A SWEEP, not a loop op.
+    Verify(AssetsVerifyArgs),
+
+    /// Report present / missing assets and how many bytes remain to restore.
+    /// Never fails on a missing asset.
+    Status(AssetsStatusArgs),
+
+    /// Print the cataloged asset paths, one per line — the VCS-neutral list a
+    /// harness feeds into a `.gitignore` managed block or a sync exclude.
+    Paths(AssetsPathsArgs),
+}
+
+/// `dbmd assets scan`.
+#[derive(Debug, Args)]
+pub struct AssetsScanArgs {
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+
+    /// Compute and report what would change, without writing the manifest.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Also report non-markdown files under `sources/` that no wrapper declares.
+    #[arg(long)]
+    pub untracked: bool,
+}
+
+/// `dbmd assets verify`.
+#[derive(Debug, Args)]
+pub struct AssetsVerifyArgs {
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+
+    /// Include optional (non-required) assets in the check.
+    #[arg(long)]
+    pub include_optional: bool,
+
+    /// Check presence + size only, skipping the full SHA-256 re-hash (fast path).
+    #[arg(long)]
+    pub quick: bool,
+}
+
+/// `dbmd assets status`.
+#[derive(Debug, Args)]
+pub struct AssetsStatusArgs {
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd assets paths`.
+#[derive(Debug, Args)]
+pub struct AssetsPathsArgs {
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
 }
 
 // (install-skill / uninstall-skill removed: the installer is text — `dbmd spec`

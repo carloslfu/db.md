@@ -119,6 +119,7 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Write(args) => cmd::write::run(ctx, args),
         Command::Link(args) => cmd::link::run(ctx, args),
         Command::Rename(args) => cmd::rename::run(ctx, args),
+        Command::Assets(args) => cmd::assets::run(ctx, args),
         Command::Spec(args) => cmd::spec::run(ctx, args),
     }
 }

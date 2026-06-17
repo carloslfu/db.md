@@ -8,9 +8,32 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.9**.
+  `Cargo.toml`, currently **v0.3.10**.
 
 ## [Unreleased]
+
+## [0.3.10] - 2026-06-17
+
+### Added
+
+- **Asset layer** (`dbmd assets`) for raw binary evidence too heavy for Git
+  (PDFs, recordings, large exports). A content file declares a binary via an
+  `asset:` / `assets:` frontmatter key; the store-root `assets.jsonl` manifest
+  records each asset's store-relative path, SHA-256, size, media type, the
+  declaring wrapper(s), and whether it is required. The manifest is a pure,
+  byte-for-byte-rebuildable projection (the analog of `index.jsonl`): it carries
+  no provider URI and no local-presence flag, so it stays portable and
+  provider-agnostic; moving the bytes is out of scope for db.md by design.
+  New commands: `dbmd assets scan` (hash declared files, write the manifest),
+  `verify` (the byte-completeness gate; `--quick` = presence+size, default =
+  full re-hash), `status` (present/missing report), and `paths` (the VCS-neutral
+  path list for an ignore mechanism). Five additive validation codes
+  (`ASSET_MANIFEST_MALFORMED`, `ASSET_UNDECLARED`, `ASSET_WRAPPER_BROKEN`,
+  `ASSET_MANIFEST_ORPHAN`, `ASSET_PATH_IS_CONTENT`), checked in the `--all`
+  sweep — text-only, so a byteless fresh clone still passes `validate` (byte
+  presence is `dbmd assets verify`, never `validate`). `SPEC.md` gains a
+  `## Assets` section. Asset paths are validated store-relative (no `..`, no
+  absolute) wherever the manifest is read.
 
 ### Changed
 

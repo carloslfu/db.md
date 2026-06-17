@@ -10,7 +10,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -35,6 +35,10 @@ ignore = "0.4"
 walkdir = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 thiserror = "2"
+# SHA-256 for the asset manifest (content hashing in dbmd-core's `assets`
+# module). MIT/Apache-2.0, zero AI/LLM; already present in Cargo.lock
+# (transitive), so promoting it to a direct dep adds no new crate to the tree.
+sha2 = "0.10"
 # Document text extraction (dbmd extract). All MIT — recorded in THIRD_PARTY_NOTICES.
 # Zero AI/LLM, zero embeddings: these are deterministic format decoders.
 pdf-extract = "0.10"      # PDF text layer (MIT)

@@ -19,6 +19,7 @@
 //! retained in [`crate::error`] as a reserved contract code, but no body
 //! returns it.)
 
+pub mod assets;
 pub mod extract;
 pub mod fm;
 pub mod format;

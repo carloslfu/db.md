@@ -954,6 +954,17 @@ see; grouped by category):
 | `INDEX_JSONL_DESYNC` | error | a file isn't in the `index.jsonl`, or a jsonl record points at a missing file |
 | `INDEX_JSONL_STALE` | error | an `index.jsonl` record's fields don't match the file's frontmatter |
 | `TAGS_MALFORMED` | warning | `tags` isn't a flat YAML list of short scalar labels |
+| `ASSET_MANIFEST_MALFORMED` | error | a line in `assets.jsonl` isn't a valid asset record — run `dbmd assets scan` |
+| `ASSET_UNDECLARED` | error | a content file's `asset`/`assets` path has no record in `assets.jsonl` — run `dbmd assets scan` |
+| `ASSET_WRAPPER_BROKEN` | error | an `assets.jsonl` record names a wrapper file that doesn't exist |
+| `ASSET_MANIFEST_ORPHAN` | warning | an `assets.jsonl` record's path is referenced by no wrapper |
+| `ASSET_PATH_IS_CONTENT` | warning | an `asset`/`assets` path points at a tracked markdown content file |
+
+The `ASSET_*` codes are checked by the full sweep (`dbmd validate --all`), not
+the working set — like the `DUP_*` dedup codes — and are text-only: validation
+never hashes a byte, so a fresh clone whose assets have not been restored still
+passes. Byte presence and hash correctness are `dbmd assets verify`. See
+[Assets](#assets).
 
 v0.2 reworked the type-driven codes — it dropped the six type-specific
 `DUP_*` collisions and `LAYER_TYPE_MISMATCH`, and added the generic
@@ -1179,6 +1190,141 @@ The files remain the source of truth. You *can* derive anything you
 like on top — a SQLite catalog, a tantivy index, embeddings for some
 other tool — but you do not *need* to for the separated plain-file
 flavor's sweet spot. The packed engine is the path past that.
+
+## Assets
+
+Most db.md content is text and belongs in the store's version control. Raw
+binary evidence does not: a signed PDF, a meeting recording, or a large export
+can be far heavier than Git should carry, and git over the raw tree is the
+store's tighter ceiling (see [Scale](#scale) — "two ceilings"). The asset layer
+keeps that evidence in the store's logical model and out of the VCS path, with a
+manifest that proves a local copy is complete.
+
+This layer **tracks and verifies** assets; it does not move bytes. Uploading
+evidence to durable storage and restoring it onto a fresh machine is a storage
+layer built on top, keyed off the manifest's `sha256`. The contract db.md owns
+is the portable proof: *these assets belong to this store, and this is how to
+prove the local copy is complete.*
+
+### Wrapper and asset
+
+A **wrapper** is an ordinary content file that declares, in frontmatter, a
+binary it is about. Usually a source under `sources/`, but a `records/` entry (a
+receipt on an expense) or a `wiki/` page may declare one too — the asset layer
+spans all three layers. The wrapper carries the universal frontmatter and the
+agent-usable text (extracted text, a transcript, notes); it is small and
+version-controlled like any other content file.
+
+A **raw asset** is the binary the wrapper is about, at a real store-relative
+path so the working copy is genuinely complete and openable by any tool. It is
+recorded in the manifest and kept out of the VCS path. An asset is never a
+wiki-link target: wiki-links are edges between markdown nodes and a binary is
+not a node, so assets never appear in `graph` / `rename` / `backlinks`.
+
+Declare assets with an `asset:` (single) or `assets:` (list) frontmatter key:
+
+```yaml
+---
+type: pdf-source
+summary: "Acme MSA, countersigned 2026-06-15"
+asset: sources/docs/2026/06/acme-msa.pdf
+---
+```
+
+```yaml
+---
+type: recording
+summary: "Kickoff call; transcript in records/meetings"
+assets:
+  - sources/recordings/2026/06/kickoff.mp4
+  - { path: sources/recordings/2026/06/kickoff.vtt, required: false }
+---
+```
+
+A bare path is required by default. The object form `{ path, required }` marks
+an asset optional — a regenerable or nice-to-have artifact the store does not
+need to be byte-complete. The manager writes these keys on ingest; operators
+don't write frontmatter by hand.
+
+### The `assets.jsonl` manifest
+
+A single root-level file, one JSON object per asset — the asset analog of the
+type-folder `index.jsonl`: a derived, write-through, rebuildable plain file
+(JSONL, so it stays git-diffable line-by-line and ripgrep-able), not a database.
+Every field is derivable from the wrappers plus the files on disk, so a scan
+where the bytes are present reproduces it byte-for-byte.
+
+```json
+{"path":"sources/docs/2026/06/acme-msa.pdf","sha256":"9f2c4e…","bytes":12483910,"media_type":"application/pdf","wrappers":["sources/docs/2026/06/acme-msa.pdf.md"],"required":true}
+```
+
+- `path` — store-relative, forward-slash, with extension. The record key. Two
+  records may share a `sha256` (identical bytes at two paths); the record keys
+  on path, a storage layer dedupes on hash.
+- `sha256` — lowercase-hex SHA-256 of the bytes: the integrity check, and the
+  stable key a storage layer addresses the blob by.
+- `bytes` — size.
+- `media_type` — best-effort MIME from the extension (deterministic, so it does
+  not break rebuild equivalence).
+- `wrappers` — the content file(s) that declare the asset, sorted; usually one.
+- `required` — whether the asset is needed for byte-completeness (default
+  `true`; `false` only when every declaration marks it optional).
+
+The manifest records **no** local-presence flag (that is machine state, computed
+on demand) and **no** storage location or provider URI (a storage layer derives
+that from the `sha256`). Those omissions are deliberate: the manifest stays
+portable and provider-agnostic, and its Git diff stays stable across machines.
+Records are sorted by path; on a concurrent-clone merge, set `assets.jsonl
+merge=union` in `.gitattributes` (the same floor `log.md` uses) and let a later
+`dbmd assets scan` recompact.
+
+### Keeping bytes out of the VCS
+
+Assets are recorded in the manifest and excluded from version control. **db.md
+does not write a `.gitignore` and never runs git** — a store may be carried by
+Git or by a sync service, so the toolkit stays VCS-neutral. `dbmd assets paths`
+prints the asset paths, one per line, for whatever ignore mechanism the store
+uses; maintaining the ignore list — and, for Git, ensuring no asset was
+committed before it was ignored (a tracked binary stays in history) — is the
+operator's or harness's job, not the format's.
+
+### Path safety
+
+Every declared and recorded asset path must be store-relative, forward-slash,
+with no absolute prefix and no `..` component, and must resolve under the store
+root. `dbmd` enforces this wherever it reads the manifest, so a malformed or
+hostile declaration can never make a scan hash, or a restore write, a file
+outside the store.
+
+### Operations
+
+`dbmd assets` has four leaves; none runs git or touches the network:
+
+- `dbmd assets scan` — read every content file's `asset`/`assets`, hash the
+  present files, and rewrite `assets.jsonl`. The manifest is a projection of the
+  declarations: a path no longer declared drops out, and a path whose bytes are
+  absent but were previously cataloged is preserved (the eviction case — it
+  cannot be re-hashed). Scan is the from-scratch and bulk-drop reconciliation,
+  the asset analog of `index rebuild`. Scanning needs the bytes present (to
+  hash); `status`/`verify` read the committed hashes and work without them.
+- `dbmd assets verify` — the byte-completeness gate: every required asset (plus
+  optional under `--include-optional`) is present locally and matches the
+  manifest. `--quick` checks presence and size; the default re-hashes. Exits
+  non-zero when anything is missing or corrupt. A SWEEP, not a loop op.
+- `dbmd assets status` — a non-failing report of present / missing and bytes to
+  restore.
+- `dbmd assets paths` — the path list above.
+
+### Validation
+
+`dbmd validate --all` cross-checks the manifest against wrapper declarations as
+part of the full sweep, the same way it checks entity dedup and index sync. The
+check is text-only — it never hashes a byte or reads an asset's contents — so a
+fresh clone whose bytes have not been restored still passes `validate`. Byte
+presence and hash correctness are `dbmd assets verify`, not `validate`. The
+codes are `ASSET_MANIFEST_MALFORMED`, `ASSET_UNDECLARED`, `ASSET_WRAPPER_BROKEN`,
+`ASSET_MANIFEST_ORPHAN`, and `ASSET_PATH_IS_CONTENT` (see
+[Validation](#validation)).
 
 ## Roadmap
 

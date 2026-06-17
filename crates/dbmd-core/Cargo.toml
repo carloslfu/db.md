@@ -29,6 +29,9 @@ ignore = { workspace = true }
 walkdir = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+# SHA-256 content hashing for the asset manifest (`assets` module). Deterministic,
+# zero AI/LLM; recorded in THIRD_PARTY_NOTICES.
+sha2 = { workspace = true }
 # Document text extraction adapters (`extract` module). Deterministic format
 # decoders — zero AI/LLM, zero embeddings. All MIT; recorded in THIRD_PARTY_NOTICES.
 pdf-extract = { workspace = true }

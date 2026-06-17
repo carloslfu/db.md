@@ -180,6 +180,17 @@ pub mod codes {
     pub const INDEX_JSONL_STALE: &str = "INDEX_JSONL_STALE";
     /// `tags` isn't a flat YAML list of short scalar labels.
     pub const TAGS_MALFORMED: &str = "TAGS_MALFORMED";
+    /// a line in `assets.jsonl` is not a valid asset record.
+    pub const ASSET_MANIFEST_MALFORMED: &str = "ASSET_MANIFEST_MALFORMED";
+    /// a content file references an `asset`/`assets` path with no record in
+    /// `assets.jsonl` (run `dbmd assets scan`).
+    pub const ASSET_UNDECLARED: &str = "ASSET_UNDECLARED";
+    /// an `assets.jsonl` record names a wrapper file that does not exist.
+    pub const ASSET_WRAPPER_BROKEN: &str = "ASSET_WRAPPER_BROKEN";
+    /// an `assets.jsonl` record's path is referenced by no wrapper.
+    pub const ASSET_MANIFEST_ORPHAN: &str = "ASSET_MANIFEST_ORPHAN";
+    /// an `asset`/`assets` path points at a tracked markdown content file.
+    pub const ASSET_PATH_IS_CONTENT: &str = "ASSET_PATH_IS_CONTENT";
 }
 
 /// The SPEC's `summary` length bound (chars). Over it → `SUMMARY_TOO_LONG`.
@@ -328,6 +339,12 @@ pub fn validate_all(store: &Store) -> crate::Result<Vec<Issue>> {
 
     // Cross-file: log.md well-formedness + ordering.
     check_log(store, &mut issues);
+
+    // Cross-file: asset manifest (assets.jsonl) integrity against wrapper
+    // declarations. Text-only, no hashing, no byte reads — a SWEEP check like
+    // dedup. Byte presence/correctness is `dbmd assets verify`, not validate, so
+    // a fresh clone with no restored bytes still passes here.
+    check_assets(store, &parsed, &mut issues);
 
     issues.sort_by(issue_order);
     Ok(issues)
@@ -3453,6 +3470,129 @@ fn slugish(s: &str) -> String {
         .map(|c| if c.is_whitespace() { '-' } else { c })
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '/' || *c == '_')
         .collect()
+}
+
+/// Cross-file asset-manifest integrity (the `--all` sweep). Text-only: it never
+/// hashes a byte or reads an asset file's contents — byte presence and hash
+/// correctness are `dbmd assets verify`, not `validate`, so a fresh clone with
+/// no restored bytes still passes. Cross-checks `assets.jsonl` against every
+/// content file's `asset`/`assets` declarations.
+fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Issue>) {
+    use crate::assets;
+
+    let manifest_rel = Path::new(assets::MANIFEST_FILE);
+    let manifest_abs = store.root.join(assets::MANIFEST_FILE);
+
+    // Lenient manifest read: a malformed line is reported, not fatal.
+    let mut manifest: BTreeMap<String, assets::AssetRecord> = BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(&manifest_abs) {
+        for (i, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<assets::AssetRecord>(line) {
+                Ok(rec) => {
+                    manifest.insert(rec.path.clone(), rec);
+                }
+                Err(e) => push(
+                    issues,
+                    Severity::Error,
+                    codes::ASSET_MANIFEST_MALFORMED,
+                    manifest_rel,
+                    Some((i as u32) + 1),
+                    None,
+                    format!("invalid {} record: {e}", assets::MANIFEST_FILE),
+                    Some("run `dbmd assets scan` to rebuild the manifest".to_string()),
+                    vec![],
+                ),
+            }
+        }
+    }
+
+    // Per-wrapper declarations: every declared asset must be in the manifest and
+    // must not point at a markdown content file.
+    let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (rel, p) in parsed {
+        let Some(map) = &p.fm else {
+            continue;
+        };
+        for decl in assets::declarations_from_yaml_map(map) {
+            let norm = match assets::normalize_asset_path(&decl.path) {
+                Ok(n) => n,
+                Err(_) => continue, // a bad declared path is surfaced by `scan`, not here
+            };
+            declared.insert(norm.clone());
+            let is_md = Path::new(&norm)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("md"))
+                .unwrap_or(false);
+            if is_md {
+                push(
+                    issues,
+                    Severity::Warning,
+                    codes::ASSET_PATH_IS_CONTENT,
+                    rel,
+                    None,
+                    Some("asset".to_string()),
+                    format!("asset path `{norm}` points at a markdown content file"),
+                    Some("assets are raw binaries; reference a non-markdown path".to_string()),
+                    vec![PathBuf::from(&norm)],
+                );
+            }
+            if !manifest.contains_key(&norm) {
+                push(
+                    issues,
+                    Severity::Error,
+                    codes::ASSET_UNDECLARED,
+                    rel,
+                    None,
+                    Some("asset".to_string()),
+                    format!(
+                        "references asset `{norm}` with no record in {}",
+                        assets::MANIFEST_FILE
+                    ),
+                    Some("run `dbmd assets scan` to catalog it".to_string()),
+                    vec![PathBuf::from(&norm)],
+                );
+            }
+        }
+    }
+
+    // Per-record: wrapper existence + orphan detection.
+    for (path, rec) in &manifest {
+        for w in &rec.wrappers {
+            if !store.root.join(w).is_file() {
+                push(
+                    issues,
+                    Severity::Error,
+                    codes::ASSET_WRAPPER_BROKEN,
+                    Path::new(path),
+                    None,
+                    None,
+                    format!("manifest record for `{path}` names a missing wrapper `{w}`"),
+                    Some("run `dbmd assets scan` to reconcile the manifest".to_string()),
+                    vec![PathBuf::from(w)],
+                );
+            }
+        }
+        if !declared.contains(path) {
+            push(
+                issues,
+                Severity::Warning,
+                codes::ASSET_MANIFEST_ORPHAN,
+                Path::new(path),
+                None,
+                None,
+                format!(
+                    "`{path}` is in {} but no wrapper references it",
+                    assets::MANIFEST_FILE
+                ),
+                Some("run `dbmd assets scan` to drop the orphan, or add a wrapper".to_string()),
+                vec![],
+            );
+        }
+    }
 }
 
 /// Push a fully-formed [`Issue`].
