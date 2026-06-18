@@ -220,6 +220,15 @@ moving in this direction: Mem0's 2026 migration docs call out ADD-only
 extraction, hybrid search, and entity linking. db.md takes the further bet:
 keep the facts as dated files and skip the vector store.
 
+GBrain and db.md are two readings of Karpathy's LLM Wiki, the 2026 pattern where
+an agent compiles raw notes into a linked markdown wiki the model reads directly.
+db.md is the faithful one: raw and wiki layers, index and log, plain markdown,
+answered by index and grep with no vector store. GBrain is the big build, the
+same files with Postgres, pgvector, and a reranker in front of them, the
+"embedding-based RAG infrastructure" the pattern set out to avoid. Its own
+benchmark says the graph carries the result and the embeddings add almost
+nothing. Same idea, two sizes. db.md keeps it the size Karpathy drew.
+
 ## Why files
 
 The application database has been a service for decades: a daemon, a wire
@@ -435,6 +444,7 @@ maintain. db.md ships a convention you own.
 
 | Tool | What it is | What sits between you and your data |
 |---|---|---|
+| **GBrain** | Garry Tan's open-source agent memory: markdown and frontmatter as the source of truth, a self-wiring link graph, then a Postgres and pgvector engine with a reranker, a derived cache it rebuilds from the files | a vector index and a reranker you keep tuned. The files are yours and readable, but the answers come from the engine. db.md makes the bet GBrain would not: that the model reads the files better than a stack you maintain |
 | **Mem0** | managed memory: an LLM extracts facts, embeds them, and retrieves by similarity; its 2026 migration adds ADD-only extraction, hybrid search, and entity linking | a vector-and-graph service you call. Your memories are mediated by a retrieval stack |
 | **Letta / MemGPT** | agent memory with editable memory blocks and archival retrieval | a runtime and retrieval layer around context. db.md keeps durable state as files |
 | **Zep / Graphiti** | temporal memory built as a derived knowledge graph | a hosted graph and its API, a second structure kept in step with your data |
