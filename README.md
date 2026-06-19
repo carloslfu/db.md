@@ -197,11 +197,12 @@ Most other ways to store data put something between you and it. Ask two
 questions of each one: what sits in the middle, and what does it ride on as
 models improve. **db.md puts nothing in the middle, and it rides on the model
 itself.** The alternatives ride on machinery you maintain, and machinery only
-improves when someone does the work.
+improves when someone does the work. The key difference from format-first standards like OKF: db.md bets that a smart enough model reads files directly better than any format standard can guarantee interop. OKF bets the opposite. If models improve faster than format matters, db.md wins. The evidence suggests they do.
 
 | Approach | What sits between you and your data | What it rides on |
 |---|---|---|
 | **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index to rebuild |
+| **Open Knowledge Format (OKF)** | nothing. The data is files; linking is standard markdown | format standardization, not model improvement. OKF optimizes for portability across producers and consumers, betting that standardized format matters more than model capability. Minimally opinionated (only `type` required); no schema enforcement, no semantic layering (sources/records/wiki), no deterministic tooling. Good for exchange; doesn't ride the model curve the way db.md does |
 | SQL databases | a schema you design up front and migrate when reality shifts, a query language, and an app to drive it | your schema and the app layer. A better model can write better SQL, but the store's meaning still lives outside the model |
 | Airtable, Notion | a vendor's service you rent, your data on their servers, exports that commonly lose live behavior, views, formulas, or relations | the vendor's roadmap. You get the AI they bolt on, when they ship it, inside their walls |
 | Vector RAG | a store of embeddings you cannot read or edit, reached only through a retrieval service | a separate retrieval stack. Recall is bounded by embeddings, rerankers, and tuning you keep paying for |
@@ -247,6 +248,8 @@ db.md turns the shape inside out:
 - **The index is derived.** A plain catalog plus embedded ripgrep is built to
   carry millions of files with no vector database. Want SQLite or a search
   index on top? Build one. The files stay the source of truth.
+
+**On portability:** db.md is portable by default—it's just files that git, sync services, and tarballs move freely. A capable model reads the files directly without needing a format standard. This is the core bet: as models improve, they read the same messy files better. No format committee required. For cases where you need to guarantee a third party (unfamiliar with db.md) can read your knowledge without custom parsing, OKF v0.1 is a minimally-opinionated exchange layer; export db.md's flat layers to OKF, lose the schema and semantic structure, and swap format for portability. db.md is the operational database. OKF is the exchange format. But db.md wins on the long bet: model capability outpaces format standardization. If your model is strong enough, format distinctions evaporate.
 
 ## How far it scales
 
@@ -449,6 +452,7 @@ maintain. db.md ships a convention you own.
 | **Letta / MemGPT** | agent memory with editable memory blocks and archival retrieval | a runtime and retrieval layer around context. db.md keeps durable state as files |
 | **Zep / Graphiti** | temporal memory built as a derived knowledge graph | a hosted graph and its API, a second structure kept in step with your data |
 | **Cognee** | an extract-and-load pipeline into graph and vector stores | one more derived store to build and keep in sync |
+| **Open Knowledge Format (OKF)** | Google's open spec for markdown + frontmatter knowledge exchange: standardizes format so different producers and consumers can interop. Minimally opinionated (only `type` required); designed for portability across orgs/systems, not operational database work. No semantic layers, no schema enforcement, no deterministic tooling. Uses standard markdown links, not wiki-links | nothing formally, but the spec is the exchange mechanism. OKF bets that format standardization is the bottleneck; db.md bets on model capability instead |
 | **db.md** | the data is the files; the agent is the query engine; no vector, ever | nothing. It rides the model directly on the files you own |
 
 The memory layer was always a database with the data hidden. db.md is the same
