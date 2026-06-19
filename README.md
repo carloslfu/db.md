@@ -248,7 +248,7 @@ db.md turns the shape inside out:
   carry millions of files with no vector database. Want SQLite or a search
   index on top? Build one. The files stay the source of truth.
 
-**On portability:** db.md is portable by default—it's just files that git, sync services, and tarballs move freely. A capable model reads the files directly without needing a format standard. This is the core bet: as models improve, they read the same messy files better. No format committee required. For cases where you need to guarantee a third party (unfamiliar with db.md) can read your knowledge without custom parsing, OKF v0.1 is a minimally-opinionated exchange layer; export db.md's flat layers to OKF, lose the schema and semantic structure, and swap format for portability. db.md is the operational database. OKF is the exchange format. But db.md wins on the long bet: model capability outpaces format standardization. If your model is strong enough, format distinctions evaporate.
+**On portability:** db.md is portable by default. It's just files. Git, tarballs, sync services move them. A capable model reads them directly without needing a format standard. That's the bet: as models improve, they read the same files better. If you need to guarantee a third party can read your knowledge without knowing db.md, OKF is a minimal exchange layer. Export, lose schema and semantics, gain portability. db.md is the operational store. OKF is the transport. Model capability outpaces format standardization over time. Format distinctions fade.
 
 ## How far it scales
 
