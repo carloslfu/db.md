@@ -455,10 +455,8 @@ maintain. db.md ships a convention you own.
 | **db.md** | the data is the files; the agent is the query engine; no vector, ever | nothing. It rides the model directly on the files you own |
 
 The memory layer was always a database with the data hidden. db.md is the same
-job with the data left in the open. It also composes with the rest of the stack:
-[computer.md](https://github.com/carloslfu/computer.md) for the agentic computer
-that runs it, AGENTS.md for instructions, MCP for tools. Different layers, not
-rivals.
+job with the data left in the open. It composes with AGENTS.md for instructions
+and MCP for tools. Different layers, not rivals.
 
 ## What's in this repo
 
