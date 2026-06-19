@@ -193,21 +193,20 @@ v0.2, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
 ## How it compares
 
-Most other ways to store data put something between you and it. Ask two
-questions of each one: what sits in the middle, and what does it ride on as
-models improve. **db.md puts nothing in the middle, and it rides on the model
-itself.** The alternatives ride on machinery you maintain, and machinery only
-improves when someone does the work. The key difference from format-first standards like OKF: db.md bets that a smart enough model reads files directly better than any format standard can guarantee interop. OKF bets the opposite. If models improve faster than format matters, db.md wins. The evidence suggests they do.
+Most other ways to store data put something between you and it. Ask three
+questions of each one: what sits in the middle, what does it ride on as
+the world improves, and what has to stay true for it to work. **db.md puts nothing in the middle, rides the model curve directly, and bets that models improve faster than schema matters.** The alternatives either ride on machinery you maintain (which only improves when someone does the work), or bet that format standardization solves the problem.
 
-| Approach | What sits between you and your data | What it rides on |
-|---|---|---|
-| **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index to rebuild |
-| **Open Knowledge Format (OKF)** | nothing. The data is files; linking is standard markdown | format standardization, not model improvement. OKF optimizes for portability across producers and consumers, betting that standardized format matters more than model capability. Minimally opinionated (only `type` required); no schema enforcement, no semantic layering (sources/records/wiki), no deterministic tooling. Good for exchange; doesn't ride the model curve the way db.md does |
-| SQL databases | a schema you design up front and migrate when reality shifts, a query language, and an app to drive it | your schema and the app layer. A better model can write better SQL, but the store's meaning still lives outside the model |
-| Airtable, Notion | a vendor's service you rent, your data on their servers, exports that commonly lose live behavior, views, formulas, or relations | the vendor's roadmap. You get the AI they bolt on, when they ship it, inside their walls |
-| Vector RAG | a store of embeddings you cannot read or edit, reached only through a retrieval service | a separate retrieval stack. Recall is bounded by embeddings, rerankers, and tuning you keep paying for |
-| Knowledge-graph memory | a derived graph beside your files, queried through an API, kept fresh only if the sync path stays correct | a better model too, but spent rebuilding a graph that can drift from your files, not working the files themselves |
-| Karpathy's LLM Wiki | nothing. Plain markdown the model reads. This is db.md's lineage | the model curve, directly on the files. Also db.md's lineage |
+| Approach | What sits between you and your data | What it rides on | The bet / What has to stay true |
+|---|---|---|---|
+| **Karpathy's LLM Wiki** | nothing. Plain markdown the model reads directly | the model curve. Better models = better file reading, no index rebuild needed | Models improve fast enough to read context directly. This is the foundational idea |
+| **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index | Agents improve faster than infrastructure. Three semantic layers + schema repair work because models are smart enough. Files outlast all tools |
+| **Open Knowledge Format (OKF)** | nothing. The data is files; linking is standard markdown | format standardization, not model improvement. Works at any capability level | Format simplicity is the bottleneck, not model capability. Standardized format enables exchange across orgs/systems regardless of who produces or consumes |
+| **GBrain** | a Postgres + pgvector engine and reranker in front of the files | both the model curve AND a maintained graph+embedding stack | Files alone aren't enough; you need a graph engine and vector index for good answers. The graph is load-bearing, not the files |
+| **Vector RAG** | a store of embeddings you cannot read or edit, reached only through a retrieval service | a separate retrieval stack you maintain. Recall bounded by embeddings, rerankers, tuning | Embeddings + reranking solve retrieval better than raw file reading. You own the machinery; better models help but don't eliminate the stack |
+| **Knowledge-graph memory** | a derived graph beside your files, queried through an API, kept fresh only if the sync path stays correct | a better model too, but spent rebuilding a graph that drifts from files | A graph layer improves on raw data. The graph is the answer source, not the files. Maintenance burden is acceptable |
+| **SQL databases** | a schema you design up front, a query language, and an app to drive it | your schema and the app layer. Better models can write better SQL, but the store's meaning lives outside the model | Upfront schema design is stable enough. Apps mediate between the model and the data. Migrations are acceptable costs |
+| **Airtable, Notion** | a vendor's service you rent, your data on their servers, exports that commonly lose live behavior, views, formulas, relations | the vendor's roadmap and release cycle. You get the AI they bolt on, when they ship it, inside their walls | Outsourcing is cheaper than operating. Vendor roadmap aligns with your needs. Platform lock-in is acceptable |
 
 The fight db.md picks most directly is with vector RAG. **db.md computes,
 stores, and searches no vector, ever.** RAG engineers a retrieval pipeline over
