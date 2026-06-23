@@ -928,6 +928,30 @@ guarantee the format gives you. (A future opt-in `RECORD_UNGROUNDED`
 info-level check could surface obviously source-less records, but v0.3
 ships no such check by default; see [Roadmap](#roadmap).)
 
+### Importing existing data
+
+Bringing an existing knowledge base in — a folder of notes, an Obsidian
+vault, a Notion export, another wiki — follows three rules on top of the
+source-first discipline above:
+
+- **Provenance, not polish, decides the layer.** An artifact you did not
+  author is a *source*, however finished it looks. A polished external wiki is
+  evidence: it lands under `sources/`, and the `meta-type: conclusion` records
+  are the synthesis *your* agent writes *from* it (reconstructable by meaning,
+  per above). Don't file someone else's synthesis directly as your conclusions
+  — that claims an authorship the store can't defend.
+- **Reference vs. replace.** *Reference*: the external base stays the source of
+  truth — import it under `sources/` and synthesize records from it. *Replace*:
+  the store becomes its living home — the content becomes `records/` (a vault
+  you authored and are lifting is your own synthesis → `meta-type: conclusion`),
+  and the raw export is kept under `sources/` as the frozen provenance/rollback
+  copy. When unsure, default to reference; promote to records when the store is
+  meant to own the content.
+- **Don't port the source system's folder tree.** Its hierarchy was built for
+  humans clicking folders. Reorganize by `type` + `meta-type`, wiki-links, and
+  the derived index; the old folder names become `type`/`tags`, not nested
+  directories. Map by meaning, not by mirroring.
+
 ### Pre-write checks
 
 Before `dbmd write`, `dbmd link`, or `dbmd fm set`, the agent

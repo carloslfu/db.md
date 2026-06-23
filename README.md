@@ -331,10 +331,11 @@ offer to wire a remote (a folder I already sync is also fine). Only skip version
 control if I explicitly tell you I want a throwaway, unversioned store. If I
 already have notes, exports, or a knowledge base to bring in (a folder of files,
 an Obsidian vault, a Notion export, anything), evaluate it first and show me a
-migration plan that maps it into the store's sources and records (with synthesis
-written as records carrying meta-type: conclusion) with frontmatter and links,
-then migrate it once I approve, preserving each source's provenance and verifying
-nothing was lost. Moving the data is only half of it:
+migration plan that maps it in by provenance, not polish: whatever I didn't
+author is a source (however finished it looks), and the synthesis you write from
+it is a record with meta-type: conclusion. Reorganize by type, meta-type, and
+links rather than mirroring the old folder tree. Migrate it once I approve,
+preserving each source's provenance and verifying nothing was lost. Moving the data is only half of it:
 also find whatever already connects to that knowledge base (my skills, commands,
 and scripts) and update them to point at the new store, so nothing keeps reading
 the old location. Don't create long-lived migration-map pages or temporary
