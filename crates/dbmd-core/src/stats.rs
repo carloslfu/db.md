@@ -725,10 +725,10 @@ mod tests {
         // a itself has an outgoing link => also not an orphan. Zero orphans.
         write_rel(
             &store,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: a\n---\n\n[[wiki/people/b]]\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nsummary: a\n---\n\n[[records/profiles/b]]\n",
         );
-        write_rel(&store, "wiki/people/b.md", &doc("wiki-page", "b"));
+        write_rel(&store, "records/profiles/b.md", &doc("profile", "b"));
 
         let s = compute(&store).expect("compute");
         assert_eq!(s.orphan_count, 0);
@@ -775,10 +775,10 @@ mod tests {
         // (the parser accepts `.md`; validate only warns). Not broken.
         write_rel(
             &store,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: a\n---\n\n[[wiki/people/b.md]]\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nsummary: a\n---\n\n[[records/profiles/b.md]]\n",
         );
-        write_rel(&store, "wiki/people/b.md", &doc("wiki-page", "b"));
+        write_rel(&store, "records/profiles/b.md", &doc("profile", "b"));
 
         let s = compute(&store).expect("compute");
         assert_eq!(
@@ -813,15 +813,15 @@ mod tests {
     #[test]
     fn display_alias_links_resolve_to_the_target_not_the_alias() {
         let (_d, store) = temp_store();
-        // `[[wiki/people/b|Bob]]` targets b, displays "Bob". The alias must be
-        // stripped: the edge goes to b (exists), so it's not broken and b is
+        // `[[records/profiles/b|Bob]]` targets b, displays "Bob". The alias must
+        // be stripped: the edge goes to b (exists), so it's not broken and b is
         // not an orphan.
         write_rel(
             &store,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: a\n---\n\nmet [[wiki/people/b|Bob]] today\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nsummary: a\n---\n\nmet [[records/profiles/b|Bob]] today\n",
         );
-        write_rel(&store, "wiki/people/b.md", &doc("wiki-page", "b"));
+        write_rel(&store, "records/profiles/b.md", &doc("profile", "b"));
 
         let s = compute(&store).expect("compute");
         assert_eq!(s.broken_link_count, 0, "alias target resolves and exists");
@@ -950,14 +950,14 @@ mod tests {
         // was dropped. With (byte, run-length) tracking the block only closes on
         // a matching ``` fence.
         let (_d, store) = temp_store();
-        write_rel(&store, "wiki/people/bob.md", &doc("wiki-page", "bob"));
+        write_rel(&store, "records/profiles/bob.md", &doc("profile", "bob"));
         // ```text … ~~~ x (inner tilde line) … [[ghost]] … ``` then a real link.
         write_rel(
             &store,
-            "wiki/pages/howto.md",
-            "---\ntype: wiki-page\nsummary: howto\n---\n\
-             \n```text\n~~~ x\n[[wiki/people/ghost]]\n```\n\
-             \nReal: [[wiki/people/bob]]\n",
+            "records/concepts/howto.md",
+            "---\ntype: concept\nsummary: howto\n---\n\
+             \n```text\n~~~ x\n[[records/profiles/ghost]]\n```\n\
+             \nReal: [[records/profiles/bob]]\n",
         );
 
         let s = compute(&store).expect("compute");
@@ -1136,7 +1136,7 @@ mod tests {
         // A `..` that stays nominally under a layer prefix is still an escape and
         // is rejected before any probe.
         assert!(
-            !target_resolves_on_disk(&store.root, Path::new("records/../wiki/secret")),
+            !target_resolves_on_disk(&store.root, Path::new("records/../records/secret")),
             "any `..` component is rejected before a probe, even one re-entering a layer"
         );
 

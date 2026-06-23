@@ -137,7 +137,7 @@ pub fn tree(store: &Store, layer: Option<Layer>, type_: Option<&str>) -> Result<
 
 /// The on-disk folder name for a layer. A render-local copy of the canonical
 /// layer→dir mapping so the walk never depends on store-side helpers; the names
-/// are fixed by the db.md spec (`sources` / `records` / `wiki`).
+/// are fixed by the db.md spec (`sources` / `records`).
 fn layer_dir_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Sources => "sources",
@@ -724,7 +724,7 @@ mod tests {
         let fx = Fixture::new();
         fx.write("sources/emails/a.md", &doc("a"));
         fx.write("records/contacts/b.md", &doc("b"));
-        fx.write("wiki/people/c.md", &doc("c"));
+        fx.write("sources/notes/c.md", &doc("c"));
 
         let tree = tree(&fx.store, Some(Layer::Records), None).expect("tree");
         let layers: Vec<Layer> = tree.layers.iter().map(|l| l.layer).collect();
@@ -932,9 +932,9 @@ mod tests {
         // Body line 1: ""   2: "# Title"  3: ""  4: "## Alpha"  5: "text"
         //      6: "### Sub"  7: "more"  8: "## Beta"  9: "end"
         let file = "---\ntype: note\nsummary: s\n---\n\n# Title\n\n## Alpha\ntext\n### Sub\nmore\n## Beta\nend\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert_eq!(
             headings(&o),
             vec![
@@ -944,16 +944,16 @@ mod tests {
             ],
             "only ##+ headings, with body-relative 1-based line numbers; the # title is not a section"
         );
-        assert_eq!(o.file, PathBuf::from("wiki/notes/n.md"));
+        assert_eq!(o.file, PathBuf::from("records/notes/n.md"));
     }
 
     #[test]
     fn outline_section_body_spans_to_next_sibling_or_shallower_heading() {
         let fx = Fixture::new();
         let file = "---\nx: 1\n---\n## Alpha\na1\na2\n### Sub\ns1\n## Beta\nb1\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         let alpha = &o.sections[0];
         // Alpha (##) absorbs its own lines AND the nested ### Sub, stopping at ## Beta.
         assert_eq!(alpha.heading, "Alpha");
@@ -981,9 +981,9 @@ mod tests {
         let fx = Fixture::new();
         // A later level-1 `#` is shallower than `##` and must close the ## body.
         let file = "---\nx: 1\n---\n## Sec\nbody1\n# NewTitle\nafter\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert_eq!(headings(&o), vec![("Sec".to_string(), 2, 1)]);
         assert_eq!(
             o.sections[0].body, "## Sec\nbody1\n",
@@ -995,9 +995,9 @@ mod tests {
     fn outline_ignores_headings_inside_fenced_code_blocks() {
         let fx = Fixture::new();
         let file = "---\nx: 1\n---\n## Real\n```\n## fake heading in code\n### also fake\n```\nafter\n## AlsoReal\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         // Body lines: 1 `## Real`, 2 ```, 3/4 fenced fakes, 5 ```, 6 `after`,
         // 7 `## AlsoReal` — so AlsoReal is heading on body line 7.
         assert_eq!(
@@ -1013,9 +1013,9 @@ mod tests {
     fn outline_ignores_tilde_fences_too() {
         let fx = Fixture::new();
         let file = "---\nx: 1\n---\n## Real\n~~~\n## fake\n~~~\ntail\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert_eq!(headings(&o), vec![("Real".to_string(), 2, 1)]);
     }
 
@@ -1024,9 +1024,9 @@ mod tests {
         let fx = Fixture::new();
         // `#tag` (no space) is not a heading; 7 hashes exceeds ATX max of 6.
         let file = "---\nx: 1\n---\n#nospace\n####### sevenhashes\n## Good\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert_eq!(
             headings(&o),
             vec![("Good".to_string(), 2, 3)],
@@ -1038,9 +1038,9 @@ mod tests {
     fn outline_strips_atx_closing_hashes_from_heading_text() {
         let fx = Fixture::new();
         let file = "---\nx: 1\n---\n## Title ##\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert_eq!(o.sections[0].heading, "Title");
     }
 
@@ -1052,9 +1052,9 @@ mod tests {
         // and a bare `## ##` is an empty heading.
         let fx = Fixture::new();
         let file = "---\nx: 1\n---\n## C#\n## F#\n## Ada ##\n## ##\n";
-        fx.write("wiki/notes/langs.md", file);
+        fx.write("records/notes/langs.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/langs.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/langs.md")).expect("outline");
         let texts: Vec<String> = o.sections.iter().map(|s| s.heading.clone()).collect();
         assert_eq!(
             texts,
@@ -1073,9 +1073,9 @@ mod tests {
         let fx = Fixture::new();
         // No `---` block at all; the whole file is body, so ## is on line 1.
         let file = "## First\ntext\n## Second\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert_eq!(
             headings(&o),
             vec![("First".to_string(), 2, 1), ("Second".to_string(), 2, 3)],
@@ -1102,11 +1102,11 @@ mod tests {
     fn outline_of_a_file_with_no_headings_is_empty() {
         let fx = Fixture::new();
         fx.write(
-            "wiki/notes/n.md",
+            "records/notes/n.md",
             "---\nx: 1\n---\njust prose, no headings\n",
         );
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert!(
             o.sections.is_empty(),
             "a heading-free body yields no sections"
@@ -1116,7 +1116,7 @@ mod tests {
     #[test]
     fn outline_missing_file_is_an_io_error() {
         let fx = Fixture::new();
-        let err = outline(&fx.store, Path::new("wiki/notes/does-not-exist.md"))
+        let err = outline(&fx.store, Path::new("records/notes/does-not-exist.md"))
             .expect_err("missing file should error");
         assert!(
             matches!(err, StoreError::Io(_)),
@@ -1130,9 +1130,9 @@ mod tests {
         // CRLF frontmatter terminator + a heading indented up to 3 spaces (still
         // a heading per CommonMark) and one indented 4 (a code indent — not).
         let file = "---\r\nx: 1\r\n---\r\n   ## Indented3\nbody\n    ## Indented4Code\n";
-        fx.write("wiki/notes/n.md", file);
+        fx.write("records/notes/n.md", file);
 
-        let o = outline(&fx.store, Path::new("wiki/notes/n.md")).expect("outline");
+        let o = outline(&fx.store, Path::new("records/notes/n.md")).expect("outline");
         assert_eq!(
             headings(&o),
             vec![("Indented3".to_string(), 2, 1)],

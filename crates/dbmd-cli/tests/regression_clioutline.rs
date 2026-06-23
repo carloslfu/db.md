@@ -17,7 +17,7 @@ use common::{dbmd, write_file};
 /// The canonical two-section shape: two `##` and one nested `###`.
 const TWO_SECTIONS: &str = "\
 ---
-type: wiki-page
+type: note
 summary: a page
 ---
 

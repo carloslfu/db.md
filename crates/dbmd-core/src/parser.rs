@@ -2559,12 +2559,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            with_id.effective_id(Path::new("wiki/people/sarah-chen.md")),
+            with_id.effective_id(Path::new("records/profiles/sarah-chen.md")),
             "explicit-id"
         );
         let no_id = Frontmatter::default();
         assert_eq!(
-            no_id.effective_id(Path::new("wiki/people/sarah-chen.md")),
+            no_id.effective_id(Path::new("records/profiles/sarah-chen.md")),
             "sarah-chen"
         );
     }
@@ -2987,7 +2987,7 @@ mod tests {
 
     // ── parse_db_md ──────────────────────────────────────────────────────────
 
-    const CANONICAL_DB_MD: &str = "---\ntype: db-md\nscope: company\nowner: Sarah Chen\n---\n\n# Acme operations knowledge base\n\nCompany-scale institutional memory for Acme.\n\n## Agent instructions\n\nPrioritize creating `contact` records from new-sender emails. Use British English.\n\n## Policies\n\n### Frozen pages\n- `records/decisions/2026-q1-strategy.md` — finalized, do not modify.\n- `wiki/synthesis/2026-annual-plan.md` — signed-off plan.\n\n### Ignored types\n- `test`, `temp` — read but never synthesize.\n\n## Schemas\n\n### contact\n- name (required)\n- email (required, email)\n- company (required, link to records/companies/)\n- role (string)\n\n### expense\n- date (required, date)\n- amount (required)\n- currency (default USD)\n";
+    const CANONICAL_DB_MD: &str = "---\ntype: db-md\nscope: company\nowner: Sarah Chen\n---\n\n# Acme operations knowledge base\n\nCompany-scale institutional memory for Acme.\n\n## Agent instructions\n\nPrioritize creating `contact` records from new-sender emails. Use British English.\n\n## Policies\n\n### Frozen pages\n- `records/decisions/2026-q1-strategy.md` — finalized, do not modify.\n- `records/synthesis/2026-annual-plan.md` — signed-off plan.\n\n### Ignored types\n- `test`, `temp` — read but never synthesize.\n\n## Schemas\n\n### contact\n- name (required)\n- email (required, email)\n- company (required, link to records/companies/)\n- role (string)\n\n### expense\n- date (required, date)\n- amount (required)\n- currency (default USD)\n";
 
     #[test]
     fn parse_db_md_extracts_all_canonical_sections() {
@@ -3005,7 +3005,7 @@ mod tests {
             config.frozen_pages,
             vec![
                 PathBuf::from("records/decisions/2026-q1-strategy.md"),
-                PathBuf::from("wiki/synthesis/2026-annual-plan.md"),
+                PathBuf::from("records/synthesis/2026-annual-plan.md"),
             ]
         );
 
@@ -3471,7 +3471,7 @@ mod tests {
         };
         assert!(deep.is_frozen(Path::new("records/decisions/sub/q1.md")));
         assert!(deep.is_frozen(Path::new("records/x.md")));
-        assert!(!deep.is_frozen(Path::new("wiki/x.md")));
+        assert!(!deep.is_frozen(Path::new("sources/x.md")));
         // A `*.md`-style intra-segment glob.
         let suffix = Config {
             frozen_pages: vec![PathBuf::from("records/decisions/q*")],

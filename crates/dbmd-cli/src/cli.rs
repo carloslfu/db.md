@@ -24,7 +24,8 @@ use crate::context::ColorChoice;
 /// plain files.
 ///
 /// db.md is one directory: raw evidence in `sources/`, atomic typed data in
-/// `records/`, curator-synthesized narrative in `wiki/`, and a single `DB.md`
+/// `records/` (curator-synthesized narrative lives in `records/` too, as
+/// conclusion records tagged `meta-type: conclusion`), and a single `DB.md`
 /// at the root. `dbmd` reads, writes, validates, searches, and indexes that
 /// store. It embeds ripgrep and has zero AI/LLM dependencies — the agent
 /// driving `dbmd` is the semantic layer; `dbmd` is deterministic plumbing.
@@ -627,7 +628,7 @@ pub struct IndexRebuildArgs {
 #[derive(Debug, Args)]
 pub struct IndexShowArgs {
     /// The layer or type-folder whose `index.md` to print (e.g.
-    /// `wiki/people`). Omit for the root `index.md`.
+    /// `records/profiles`). Omit for the root `index.md`.
     #[arg(value_name = "PATH")]
     pub path: Option<String>,
 

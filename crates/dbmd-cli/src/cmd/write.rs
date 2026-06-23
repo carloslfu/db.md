@@ -90,8 +90,8 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     // regardless of how sharding would relocate the name — refusal is keyed on
     // the policy path. Enforcing on the caller-supplied (normalized, unsharded)
     // path here catches an explicit frozen target like
-    // `wiki/synthesis/2026-annual-plan` even though `wiki-page` sharding would
-    // otherwise rewrite it to `wiki/topics/…` and slip past the policy. This
+    // `records/synthesis/2026-annual-plan` even when type-folder sharding would
+    // otherwise relocate the name and let it slip past the policy. This
     // also runs BEFORE the collision check so an *existing* frozen page reports
     // `POLICY_FROZEN_PAGE` (a policy refusal), not `PATH_COLLISION`.
     let requested_rel = to_store_relative(&store, &args.path);
@@ -399,9 +399,9 @@ fn resolve_write_path(
     // Honour an agent-supplied **conforming** type-folder. When the path names a
     // `<layer>/<sub-folder>/…/<file>` whose layer matches the type's canonical
     // layer, the agent's `<layer>/<sub-folder>` is the type-folder — this is the
-    // only way to reach the SPEC's `wiki/people/`, `wiki/projects/`,
-    // `wiki/synthesis/` (a `wiki-page` is filed under `wiki/<topic>/`, any topic),
-    // and likewise an alternate records sub-folder. Sharding still applies under
+    // only way to reach the SPEC's conclusion-record folders `records/profiles/`,
+    // `records/projects/`, `records/synthesis/`, and likewise an alternate records
+    // sub-folder. Sharding still applies under
     // the chosen folder (we pass the 2-component type-folder and let the sharder
     // re-derive `<YYYY>/<MM>`, so a re-supplied shard segment isn't doubled).
     // Anything under-specified (bare filename, or `<layer>/<file>`) or in the

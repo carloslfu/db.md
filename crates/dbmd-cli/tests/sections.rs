@@ -12,7 +12,7 @@ use common::{corpus_a, dbmd, write_file};
 /// A file with two `##` sections and one nested `###` — the canonical shape.
 const TWO_SECTIONS: &str = "\
 ---
-type: wiki-page
+type: note
 summary: a page
 ---
 
@@ -79,7 +79,7 @@ fn file_with_no_h2_sections_prints_nothing() {
     let file = write_file(
         tmp.path(),
         "flat.md",
-        "---\ntype: wiki-page\nsummary: s\n---\n\n# Only a title\n\nJust prose.\n",
+        "---\ntype: note\nsummary: s\n---\n\n# Only a title\n\nJust prose.\n",
     );
 
     let out = dbmd().arg("sections").arg(&file).assert().success();
@@ -93,7 +93,7 @@ fn fenced_code_headings_are_not_sections() {
     let file = write_file(
         tmp.path(),
         "code.md",
-        "---\ntype: wiki-page\nsummary: s\n---\n\n## Real\n\n```\n## not a heading\n```\n\n## Also real\n",
+        "---\ntype: note\nsummary: s\n---\n\n## Real\n\n```\n## not a heading\n```\n\n## Also real\n",
     );
 
     let out = dbmd().arg("sections").arg(&file).assert().success();

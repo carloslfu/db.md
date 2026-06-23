@@ -137,7 +137,7 @@ fn log_append_rotates_multiple_prior_months_into_archives_and_keeps_current_acti
     let oct1 = entry_block("2023-10-05 09:00", "ingest", "sources/a", "october one");
     let oct2 = entry_block("2023-10-20 14:30", "create", "records/b", "october two");
     let nov1 = entry_block("2023-11-08 08:15", "update", "records/c", "november one");
-    let nov2 = entry_block("2023-11-25 16:45", "link", "wiki/d", "november two");
+    let nov2 = entry_block("2023-11-25 16:45", "link", "records/d", "november two");
     write_active_log(&root, &[oct1, oct2, nov1, nov2]);
 
     // No archive dir yet.
@@ -202,7 +202,7 @@ fn log_append_rotates_multiple_prior_months_into_archives_and_keeps_current_acti
         "October archive must not hold November entries:\n{oct_text}"
     );
     assert!(nov_text.contains("## [2023-11-08 08:15] update | records/c"));
-    assert!(nov_text.contains("## [2023-11-25 16:45] link | wiki/d"));
+    assert!(nov_text.contains("## [2023-11-25 16:45] link | records/d"));
     assert!(
         !nov_text.contains("october"),
         "November archive must not hold October entries:\n{nov_text}"
@@ -285,7 +285,7 @@ fn log_tail_reverse_reads_across_active_and_archive_boundary() {
         "2023-12",
         &[
             entry_block("2023-12-03 10:00", "update", "records/d1", "dec one"),
-            entry_block("2023-12-30 23:10", "link", "wiki/d2", "dec two"),
+            entry_block("2023-12-30 23:10", "link", "records/d2", "dec two"),
         ],
     );
     write_active_log(
@@ -371,7 +371,7 @@ fn log_since_reverse_reads_across_boundary_and_excludes_cutoff() {
         "2023-12",
         &[
             entry_block("2023-12-03 10:00", "update", "records/d1", "dec one"),
-            entry_block("2023-12-30 23:10", "link", "wiki/d2", "dec two"),
+            entry_block("2023-12-30 23:10", "link", "records/d2", "dec two"),
         ],
     );
     write_active_log(

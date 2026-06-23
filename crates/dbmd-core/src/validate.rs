@@ -713,10 +713,11 @@ fn check_frontmatter(
                 vec![PathBuf::from("DB.md")],
             );
         }
-        // A wiki-page deriving from an ignored-type record → warning. The
-        // decision lives in the shared `derived_from_ignored_type` entry point;
-        // this side only supplies the `derived_from` targets (with their line,
-        // which the issue carries) and renders the finding.
+        // A conclusion record (`meta-type: conclusion`) deriving from an
+        // ignored-type record → warning. The decision lives in the shared
+        // `derived_from_ignored_type` entry point; this side only supplies the
+        // `derived_from` targets (with their line, which the issue carries) and
+        // renders the finding.
         let meta_type = fm
             .get("meta-type")
             .and_then(scalar_string)
@@ -2408,8 +2409,8 @@ fn not_a_store_issue(store: &Store) -> Issue {
     }
 }
 
-/// True if a store-relative path is a content file: under `sources/`,
-/// `records/`, or `wiki/` and not an `index.md`/`index.jsonl`/`log.md`.
+/// True if a store-relative path is a content file: under `sources/` or
+/// `records/` and not an `index.md`/`index.jsonl`/`log.md`.
 fn is_content_file(rel: &Path) -> bool {
     let Some(first) = rel.iter().next().and_then(|s| s.to_str()) else {
         return false;
@@ -2949,7 +2950,7 @@ fn type_folder_of(rel: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(comps[0]).join(comps[1]))
 }
 
-/// **SWEEP.** Walk every `.md` content file under `sources/`/`records/`/`wiki/`,
+/// **SWEEP.** Walk every `.md` content file under `sources/`/`records/`,
 /// returning store-relative paths to be parsed in full. Skips hidden dirs and
 /// the index twin (`index.jsonl`). Used only by `validate_all`; the working-set
 /// incoming-linker scan rides the embedded-ripgrep `Store::find_links_to_any`
@@ -3319,10 +3320,10 @@ pub struct DerivedFromIgnored {
 }
 
 /// **The single authoritative `### Ignored types` derivation check.** Decides
-/// whether a `wiki-page` derives from an ignored-type record: the type must be
-/// `wiki-page`, `### Ignored types` must be non-empty, and some `derived_from`
-/// target must resolve to a record whose `type` is in `ignored_types`. Returns
-/// the first such target (and its type), or `None`.
+/// whether a conclusion record derives from an ignored-type record: the
+/// `meta-type` must be `conclusion`, `### Ignored types` must be non-empty, and
+/// some `derived_from` target must resolve to a record whose `type` is in
+/// `ignored_types`. Returns the first such target (and its type), or `None`.
 ///
 /// Both surfaces call this so the policy lives in exactly one place:
 /// [`check_content_file`] (read side — `dbmd validate`) feeds it the
@@ -4145,8 +4146,8 @@ mod tests {
         let fx = Fixture::new();
         let s = "y".repeat(200);
         fx.write(
-            "wiki/people/a.md",
-            &format!("---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: \"{s}\"\n---\n\nbody\n"),
+            "records/profiles/a.md",
+            &format!("---\ntype: profile\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: \"{s}\"\n---\n\nbody\n"),
         );
         let issues = fx.store_all();
         assert!(
@@ -4258,7 +4259,7 @@ mod tests {
         fx.write("records/contacts/target.md", &valid_contact("target"));
         let mut body = valid_contact("links to target");
         body.push_str("\nSee [[records/contacts/target]].\n");
-        fx.write("wiki/people/a.md", &body);
+        fx.write("records/contacts/a.md", &body);
         let issues = fx.store_all();
         assert!(!has(&issues, codes::WIKI_LINK_BROKEN), "{issues:#?}");
         assert!(!has(&issues, codes::WIKI_LINK_SHORT_FORM), "{issues:#?}");
@@ -4287,7 +4288,7 @@ mod tests {
         let fx = Fixture::new();
         let mut body = valid_contact("has a fenced example");
         body.push_str("\n```\n[[sarah-chen]]\n```\n");
-        fx.write("wiki/people/a.md", &body);
+        fx.write("records/contacts/a.md", &body);
         let issues = fx.store_all();
         assert!(
             !has(&issues, codes::WIKI_LINK_SHORT_FORM),
@@ -5541,8 +5542,8 @@ mod tests {
         // `changed` was renamed/removed (logged). `linker` points at it with a
         // now-broken link and was NOT itself logged — but must be pulled in.
         fx.write(
-            "wiki/people/linker.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: links to a removed page\n---\n\nSee [[records/contacts/changed]].\n",
+            "records/profiles/linker.md",
+            "---\ntype: profile\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: links to a removed page\n---\n\nSee [[records/contacts/changed]].\n",
         );
         // `changed.md` does NOT exist on disk (removed).
         fx.write(
@@ -5552,7 +5553,7 @@ mod tests {
         let issues = validate_working_set(&fx.store(), None).unwrap();
         assert!(
             issues.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN
-                && i.file == Path::new("wiki/people/linker.md")),
+                && i.file == Path::new("records/profiles/linker.md")),
             "incoming linker to a removed path must be validated: {issues:#?}"
         );
     }
@@ -5634,8 +5635,8 @@ mod tests {
     #[test]
     fn issues_are_sorted_by_file_then_line() {
         let fx = Fixture::new();
-        fx.write("wiki/people/z.md", "---\ntype: wiki-page\ncreated: BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n");
-        fx.write("wiki/people/a.md", "---\ntype: wiki-page\ncreated: BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n");
+        fx.write("records/profiles/z.md", "---\ntype: profile\nmeta-type: conclusion\ncreated: BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n");
+        fx.write("records/profiles/a.md", "---\ntype: profile\nmeta-type: conclusion\ncreated: BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n");
         let issues = fx.store_all();
         let files: Vec<&PathBuf> = issues.iter().map(|i| &i.file).collect();
         let mut sorted = files.clone();
@@ -5675,7 +5676,7 @@ mod tests {
         fx.write("records/contacts/sarah-chen.md", &valid_contact("sarah"));
         let mut body = valid_contact("links to sarah");
         body.push_str("\nSee [[records/contacts/sarah-chen]].\n");
-        fx.write("wiki/people/p.md", &body);
+        fx.write("records/contacts/p.md", &body);
         let issues = fx.store_all();
         assert!(!has(&issues, codes::WIKI_LINK_AMBIGUOUS), "{issues:#?}");
     }
@@ -5714,8 +5715,8 @@ mod tests {
         // links to `records/contacts/sarah-chen` (a longer path sharing a prefix).
         let fx = Fixture::new();
         fx.write(
-            "wiki/people/only-sarah-chen.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nSee [[records/contacts/sarah-chen]].\n",
+            "records/profiles/only-sarah-chen.md",
+            "---\ntype: profile\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nSee [[records/contacts/sarah-chen]].\n",
         );
         // The log says `records/contacts/sarah` (the shorter path) changed.
         fx.write(
@@ -5726,7 +5727,7 @@ mod tests {
         assert!(
             !issues
                 .iter()
-                .any(|i| i.file == Path::new("wiki/people/only-sarah-chen.md")),
+                .any(|i| i.file == Path::new("records/profiles/only-sarah-chen.md")),
             "a prefix-sharing link must not pull a file into the working set: {issues:#?}"
         );
     }
@@ -5780,8 +5781,8 @@ mod tests {
         let fx = Fixture::new();
         // Linker A → deleted target #1 (in the body).
         fx.write(
-            "wiki/people/refers-sarah.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nSee [[records/contacts/sarah-chen]].\n",
+            "records/profiles/refers-sarah.md",
+            "---\ntype: profile\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nSee [[records/contacts/sarah-chen]].\n",
         );
         // Linker B → deleted target #2 (in a typed frontmatter field — an edge the
         // sidecar `links` projection would miss, which is why this must be a
@@ -5800,7 +5801,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|i| i.file == Path::new("wiki/people/refers-sarah.md")
+                .any(|i| i.file == Path::new("records/profiles/refers-sarah.md")
                     && i.code == codes::WIKI_LINK_BROKEN),
             "linker to the FIRST deleted target must be pulled in and flagged: {issues:#?}"
         );

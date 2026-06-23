@@ -1902,7 +1902,7 @@ mod tests {
             "expense",
             Some("Lunch with vendor"),
             Some("2026-05-10T10:00:00Z"),
-            "created: 2026-05-10T09:00:00Z\nstatus: paid\namount: 42\ncompany: [[records/companies/acme]]\nrelated:\n  - [[wiki/themes/spend]]\ntags:\n  - food\nlinks:\n  - wiki/themes/spend\n  - [[wiki/themes/renewal]]\n",
+            "created: 2026-05-10T09:00:00Z\nstatus: paid\namount: 42\ncompany: [[records/companies/acme]]\nrelated:\n  - [[records/concepts/spend]]\ntags:\n  - food\nlinks:\n  - records/concepts/spend\n  - [[records/concepts/renewal]]\n",
         );
         write_doc(
             &store,
@@ -1935,8 +1935,8 @@ mod tests {
         assert_eq!(
             r1.links,
             vec![
-                "wiki/themes/spend".to_string(),
-                "[[wiki/themes/renewal]]".to_string()
+                "records/concepts/spend".to_string(),
+                "[[records/concepts/renewal]]".to_string()
             ]
         );
         assert_eq!(
@@ -1951,7 +1951,7 @@ mod tests {
         );
         assert_eq!(
             r1.fields.get("related"),
-            Some(&serde_json::json!(["[[wiki/themes/spend]]"]))
+            Some(&serde_json::json!(["[[records/concepts/spend]]"]))
         );
         // Reserved keys never leak into `fields`.
         for reserved in [
@@ -1966,7 +1966,7 @@ mod tests {
         // Stable key order: declared fields first, then sorted extras.
         assert!(
             lines[1].starts_with(
-                r#"{"path":"records/expenses/2026/05/e1.md","type":"expense","summary":"Lunch with vendor","tags":["food"],"links":["wiki/themes/spend","[[wiki/themes/renewal]]"],"created":"2026-05-10T09:00:00Z","updated":"2026-05-10T10:00:00Z","#
+                r#"{"path":"records/expenses/2026/05/e1.md","type":"expense","summary":"Lunch with vendor","tags":["food"],"links":["records/concepts/spend","[[records/concepts/renewal]]"],"created":"2026-05-10T09:00:00Z","updated":"2026-05-10T10:00:00Z","#
             ),
             "jsonl key order not stable:\n{}",
             lines[1]
@@ -1976,7 +1976,7 @@ mod tests {
         // declare one, so it appears among the sorted extras (between `company`
         // and `related`).
         assert!(
-            lines[1].ends_with(r#""amount":42,"company":"[[records/companies/acme]]","meta-type":"fact","related":["[[wiki/themes/spend]]"],"status":"paid"}"#),
+            lines[1].ends_with(r#""amount":42,"company":"[[records/companies/acme]]","meta-type":"fact","related":["[[records/concepts/spend]]"],"status":"paid"}"#),
             "extras must be sorted:\n{}",
             lines[1]
         );
@@ -2212,7 +2212,7 @@ mod tests {
                 "contact",
                 "Sarah",
                 "2026-05-15T10:00:00Z",
-                "links:\n  - wiki/people/sarah\n",
+                "links:\n  - records/profiles/sarah\n",
             ),
             (
                 "records/contacts/elena.md",
@@ -2393,21 +2393,21 @@ mod tests {
     /// having no type-folder — making the producer (path computation) disagree
     /// with the consumer (index): the loop path crashes (`on_write` → `Err`, it
     /// tries to write `index.md` *inside* a file) while the sweep path silently
-    /// drops the page from every catalog. `wiki-page` is now an unrecognized
-    /// type, so `shard_path_for` files it under the records-layer fallback
-    /// `records/wiki-page/<file>` — a conforming 3-component path. This test
+    /// drops the page from every catalog. A conclusion `profile` is a custom
+    /// (non-built-in) type, so `shard_path_for` files it under the records-layer
+    /// fallback `records/profile/<file>` — a conforming 3-component path. This test
     /// drives both paths through the real `shard_path_for` output and asserts
     /// (1) `on_write` succeeds, (2) the page appears in the rebuilt catalog, and
     /// (3) write-through == rebuild.
     #[test]
-    fn wiki_page_at_shard_path_for_is_indexable_end_to_end() {
+    fn custom_type_at_shard_path_for_is_indexable_end_to_end() {
         let (_d1, wt) = mk_store();
         let (_d2, rb) = mk_store();
 
-        // The toolkit's own canonical write path for a wiki-page.
+        // The toolkit's own canonical write path for a custom-type record.
         let rel = wt
             .shard_path_for(
-                "wiki-page",
+                "profile",
                 &crate::parser::Frontmatter::default(),
                 "renewal-theme",
             )
@@ -2423,7 +2423,7 @@ mod tests {
         write_doc(
             &wt,
             &rel_str,
-            "wiki-page",
+            "profile",
             Some("Renewal theme"),
             Some("2026-05-21T10:00:00Z"),
             "",
@@ -2431,44 +2431,43 @@ mod tests {
         write_doc(
             &rb,
             &rel_str,
-            "wiki-page",
+            "profile",
             Some("Renewal theme"),
             Some("2026-05-21T10:00:00Z"),
             "",
         );
 
-        // (1) Loop path must NOT error (the old `wiki/<file>` shape returned
-        // Err(Io(NotADirectory))).
+        // (1) Loop path must NOT error (a 2-component `<layer>/<file>` shape
+        // returned Err(Io(NotADirectory))).
         Index::on_write(&wt, &rel)
-            .expect("on_write must succeed for a toolkit-computed wiki-page path");
+            .expect("on_write must succeed for a toolkit-computed custom-type path");
         Index::rebuild_all(&rb).unwrap();
 
         // (2) The page is present in the rebuilt catalog (the old flat-path bug
         // silently omitted it from every artifact). The individual page link
         // lives in the *type-folder* index; the *layer* index rolls the
-        // type-folder up — assert both, since the bug erased both. `wiki-page`
-        // is now an unrecognized type, so its canonical folder is the
-        // records-layer fallback `records/wiki-page`.
-        let page_link = wiki_target(&rel); // records/wiki-page/renewal-theme
-        let tf_md = read(&rb, "records/wiki-page/index.md");
+        // type-folder up — assert both, since the bug erased both. A custom
+        // type's canonical folder is the records-layer fallback `records/profile`.
+        let page_link = wiki_target(&rel); // records/profile/renewal-theme
+        let tf_md = read(&rb, "records/profile/index.md");
         assert!(
             tf_md.contains(&format!("[[{page_link}]]")),
             "type-folder index must list the page link, got:\n{tf_md}"
         );
         assert!(
-            exists(&rb, "records/wiki-page/index.jsonl"),
+            exists(&rb, "records/profile/index.jsonl"),
             "type-folder jsonl must exist"
         );
         assert!(
-            read(&rb, "records/wiki-page/index.jsonl").contains(&rel_str),
+            read(&rb, "records/profile/index.jsonl").contains(&rel_str),
             "type-folder jsonl must contain the page row"
         );
         // The layer index rolls the type-folder up (proves the page's folder is
         // visible to the layer catalog, not dropped).
         let layer_md = read(&rb, "records/index.md");
         assert!(
-            layer_md.contains("records/wiki-page/index"),
-            "layer index must roll up the records/wiki-page type-folder, got:\n{layer_md}"
+            layer_md.contains("records/profile/index"),
+            "layer index must roll up the records/profile type-folder, got:\n{layer_md}"
         );
 
         // (3) Write-through equals rebuild byte-for-byte — loop and sweep agree.
@@ -2482,7 +2481,7 @@ mod tests {
         for (k, v) in &a {
             assert_eq!(
                 v, &b[k],
-                "wiki-page artifact {k} differs between on_write and rebuild"
+                "custom-type artifact {k} differs between on_write and rebuild"
             );
         }
     }

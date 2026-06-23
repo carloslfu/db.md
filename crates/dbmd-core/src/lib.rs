@@ -1,9 +1,10 @@
 //! `dbmd-core` — the reference library for **db.md**, the open database in
 //! plain files.
 //!
-//! db.md is one directory: raw evidence in `sources/`, atomic typed data in
-//! `records/`, curator-synthesized narrative in `wiki/`, and a single `DB.md`
-//! config file at the root. Records are markdown files with YAML frontmatter;
+//! db.md is one directory: raw evidence in `sources/`, atomic typed data plus
+//! curator-synthesized conclusions (`meta-type: conclusion`) in `records/`, and
+//! a single `DB.md` config file at the root. Records are markdown files with
+//! YAML frontmatter;
 //! relationships are wiki-links; the index is the derived, write-through
 //! `index.md` / `index.jsonl` catalog plus embedded ripgrep.
 //!

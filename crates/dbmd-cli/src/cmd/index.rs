@@ -459,8 +459,9 @@ mod tests {
     use super::*;
 
     /// Build a store with one populated type-folder (`records/contacts`) plus an
-    /// empty type-folder (`records/empty`) and two empty layers (`sources`,
-    /// `wiki`), mirroring the dry-run/real-rebuild divergence repro.
+    /// empty type-folder (`records/empty`), the empty `sources` layer, and a
+    /// stray non-layer directory (`wiki`, no longer a recognized layer), mirroring
+    /// the dry-run/real-rebuild divergence repro.
     fn store_with_empty_scopes() -> (tempfile::TempDir, Store) {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
@@ -478,8 +479,10 @@ mod tests {
         )
         .unwrap();
 
-        // Empty type-folder + two empty layers: a real rebuild writes nothing for
-        // these (and deletes any stale artifacts).
+        // Empty type-folder + the empty `sources` layer + a stray non-layer dir:
+        // a real rebuild writes nothing for these (and deletes any stale
+        // artifacts). `wiki` is no longer a recognized layer, so it stands in here
+        // as a directory the rebuild must ignore entirely.
         std::fs::create_dir_all(root.join("records/empty")).unwrap();
         std::fs::create_dir_all(root.join("sources")).unwrap();
         std::fs::create_dir_all(root.join("wiki")).unwrap();

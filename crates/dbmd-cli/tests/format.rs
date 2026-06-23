@@ -120,12 +120,12 @@ fn frozen_page_is_refused_exit_four_no_write() {
     std::fs::write(
         tmp.path().join("DB.md"),
         "---\ntype: db-md\nscope: company\nowner: T\n---\n\n# S\n\n\
-         ## Policies\n\n### Frozen pages\n- `wiki/synthesis/plan.md` — signed off.\n",
+         ## Policies\n\n### Frozen pages\n- `records/synthesis/plan.md` — signed off.\n",
     )
     .unwrap();
     let file = write_file(
         tmp.path(),
-        "wiki/synthesis/plan.md",
+        "records/synthesis/plan.md",
         SCRAMBLED, // deliberately non-canonical, to prove no rewrite happens
     );
     let before = std::fs::read_to_string(&file).unwrap();

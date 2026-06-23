@@ -565,7 +565,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("dbmd-rename-noop-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("linker.md");
-        let original = "Only [[wiki/topics/elsewhere]] here.";
+        let original = "Only [[records/concepts/elsewhere]] here.";
         std::fs::write(&f, original).unwrap();
 
         let changed = rewrite_links_in_file(

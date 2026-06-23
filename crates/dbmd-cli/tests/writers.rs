@@ -859,12 +859,12 @@ fn rename_moves_file_and_rewrites_incoming_links() {
     );
     // Two linkers reference the old path (one with display text).
     store.seed(
-        "wiki/topics/a.md",
-        "---\ntype: wiki-page\nsummary: s\n---\nSee [[records/contacts/sarah]].\n",
+        "records/concepts/a.md",
+        "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\nSee [[records/contacts/sarah]].\n",
     );
     store.seed(
-        "wiki/topics/b.md",
-        "---\ntype: wiki-page\nsummary: s\n---\nWith [[records/contacts/sarah|Sarah]].\n",
+        "records/concepts/b.md",
+        "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\nWith [[records/contacts/sarah|Sarah]].\n",
     );
 
     let out = store.run(&[
@@ -880,8 +880,8 @@ fn rename_moves_file_and_rewrites_incoming_links() {
     assert!(store.abs("records/contacts/sarah-chen.md").exists());
 
     // Both incoming links were rewritten (display text preserved).
-    let a = std::fs::read_to_string(store.abs("wiki/topics/a.md")).unwrap();
-    let b = std::fs::read_to_string(store.abs("wiki/topics/b.md")).unwrap();
+    let a = std::fs::read_to_string(store.abs("records/concepts/a.md")).unwrap();
+    let b = std::fs::read_to_string(store.abs("records/concepts/b.md")).unwrap();
     assert!(a.contains("[[records/contacts/sarah-chen]]"), "{a}");
     assert!(b.contains("[[records/contacts/sarah-chen|Sarah]]"), "{b}");
 

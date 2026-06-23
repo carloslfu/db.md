@@ -38,9 +38,10 @@
 //!   `--type` / `--in` an *I/O* scope, not just a result filter: a typed/layer-scoped
 //!   `backlinks` reads only the relevant layer's sidecars (O(entities-in-layer))
 //!   and parses only those files. A type's records can span several folders within
-//!   its layer (`wiki-page` under any `wiki/<topic>/`), so the read is layer-wide,
-//!   not a single canonical folder — otherwise off-canonical-folder linkers would
-//!   be silently dropped.
+//!   its layer (a `profile` filed under any `records/<folder>/`, not only its
+//!   canonical `records/profiles/`), so the read is layer-wide, not a single
+//!   canonical folder — otherwise off-canonical-folder linkers would be silently
+//!   dropped.
 //!
 //! **Why the scoped path confirms by parsing the candidate, not by trusting the
 //! sidecar's `links` field.** A sidecar record's `links` is the file's
@@ -139,9 +140,9 @@ pub fn backlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreError>
 ///   the sanctioned loop cost. Each candidate is then confirmed by a single-file
 ///   parse. When `types` lists several types, the sidecars of each type's layer
 ///   are read and the candidate sets unioned (filtered to the type), so a type
-///   whose records span multiple folders within its layer (e.g. `wiki-page` under
-///   any `wiki/<topic>/`) is fully covered; a `layer` further restricts the
-///   candidate paths to that layer.
+///   whose records span multiple folders within its layer (e.g. a `profile` filed
+///   under any `records/<folder>/`) is fully covered; a `layer` further restricts
+///   the candidate paths to that layer.
 ///
 /// **Correctness (one edge set, both paths).** An incoming edge to X is exactly:
 /// some file whose [`forwardlinks`] contains X — a wiki-link in the body or in
@@ -264,15 +265,16 @@ pub fn forwardlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreErr
 ///   `None`) via [`Store::sidecar_records`].
 ///
 /// **Why the whole layer, not just the type's canonical folder.** A `type` can
-/// legitimately span several folders within one layer — `wiki-page` is the
-/// canonical case (SPEC files it under `wiki/<topic>/` for an *arbitrary* topic:
-/// `wiki/topics/`, `wiki/people/`, `wiki/projects/`, …). Reading only the
-/// single canonical-guess folder (`wiki/topics/`) would silently drop every
-/// wiki-page filed elsewhere in the layer, so a scoped `backlinks --type
-/// wiki-page` would under-report dependents the moment that canonical folder
-/// exists — breaking the docstring's promise that the scoped edge set equals the
-/// unscoped one. Reading the type's full layer subtree and filtering by `type`
-/// is complete and still O(entities-in-layer), the sanctioned loop scope.
+/// legitimately span several folders within one layer — a conclusion `profile`
+/// is the canonical case (it lives under `records/profiles/` by default, but an
+/// agent may file one under any other `records/<folder>/`: `records/people/`,
+/// `records/projects/`, …). Reading only the single canonical-guess folder
+/// (`records/profiles/`) would silently drop every profile filed elsewhere in the
+/// layer, so a scoped `backlinks --type profile` would under-report dependents the
+/// moment that canonical folder exists — breaking the docstring's promise that the
+/// scoped edge set equals the unscoped one. Reading the type's full layer subtree
+/// and filtering by `type` is complete and still O(entities-in-layer), the
+/// sanctioned loop scope.
 fn candidate_records(
     store: &Store,
     types: &[String],
@@ -286,8 +288,8 @@ fn candidate_records(
     for type_ in types {
         // A type lives in exactly one layer; read that whole layer's sidecars so
         // a record filed under a non-canonical folder of the same type (e.g. a
-        // `wiki-page` under `wiki/people/` rather than `wiki/topics/`) is still a
-        // candidate. An explicit `--in` layer that disagrees with the type's
+        // `profile` under `records/people/` rather than `records/profiles/`) is
+        // still a candidate. An explicit `--in` layer that disagrees with the type's
         // layer can never match the type, so skip the read entirely.
         let type_layer = layer_for_type(type_);
         if let Some(scope) = layer {
@@ -751,8 +753,8 @@ fn path_layer(rel: &Path) -> Option<Layer> {
     }
 }
 
-/// True if a store-relative path is a *content* file: under `sources/`,
-/// `records/`, or `wiki/`, a `.md` file, and not an `index.md`. Meta files
+/// True if a store-relative path is a *content* file: under `sources/` or
+/// `records/`, a `.md` file, and not an `index.md`. Meta files
 /// (`DB.md`, `log.md`, `log/…`, sidecars) are excluded.
 fn is_content_rel(rel: &Path) -> bool {
     if path_layer(rel).is_none() {
@@ -766,8 +768,8 @@ fn is_content_rel(rel: &Path) -> bool {
 }
 
 /// Walk every content `.md` file in the store via the **`ignore`** walker
-/// (the ripgrep directory engine). Only the three layer roots
-/// (`sources/`/`records/`/`wiki/`) are descended, so `DB.md`, `log.md`, and
+/// (the ripgrep directory engine). Only the two layer roots
+/// (`sources/`/`records/`) are descended, so `DB.md`, `log.md`, and
 /// `log/` at the store root are structurally never reached; hidden dirs and
 /// per-folder `index.md` sidecars are filtered out ([`is_content_rel`]). Honors
 /// `.gitignore` the way `rg` does. Returns absolute paths. SWEEP-class.
@@ -967,8 +969,8 @@ mod tests {
             "records/contacts/sarah"
         );
         assert_eq!(
-            normalize_target(Path::new("./wiki/people/elena")),
-            "wiki/people/elena"
+            normalize_target(Path::new("./records/profiles/elena")),
+            "records/profiles/elena"
         );
         assert_eq!(normalize_target(Path::new("/records/x")), "records/x");
         // Bare and `.md` forms must collapse to the same key, or edges won't unify.
@@ -982,11 +984,11 @@ mod tests {
 
     #[test]
     fn extract_handles_display_text_and_md_suffix() {
-        let body = "See [[wiki/people/sarah-chen|Sarah]] and [[records/contacts/elena.md]].";
+        let body = "See [[records/profiles/sarah-chen|Sarah]] and [[records/contacts/elena.md]].";
         let got = extract_link_targets(body);
         assert_eq!(
             got,
-            vec!["wiki/people/sarah-chen", "records/contacts/elena"]
+            vec!["records/profiles/sarah-chen", "records/contacts/elena"]
         );
     }
 
@@ -1048,7 +1050,7 @@ mod tests {
         // Boundary correctness, anchored to the SAME normalize_target the read
         // side keys on: `records/contacts/sarah-chen` must NOT match the longer
         // `[[…-jr]]`, the short-form `[[sarah-chen]]`, or an unrelated target.
-        let input = "[[records/contacts/sarah-chen-jr]] [[sarah-chen]] [[wiki/topics/x]]";
+        let input = "[[records/contacts/sarah-chen-jr]] [[sarah-chen]] [[records/concepts/x]]";
         let got = rewrite_links_to(
             input,
             Path::new("records/contacts/sarah-chen"),
@@ -1084,11 +1086,11 @@ mod tests {
         // the walk.)
         let fx = Fixture::new();
         let body = "Met [[records/contacts/sarah.md|Sarah]] and not [[records/contacts/sarah-2]].";
-        fx.write("wiki/people/bio.md", "wiki-page", "bio", body);
+        fx.write("records/profiles/bio.md", "profile", "bio", body);
 
         // Read side: the parser sees two outgoing edges, both in canonical bare
         // form (the `.md` spelling collapsed). `sarah` is a real edge here.
-        let edges = forwardlinks(&fx.store, &fx.p("wiki/people/bio.md")).unwrap();
+        let edges = forwardlinks(&fx.store, &fx.p("records/profiles/bio.md")).unwrap();
         assert_eq!(
             paths(&edges),
             vec!["records/contacts/sarah", "records/contacts/sarah-2"],
@@ -1111,8 +1113,8 @@ mod tests {
         // Cross-check through the parser: the rewritten text's edge set is the
         // original with `sarah` swapped for `sarah-chen` — proving the rewrite
         // moved exactly one edge, the one the read side keyed on.
-        fx.write("wiki/people/bio.md", "wiki-page", "bio", &got);
-        let after = forwardlinks(&fx.store, &fx.p("wiki/people/bio.md")).unwrap();
+        fx.write("records/profiles/bio.md", "profile", "bio", &got);
+        let after = forwardlinks(&fx.store, &fx.p("records/profiles/bio.md")).unwrap();
         assert_eq!(
             paths(&after),
             vec!["records/contacts/sarah-2", "records/contacts/sarah-chen"],
@@ -1131,7 +1133,7 @@ mod tests {
 
     #[test]
     fn rewrite_no_match_returns_input_unchanged() {
-        let input = "no links, [external](https://x), and [[wiki/topics/y]]";
+        let input = "no links, [external](https://x), and [[records/concepts/y]]";
         let got = rewrite_links_to(input, Path::new("records/x"), Path::new("records/z"));
         assert_eq!(got, input);
     }
@@ -1186,14 +1188,14 @@ Real link: [[records/contacts/robert]].
     fn forwardlinks_returns_sorted_deduped_targets_excluding_self() {
         let fx = Fixture::new();
         fx.write(
-            "wiki/projects/renewal.md",
-            "wiki-page",
+            "records/projects/renewal.md",
+            "synthesis",
             "Renewal project",
-            "Links: [[records/contacts/sarah]] [[records/companies/acme]] [[records/contacts/sarah]] and itself [[wiki/projects/renewal]].",
+            "Links: [[records/contacts/sarah]] [[records/companies/acme]] [[records/contacts/sarah]] and itself [[records/projects/renewal]].",
         );
         // The targets need not exist on disk for forwardlinks (it reads the one
         // file only). Self-links are dropped; duplicates collapse; sorted asc.
-        let got = forwardlinks(&fx.store, &fx.p("wiki/projects/renewal.md")).unwrap();
+        let got = forwardlinks(&fx.store, &fx.p("records/projects/renewal.md")).unwrap();
         assert_eq!(
             paths(&got),
             vec!["records/companies/acme", "records/contacts/sarah"]
@@ -1207,7 +1209,7 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         fx.write_raw(
             "records/meetings/m1.md",
-            "---\ntype: meeting\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: Renewal sync\ncompany: [[records/companies/acme]]\nattendees:\n  - [[records/contacts/sarah]]\n  - [[records/contacts/elena]]\n---\nNotes about [[wiki/projects/renewal]].\n",
+            "---\ntype: meeting\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: Renewal sync\ncompany: [[records/companies/acme]]\nattendees:\n  - [[records/contacts/sarah]]\n  - [[records/contacts/elena]]\n---\nNotes about [[records/projects/renewal]].\n",
         );
         let got = forwardlinks(&fx.store, &fx.p("records/meetings/m1.md")).unwrap();
         assert_eq!(
@@ -1216,7 +1218,7 @@ Real link: [[records/contacts/robert]].
                 "records/companies/acme",
                 "records/contacts/elena",
                 "records/contacts/sarah",
-                "wiki/projects/renewal",
+                "records/projects/renewal",
             ]
         );
     }
@@ -1224,7 +1226,7 @@ Real link: [[records/contacts/robert]].
     #[test]
     fn forwardlinks_missing_file_is_empty_not_error() {
         let fx = Fixture::new();
-        let got = forwardlinks(&fx.store, &fx.p("wiki/people/ghost.md")).unwrap();
+        let got = forwardlinks(&fx.store, &fx.p("records/profiles/ghost.md")).unwrap();
         assert!(got.is_empty());
     }
 
@@ -1232,13 +1234,13 @@ Real link: [[records/contacts/robert]].
     fn forwardlinks_resolves_seed_given_without_md_extension() {
         let fx = Fixture::new();
         fx.write(
-            "wiki/people/sarah.md",
-            "wiki-page",
+            "records/profiles/sarah.md",
+            "profile",
             "Sarah bio",
             "Works at [[records/companies/acme]].",
         );
         // Seed passed in bare wiki-link form (no `.md`) must still resolve.
-        let got = forwardlinks(&fx.store, &fx.p("wiki/people/sarah")).unwrap();
+        let got = forwardlinks(&fx.store, &fx.p("records/profiles/sarah")).unwrap();
         assert_eq!(paths(&got), vec!["records/companies/acme"]);
     }
 
@@ -1338,13 +1340,13 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         // A page that links to itself is not its own backlink.
         fx.write(
-            "wiki/synthesis/overview.md",
-            "wiki-page",
+            "records/synthesis/overview.md",
+            "synthesis",
             "Overview",
-            "This page [[wiki/synthesis/overview]] references itself.",
+            "This page [[records/synthesis/overview]] references itself.",
         );
         fx.reindex();
-        let got = backlinks(&fx.store, &fx.p("wiki/synthesis/overview.md")).unwrap();
+        let got = backlinks(&fx.store, &fx.p("records/synthesis/overview.md")).unwrap();
         assert!(
             got.is_empty(),
             "self-link must not appear as a backlink, got {got:?}"
@@ -1356,8 +1358,8 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         fx.write("records/contacts/lonely.md", "contact", "Lonely", "");
         fx.write(
-            "wiki/people/unrelated.md",
-            "wiki-page",
+            "records/profiles/unrelated.md",
+            "profile",
             "x",
             "[[records/companies/acme]]",
         );
@@ -1539,7 +1541,7 @@ Real link: [[records/contacts/robert]].
     #[test]
     fn backlinks_filtered_type_scopes_the_candidate_set() {
         // `--type` narrows backlinks to linkers of that type. Two files link to
-        // the target — one `meeting`, one `wiki-page`; filtering to `meeting`
+        // the target — one `meeting`, one `profile`; filtering to `meeting`
         // returns only the meeting.
         let fx = Fixture::new();
         fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
@@ -1692,17 +1694,22 @@ Real link: [[records/contacts/robert]].
     #[test]
     fn neighborhood_hops_zero_is_empty() {
         let fx = Fixture::new();
-        fx.write("wiki/people/a.md", "wiki-page", "A", "[[wiki/people/b]]");
-        fx.write("wiki/people/b.md", "wiki-page", "B", "");
+        fx.write(
+            "records/profiles/a.md",
+            "profile",
+            "A",
+            "[[records/profiles/b]]",
+        );
+        fx.write("records/profiles/b.md", "profile", "B", "");
         let slice = neighborhood(
             &fx.store,
-            &fx.p("wiki/people/a.md"),
+            &fx.p("records/profiles/a.md"),
             0,
             &[],
             Direction::Both,
         )
         .unwrap();
-        assert_eq!(slice.seed, fx.p("wiki/people/a"));
+        assert_eq!(slice.seed, fx.p("records/profiles/a"));
         assert!(slice.nodes.is_empty());
     }
 
@@ -1710,15 +1717,15 @@ Real link: [[records/contacts/robert]].
     fn neighborhood_outgoing_one_hop_reads_summary_and_type() {
         let fx = Fixture::new();
         fx.write(
-            "wiki/people/a.md",
-            "wiki-page",
+            "records/profiles/a.md",
+            "profile",
             "Person A",
             "Knows [[records/contacts/b]].",
         );
         fx.write("records/contacts/b.md", "contact", "Contact B summary", "");
         let slice = neighborhood(
             &fx.store,
-            &fx.p("wiki/people/a.md"),
+            &fx.p("records/profiles/a.md"),
             1,
             &[],
             Direction::Outgoing,
@@ -1730,7 +1737,10 @@ Real link: [[records/contacts/robert]].
         assert_eq!(n.summary, "Contact B summary");
         assert_eq!(n.type_.as_deref(), Some("contact"));
         assert_eq!(n.hops, 1);
-        assert_eq!(n.via, Some((fx.p("wiki/people/a"), Direction::Outgoing)));
+        assert_eq!(
+            n.via,
+            Some((fx.p("records/profiles/a"), Direction::Outgoing))
+        );
     }
 
     #[test]
@@ -1780,21 +1790,27 @@ Real link: [[records/contacts/robert]].
     fn neighborhood_bounded_bfs_respects_hop_limit_and_min_distance() {
         let fx = Fixture::new();
         // Chain a -> b -> c -> d, all outgoing.
-        fx.write("wiki/c/a.md", "wiki-page", "A", "[[wiki/c/b]]");
-        fx.write("wiki/c/b.md", "wiki-page", "B", "[[wiki/c/c]]");
-        fx.write("wiki/c/c.md", "wiki-page", "C", "[[wiki/c/d]]");
-        fx.write("wiki/c/d.md", "wiki-page", "D", "");
-        let slice =
-            neighborhood(&fx.store, &fx.p("wiki/c/a.md"), 2, &[], Direction::Outgoing).unwrap();
+        fx.write("records/c/a.md", "concept", "A", "[[records/c/b]]");
+        fx.write("records/c/b.md", "concept", "B", "[[records/c/c]]");
+        fx.write("records/c/c.md", "concept", "C", "[[records/c/d]]");
+        fx.write("records/c/d.md", "concept", "D", "");
+        let slice = neighborhood(
+            &fx.store,
+            &fx.p("records/c/a.md"),
+            2,
+            &[],
+            Direction::Outgoing,
+        )
+        .unwrap();
         // 2 hops reaches b (1) and c (2), not d (3).
         let by_path: HashMap<String, u32> = slice
             .nodes
             .iter()
             .map(|n| (n.path.to_string_lossy().to_string(), n.hops))
             .collect();
-        assert_eq!(by_path.get("wiki/c/b").copied(), Some(1));
-        assert_eq!(by_path.get("wiki/c/c").copied(), Some(2));
-        assert_eq!(by_path.get("wiki/c/d"), None);
+        assert_eq!(by_path.get("records/c/b").copied(), Some(1));
+        assert_eq!(by_path.get("records/c/c").copied(), Some(2));
+        assert_eq!(by_path.get("records/c/d"), None);
         assert_eq!(slice.nodes.len(), 2);
     }
 
@@ -1803,16 +1819,27 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         // Diamond: a -> b, a -> c, b -> d, c -> d. d is reachable at hop 2 from
         // either branch; it must be recorded once, at hop 2.
-        fx.write("wiki/d/a.md", "wiki-page", "A", "[[wiki/d/b]] [[wiki/d/c]]");
-        fx.write("wiki/d/b.md", "wiki-page", "B", "[[wiki/d/d]]");
-        fx.write("wiki/d/c.md", "wiki-page", "C", "[[wiki/d/d]]");
-        fx.write("wiki/d/d.md", "wiki-page", "D", "");
-        let slice =
-            neighborhood(&fx.store, &fx.p("wiki/d/a.md"), 3, &[], Direction::Outgoing).unwrap();
+        fx.write(
+            "records/d/a.md",
+            "concept",
+            "A",
+            "[[records/d/b]] [[records/d/c]]",
+        );
+        fx.write("records/d/b.md", "concept", "B", "[[records/d/d]]");
+        fx.write("records/d/c.md", "concept", "C", "[[records/d/d]]");
+        fx.write("records/d/d.md", "concept", "D", "");
+        let slice = neighborhood(
+            &fx.store,
+            &fx.p("records/d/a.md"),
+            3,
+            &[],
+            Direction::Outgoing,
+        )
+        .unwrap();
         let d_nodes: Vec<&ContextNode> = slice
             .nodes
             .iter()
-            .filter(|n| n.path == fx.p("wiki/d/d"))
+            .filter(|n| n.path == fx.p("records/d/d"))
             .collect();
         assert_eq!(d_nodes.len(), 1, "d must appear exactly once");
         assert_eq!(d_nodes[0].hops, 2, "d's min distance from a is 2");
@@ -1826,8 +1853,8 @@ Real link: [[records/contacts/robert]].
         // seed -> contact -> meeting. Filtering to `meeting` must still reach
         // the meeting THROUGH the (excluded) contact at hop 2.
         fx.write(
-            "wiki/people/seed.md",
-            "wiki-page",
+            "records/profiles/seed.md",
+            "profile",
             "Seed",
             "[[records/contacts/sarah]]",
         );
@@ -1841,7 +1868,7 @@ Real link: [[records/contacts/robert]].
         let only_meetings = vec!["meeting".to_string()];
         let slice = neighborhood(
             &fx.store,
-            &fx.p("wiki/people/seed.md"),
+            &fx.p("records/profiles/seed.md"),
             2,
             &only_meetings,
             Direction::Outgoing,
@@ -1873,21 +1900,21 @@ Real link: [[records/contacts/robert]].
         // — so the absence of `deep` is observable proof the traversal stopped.
         let fx = Fixture::new();
         fx.write(
-            "wiki/n/seed.md",
-            "wiki-page",
+            "records/n/seed.md",
+            "concept",
             "Seed",
-            "[[wiki/n/a]] [[wiki/n/b]] [[wiki/n/c]]",
+            "[[records/n/a]] [[records/n/b]] [[records/n/c]]",
         );
-        fx.write("wiki/n/a.md", "wiki-page", "A", "[[wiki/n/deep]]");
-        fx.write("wiki/n/b.md", "wiki-page", "B", "");
-        fx.write("wiki/n/c.md", "wiki-page", "C", "");
-        fx.write("wiki/n/deep.md", "wiki-page", "Deep", "");
+        fx.write("records/n/a.md", "concept", "A", "[[records/n/deep]]");
+        fx.write("records/n/b.md", "concept", "B", "");
+        fx.write("records/n/c.md", "concept", "C", "");
+        fx.write("records/n/deep.md", "concept", "Deep", "");
 
         // Uncapped over 3 hops: all four reachable nodes appear (a, b, c at hop 1,
         // deep at hop 2) — the full set the cap is measured against.
         let full = neighborhood(
             &fx.store,
-            &fx.p("wiki/n/seed.md"),
+            &fx.p("records/n/seed.md"),
             3,
             &[],
             Direction::Outgoing,
@@ -1901,7 +1928,12 @@ Real link: [[records/contacts/robert]].
                     .map(|n| n.path.clone())
                     .collect::<Vec<_>>()
             ),
-            vec!["wiki/n/a", "wiki/n/b", "wiki/n/c", "wiki/n/deep"],
+            vec![
+                "records/n/a",
+                "records/n/b",
+                "records/n/c",
+                "records/n/deep"
+            ],
             "uncapped traversal reaches every node within the hop budget"
         );
 
@@ -1910,7 +1942,7 @@ Real link: [[records/contacts/robert]].
         // expanded into hop 2, so the deep node was never traversed to.
         let capped = neighborhood_capped(
             &fx.store,
-            &fx.p("wiki/n/seed.md"),
+            &fx.p("records/n/seed.md"),
             3,
             &[],
             Direction::Outgoing,
@@ -1925,7 +1957,7 @@ Real link: [[records/contacts/robert]].
                     .map(|n| n.path.clone())
                     .collect::<Vec<_>>()
             ),
-            vec!["wiki/n/a", "wiki/n/b"],
+            vec!["records/n/a", "records/n/b"],
             "the cap bounds traversal: only the first 2 nodes are reached, and the \
              hop-2 `deep` node (reachable only by expanding a capped-out node) is \
              never traversed"
@@ -1934,7 +1966,7 @@ Real link: [[records/contacts/robert]].
         // `max_nodes = None` is exactly the unbounded `neighborhood` behavior.
         let uncapped = neighborhood_capped(
             &fx.store,
-            &fx.p("wiki/n/seed.md"),
+            &fx.p("records/n/seed.md"),
             3,
             &[],
             Direction::Outgoing,
@@ -1997,11 +2029,11 @@ Real link: [[records/contacts/robert]].
     fn neighborhood_cycle_terminates() {
         let fx = Fixture::new();
         // a <-> b cycle. Must not loop forever; each appears once.
-        fx.write("wiki/g/a.md", "wiki-page", "A", "[[wiki/g/b]]");
-        fx.write("wiki/g/b.md", "wiki-page", "B", "[[wiki/g/a]]");
+        fx.write("records/g/a.md", "concept", "A", "[[records/g/b]]");
+        fx.write("records/g/b.md", "concept", "B", "[[records/g/a]]");
         fx.reindex();
         let slice =
-            neighborhood(&fx.store, &fx.p("wiki/g/a.md"), 10, &[], Direction::Both).unwrap();
+            neighborhood(&fx.store, &fx.p("records/g/a.md"), 10, &[], Direction::Both).unwrap();
         // From a: b is the only other node (a is the seed, excluded).
         assert_eq!(
             paths(
@@ -2011,7 +2043,7 @@ Real link: [[records/contacts/robert]].
                     .map(|n| n.path.clone())
                     .collect::<Vec<_>>()
             ),
-            vec!["wiki/g/b"]
+            vec!["records/g/b"]
         );
     }
 
@@ -2021,8 +2053,13 @@ Real link: [[records/contacts/robert]].
     fn orphans_finds_files_with_no_edges_either_direction() {
         let fx = Fixture::new();
         // Wired pair: a links to b (a has outgoing, b has incoming).
-        fx.write("wiki/people/a.md", "wiki-page", "A", "[[wiki/people/b]]");
-        fx.write("wiki/people/b.md", "wiki-page", "B", "");
+        fx.write(
+            "records/profiles/a.md",
+            "profile",
+            "A",
+            "[[records/profiles/b]]",
+        );
+        fx.write("records/profiles/b.md", "profile", "B", "");
         // Orphan: no links in or out.
         fx.write(
             "sources/emails/lonely.md",
@@ -2370,8 +2407,8 @@ Trailing [[records/contacts/sarah]].
             "the contact",
         );
         fx.write(
-            "wiki/topics/traversal.md",
-            "wiki-page",
+            "records/concepts/traversal.md",
+            "concept",
             "Traversal",
             "See [[../outside/secret]].",
         );
@@ -2379,7 +2416,7 @@ Trailing [[records/contacts/sarah]].
 
         // The escaping target is not a forward edge.
         assert!(
-            forwardlinks(&fx.store, Path::new("wiki/topics/traversal.md"))
+            forwardlinks(&fx.store, Path::new("records/concepts/traversal.md"))
                 .unwrap()
                 .is_empty(),
             "an escaping `[[../outside/secret]]` must not be a forward edge"
@@ -2389,7 +2426,7 @@ Trailing [[records/contacts/sarah]].
         // external file (the external file is never read/traversed).
         let slice = neighborhood(
             &fx.store,
-            Path::new("wiki/topics/traversal.md"),
+            Path::new("records/concepts/traversal.md"),
             2,
             &[],
             Direction::Outgoing,

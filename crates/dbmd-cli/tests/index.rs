@@ -101,12 +101,12 @@ fn rebuild_layer_repairs_type_folder_artifacts() {
 
 // ── write-through == rebuild (THE invariant, end-to-end through the CLI) ─────────
 
-/// Live index artifacts (`index.md` + `index.jsonl`) under the store's three
+/// Live index artifacts (`index.md` + `index.jsonl`) under the store's two
 /// layers + the root, mapped to their bytes — the surface the byte-identity
 /// invariant compares.
 ///
-/// Scoped to `index.md` / `index.jsonl` at root + `sources/` + `records/` +
-/// `wiki/`. corpus-a also ships a committed *golden snapshot* of the whole
+/// Scoped to `index.md` / `index.jsonl` at root + `sources/` + `records/`.
+/// corpus-a also ships a committed *golden snapshot* of the whole
 /// index hierarchy under `EXPECTED/index/`; those are fixtures for other tests,
 /// not part of the store's own catalog (the write/rebuild paths never touch
 /// them), so they are deliberately excluded here.

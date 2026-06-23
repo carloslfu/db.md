@@ -20,7 +20,7 @@ fn synthetic_store() -> tempfile::TempDir {
         "records/companies/acme.md",
         "---\ntype: company\nsummary: Acme\n---\n\n# Acme\n",
     );
-    // Three linkers, in different layers, each a different accepted spelling.
+    // Three linkers, in different folders, each a different accepted spelling.
     write_file(
         root,
         "records/contacts/sarah.md",
@@ -28,8 +28,8 @@ fn synthetic_store() -> tempfile::TempDir {
     );
     write_file(
         root,
-        "wiki/people/sarah.md",
-        "---\ntype: wiki-page\nsummary: s\n---\n\nSee [[records/companies/acme|Acme Inc]].\n",
+        "records/profiles/sarah.md",
+        "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\n\nSee [[records/companies/acme|Acme Inc]].\n",
     );
     write_file(
         root,
@@ -39,8 +39,8 @@ fn synthetic_store() -> tempfile::TempDir {
     // A non-linker, and a longer path that must NOT match on a prefix.
     write_file(
         root,
-        "wiki/people/bob.md",
-        "---\ntype: wiki-page\nsummary: s\n---\n\nNo links here.\n",
+        "records/profiles/bob.md",
+        "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\n\nNo links here.\n",
     );
     write_file(
         root,
@@ -66,8 +66,8 @@ fn text_lists_every_accepted_spelling_sorted() {
     // All three spellings ([[x]], [[x|d]], [[x.md]]) resolve; sorted by path;
     // the non-linker and the prefix-only longer path are excluded.
     let expected = "records/contacts/sarah.md\n\
-                    sources/emails/2026/05/intro.md\n\
-                    wiki/people/sarah.md\n";
+                    records/profiles/sarah.md\n\
+                    sources/emails/2026/05/intro.md\n";
     assert_eq!(stdout, expected);
 }
 
@@ -91,8 +91,8 @@ fn json_reports_target_count_and_links() {
         "count": 3,
         "links": [
             "records/contacts/sarah.md",
+            "records/profiles/sarah.md",
             "sources/emails/2026/05/intro.md",
-            "wiki/people/sarah.md",
         ],
     });
     assert_eq!(parsed, expected);
@@ -104,7 +104,7 @@ fn target_with_no_backlinks_is_empty_success() {
     // A real file nobody links to.
     let out = dbmd()
         .arg("links")
-        .arg("wiki/people/bob")
+        .arg("records/profiles/bob")
         .arg("--dir")
         .arg(tmp.path())
         .assert()

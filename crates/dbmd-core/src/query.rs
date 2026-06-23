@@ -47,7 +47,7 @@ impl Query {
         self
     }
 
-    /// Restrict to one layer (`Sources` / `Records` / `Wiki`) — scopes which
+    /// Restrict to one layer (`Sources` / `Records`) — scopes which
     /// sidecars' records survive. Setting it again replaces the previous layer.
     pub fn with_layer(mut self, layer: Layer) -> Self {
         self.layer = Some(layer);
@@ -169,7 +169,7 @@ impl Query {
 }
 
 /// True if `record`'s store-relative `path` lives under `layer`'s top-level
-/// folder (`sources/` / `records/` / `wiki/`). The sidecar readers can return
+/// folder (`sources/` / `records/`). The sidecar readers can return
 /// records from any layer (a `type` folder name is not unique across layers),
 /// so a `with_layer` scope is enforced here on the record's path.
 fn record_in_layer(record: &IndexRecord, layer: Layer) -> bool {
@@ -869,7 +869,7 @@ mod tests {
         );
         r.summary = "Renewal champion".into();
         r.tags = vec!["vip".into()];
-        r.links = vec!["wiki/people/sarah-chen.md".into()];
+        r.links = vec!["records/profiles/sarah-chen.md".into()];
         let recs = [r];
         let (_dir, store) = store_with_sidecars(&[("records/contacts", &recs)]);
 
@@ -878,7 +878,10 @@ mod tests {
         let only = &got[0];
         assert_eq!(only.summary, "Renewal champion");
         assert_eq!(only.tags, vec!["vip".to_string()]);
-        assert_eq!(only.links, vec!["wiki/people/sarah-chen.md".to_string()]);
+        assert_eq!(
+            only.links,
+            vec!["records/profiles/sarah-chen.md".to_string()]
+        );
         assert_eq!(
             only.fields.get("company"),
             Some(&Value::String("acme".into())),

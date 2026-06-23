@@ -39,7 +39,7 @@ use crate::parser::{parse_db_md, Config, Frontmatter};
 /// content layers never mistakes a catalog for a record.
 ///
 /// Only `index.md` is excluded by basename, because the content walks traverse
-/// the layer dirs (`sources/`/`records/`/`wiki/`) and `index.md` is the only
+/// the layer dirs (`sources/`/`records/`) and `index.md` is the only
 /// meta file that appears INSIDE them. The root `DB.md` / `log.md` (and the
 /// `log/` archive) live at the store root, outside every layer, so they are
 /// never reached by these walks — and a content file that merely happens to be
@@ -216,7 +216,7 @@ impl Store {
     }
 
     /// **SWEEP.** Recursively iterate every `.md` content file across
-    /// `sources/`, `records/`, and `wiki/`, skipping hidden dirs and `log/`.
+    /// `sources/` and `records/`, skipping hidden dirs and `log/`.
     /// Used only by `validate --all`, `index rebuild`, and `stats` — never on
     /// the interactive loop.
     pub fn walk(&self) -> Result<Vec<PathBuf>, StoreError> {
@@ -291,7 +291,8 @@ impl Store {
     /// stays flat. True for source types and event record types
     /// (`expense`/`invoice`/`meeting` + custom `order`/`ticket`/`transaction`),
     /// or when `DB.md ## Schemas` declares `shard: by-date`. False for
-    /// dedup-bounded entity types (`contact`/`company`/`decision`) and `wiki/`.
+    /// dedup-bounded entity types (`contact`/`company`/`decision`) and
+    /// conclusion records (`profile`/`concept`/`synthesis`).
     pub fn type_shards(&self, type_: &str) -> bool {
         // A `DB.md ## Schemas` `### <type>` block with a `shard:` directive is
         // authoritative — it is the v0.2 generic-model way to declare sharding,
@@ -303,7 +304,8 @@ impl Store {
         // *type*:
         //  - source types carry a primary date field and shard;
         //  - event record types track business volume and shard;
-        //  - dedup-bounded entity types and curation-bounded wiki stay flat.
+        //  - dedup-bounded entity types and curation-bounded conclusion
+        //    records (`profile`/`concept`/`synthesis`) stay flat.
         // Any type can override this via a `shard:` directive (above).
         matches!(
             type_,
@@ -319,7 +321,8 @@ impl Store {
     /// Compute the canonical write path for a new file. For a sharding type
     /// (per [`Store::type_shards`]) insert `<YYYY>/<MM>/` from the type's
     /// primary date field (`email.date`, `expense.date`, … fallback `created`)
-    /// under the type folder; flat types and `wiki/` get no shard segment.
+    /// under the type folder; flat types (entity + conclusion records) get no
+    /// shard segment.
     /// Deterministic + stable: same input → same path, so a record never moves
     /// once written.
     pub fn shard_path_for(
@@ -333,11 +336,12 @@ impl Store {
 
     /// Like [`Store::shard_path_for`], but compute the path under an explicit,
     /// caller-resolved type-folder rather than the canonical default. This lets a
-    /// write surface honour an agent-supplied conforming sub-folder — e.g.
-    /// `wiki/projects/`, `wiki/people/`, `wiki/synthesis/` (the SPEC files a
-    /// `wiki-page` under `wiki/<topic>/`, i.e. ANY topic sub-folder, not only the
-    /// `wiki/topics` default) — while still applying date-sharding for sharding
-    /// types. The folder must be a conforming `<layer>/<type-folder>` (2
+    /// write surface honour an agent-supplied conforming sub-folder — e.g. a
+    /// conclusion record filed under `records/profiles/`, `records/concepts/`, or
+    /// `records/synthesis/` (a conclusion record may be filed under ANY
+    /// `records/<folder>/`, not only its canonical one) — while still applying
+    /// date-sharding for sharding types. The folder must be a conforming
+    /// `<layer>/<type-folder>` (2
     /// components, recognized layer); the caller is responsible for that (see the
     /// CLI's `resolve_write_path`), so it is taken as given here.
     ///
@@ -354,7 +358,8 @@ impl Store {
         let filename = ensure_md_extension(name);
 
         if !self.type_shards(type_) {
-            // Flat type (entity records, wiki, decisions): no shard segment.
+            // Flat type (entity records, conclusion records, decisions): no
+            // shard segment.
             return Ok(folder.join(filename));
         }
 
@@ -486,9 +491,9 @@ impl Store {
     /// The whole-layer read — rather than reading only the type's canonical
     /// folder sidecar when it happens to exist — is what makes the result
     /// *complete*. A single `type` can legitimately be filed across several
-    /// folders within its layer: `wiki-page` under `wiki/<topic>/` for any
-    /// topic (SPEC), or a `contact` filed in `records/clients/` alongside the
-    /// canonical `records/contacts/`. The previous code read only the
+    /// folders within its layer: a conclusion `profile` filed under any
+    /// `records/<folder>/`, or a `contact` filed in `records/clients/` alongside
+    /// the canonical `records/contacts/`. The previous code read only the
     /// canonical-guess sidecar whenever it was a file, which silently dropped
     /// those non-canonical records the moment the canonical sidecar existed —
     /// returning an incomplete set, and a *different* set as the store grew
@@ -683,7 +688,7 @@ impl Store {
     /// Locate every `index.jsonl` sidecar under `layer` (when given) else the
     /// whole store (skip hidden + `log/`), returning store-relative paths. A
     /// scoped read walks `<root>/<layer>/`; the store-wide read enumerates the
-    /// three canonical layer subtrees (`sources/`, `records/`, `wiki/`) — the
+    /// two canonical layer subtrees (`sources/`, `records/`) — the
     /// same store model [`Store::walk`] uses — rather than walking from
     /// `self.root`. Walking from root would descend into non-layer top-level
     /// dirs (`EXPECTED/` test goldens, an `archive/` of frozen index copies,
@@ -1157,8 +1162,8 @@ fn default_type_folder(type_: &str) -> PathBuf {
 }
 
 /// The canonical [`Layer`] a `type_` belongs to, derived from its default
-/// type-folder (`email` → `Sources`, `contact` → `Records`, `wiki-page` →
-/// `Wiki`, unrecognized → `Records`). The write path uses this to decide whether
+/// type-folder (`email` → `Sources`, `contact` → `Records`, a conclusion
+/// `profile` → `Records`, unrecognized → `Records`). The write path uses this to decide whether
 /// an agent-supplied folder is in the *right* layer for the type before honouring
 /// its sub-folder choice.
 pub fn layer_for_type(type_: &str) -> Layer {
@@ -1166,7 +1171,7 @@ pub fn layer_for_type(type_: &str) -> Layer {
 }
 
 /// The [`Layer`] a type-folder path lives in, read from its first component
-/// (`sources/` → `Sources`, `records/` → `Records`, `wiki/` → `Wiki`). Used to
+/// (`sources/` → `Sources`, `records/` → `Records`). Used to
 /// bound [`Store::find_by_type`]'s whole-layer sidecar read to a single layer
 /// subtree. Returns `None` for a path with no recognized layer prefix; every
 /// value [`default_type_folder`] produces has one, so in practice this is
@@ -1189,8 +1194,9 @@ fn layer_of_folder(folder: &Path) -> Option<Layer> {
 /// pluralization/singularization) so it round-trips with `default_type_folder`,
 /// whose unrecognized fallback is the bare type name (`task` ⇄ `records/task`).
 /// Singularizing here would break that round-trip (`records/tasks` → `task`
-/// while `default_type_folder("task")` → `records/task`). `wiki/<topic>` always
-/// infers `wiki-page`, since every wiki page is filed under a topic folder.
+/// while `default_type_folder("task")` → `records/task`). A conclusion record's
+/// folder (e.g. `records/profiles/`) infers its bare folder name (`profiles`),
+/// the same custom-type fallback as any other unrecognized folder.
 pub fn infer_type_from_path(rel: &Path) -> Option<String> {
     let mut comps = rel.components().filter_map(|c| c.as_os_str().to_str());
     let layer = comps.next()?;
@@ -1800,14 +1806,7 @@ mod tests {
             assert!(store.type_shards(t), "{t} should shard");
         }
         for t in [
-            "contact",
-            "company",
-            "decision",
-            "wiki-page",
-            "index",
-            "log",
-            "db-md",
-            "proposal",
+            "contact", "company", "decision", "profile", "index", "log", "db-md", "proposal",
         ] {
             assert!(!store.type_shards(t), "{t} should stay flat");
         }
@@ -1954,15 +1953,15 @@ mod tests {
             .unwrap();
         assert_eq!(p, PathBuf::from("records/contacts/sarah-chen.md"));
 
-        // wiki-page is now an unrecognized type: it is flat (no date shard) and
-        // lands under the records-layer fallback folder `records/<type>` —
-        // `records/wiki-page/<name>.md`, a conforming 3-component
+        // A conclusion `profile` is a custom (non-built-in) type: it is flat (no
+        // date shard) and lands under the records-layer fallback folder
+        // `records/<type>` — `records/profile/<name>.md`, a conforming 3-component
         // `<layer>/<type-folder>/<file>` path. A 2-component path would be
         // invisible to the index/validate type-folder model.
         let p = store
-            .shard_path_for("wiki-page", &Frontmatter::default(), "renewal-theme")
+            .shard_path_for("profile", &Frontmatter::default(), "renewal-theme")
             .unwrap();
-        assert_eq!(p, PathBuf::from("records/wiki-page/renewal-theme.md"));
+        assert_eq!(p, PathBuf::from("records/profile/renewal-theme.md"));
     }
 
     /// Regression: a type written through the toolkit's own path computation
@@ -1970,15 +1969,16 @@ mod tests {
     /// 2-component `<layer>/<file>` path is one `type_folder_of` (in both `index`
     /// and `validate`) treats as "no type-folder" — it would either crash
     /// `Index::on_write` (it tried to create `index.md` inside a file) or be
-    /// silently dropped from every catalog by `Index::rebuild_all`. `wiki-page`
-    /// is now an unrecognized type, so it falls back to `records/wiki-page` —
-    /// still a conforming 3-component `<layer>/<type-folder>/<file>` path.
+    /// silently dropped from every catalog by `Index::rebuild_all`. A custom
+    /// (non-built-in) type like a conclusion `profile` falls back to
+    /// `records/<type>` — still a conforming 3-component
+    /// `<layer>/<type-folder>/<file>` path.
     #[test]
-    fn shard_path_wiki_page_is_indexable_three_component_path() {
+    fn shard_path_custom_type_is_indexable_three_component_path() {
         let dir = empty_store();
         let store = open(&dir);
         let p = store
-            .shard_path_for("wiki-page", &Frontmatter::default(), "renewal-theme")
+            .shard_path_for("profile", &Frontmatter::default(), "renewal-theme")
             .unwrap();
         // First two components are a layer + a non-empty type-folder segment;
         // the file is the third. This is exactly the shape `type_folder_of`
@@ -1987,12 +1987,12 @@ mod tests {
         assert_eq!(
             comps.len(),
             3,
-            "wiki-page path must be <layer>/<type-folder>/<file>, got {p:?}"
+            "custom-type path must be <layer>/<type-folder>/<file>, got {p:?}"
         );
         assert_eq!(
             comps[0], "records",
-            "first component must be the records layer (wiki-page is now an \
-             unrecognized type, filed under the records fallback)"
+            "first component must be the records layer (a custom type is \
+             filed under the records fallback)"
         );
         assert!(
             !comps[1].is_empty() && comps[1] != "renewal-theme.md",
@@ -2045,8 +2045,10 @@ mod tests {
         // Plain link.
         write(
             root,
-            "wiki/people/sarah.md",
-            &format!("---\ntype: wiki-page\nsummary: s\n---\nSee [[{target}]].\n"),
+            "records/profiles/sarah.md",
+            &format!(
+                "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\nSee [[{target}]].\n"
+            ),
         );
         // Link with display text.
         write(
@@ -2057,8 +2059,10 @@ mod tests {
         // Link with .md extension (accepted, warned by validate).
         write(
             root,
-            "wiki/themes/t.md",
-            &format!("---\ntype: wiki-page\nsummary: s\n---\n[[{target}.md]]\n"),
+            "records/concepts/t.md",
+            &format!(
+                "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n[[{target}.md]]\n"
+            ),
         );
         // A catalog/index file also contains the link literally — included.
         write(
@@ -2069,21 +2073,23 @@ mod tests {
         // No link to the target.
         write(
             root,
-            "wiki/people/elena.md",
-            "---\ntype: wiki-page\nsummary: s\n---\nNo links here.\n",
+            "records/profiles/elena.md",
+            "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\nNo links here.\n",
         );
         // Short-form link must NOT match the full-path target.
         write(
             root,
-            "wiki/people/bob.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n[[sarah-chen]]\n",
+            "records/profiles/bob.md",
+            "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\n[[sarah-chen]]\n",
         );
         // A longer path that merely starts with the target must NOT match
         // (boundary correctness): target `sarah-chen` vs `sarah-chen-jr`.
         write(
             root,
-            "wiki/people/jr.md",
-            &format!("---\ntype: wiki-page\nsummary: s\n---\n[[{target}-jr]]\n"),
+            "records/profiles/jr.md",
+            &format!(
+                "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\n[[{target}-jr]]\n"
+            ),
         );
 
         let store = open(&dir);
@@ -2091,10 +2097,10 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "records/concepts/t.md".to_string(),
                 "records/contacts/index.md".to_string(),
                 "records/meetings/2026/05/m.md".to_string(),
-                "wiki/people/sarah.md".to_string(),
-                "wiki/themes/t.md".to_string(),
+                "records/profiles/sarah.md".to_string(),
             ]
         );
     }
@@ -2107,13 +2113,13 @@ mod tests {
         let root = dir.path();
         write(
             root,
-            "wiki/a.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n[[records/contacts/sarah]]\n",
+            "records/concepts/a.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n[[records/contacts/sarah]]\n",
         );
         write(
             root,
-            "wiki/b.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n[[records/contacts/sarah-chen]]\n",
+            "records/concepts/b.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n[[records/contacts/sarah-chen]]\n",
         );
         let store = open(&dir);
 
@@ -2123,7 +2129,7 @@ mod tests {
                     .find_links_to(Path::new("records/contacts/sarah"))
                     .unwrap()
             ),
-            vec!["wiki/a.md".to_string()]
+            vec!["records/concepts/a.md".to_string()]
         );
         assert_eq!(
             rels(
@@ -2131,7 +2137,7 @@ mod tests {
                     .find_links_to(Path::new("records/contacts/sarah-chen"))
                     .unwrap()
             ),
-            vec!["wiki/b.md".to_string()]
+            vec!["records/concepts/b.md".to_string()]
         );
     }
 
@@ -2152,8 +2158,10 @@ mod tests {
         // A clean, fully-UTF-8 linker that MUST be returned regardless.
         write(
             root,
-            "wiki/people/clean.md",
-            &format!("---\ntype: wiki-page\nsummary: s\n---\nSee [[{target}]].\n"),
+            "records/profiles/clean.md",
+            &format!(
+                "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\nSee [[{target}]].\n"
+            ),
         );
 
         // A linker whose link line ALSO carries a stray 0xFF byte (a mis-decoded
@@ -2183,8 +2191,8 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "records/profiles/clean.md".to_string(),
                 "sources/emails/2026/05/raw.md".to_string(),
-                "wiki/people/clean.md".to_string(),
             ],
             "both the clean linker and the one with an invalid byte on the link \
              line are reported; the scan degrades, it does not fail"
@@ -2210,13 +2218,13 @@ mod tests {
         // Two distinct targets, each with its own linker.
         write(
             root,
-            "wiki/links-sarah.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n[[records/contacts/sarah-chen]]\n",
+            "records/concepts/links-sarah.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n[[records/contacts/sarah-chen]]\n",
         );
         write(
             root,
-            "wiki/links-acme.md",
-            "---\ntype: wiki-page\nsummary: s\n---\nDeal with [[records/companies/acme|Acme]].\n",
+            "records/concepts/links-acme.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\nDeal with [[records/companies/acme|Acme]].\n",
         );
         // One file links to BOTH targets — must appear exactly once (deduped),
         // proving the per-file early-exit folds multiple-target hits into a
@@ -2232,14 +2240,14 @@ mod tests {
         // carries `sarah-chen` as one arm.
         write(
             root,
-            "wiki/links-jr.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n[[records/contacts/sarah-chen-jr]]\n",
+            "records/concepts/links-jr.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n[[records/contacts/sarah-chen-jr]]\n",
         );
         // A file that links to neither requested target.
         write(
             root,
-            "wiki/unrelated.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n[[wiki/themes/spend]]\n",
+            "records/concepts/unrelated.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n[[records/concepts/spend]]\n",
         );
 
         let store = open(&dir);
@@ -2252,9 +2260,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "records/concepts/links-acme.md".to_string(),
+                "records/concepts/links-sarah.md".to_string(),
                 "records/meetings/2026/05/m.md".to_string(),
-                "wiki/links-acme.md".to_string(),
-                "wiki/links-sarah.md".to_string(),
             ],
             "batch finder must return the deduped union of linkers across all \
              targets, excluding the prefix-sibling and the unrelated file"
@@ -2286,8 +2294,8 @@ mod tests {
         let root = dir.path();
         write(
             root,
-            "wiki/a.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n[[records/contacts/sarah-chen]]\n",
+            "records/concepts/a.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n[[records/contacts/sarah-chen]]\n",
         );
         let store = open(&dir);
 
@@ -2406,8 +2414,9 @@ mod tests {
         // sidecar and drop same-type records filed in a non-canonical folder in
         // the SAME layer — so the result flipped to incomplete the moment a
         // canonical record was added. The write path actively enables such a
-        // layout (`records/clients/` for a `contact`, `wiki/<topic>/` for any
-        // `wiki-page`), so this is a reachable, dedup-breaking omission.
+        // layout (`records/clients/` for a `contact`, any `records/<folder>/`
+        // for a conclusion `profile`), so this is a reachable, dedup-breaking
+        // omission.
         let dir = empty_store();
         let root = dir.path();
 
@@ -2814,8 +2823,6 @@ mod tests {
         // The canonical invariant: inference is the inverse of the forward map.
         // Every recognized type, routed through `default_type_folder` and then
         // back through `infer_type_from_path`, must return the original type.
-        // `wiki-page` is the one many-to-one case (every topic folder maps back
-        // to `wiki-page`), so its forward folder still round-trips.
         let recognized = [
             "email",
             "transcript",
@@ -2826,7 +2833,6 @@ mod tests {
             "meeting",
             "decision",
             "invoice",
-            "wiki-page",
         ];
         for type_ in recognized {
             let folder = default_type_folder(type_);
@@ -2872,7 +2878,6 @@ mod tests {
         // type-folder, so inference yields None (matches the old CLI contract).
         assert_eq!(infer_type_from_path(Path::new("records/x.md")), None);
         assert_eq!(infer_type_from_path(Path::new("sources/x.md")), None);
-        assert_eq!(infer_type_from_path(Path::new("wiki/x.md")), None);
         assert_eq!(infer_type_from_path(Path::new("x.md")), None);
         // Unknown leading layer is never inferred.
         assert_eq!(infer_type_from_path(Path::new("foo/bar/x.md")), None);
@@ -3033,7 +3038,7 @@ After [[records/companies/acme]].
     #[test]
     fn canonical_link_target_strips_md_dotslash_and_trims() {
         assert_eq!(canonical_link_target("  records/x.md  "), "records/x");
-        assert_eq!(canonical_link_target("./wiki/y"), "wiki/y");
+        assert_eq!(canonical_link_target("./records/y"), "records/y");
         assert_eq!(canonical_link_target("/records/z"), "records/z");
     }
 
@@ -3096,8 +3101,8 @@ After [[records/companies/acme]].
         let root = dir.path();
         write(
             root,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: s\n---\nSee [[ records/contacts/sarah ]] today.\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\nSee [[ records/contacts/sarah ]] today.\n",
         );
         let store = open(&dir);
         let got = rels(
@@ -3107,7 +3112,7 @@ After [[records/companies/acme]].
         );
         assert_eq!(
             got,
-            vec!["wiki/people/a.md".to_string()],
+            vec!["records/profiles/a.md".to_string()],
             "a padded `[[ x ]]` link must be found as a backward edge, matching forwardlinks"
         );
     }
@@ -3118,8 +3123,8 @@ After [[records/companies/acme]].
         let root = dir.path();
         write(
             root,
-            "wiki/topics/howto.md",
-            "---\ntype: wiki-page\nsummary: s\n---\n```markdown\n[[records/contacts/sarah]]\n```\n",
+            "records/concepts/howto.md",
+            "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\n```markdown\n[[records/contacts/sarah]]\n```\n",
         );
         let store = open(&dir);
         let got = store
@@ -3143,8 +3148,8 @@ After [[records/companies/acme]].
         let root = dir.path();
         write(
             root,
-            "wiki/people/bio.md",
-            "---\ntype: wiki-page\nsummary: s\n---\nSee [[records/contacts/Sarah-Chen]].\n",
+            "records/profiles/bio.md",
+            "---\ntype: profile\nmeta-type: conclusion\nsummary: s\n---\nSee [[records/contacts/Sarah-Chen]].\n",
         );
         let store = open(&dir);
         let got = rels(
@@ -3154,7 +3159,7 @@ After [[records/companies/acme]].
         );
         assert_eq!(
             got,
-            vec!["wiki/people/bio.md".to_string()],
+            vec!["records/profiles/bio.md".to_string()],
             "a case-variant link must be found on a case-insensitive filesystem"
         );
     }

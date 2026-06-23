@@ -137,8 +137,8 @@ fn regression_rename_skips_non_utf8_linker_and_completes_consistently() {
     );
     // A clean linker that MUST be rewritten.
     store.seed(
-        "wiki/topics/clean.md",
-        "---\ntype: wiki-page\nsummary: s\n---\nSee [[records/contacts/sarah]].\n",
+        "records/concepts/clean.md",
+        "---\ntype: concept\nmeta-type: conclusion\nsummary: s\n---\nSee [[records/contacts/sarah]].\n",
     );
     // A non-UTF8 linker: a valid ASCII link line PLUS a stray Latin-1 byte
     // (0xE9 = 'é' in Latin-1, invalid as a standalone UTF-8 byte). ripgrep's
@@ -179,7 +179,7 @@ fn regression_rename_skips_non_utf8_linker_and_completes_consistently() {
     );
 
     // The clean linker WAS rewritten to the new target.
-    let clean = std::fs::read_to_string(store.abs("wiki/topics/clean.md")).unwrap();
+    let clean = std::fs::read_to_string(store.abs("records/concepts/clean.md")).unwrap();
     assert!(
         clean.contains("[[records/contacts/sarah-chen]]"),
         "clean linker must be retargeted; got: {clean}"
@@ -219,10 +219,10 @@ fn regression_rename_skips_non_utf8_linker_and_completes_consistently() {
 /// externally-dropped source cannot corrupt a rename of an unrelated record.
 ///
 /// Pre-fix, the very first non-UTF8 linker encountered in BTreeSet order
-/// (`sources/...` sorts before `wiki/...`) would abort the loop, so the
-/// `wiki/topics/late.md` linker that sorts AFTER it would be left dangling at
-/// `[[old]]` while the file had already moved. Post-fix every clean linker is
-/// rewritten regardless of where the bad one falls in iteration order.
+/// (`sources/a-import.md` sorts before `sources/z-late.md`) would abort the
+/// loop, so the `sources/z-late.md` linker that sorts AFTER it would be left
+/// dangling at `[[old]]` while the file had already moved. Post-fix every clean
+/// linker is rewritten regardless of where the bad one falls in iteration order.
 #[test]
 fn regression_rename_non_utf8_linker_does_not_strand_later_linkers() {
     let store = Store::new();
@@ -230,9 +230,9 @@ fn regression_rename_non_utf8_linker_does_not_strand_later_linkers() {
         "records/contacts/sarah.md",
         "---\ntype: contact\nsummary: x\n---\n# Sarah\n",
     );
-    // A non-UTF8 linker under `sources/` — sorts BEFORE `wiki/` in the
-    // BTreeSet order `find_links_to` returns, so pre-fix it aborts the loop
-    // before the `wiki/` linker below is ever reached.
+    // A non-UTF8 linker that sorts EARLY — sorts BEFORE the clean linker below in
+    // the BTreeSet order `find_links_to` returns, so pre-fix it aborts the loop
+    // before the later linker is ever reached.
     let mut bad: Vec<u8> = Vec::new();
     bad.extend_from_slice(b"---\ntype: source\nsummary: s\n---\n");
     bad.extend_from_slice(b"[[records/contacts/sarah]] ");
@@ -241,8 +241,8 @@ fn regression_rename_non_utf8_linker_does_not_strand_later_linkers() {
     store.seed_bytes("sources/a-import.md", &bad);
     // A clean linker that sorts AFTER the bad one and MUST still be rewritten.
     store.seed(
-        "wiki/topics/late.md",
-        "---\ntype: wiki-page\nsummary: s\n---\nMentions [[records/contacts/sarah|Sarah]].\n",
+        "sources/z-late.md",
+        "---\ntype: note\nsummary: s\n---\nMentions [[records/contacts/sarah|Sarah]].\n",
     );
 
     let out = store.run(&[
@@ -259,7 +259,7 @@ fn regression_rename_non_utf8_linker_does_not_strand_later_linkers() {
 
     // The later-sorting clean linker is rewritten (display preserved) — proof
     // the bad linker did not abort the loop before reaching it.
-    let late = std::fs::read_to_string(store.abs("wiki/topics/late.md")).unwrap();
+    let late = std::fs::read_to_string(store.abs("sources/z-late.md")).unwrap();
     assert!(
         late.contains("[[records/contacts/sarah-chen|Sarah]]"),
         "a clean linker sorting after a non-UTF8 linker must still be rewritten; got: {late}"
@@ -334,8 +334,8 @@ fn regression_rename_restamps_moved_file_updated_but_not_linkers() {
     // A linker whose `updated` is OLD and must stay old: rewriting its link text
     // is not an edit of the linker for recency purposes.
     store.seed(
-        "wiki/topics/clean.md",
-        "---\ntype: wiki-page\ncreated: 2026-01-01T00:00:00+00:00\nupdated: 2026-01-01T00:00:00+00:00\nsummary: s\n---\nSee [[records/contacts/sarah]].\n",
+        "records/concepts/clean.md",
+        "---\ntype: concept\nmeta-type: conclusion\ncreated: 2026-01-01T00:00:00+00:00\nupdated: 2026-01-01T00:00:00+00:00\nsummary: s\n---\nSee [[records/contacts/sarah]].\n",
     );
 
     let now = "2026-05-29T18:00:00Z";
@@ -372,7 +372,7 @@ fn regression_rename_restamps_moved_file_updated_but_not_linkers() {
 
     // The linker's link text was rewritten, but its `updated` must NOT be bumped:
     // a renamed link target is not a fresh edit of the linking record.
-    let clean = std::fs::read_to_string(store.abs("wiki/topics/clean.md")).unwrap();
+    let clean = std::fs::read_to_string(store.abs("records/concepts/clean.md")).unwrap();
     assert!(
         clean.contains("[[records/contacts/sarah-chen]]"),
         "the linker's link text must be retargeted; got: {clean}"

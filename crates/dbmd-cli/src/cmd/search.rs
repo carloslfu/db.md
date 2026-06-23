@@ -19,7 +19,7 @@
 //!   arbitrary-regex file scan, and shelling out to `rg` is forbidden).
 //!
 //! When no structured/link filter is given, the candidate set is every content
-//! file under `sources/` / `records/` / `wiki/` — a path-only `ignore` walk
+//! file under `sources/` / `records/` — a path-only `ignore` walk
 //! (the same engine `rg` uses), not a frontmatter parse. Meta files (`DB.md`,
 //! `index.md`, `index.jsonl`, `log.md`) are never content and never match.
 //!
@@ -620,7 +620,7 @@ fn path_in_layer(rel: &Path, layer: Layer) -> bool {
 }
 
 /// True if a store-relative path is a *content* file the search should scan:
-/// under `sources/` / `records/` / `wiki/`, a `.md` file, and not a per-folder
+/// under `sources/` / `records/`, a `.md` file, and not a per-folder
 /// `index.md`. (`index.jsonl` is excluded by the `.md` check; `DB.md` / `log.md`
 /// live at the root, outside every layer, and never reach here.)
 fn is_content_file(rel: &Path) -> bool {
