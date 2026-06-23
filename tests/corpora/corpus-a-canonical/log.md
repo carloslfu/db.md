@@ -28,14 +28,14 @@ Elena confirms the 120 → 175 seat expansion by email.
 ## [2026-05-22 11:05] create | [[records/meetings/2026/05/2026-05-22-northstar-renewal-call]]
 Logged the renewal call; 175 seats agreed, volume discount confirmed at 150.
 
-## [2026-05-22 12:30] update | [[wiki/projects/northstar-renewal]]
+## [2026-05-22 12:30] update | [[records/projects/northstar-renewal]]
 Refreshed the renewal narrative with the call outcome and the confirming email.
 
-## [2026-05-23 09:00] link | [[wiki/synthesis/2026-renewal-plan]]
+## [2026-05-23 09:00] link | [[records/synthesis/2026-renewal-plan]]
 Cross-linked the signed-off renewal plan from the project page; page is now frozen.
 
 ## [2026-05-31 10:00] index-rebuild | -
 Full `dbmd index rebuild` after the May expense drop; root + layer + type-folder catalogs reconciled.
 
 ## [2026-05-31 10:05] validate
-PASS — 0 errors, 0 warnings. Store is clean across all three layers.
+PASS — 0 errors, 0 warnings. Store is clean across both layers.

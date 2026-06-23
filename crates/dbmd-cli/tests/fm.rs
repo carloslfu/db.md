@@ -137,9 +137,9 @@ fn set_resorts_index_when_recency_changes() {
 
 #[test]
 fn set_refuses_a_frozen_page_corpus_a() {
-    // corpus-a freezes wiki/synthesis/2026-renewal-plan.md.
+    // corpus-a freezes records/synthesis/2026-renewal-plan.md.
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
-    let frozen = "wiki/synthesis/2026-renewal-plan.md";
+    let frozen = "records/synthesis/2026-renewal-plan.md";
     let before = std::fs::read_to_string(store.join(frozen)).unwrap();
 
     let out = dbmd()
@@ -188,7 +188,7 @@ fn set_refuses_a_frozen_page_passed_as_absolute_path() {
     // entry if the path resolution canonicalizes both sides. Before the fix this
     // exited 0 and mutated the frozen file (it added `status: draft`).
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
-    let frozen = "wiki/synthesis/2026-renewal-plan.md";
+    let frozen = "records/synthesis/2026-renewal-plan.md";
     let abs = store.join(frozen);
     let before = std::fs::read_to_string(&abs).unwrap();
 
@@ -513,7 +513,7 @@ fn init_errors_when_type_cannot_be_inferred() {
 #[test]
 fn init_refuses_a_frozen_page() {
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
-    let frozen = "wiki/synthesis/2026-renewal-plan.md";
+    let frozen = "records/synthesis/2026-renewal-plan.md";
     let before = std::fs::read_to_string(store.join(frozen)).unwrap();
 
     dbmd()
@@ -534,7 +534,7 @@ fn init_refuses_a_frozen_page_passed_as_absolute_path() {
     // store-relative key the frozen entry uses. Before the fix this exited 0 and
     // rewrote the frozen file's frontmatter.
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
-    let frozen = "wiki/synthesis/2026-renewal-plan.md";
+    let frozen = "records/synthesis/2026-renewal-plan.md";
     let abs = store.join(frozen);
     let before = std::fs::read_to_string(&abs).unwrap();
 

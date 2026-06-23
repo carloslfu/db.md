@@ -61,13 +61,21 @@ fn json_stdout(args: &[&str]) -> String {
 
 // ── search ────────────────────────────────────────────────────────────────
 
-/// `dbmd search "renewal" --type wiki-page --json` — the `file:line:text` match
-/// envelope over the wiki-page candidate set. Exercises the structured-filter →
-/// ripgrep path end to end; every `file` is store-relative.
+/// `dbmd search "renewal" --in records --where meta-type=conclusion --json` —
+/// the `file:line:text` match envelope over the conclusion-record candidate set
+/// (the former wiki synthesis pages). Exercises the structured-filter → ripgrep
+/// path end to end; every `file` is store-relative.
 #[test]
 fn search_json_envelope() {
-    let out = json_stdout(&["search", "renewal", "--type", "wiki-page"]);
-    insta::assert_snapshot!("search_renewal_wiki_page", out);
+    let out = json_stdout(&[
+        "search",
+        "renewal",
+        "--in",
+        "records",
+        "--where",
+        "meta-type=conclusion",
+    ]);
+    insta::assert_snapshot!("search_renewal_conclusion", out);
 }
 
 // ── validate ────────────────────────────────────────────────────────────────
@@ -151,11 +159,15 @@ fn stats_json_overview() {
 
 // ── graph backlinks ─────────────────────────────────────────────────────────
 
-/// `dbmd graph backlinks wiki/projects/northstar-renewal.md --json` — the
+/// `dbmd graph backlinks records/projects/northstar-renewal.md --json` — the
 /// incoming wiki-link array (dependents / blast radius), store-relative and
-/// sorted. The renewal project page is the most-linked hub in the corpus.
+/// sorted. The renewal project conclusion record is the most-linked hub.
 #[test]
 fn graph_backlinks_json() {
-    let out = json_stdout(&["graph", "backlinks", "wiki/projects/northstar-renewal.md"]);
+    let out = json_stdout(&[
+        "graph",
+        "backlinks",
+        "records/projects/northstar-renewal.md",
+    ]);
     insta::assert_snapshot!("graph_backlinks_northstar_renewal", out);
 }

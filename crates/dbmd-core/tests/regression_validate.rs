@@ -38,7 +38,7 @@ fn fresh_store(dir: &Path) {
         "---\ntype: db-md\nscope: company\nowner: Test\n---\n",
     )
     .unwrap();
-    for layer in ["sources", "records", "wiki"] {
+    for layer in ["sources", "records"] {
         std::fs::create_dir_all(dir.join(layer)).unwrap();
     }
 }

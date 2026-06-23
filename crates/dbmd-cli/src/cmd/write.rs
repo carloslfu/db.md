@@ -134,7 +134,7 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
         return Err(core_err(e));
     }
     let index_warning = index_on_write(&store, &resolved);
-    let policy_warning = ignored_type_derivation_warning(&store, &args.r#type, &fm);
+    let policy_warning = ignored_type_derivation_warning(&store, &fm);
 
     emit_result(
         ctx,
@@ -547,25 +547,26 @@ fn read_body_file(path: &str) -> Result<String, CliError> {
 }
 
 /// Emit the `POLICY_IGNORED_TYPE_DERIVED` warning when a freshly-written
-/// `wiki-page` declares a `derived_from:` wiki-link to a record whose type is in
-/// `### Ignored types`. Read-only enforcement: writes don't block on it, they
-/// warn (matches `dbmd validate`'s Warning-severity finding). Returns the human
-/// warning text, or `None` when it doesn't apply.
+/// `meta-type: conclusion` record declares a `derived_from:` wiki-link to a
+/// record whose type is in `### Ignored types`. Read-only enforcement: writes
+/// don't block on it, they warn (matches `dbmd validate`'s Warning-severity
+/// finding). Returns the human warning text, or `None` when it doesn't apply.
 ///
 /// The policy decision is **not** re-implemented here: it routes through the
 /// single `dbmd_core::validate::derived_from_ignored_type` entry point that
 /// `dbmd validate` also uses, so the two surfaces can't diverge. This handler
 /// only supplies the `derived_from` targets from the composed frontmatter and
 /// renders the write-time warning string.
-fn ignored_type_derivation_warning(store: &Store, type_: &str, fm: &Frontmatter) -> Option<String> {
+fn ignored_type_derivation_warning(store: &Store, fm: &Frontmatter) -> Option<String> {
     let targets = fm
         .link_fields()
         .into_iter()
         .filter(|(key, _)| key == "derived_from")
         .map(|(_, link)| link.target);
-    let hit = dbmd_core::validate::derived_from_ignored_type(store, type_, targets)?;
+    let hit =
+        dbmd_core::validate::derived_from_ignored_type(store, fm.effective_meta_type(), targets)?;
     Some(format!(
-        "wiki-page derives from ignored-type record `{}` (type `{}`, per DB.md ## Policies → ### Ignored types)",
+        "conclusion record derives from ignored-type record `{}` (type `{}`, per DB.md ## Policies → ### Ignored types)",
         hit.target, hit.target_type
     ))
 }

@@ -84,7 +84,7 @@ fn parse_layer(value: Option<&str>) -> Result<Option<Layer>, CliError> {
             CliError::new(
                 ExitCode::Runtime,
                 "BAD_LAYER",
-                format!("unknown layer `{name}` (expected sources, records, or wiki)"),
+                format!("unknown layer `{name}` (expected sources, records)"),
             )
         }),
     }

@@ -18,7 +18,7 @@ status: active
 
 This body uses the bare-basename link [[northstar]]. Two files in the
 store carry that basename: records/companies/northstar.md and
-wiki/companies/northstar.md. Under the defensive short-form resolver a
+records/synthesis/northstar.md. Under the defensive short-form resolver a
 bare target that matches two or more files is reported as ambiguous
 (rather than the plain short-form error), because the resolver cannot
 pick one. The company link above is the correct full-path form.

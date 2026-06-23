@@ -21,11 +21,11 @@ use common::{copy_store_to_temp, corpus_a, dbmd};
 ///
 /// Trigger: a store where a folder's on-disk record set diverges from the root
 /// rollup. corpus-a ships 4 contacts (`Contacts (4)`, layer total `Records
-/// (505)`); we add a 5th contact file on disk WITHOUT touching any index, then
+/// (509)`); we add a 5th contact file on disk WITHOUT touching any index, then
 /// run `dbmd index rebuild --layer records`. Post-fix, the folder, layer, AND
 /// root must all reflect 5 contacts / a `Records` total of 506. Pre-fix, the
 /// folder + layer were corrected but the root still read `Contacts (4)` /
-/// `Records (505)`.
+/// `Records (509)`.
 #[test]
 fn regression_rebuild_layer_refreshes_root_index_counts() {
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
@@ -38,7 +38,7 @@ fn regression_rebuild_layer_refreshes_root_index_counts() {
         "precondition: corpus-a root must list 4 contacts:\n{root_before}"
     );
     assert!(
-        root_before.contains("## Records (505)\n"),
+        root_before.contains("## Records (509)\n"),
         "precondition: corpus-a records layer total must be 505:\n{root_before}"
     );
 
@@ -91,7 +91,7 @@ fn regression_rebuild_layer_refreshes_root_index_counts() {
          not the stale 4 (root/folder count desync):\n{root_after}"
     );
     assert!(
-        root_after.contains("## Records (506)\n"),
+        root_after.contains("## Records (510)\n"),
         "root index.md records-layer total must be refreshed to 506 after the \
          layer rebuild, not the stale 505:\n{root_after}"
     );

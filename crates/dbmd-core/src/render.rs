@@ -142,7 +142,6 @@ fn layer_dir_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Sources => "sources",
         Layer::Records => "records",
-        Layer::Wiki => "wiki",
     }
 }
 
@@ -535,10 +534,12 @@ mod tests {
     #[test]
     fn tree_groups_by_layer_then_type_folder_in_canonical_order() {
         let fx = Fixture::new();
-        // Deliberately seed wiki before records before sources on disk by name
-        // so a naive readdir order would be alphabetical (records, sources,
-        // wiki) — the tree must instead emit the canonical Sources→Records→Wiki.
-        fx.write("wiki/people/sarah.md", &doc("sarah bio"));
+        // Deliberately seed records before sources on disk by name so a naive
+        // readdir order would be alphabetical (records, sources) — the tree must
+        // instead emit the canonical Sources→Records. The conclusion record
+        // (former wiki-page) lives under records/profiles, a second records
+        // type-folder, so the within-layer ordering is exercised too.
+        fx.write("records/profiles/sarah.md", &doc("sarah bio"));
         fx.write("records/contacts/sarah-chen.md", &doc("sarah contact"));
         fx.write("sources/emails/a.md", &doc("an email"));
 
@@ -546,7 +547,7 @@ mod tests {
         let layer_order: Vec<Layer> = tree.layers.iter().map(|l| l.layer).collect();
         assert_eq!(
             layer_order,
-            vec![Layer::Sources, Layer::Records, Layer::Wiki],
+            vec![Layer::Sources, Layer::Records],
             "layers must come back in canonical order regardless of on-disk name order"
         );
 
@@ -564,9 +565,9 @@ mod tests {
                     vec!["records/contacts/sarah-chen.md".to_string()]
                 ),
                 (
-                    Layer::Wiki,
-                    "wiki/people".to_string(),
-                    vec!["wiki/people/sarah.md".to_string()]
+                    Layer::Records,
+                    "records/profiles".to_string(),
+                    vec!["records/profiles/sarah.md".to_string()]
                 ),
             ]
         );
@@ -684,7 +685,7 @@ mod tests {
         assert!(tree
             .layers
             .iter()
-            .all(|l| matches!(l.layer, Layer::Sources | Layer::Records | Layer::Wiki)));
+            .all(|l| matches!(l.layer, Layer::Sources | Layer::Records)));
     }
 
     #[test]
@@ -742,10 +743,10 @@ mod tests {
     #[test]
     fn tree_type_filter_matches_frontmatter_type_across_layers() {
         let fx = Fixture::new();
-        // Same `note` type filed under two layers (in folders whose names are
+        // Same `note` type filed under both layers (in folders whose names are
         // NOT the type), plus a contact to exclude.
         fx.write("sources/inbox/s.md", &typed("note", "source note"));
-        fx.write("wiki/scratch/w.md", &typed("note", "wiki note"));
+        fx.write("records/scratch/r.md", &typed("note", "record note"));
         fx.write("records/contacts/c.md", &typed("contact", "contact"));
 
         let tree = tree(&fx.store, None, Some("note")).expect("tree");
@@ -760,7 +761,7 @@ mod tests {
             files,
             vec![
                 "sources/inbox/s.md".to_string(),
-                "wiki/scratch/w.md".to_string()
+                "records/scratch/r.md".to_string()
             ],
             "type filter matches the frontmatter type across layers, regardless of folder name"
         );
@@ -774,7 +775,10 @@ mod tests {
         // (`contacts`) to the requested type (`contact`) and returned nothing.
         let fx = Fixture::new();
         fx.write("records/contacts/sarah.md", &typed("contact", "sarah"));
-        fx.write("wiki/people/sarah.md", &typed("wiki-page", "sarah bio"));
+        // A synthesis profile the agent authored, filed under a topic folder
+        // whose name is not its type (the old `wiki/` layer / `wiki-page` type
+        // are gone — this is a real `profile` record).
+        fx.write("records/profiles/sarah.md", &typed("profile", "sarah bio"));
 
         // The documented frontmatter type matches.
         let by_type = tree(&fx.store, None, Some("contact")).expect("tree");
@@ -798,9 +802,10 @@ mod tests {
             "the folder directory name is not the frontmatter type and must not match"
         );
 
-        // `wiki-page` records, filed under topic folders, are now reachable.
-        let wiki = tree(&fx.store, None, Some("wiki-page")).expect("tree");
-        let wiki_files: Vec<String> = wiki
+        // A custom type filed under a topic folder whose name is not the type
+        // is still reachable by its frontmatter type.
+        let profiles = tree(&fx.store, None, Some("profile")).expect("tree");
+        let profile_files: Vec<String> = profiles
             .layers
             .iter()
             .flat_map(|l| &l.type_folders)
@@ -808,9 +813,9 @@ mod tests {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            wiki_files,
-            vec!["wiki/people/sarah.md".to_string()],
-            "--type wiki-page matches the frontmatter type under a topic folder"
+            profile_files,
+            vec!["records/profiles/sarah.md".to_string()],
+            "--type profile matches the frontmatter type under a topic folder"
         );
     }
 

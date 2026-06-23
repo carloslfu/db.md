@@ -109,9 +109,9 @@ fn fenced_code_headings_are_not_sections() {
 }
 
 #[test]
-fn corpus_a_wiki_page_sections_are_seen() {
-    // The committed happy-path wiki page has `## Timeline` and `## Commercials`.
-    let file = corpus_a().join("wiki/projects/northstar-renewal.md");
+fn corpus_a_conclusion_record_sections_are_seen() {
+    // The committed happy-path conclusion record has `## Timeline` and `## Commercials`.
+    let file = corpus_a().join("records/projects/northstar-renewal.md");
 
     let out = dbmd()
         .arg("--json")

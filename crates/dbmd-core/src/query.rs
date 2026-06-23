@@ -188,7 +188,6 @@ fn layer_dir_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Sources => "sources",
         Layer::Records => "records",
-        Layer::Wiki => "wiki",
     }
 }
 
@@ -358,9 +357,9 @@ mod tests {
             .with_type("contact")
             .with_type("company")
             .with_layer(Layer::Sources)
-            .with_layer(Layer::Wiki);
+            .with_layer(Layer::Records);
         assert_eq!(q.type_.as_deref(), Some("company"));
-        assert_eq!(q.layer, Some(Layer::Wiki));
+        assert_eq!(q.layer, Some(Layer::Records));
     }
 
     #[test]
@@ -632,7 +631,7 @@ mod tests {
         // layer predicate is live in the composed path.
         let wrong_layer = Query::new()
             .with_type("contact")
-            .with_layer(Layer::Wiki)
+            .with_layer(Layer::Sources)
             .with_where("city", "denver")
             .execute(&store)
             .unwrap();
@@ -1009,14 +1008,15 @@ mod tests {
     fn record_in_layer_keys_off_first_path_component() {
         let s = rec("sources/emails/e.md", "email", &[]);
         let r = rec("records/contacts/c.md", "contact", &[]);
-        let w = rec("wiki/people/p.md", "wiki-page", &[]);
+        // A conclusion record (the former wiki-page) lives in the records layer.
+        let c = rec("records/profiles/p.md", "profile", &[]);
 
         assert!(record_in_layer(&s, Layer::Sources));
         assert!(!record_in_layer(&s, Layer::Records));
         assert!(record_in_layer(&r, Layer::Records));
-        assert!(!record_in_layer(&r, Layer::Wiki));
-        assert!(record_in_layer(&w, Layer::Wiki));
-        assert!(!record_in_layer(&w, Layer::Sources));
+        assert!(!record_in_layer(&r, Layer::Sources));
+        assert!(record_in_layer(&c, Layer::Records));
+        assert!(!record_in_layer(&c, Layer::Sources));
     }
 
     #[test]

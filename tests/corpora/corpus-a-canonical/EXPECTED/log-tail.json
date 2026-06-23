@@ -57,13 +57,13 @@
     {
       "timestamp": "2026-05-22 12:30",
       "kind": "update",
-      "object": "[[wiki/projects/northstar-renewal]]",
+      "object": "[[records/projects/northstar-renewal]]",
       "note": "Refreshed the renewal narrative with the call outcome and the confirming email."
     },
     {
       "timestamp": "2026-05-23 09:00",
       "kind": "link",
-      "object": "[[wiki/synthesis/2026-renewal-plan]]",
+      "object": "[[records/synthesis/2026-renewal-plan]]",
       "note": "Cross-linked the signed-off renewal plan from the project page; page is now frozen."
     },
     {
@@ -76,7 +76,7 @@
       "timestamp": "2026-05-31 10:05",
       "kind": "validate",
       "object": null,
-      "note": "PASS — 0 errors, 0 warnings. Store is clean across all three layers."
+      "note": "PASS — 0 errors, 0 warnings. Store is clean across both layers."
     }
   ]
 }

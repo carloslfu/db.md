@@ -182,11 +182,15 @@ fn validate_all_matches_expected_golden_issue_for_issue_and_exits_six() {
         "the per-code issue counts must match the golden exactly"
     );
 
-    // ── v0.2 removed LAYER_TYPE_MISMATCH; the contact under wiki/ is now a
-    //    fully clean file the sweep must NOT flag (a false-positive catcher) ────
+    // ── v0.2 removed LAYER_TYPE_MISMATCH; the contact filed in a non-canonical
+    //    records folder is a fully clean FILE the sweep must NOT flag (a
+    //    false-positive catcher) ─────────────────────────────────────────────
     // The folder layout is convention, not enforcement — placement no longer
-    // warns. The `contact` under `wiki/contacts/` is schema-valid with resolving
-    // links, so it carries zero issues.
+    // warns. The `contact` under `records/clients/` (not the canonical
+    // `records/contacts/`) is schema-valid with resolving links, so the file
+    // itself carries zero issues. (Its folder's `index.jsonl` is deliberately
+    // stale on `company`, but that issue's `file` is the index.jsonl, not the
+    // contact — so no issue names the contact file.)
     let layer_issues: Vec<&serde_json::Value> = report["issues"]
         .as_array()
         .unwrap()
@@ -201,11 +205,11 @@ fn validate_all_matches_expected_golden_issue_for_issue_and_exits_six() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|i| i["file"] == "wiki/contacts/misplaced-contact.md")
+        .filter(|i| i["file"] == "records/clients/misplaced-contact.md")
         .collect();
     assert!(
         misplaced_issues.is_empty(),
-        "the contact under wiki/ is clean (schema + links valid) — no issue: {misplaced_issues:#?}"
+        "the contact in the non-canonical records folder is clean (schema + links valid) — no issue: {misplaced_issues:#?}"
     );
 
     // ── every emitted issue carries the full contract shape ──────────────────
@@ -392,15 +396,16 @@ fn policy_refusals_refuse_with_structured_error_and_do_not_write() {
         );
 
         // A `write` to a NONEXISTENT frozen path must not have created the file
-        // at the requested path — nor at any sharded relocation of it (the
-        // `wiki-page` foldering would otherwise send it to `wiki/topics/…`).
+        // at the requested path — nor at any sharded relocation of it (a
+        // `synthesis` write would otherwise land somewhere under
+        // `records/synthesis/…`).
         if before.is_none() {
             assert!(
                 !target_abs.exists(),
                 "{fixture}: the refused nonexistent frozen path must NOT be created"
             );
             if let Some(name) = Path::new(target_rel).file_name() {
-                let sharded = store.join("wiki/topics").join(name);
+                let sharded = store.join("records/synthesis").join(name);
                 assert!(
                     !sharded.exists(),
                     "{fixture}: the refused write must not slip through to a sharded location {:?}",

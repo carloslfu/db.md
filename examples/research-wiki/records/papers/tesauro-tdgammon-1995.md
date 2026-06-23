@@ -13,8 +13,8 @@ url: https://dl.acm.org/doi/10.1145/203330.203343
 tags: [reinforcement-learning, self-play, temporal-difference, value-network]
 source: [[sources/papers/tesauro-tdgammon-1995]]
 concepts:
-  - [[wiki/concepts/self-play]]
-  - [[wiki/concepts/value-network]]
+  - [[records/concepts/self-play]]
+  - [[records/concepts/value-network]]
 ---
 
 # TD-Gammon
@@ -24,5 +24,5 @@ temporal-difference learning, no human game records and no hand-coded
 evaluation. It reached world-class strength and is the canonical early
 demonstration that self-play alone can produce a strong player.
 
-See [[wiki/concepts/self-play]] for the training regime,
-[[wiki/concepts/value-network]] for the function it learned.
+See [[records/concepts/self-play]] for the training regime,
+[[records/concepts/value-network]] for the function it learned.

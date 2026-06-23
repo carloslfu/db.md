@@ -57,7 +57,8 @@ fn lines(s: &str) -> Vec<String> {
 #[test]
 fn backlinks_lists_incoming_content_links_sorted_excluding_indexes() {
     // sarah-chen is referenced by five CONTENT files in the corpus (the company
-    // record, two meetings, her wiki bio, and the renewal project). The
+    // record, two meetings, her synthesis profile, and the renewal project — all
+    // now under records/, since the wiki/ layer is gone). The
     // `records/contacts/index.md` catalog also names her, but indexes are
     // catalog, not relationship edges, so backlinks must exclude it. Output is
     // the canonical bare wiki-link form (no `.md`), sorted ascending.
@@ -75,8 +76,8 @@ fn backlinks_lists_incoming_content_links_sorted_excluding_indexes() {
             "records/companies/northstar",
             "records/meetings/2026/04/2026-04-15-northstar-quarterly-review",
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call",
-            "wiki/people/sarah-chen",
-            "wiki/projects/northstar-renewal",
+            "records/profiles/sarah-chen",
+            "records/projects/northstar-renewal",
         ]
     );
 }
@@ -99,8 +100,8 @@ fn backlinks_json_is_a_sorted_string_array() {
             "records/companies/northstar".to_string(),
             "records/meetings/2026/04/2026-04-15-northstar-quarterly-review".to_string(),
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call".to_string(),
-            "wiki/people/sarah-chen".to_string(),
-            "wiki/projects/northstar-renewal".to_string(),
+            "records/profiles/sarah-chen".to_string(),
+            "records/projects/northstar-renewal".to_string(),
         ]
     );
 }
@@ -174,25 +175,14 @@ fn backlinks_type_filter_scopes_to_the_linking_files_type() {
 
 #[test]
 fn backlinks_in_layer_filter_scopes_to_the_linking_files_layer() {
-    // `--in wiki` keeps only the wiki-layer linkers (her bio + the renewal
-    // project); the company + two meetings (records/) drop out.
+    // `--in` scopes the sidecar walk to a single layer. Every file that
+    // wiki-links to sarah-chen lives under records/ (the company record, two
+    // meetings, her synthesis profile, the renewal project), so `--in records`
+    // keeps all five and `--in sources` keeps none — no raw source artifact
+    // links to her. One layer keeps everything, the other excludes everything:
+    // proof the layer filter is applied.
     let dir = corpus_a();
     let d = dir.to_str().unwrap();
-    let wiki = run_ok(&[
-        "graph",
-        "backlinks",
-        "records/contacts/sarah-chen.md",
-        "--in",
-        "wiki",
-        "--dir",
-        d,
-    ]);
-    assert_eq!(
-        lines(&wiki),
-        vec!["wiki/people/sarah-chen", "wiki/projects/northstar-renewal"]
-    );
-
-    // `--in records` keeps only the records-layer linkers.
     let records = run_ok(&[
         "graph",
         "backlinks",
@@ -208,14 +198,32 @@ fn backlinks_in_layer_filter_scopes_to_the_linking_files_layer() {
             "records/companies/northstar",
             "records/meetings/2026/04/2026-04-15-northstar-quarterly-review",
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call",
+            "records/profiles/sarah-chen",
+            "records/projects/northstar-renewal",
         ]
+    );
+
+    // `--in sources` keeps only the source-layer linkers — there are none.
+    let sources = run_ok(&[
+        "graph",
+        "backlinks",
+        "records/contacts/sarah-chen.md",
+        "--in",
+        "sources",
+        "--dir",
+        d,
+    ]);
+    assert!(
+        sources.trim().is_empty(),
+        "no source artifact links to sarah-chen, got:\n{sources}"
     );
 }
 
 #[test]
 fn backlinks_type_and_in_compose() {
     // `--type meeting --in records` together still yield the two meetings;
-    // `--type meeting --in wiki` yields nothing (no meeting lives under wiki/).
+    // `--type meeting --in sources` yields nothing (no meeting lives under
+    // sources/ — meetings are records).
     let dir = corpus_a();
     let d = dir.to_str().unwrap();
     let both = run_ok(&[
@@ -244,25 +252,25 @@ fn backlinks_type_and_in_compose() {
         "--type",
         "meeting",
         "--in",
-        "wiki",
+        "sources",
         "--dir",
         d,
     ]);
     assert!(
         mismatch.trim().is_empty(),
-        "no meeting linker lives under wiki/, got:\n{mismatch}"
+        "no meeting linker lives under sources/, got:\n{mismatch}"
     );
 }
 
 #[test]
 fn forwardlinks_type_filter_narrows_targets_to_that_type() {
-    // The renewal wiki page links out to eight targets across types; `--type
+    // The renewal project page links out to eight targets across types; `--type
     // contact` keeps only the two contact targets.
     let dir = corpus_a();
     let out = run_ok(&[
         "graph",
         "forwardlinks",
-        "wiki/projects/northstar-renewal.md",
+        "records/projects/northstar-renewal.md",
         "--type",
         "contact",
         "--dir",
@@ -285,7 +293,7 @@ fn forwardlinks_in_layer_filter_narrows_targets_to_that_layer() {
     let out = run_ok(&[
         "graph",
         "forwardlinks",
-        "wiki/projects/northstar-renewal.md",
+        "records/projects/northstar-renewal.md",
         "--in",
         "sources",
         "--dir",
@@ -306,15 +314,16 @@ fn forwardlinks_in_layer_filter_narrows_targets_to_that_layer() {
 
 #[test]
 fn forwardlinks_returns_frontmatter_and_body_targets_sorted_deduped() {
-    // The renewal wiki page links out — from BOTH its `derived_from` frontmatter
-    // sequence and its body prose — to the company, two contacts, two meetings,
-    // a source email, a source doc, and the synthesis plan. forwardlinks must
-    // follow frontmatter edges too, dedup, drop self-links, and sort ascending.
+    // The renewal project page links out — from BOTH its `derived_from`
+    // frontmatter sequence and its body prose — to the company, two contacts,
+    // two meetings, a source email, a source doc, and the synthesis plan.
+    // forwardlinks must follow frontmatter edges too, dedup, drop self-links,
+    // and sort ascending (records/ before sources/).
     let dir = corpus_a();
     let out = run_ok(&[
         "graph",
         "forwardlinks",
-        "wiki/projects/northstar-renewal.md",
+        "records/projects/northstar-renewal.md",
         "--dir",
         dir.to_str().unwrap(),
     ]);
@@ -326,9 +335,9 @@ fn forwardlinks_returns_frontmatter_and_body_targets_sorted_deduped() {
             "records/contacts/sarah-chen",
             "records/meetings/2026/04/2026-04-15-northstar-quarterly-review",
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call",
+            "records/synthesis/2026-renewal-plan",
             "sources/docs/2026-03-15-northstar-msa",
             "sources/emails/2026/05/2026-05-22-elena-renewal",
-            "wiki/synthesis/2026-renewal-plan",
         ]
     );
 }
@@ -342,7 +351,7 @@ fn forwardlinks_and_backlinks_round_trip_on_the_same_key() {
     let fwd = run_ok(&[
         "graph",
         "forwardlinks",
-        "wiki/projects/northstar-renewal.md",
+        "records/projects/northstar-renewal.md",
         "--dir",
         d,
     ]);
@@ -355,7 +364,9 @@ fn forwardlinks_and_backlinks_round_trip_on_the_same_key() {
         "--dir",
         d,
     ]);
-    assert!(back.lines().any(|l| l == "wiki/projects/northstar-renewal"));
+    assert!(back
+        .lines()
+        .any(|l| l == "records/projects/northstar-renewal"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -366,8 +377,9 @@ fn forwardlinks_and_backlinks_round_trip_on_the_same_key() {
 fn neighborhood_one_hop_hydrates_summaries_in_json() {
     // One hop from sarah-chen reaches exactly her direct neighbors (both
     // directions): the company + renewal-call she links to, the renewal project,
-    // and the two records that link to her. Each node carries the reached file's
-    // real `summary` and `type`, at hop 1, with a `via` back toward the seed.
+    // the Q1 review that links to her, and her synthesis profile — all under
+    // records/. Each node carries the reached file's real `summary` and `type`,
+    // at hop 1, with a `via` back toward the seed.
     let dir = corpus_a();
     let out = run_ok(&[
         "--json",
@@ -392,8 +404,8 @@ fn neighborhood_one_hop_hydrates_summaries_in_json() {
             "records/companies/northstar",
             "records/meetings/2026/04/2026-04-15-northstar-quarterly-review",
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call",
-            "wiki/people/sarah-chen",
-            "wiki/projects/northstar-renewal",
+            "records/profiles/sarah-chen",
+            "records/projects/northstar-renewal",
         ]
     );
 
@@ -451,17 +463,19 @@ fn neighborhood_text_is_tab_separated_path_hops_summary() {
 
 #[test]
 fn neighborhood_in_layer_filter_narrows_to_that_layer() {
-    // `--in wiki` keeps only reached nodes under wiki/: the project page and the
-    // sarah-chen bio. The company + meetings (records/) drop out of the RESULT.
+    // The renewal project page neighbors span both layers; `--in sources` keeps
+    // only the reached nodes under sources/ — the MSA doc and the Elena renewal
+    // email. The company, contacts, meetings, and synthesis (all records/) drop
+    // out of the RESULT.
     let dir = corpus_a();
     let out = run_ok(&[
         "graph",
         "neighborhood",
-        "records/contacts/sarah-chen.md",
+        "records/projects/northstar-renewal.md",
         "--hops",
         "1",
         "--in",
-        "wiki",
+        "sources",
         "--dir",
         dir.to_str().unwrap(),
     ]);
@@ -473,8 +487,8 @@ fn neighborhood_in_layer_filter_narrows_to_that_layer() {
     assert_eq!(
         paths,
         vec![
-            "wiki/people/sarah-chen".to_string(),
-            "wiki/projects/northstar-renewal".to_string(),
+            "sources/docs/2026-03-15-northstar-msa".to_string(),
+            "sources/emails/2026/05/2026-05-22-elena-renewal".to_string(),
         ]
     );
 }
@@ -581,23 +595,23 @@ fn orphans_json_is_a_string_array() {
 
 #[test]
 fn tree_layer_scope_groups_type_folders_then_files_indented() {
-    // `--layer wiki` prints just the wiki branch: the layer line, then each
-    // type-folder (people/projects/synthesis) sorted, then its files sorted,
-    // indented two spaces per level. Meta files (index.md/index.jsonl) never
-    // appear.
+    // `--layer sources` prints just the sources branch: the layer line, then each
+    // type-folder (docs/emails) sorted, then its files sorted, indented two
+    // spaces per level. Meta files (index.md/index.jsonl) never appear.
     let dir = corpus_a();
-    let out = run_ok(&["tree", "--layer", "wiki", "--dir", dir.to_str().unwrap()]);
+    let out = run_ok(&["tree", "--layer", "sources", "--dir", dir.to_str().unwrap()]);
     assert_eq!(
         lines(&out),
         vec![
-            "wiki",
-            "  wiki/people",
-            "    wiki/people/elena-rodriguez.md",
-            "    wiki/people/sarah-chen.md",
-            "  wiki/projects",
-            "    wiki/projects/northstar-renewal.md",
-            "  wiki/synthesis",
-            "    wiki/synthesis/2026-renewal-plan.md",
+            "sources",
+            "  sources/docs",
+            "    sources/docs/2026-03-15-northstar-msa.md",
+            "    sources/docs/2026-04-30-aws-invoice.md",
+            "  sources/emails",
+            "    sources/emails/2026/04/2026-04-03-figma-renewal-notice.md",
+            "    sources/emails/2026/04/2026-04-28-aws-invoice-available.md",
+            "    sources/emails/2026/05/2026-05-12-marcus-intro.md",
+            "    sources/emails/2026/05/2026-05-22-elena-renewal.md",
         ]
     );
 }
@@ -609,36 +623,50 @@ fn tree_json_mirrors_the_layer_type_folder_file_structure() {
         "--json",
         "tree",
         "--layer",
-        "wiki",
+        "records",
         "--dir",
         dir.to_str().unwrap(),
     ]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("tree json");
     let layers = v["layers"].as_array().unwrap();
-    assert_eq!(layers.len(), 1, "only the wiki layer");
-    assert_eq!(layers[0]["layer"], "wiki");
+    assert_eq!(layers.len(), 1, "only the records layer");
+    assert_eq!(layers[0]["layer"], "records");
 
     let folders = layers[0]["type_folders"].as_array().unwrap();
     let folder_paths: Vec<&str> = folders
         .iter()
         .map(|f| f["path"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        folder_paths,
-        vec!["wiki/people", "wiki/projects", "wiki/synthesis"]
-    );
+    // The migrated conclusion folders (profiles/projects/synthesis) now sit
+    // alongside the fact folders, all under records/.
+    for expected in [
+        "records/contacts",
+        "records/profiles",
+        "records/projects",
+        "records/synthesis",
+    ] {
+        assert!(
+            folder_paths.contains(&expected),
+            "records tree must include {expected}: {folder_paths:?}"
+        );
+    }
 
-    let people_files: Vec<&str> = folders[0]["files"]
+    // profiles/ holds the two former wiki/people bios.
+    let profiles = folders
+        .iter()
+        .find(|f| f["path"] == "records/profiles")
+        .expect("records/profiles folder");
+    let profile_files: Vec<&str> = profiles["files"]
         .as_array()
         .unwrap()
         .iter()
         .map(|f| f.as_str().unwrap())
         .collect();
     assert_eq!(
-        people_files,
+        profile_files,
         vec![
-            "wiki/people/elena-rodriguez.md",
-            "wiki/people/sarah-chen.md"
+            "records/profiles/elena-rodriguez.md",
+            "records/profiles/sarah-chen.md"
         ]
     );
 }
@@ -671,18 +699,17 @@ fn tree_type_filter_keeps_only_the_named_type_folder() {
 #[test]
 fn stats_json_counts_match_the_corpus_shape() {
     // `dbmd stats <DIR>` (DIR is positional on this command). The canonical
-    // corpus has 6 source + 505 record + 4 wiki content files = 515, every
-    // wiki-link resolves (0 broken — matching EXPECTED/validate.json being
-    // empty), and exactly the two source emails are orphans. `expense`
-    // dominates the type distribution.
+    // corpus has 6 source + 509 record content files = 515, every wiki-link
+    // resolves (0 broken — matching EXPECTED/validate.json being empty), and
+    // exactly the two source emails are orphans. `expense` dominates the type
+    // distribution.
     let dir = corpus_a();
     let out = run_ok(&["--json", "stats", dir.to_str().unwrap()]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("stats json");
 
     assert_eq!(v["total_files"], 515);
     assert_eq!(v["files_per_layer"]["sources"], 6);
-    assert_eq!(v["files_per_layer"]["records"], 505);
-    assert_eq!(v["files_per_layer"]["wiki"], 4);
+    assert_eq!(v["files_per_layer"]["records"], 509);
     assert_eq!(v["broken_link_count"], 0);
     assert_eq!(v["orphan_count"], 2);
 
@@ -702,8 +729,7 @@ fn stats_text_reports_totals_and_per_layer_lines() {
     let out = run_ok(&["stats", dir.to_str().unwrap()]);
     assert!(out.contains("files: 515"), "totals line:\n{out}");
     assert!(out.contains("sources: 6"), "per-layer sources:\n{out}");
-    assert!(out.contains("records: 505"), "per-layer records:\n{out}");
-    assert!(out.contains("wiki: 4"), "per-layer wiki:\n{out}");
+    assert!(out.contains("records: 509"), "per-layer records:\n{out}");
     assert!(out.contains("broken links: 0"), "broken-link line:\n{out}");
     assert!(out.contains("orphans: 2"), "orphan line:\n{out}");
 }
@@ -717,15 +743,15 @@ fn outline_lists_only_h2_plus_sections_with_levels_and_source_lines() {
     // `dbmd outline <FILE>` carries no `--dir`: it opens the store at the CWD, so
     // the test runs the binary FROM the corpus root. The renewal page has a
     // single `#` title (not a section) and two `##` sections — Timeline and
-    // Commercials. Line numbers are source-relative: the 17-line frontmatter
-    // block precedes the body, so they fall on file lines 24 and 37.
+    // Commercials. Line numbers are source-relative: the 18-line frontmatter
+    // block precedes the body, so they fall on file lines 25 and 38.
     let dir = corpus_a();
     let out = run_in(
         &dir,
-        &["--json", "outline", "wiki/projects/northstar-renewal.md"],
+        &["--json", "outline", "records/projects/northstar-renewal.md"],
     );
     let v: serde_json::Value = serde_json::from_str(out.trim()).expect("outline json");
-    assert_eq!(v["file"], "wiki/projects/northstar-renewal.md");
+    assert_eq!(v["file"], "records/projects/northstar-renewal.md");
 
     let sections = v["sections"].as_array().unwrap();
     let got: Vec<(&str, u64, u64)> = sections
@@ -740,7 +766,7 @@ fn outline_lists_only_h2_plus_sections_with_levels_and_source_lines() {
         .collect();
     assert_eq!(
         got,
-        vec![("Timeline", 2, 24), ("Commercials", 2, 37)],
+        vec![("Timeline", 2, 25), ("Commercials", 2, 38)],
         "only ##+ headings; the # title is not a section"
     );
 }
@@ -750,7 +776,7 @@ fn outline_text_indents_by_heading_depth() {
     // Text mode prints each heading indented (level - 2) * 2 spaces; both
     // sections here are level 2, so both are flush-left.
     let dir = corpus_a();
-    let out = run_in(&dir, &["outline", "wiki/projects/northstar-renewal.md"]);
+    let out = run_in(&dir, &["outline", "records/projects/northstar-renewal.md"]);
     assert_eq!(lines(&out), vec!["Timeline", "Commercials"]);
 }
 

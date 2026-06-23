@@ -1,13 +1,13 @@
 {
-  "_comment": "Golden-master for `dbmd search` over corpus-a-canonical. Each case lists the store-relative paths that MUST match, derived from the corpus content and the SPEC search contract (embedded ripgrep over the frontmatter block + body of every CONTENT file under sources/records/wiki; meta files DB.md/index.md/index.jsonl/log.md are not content and never match). `matches` is the complete set, sorted by store-relative path ascending. Filters: --type narrows to frontmatter `type`; --in narrows to a layer; --updated-after compares the frontmatter `updated` timestamp (strictly after). Query strings are ripgrep regexes (default case-sensitive). This golden is intent-derived, not copied from tool output.",
+  "_comment": "Golden-master for `dbmd search` over corpus-a-canonical. Each case lists the store-relative paths that MUST match, derived from the corpus content and the SPEC search contract (embedded ripgrep over the frontmatter block + body of every CONTENT file under sources/records; meta files DB.md/index.md/index.jsonl/log.md are not content and never match). `matches` is the complete set, sorted by store-relative path ascending. Filters: --type narrows to frontmatter `type`; --in narrows to a layer (sources/records — the wiki layer is gone, synthesis pages are now `meta-type: conclusion` records); --where narrows on a frontmatter key=value; --updated-after compares the frontmatter `updated` timestamp (strictly after). Query strings are ripgrep regexes (default case-sensitive). This golden is intent-derived, not copied from tool output.",
   "queries": [
     {
       "query": "volume discount",
       "args": [],
-      "intent": "Plain phrase, no filter. The body-only phrase appears in the renewal call record and the project wiki page.",
+      "intent": "Plain phrase, no filter. The body-only phrase appears in the renewal call record and the project conclusion record.",
       "matches": [
         "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md",
-        "wiki/projects/northstar-renewal.md"
+        "records/projects/northstar-renewal.md"
       ]
     },
     {
@@ -21,21 +21,21 @@
     {
       "query": "async",
       "args": [],
-      "intent": "Case-sensitive default match on a working-style term present in Elena's contact record and her wiki bio.",
+      "intent": "Case-sensitive default match on a working-style term present in Elena's contact record and her profile conclusion.",
       "matches": [
         "records/contacts/elena-rodriguez.md",
-        "wiki/people/elena-rodriguez.md"
+        "records/profiles/elena-rodriguez.md"
       ]
     },
     {
       "query": "renewal",
-      "args": ["--in", "wiki"],
-      "intent": "Layer-scoped search: only wiki/ content files that contain `renewal` survive the --in filter.",
+      "args": ["--in", "records", "--where", "meta-type=conclusion"],
+      "intent": "Meta-type-scoped search: only `meta-type: conclusion` records (the former wiki synthesis pages) that contain `renewal` survive the filter.",
       "matches": [
-        "wiki/people/elena-rodriguez.md",
-        "wiki/people/sarah-chen.md",
-        "wiki/projects/northstar-renewal.md",
-        "wiki/synthesis/2026-renewal-plan.md"
+        "records/profiles/elena-rodriguez.md",
+        "records/profiles/sarah-chen.md",
+        "records/projects/northstar-renewal.md",
+        "records/synthesis/2026-renewal-plan.md"
       ]
     },
     {

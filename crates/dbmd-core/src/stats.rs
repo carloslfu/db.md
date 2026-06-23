@@ -161,7 +161,6 @@ fn layer_dir_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Sources => "sources",
         Layer::Records => "records",
-        Layer::Wiki => "wiki",
     }
 }
 
@@ -335,7 +334,7 @@ fn is_full_path(target: &Path) -> bool {
         _ => return false,
     };
     let has_rest = parts.next().is_some();
-    matches!(first.as_ref(), "sources" | "records" | "wiki") && has_rest
+    matches!(first.as_ref(), "sources" | "records") && has_rest
 }
 
 /// True if `target` stays inside the store: every component is `Normal` (a
@@ -548,13 +547,13 @@ mod tests {
         write_rel(&store, "sources/emails/a.md", &doc("email", "a"));
         write_rel(&store, "sources/emails/b.md", &doc("email", "b"));
         write_rel(&store, "records/contacts/c.md", &doc("contact", "c"));
-        write_rel(&store, "wiki/people/p.md", &doc("wiki-page", "p"));
+        // A conclusion record (former wiki-page) lives in the records layer.
+        write_rel(&store, "records/profiles/p.md", &doc("profile", "p"));
 
         let s = compute(&store).expect("compute");
         assert_eq!(s.total_files, 4);
         assert_eq!(s.files_per_layer.get(&Layer::Sources), Some(&2));
-        assert_eq!(s.files_per_layer.get(&Layer::Records), Some(&1));
-        assert_eq!(s.files_per_layer.get(&Layer::Wiki), Some(&1));
+        assert_eq!(s.files_per_layer.get(&Layer::Records), Some(&2));
     }
 
     #[test]
@@ -575,15 +574,14 @@ mod tests {
         // Hidden dir contents are skipped.
         write_rel(
             &store,
-            "wiki/.obsidian/cache.md",
-            &doc("wiki-page", "hidden"),
+            "records/.obsidian/cache.md",
+            &doc("profile", "hidden"),
         );
 
         let s = compute(&store).expect("compute");
         assert_eq!(s.total_files, 1, "only the one real content file counts");
         assert_eq!(s.files_per_layer.get(&Layer::Records), Some(&1));
         assert_eq!(s.files_per_layer.get(&Layer::Sources), None);
-        assert_eq!(s.files_per_layer.get(&Layer::Wiki), None);
     }
 
     #[test]
@@ -627,15 +625,19 @@ mod tests {
         // A content file with frontmatter but no `type:` key.
         write_rel(
             &store,
-            "wiki/themes/x.md",
+            "records/themes/x.md",
             "---\nsummary: no type here\n---\n\nbody\n",
         );
         // A content file with no frontmatter at all.
-        write_rel(&store, "wiki/themes/y.md", "just a body, no frontmatter\n");
+        write_rel(
+            &store,
+            "records/themes/y.md",
+            "just a body, no frontmatter\n",
+        );
 
         let s = compute(&store).expect("compute");
         assert_eq!(s.total_files, 2, "untyped files still count toward totals");
-        assert_eq!(s.files_per_layer.get(&Layer::Wiki), Some(&2));
+        assert_eq!(s.files_per_layer.get(&Layer::Records), Some(&2));
         assert!(
             s.type_distribution.is_empty(),
             "no type key => no distribution entry, not an empty-string bucket"
@@ -757,10 +759,10 @@ mod tests {
         // Two links: one to an existing file, one to a missing file.
         write_rel(
             &store,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: a\n---\n\n[[wiki/people/b]] and [[records/contacts/ghost]]\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nsummary: a\n---\n\n[[records/profiles/b]] and [[records/contacts/ghost]]\n",
         );
-        write_rel(&store, "wiki/people/b.md", &doc("wiki-page", "b"));
+        write_rel(&store, "records/profiles/b.md", &doc("profile", "b"));
 
         let s = compute(&store).expect("compute");
         assert_eq!(s.broken_link_count, 1, "only the ghost target is broken");
@@ -832,8 +834,8 @@ mod tests {
         // The same missing target twice => two broken-link occurrences.
         write_rel(
             &store,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: a\n---\n\n[[records/contacts/ghost]] [[records/contacts/ghost]]\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nsummary: a\n---\n\n[[records/contacts/ghost]] [[records/contacts/ghost]]\n",
         );
         let s = compute(&store).expect("compute");
         assert_eq!(
@@ -849,8 +851,8 @@ mod tests {
         // wiki edge (so this file stays an orphan) nor as a broken link.
         write_rel(
             &store,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: a\n---\n\nSee [Acme](https://acme.io/path).\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nsummary: a\n---\n\nSee [Acme](https://acme.io/path).\n",
         );
         let s = compute(&store).expect("compute");
         assert_eq!(s.broken_link_count, 0, "markdown links aren't graph edges");
@@ -896,14 +898,18 @@ mod tests {
         // one to a missing target, one to an existing target.
         write_rel(
             &store,
-            "wiki/pages/howto.md",
-            "---\ntype: wiki-page\nsummary: howto\n---\n\
+            "records/synthesis/howto.md",
+            "---\ntype: synthesis\nsummary: howto\n---\n\
              \nWrite links like this:\n\
              \n```\n[[records/contacts/ghost]]\n```\n\
              \nor this:\n\
-             \n~~~\n[[wiki/pages/real]]\n~~~\n",
+             \n~~~\n[[records/synthesis/real]]\n~~~\n",
         );
-        write_rel(&store, "wiki/pages/real.md", &doc("wiki-page", "real"));
+        write_rel(
+            &store,
+            "records/synthesis/real.md",
+            &doc("synthesis", "real"),
+        );
         let s = compute(&store).expect("compute");
         assert_eq!(
             s.broken_link_count, 0,
@@ -921,12 +927,12 @@ mod tests {
     #[test]
     fn a_link_to_an_existing_file_in_another_layer_resolves() {
         let (_d, store) = temp_store();
-        // wiki page links to a source file in a different layer; cross-layer
-        // full-path links resolve like any other.
+        // A records-layer profile links to a source file in the other layer;
+        // cross-layer full-path links resolve like any other.
         write_rel(
             &store,
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\nsummary: a\n---\n\nfrom [[sources/emails/2026/05/m]]\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\nsummary: a\n---\n\nfrom [[sources/emails/2026/05/m]]\n",
         );
         write_rel(&store, "sources/emails/2026/05/m.md", &doc("email", "m"));
 

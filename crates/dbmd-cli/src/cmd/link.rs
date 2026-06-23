@@ -21,8 +21,8 @@ use crate::cmd::write::{
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
-/// The three canonical layer dirs a full-path wiki-link target must start with.
-const LAYER_DIRS: [&str; 3] = ["sources", "records", "wiki"];
+/// The two canonical layer dirs a full-path wiki-link target must start with.
+const LAYER_DIRS: [&str; 2] = ["sources", "records"];
 
 /// Run `dbmd link`.
 ///
@@ -166,8 +166,8 @@ mod tests {
             "records/contacts/sarah"
         );
         assert_eq!(
-            canonical_link_target(&store, "wiki/topics/scale").unwrap(),
-            "wiki/topics/scale"
+            canonical_link_target(&store, "records/concepts/scale").unwrap(),
+            "records/concepts/scale"
         );
     }
 

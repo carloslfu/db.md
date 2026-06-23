@@ -45,7 +45,10 @@ store you operate on.
 
 ## What's out of scope
 
-- **Access control on the wiki layer.** db.md is filesystem-level.
+- **Access control on synthesis records.** Single-writer on
+  `meta-type: conclusion` records is a curator-contract convention, not an
+  enforced permission: it is a frontmatter property the agent honors, not a
+  filesystem boundary `dbmd` guards. db.md access control is filesystem-level.
 - **Encryption of file contents.** Use an encrypted filesystem
   (LUKS, FileVault, etc.) if the store contains sensitive data.
 - **PII redaction.** Operator's responsibility. The store's
@@ -55,7 +58,8 @@ store you operate on.
   prompt to inject. When an agent harness curates a store, a
   malicious source file could try to steer that agent. That risk
   lives in the harness, not in `dbmd`; operators should review
-  agent-generated wiki edits before treating them as authoritative.
+  agent-authored records — especially synthesis records carrying
+  `meta-type: conclusion` — before treating them as authoritative.
 
 ## Supply chain
 

@@ -1,11 +1,11 @@
 {
-  "_comment": "Hand-derived from SPEC.md § Validation and from exactly what corpus-b-edges breaks. This is the complete set of issues `dbmd validate --all --json tests/corpora/corpus-b-edges` MUST emit — no more, no fewer. Every issue is intent-derived (what MUST be true per the SPEC), never copied from tool output. NOT_A_STORE lives in EXPECTED/not-a-store.json (separate invocation). POLICY_FROZEN_PAGE lives in EXPECTED/policy-refusal/ (write-time). See EXPECTED/README.md for the per-code fixture map and the precedence rules. Issues are sorted by (file, line, code) for stable diffing; compare order-independently or sort tool output identically.",
+  "_comment": "Hand-derived from SPEC.md § Validation and from exactly what corpus-b-edges breaks. This is the complete set of issues `dbmd validate --all --json tests/corpora/corpus-b-edges` MUST emit — no more, no fewer. Every issue is intent-derived (what MUST be true per the SPEC), never copied from tool output. The db.md store has two layers only — sources/ and records/; the wiki/ layer was removed, so the former wiki/ synthesis pages are now records/synthesis/ files carrying a real type plus meta-type: conclusion, and the misplaced contact is now records/clients/. NOT_A_STORE lives in EXPECTED/not-a-store.json (separate invocation). POLICY_FROZEN_PAGE lives in EXPECTED/policy-refusal/ (write-time). See EXPECTED/README.md for the per-code fixture map and the precedence rules. Issues are sorted by (file, line, code) for stable diffing; compare order-independently or sort tool output identically.",
   "scope": "all",
   "store": "tests/corpora/corpus-b-edges",
   "summary": {
-    "errors": 44,
+    "errors": 41,
     "info": 1,
-    "total": 59,
+    "total": 56,
     "warnings": 14
   },
   "issues": [
@@ -38,6 +38,18 @@
       "related": [],
       "severity": "warning",
       "suggestion": "append corrective entries; never reorder past ones"
+    },
+    {
+      "code": "INDEX_JSONL_STALE",
+      "file": "records/clients/index.jsonl",
+      "key": "company",
+      "line": null,
+      "message": "`index.jsonl` record for `records/clients/misplaced-contact.md` is stale (company)",
+      "related": [
+        "records/clients/misplaced-contact.md"
+      ],
+      "severity": "error",
+      "suggestion": "run `dbmd index rebuild`"
     },
     {
       "code": "DUP_UNIQUE_KEY",
@@ -425,7 +437,7 @@
       "message": "short-form wiki-link `[[northstar]]` matches multiple files",
       "related": [
         "records/companies/northstar.md",
-        "wiki/companies/northstar.md"
+        "records/synthesis/northstar.md"
       ],
       "severity": "error",
       "suggestion": "use the full store-relative path to disambiguate"
@@ -523,6 +535,16 @@
       "suggestion": "use block form: one `- <tag>` per line"
     },
     {
+      "code": "INDEX_ORPHAN",
+      "file": "records/people/index.md",
+      "key": null,
+      "line": null,
+      "message": "`records/people/index.md` sits in an empty or non-canonical folder",
+      "related": [],
+      "severity": "warning",
+      "suggestion": "remove it, or run `dbmd index rebuild`"
+    },
+    {
       "code": "INDEX_JSONL_MISSING",
       "file": "records/playbooks/index.jsonl",
       "key": null,
@@ -557,6 +579,29 @@
       "suggestion": "change the `type`, or remove it from DB.md `### Ignored types` if it should be managed"
     },
     {
+      "code": "POLICY_IGNORED_TYPE_DERIVED",
+      "file": "records/synthesis/derived-from-ignored.md",
+      "key": "derived_from",
+      "line": 10,
+      "message": "conclusion record derives from ignored-type record `records/scratch/throwaway` (type `test`)",
+      "related": [
+        "records/scratch/throwaway.md",
+        "DB.md"
+      ],
+      "severity": "warning",
+      "suggestion": "drop this `derived_from` link, or remove the target type from DB.md `### Ignored types`"
+    },
+    {
+      "code": "WIKI_LINK_FLOW_FORM_LIST",
+      "file": "records/synthesis/flow-form-list.md",
+      "key": "derived_from",
+      "line": 9,
+      "message": "`derived_from` uses inline flow form `[[[a]], [[b]]]`",
+      "related": [],
+      "severity": "error",
+      "suggestion": "use YAML block-sequence form: one `- [[...]]` per line"
+    },
+    {
       "code": "DUP_UNIQUE_KEY",
       "file": "sources/emails/2026/05/2026-05-22-renewal-a.md",
       "key": null,
@@ -586,87 +631,6 @@
       "message": "file `sources/emails/2026/05/bad-timestamp.md` is missing from the complete `index.jsonl`",
       "related": [
         "sources/emails/2026/05/bad-timestamp.md"
-      ],
-      "severity": "error",
-      "suggestion": "run `dbmd index rebuild`"
-    },
-    {
-      "code": "INDEX_JSONL_STALE",
-      "file": "wiki/companies/index.jsonl",
-      "key": "derived_from",
-      "line": null,
-      "message": "`index.jsonl` record for `wiki/companies/northstar.md` is stale (derived_from)",
-      "related": [
-        "wiki/companies/northstar.md"
-      ],
-      "severity": "error",
-      "suggestion": "run `dbmd index rebuild`"
-    },
-    {
-      "code": "INDEX_JSONL_STALE",
-      "file": "wiki/contacts/index.jsonl",
-      "key": "company",
-      "line": null,
-      "message": "`index.jsonl` record for `wiki/contacts/misplaced-contact.md` is stale (company)",
-      "related": [
-        "wiki/contacts/misplaced-contact.md"
-      ],
-      "severity": "error",
-      "suggestion": "run `dbmd index rebuild`"
-    },
-    {
-      "code": "INDEX_ORPHAN",
-      "file": "wiki/people/index.md",
-      "key": null,
-      "line": null,
-      "message": "`wiki/people/index.md` sits in an empty or non-canonical folder",
-      "related": [],
-      "severity": "warning",
-      "suggestion": "remove it, or run `dbmd index rebuild`"
-    },
-    {
-      "code": "POLICY_IGNORED_TYPE_DERIVED",
-      "file": "wiki/synthesis/derived-from-ignored.md",
-      "key": "derived_from",
-      "line": 9,
-      "message": "wiki-page derives from ignored-type record `records/scratch/throwaway` (type `test`)",
-      "related": [
-        "records/scratch/throwaway.md",
-        "DB.md"
-      ],
-      "severity": "warning",
-      "suggestion": "drop this `derived_from` link, or remove the target type from DB.md `### Ignored types`"
-    },
-    {
-      "code": "WIKI_LINK_FLOW_FORM_LIST",
-      "file": "wiki/synthesis/flow-form-list.md",
-      "key": "derived_from",
-      "line": 8,
-      "message": "`derived_from` uses inline flow form `[[[a]], [[b]]]`",
-      "related": [],
-      "severity": "error",
-      "suggestion": "use YAML block-sequence form: one `- [[...]]` per line"
-    },
-    {
-      "code": "INDEX_JSONL_STALE",
-      "file": "wiki/synthesis/index.jsonl",
-      "key": "derived_from",
-      "line": null,
-      "message": "`index.jsonl` record for `wiki/synthesis/derived-from-ignored.md` is stale (derived_from)",
-      "related": [
-        "wiki/synthesis/derived-from-ignored.md"
-      ],
-      "severity": "error",
-      "suggestion": "run `dbmd index rebuild`"
-    },
-    {
-      "code": "INDEX_JSONL_STALE",
-      "file": "wiki/synthesis/index.jsonl",
-      "key": "derived_from",
-      "line": null,
-      "message": "`index.jsonl` record for `wiki/synthesis/flow-form-list.md` is stale (derived_from)",
-      "related": [
-        "wiki/synthesis/flow-form-list.md"
       ],
       "severity": "error",
       "suggestion": "run `dbmd index rebuild`"

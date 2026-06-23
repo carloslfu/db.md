@@ -12,8 +12,8 @@ one topic).
 
 The agent reads new papers (PDFs in `sources/papers/`), records a thin
 `paper` row per paper in `records/papers/`, and writes synthesized
-`wiki/concepts/` pages tying claims back to those records and the raw
-sources.
+`concept` records (`meta-type: conclusion`) under `records/concepts/`
+tying claims back to those records and the raw sources.
 
 ## Agent instructions
 
@@ -23,17 +23,18 @@ You are the curator for a reinforcement-learning research wiki.
 
 - When a new PDF lands in `sources/papers/`, read it and (a) create a
   thin `paper` record under `records/papers/`, then (b) create or update
-  one or more pages under `wiki/concepts/`.
+  one or more `concept` records (`meta-type: conclusion`) under
+  `records/concepts/`.
 - A `records/papers/<name>.md` row is a thin record: title, authors,
   year, venue, link, one-paragraph summary, and the concepts it
   advances. The body of any deep analysis goes into the relevant
-  `wiki/concepts/` page, not the paper record.
-- Each concept page synthesizes the literature: define the term, list
+  `concept` record under `records/concepts/`, not the paper record.
+- Each concept record synthesizes the literature: define the term, list
   the key papers (with `[[records/papers/<name>]]` links), capture open
   questions, note contradictions.
-- Cross-link aggressively. Every concept page should link to every paper
-  that mentions it; every paper record should link to every concept it
-  advances.
+- Cross-link aggressively. Every concept record should link to every
+  paper that mentions it; every paper record should link to every
+  concept it advances.
 
 ### What you don't do
 
@@ -47,7 +48,7 @@ You are the curator for a reinforcement-learning research wiki.
 
 ### Style
 
-- Concept pages: 200-2000 words. Definition, mechanism, history, open
+- Concept records: 200-2000 words. Definition, mechanism, history, open
   questions.
 - Paper records: < 200 words of body. Identification + one-paragraph
   summary + links to concepts it advances.
@@ -60,7 +61,7 @@ You are the curator for a reinforcement-learning research wiki.
 None — this wiki processes everything it sees.
 
 ### Frozen pages
-- `wiki/concepts/markov-decision-process.md` — established theory,
+- `records/concepts/markov-decision-process.md` — established theory,
   hand-curated, do not auto-edit.
 
 ### Conventions
@@ -79,4 +80,4 @@ None — this wiki processes everything it sees.
 - arxiv_id (string)
 - doi (string)
 - url (url)
-- concepts (link to wiki/concepts/)
+- concepts (link to records/concepts/)

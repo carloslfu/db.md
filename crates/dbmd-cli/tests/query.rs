@@ -99,15 +99,18 @@ fn limit_caps_the_result_count() {
 
 #[test]
 fn in_layer_scopes_results() {
-    // `--type wiki-page --in records` must be empty (wiki-pages live in wiki/).
-    let in_records = query_paths(&["--type", "wiki-page", "--in", "records"]);
+    // A records-layer type is found when scoped to `records`, and absent when
+    // scoped to `sources` — `--in` scopes by layer.
+    let in_records = query_paths(&["--type", "contact", "--in", "records"]);
     assert!(
-        in_records.is_empty(),
-        "wiki-page records are not under records/: {in_records:?}"
+        !in_records.is_empty(),
+        "contacts live under records/: {in_records:?}"
     );
-    // The same type scoped to its real layer is non-empty.
-    let in_wiki = query_paths(&["--type", "wiki-page", "--in", "wiki"]);
-    assert!(!in_wiki.is_empty(), "wiki-pages live under wiki/");
+    let in_sources = query_paths(&["--type", "contact", "--in", "sources"]);
+    assert!(
+        in_sources.is_empty(),
+        "contacts are not under sources/: {in_sources:?}"
+    );
 }
 
 #[test]

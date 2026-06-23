@@ -117,6 +117,8 @@ pub mod codes {
     pub const FM_MALFORMED_YAML: &str = "FM_MALFORMED_YAML";
     /// `created` or `updated` isn't ISO-8601.
     pub const FM_BAD_TIMESTAMP: &str = "FM_BAD_TIMESTAMP";
+    /// `meta-type` is present but not one of fact / operational / conclusion.
+    pub const FM_BAD_META_TYPE: &str = "FM_BAD_META_TYPE";
     /// content file has no `summary`.
     pub const SUMMARY_MISSING: &str = "SUMMARY_MISSING";
     /// `summary` present but empty.
@@ -151,7 +153,7 @@ pub mod codes {
     pub const POLICY_FROZEN_PAGE: &str = "POLICY_FROZEN_PAGE";
     /// a file with an `### Ignored types` type exists.
     pub const POLICY_IGNORED_TYPE_PRESENT: &str = "POLICY_IGNORED_TYPE_PRESENT";
-    /// a `wiki-page` derives from an ignored-type record.
+    /// a `meta-type: conclusion` record derives from an ignored-type record.
     pub const POLICY_IGNORED_TYPE_DERIVED: &str = "POLICY_IGNORED_TYPE_DERIVED";
     /// a `log.md` entry header timestamp is unparseable.
     pub const LOG_BAD_TIMESTAMP: &str = "LOG_BAD_TIMESTAMP";
@@ -537,6 +539,31 @@ fn check_frontmatter(
         );
     }
 
+    // ── meta-type (records-only epistemic class; closed enum) ─────────────────
+    // Present-but-out-of-enum is an error; absent is fine (effective default
+    // `fact`). Sources don't normally carry one, but validating the value when
+    // present is layer-agnostic and harmless.
+    if is_content {
+        if let Some(mt) = fm.get("meta-type").and_then(scalar_string) {
+            if !matches!(mt.as_str(), "fact" | "operational" | "conclusion") {
+                push(
+                    issues,
+                    Severity::Error,
+                    codes::FM_BAD_META_TYPE,
+                    rel,
+                    fm_key_line_or_top(fm_yaml, "meta-type"),
+                    Some("meta-type".into()),
+                    format!("`meta-type: {mt}` is not one of fact / operational / conclusion"),
+                    Some(
+                        "use one of: fact, operational, conclusion (or omit for the default `fact`)"
+                            .into(),
+                    ),
+                    vec![],
+                );
+            }
+        }
+    }
+
     // ── summary (universal on content files) ──────────────────────────────────
     if is_content {
         check_summary(rel, fm, fm_yaml, issues);
@@ -690,9 +717,13 @@ fn check_frontmatter(
         // decision lives in the shared `derived_from_ignored_type` entry point;
         // this side only supplies the `derived_from` targets (with their line,
         // which the issue carries) and renders the finding.
+        let meta_type = fm
+            .get("meta-type")
+            .and_then(scalar_string)
+            .unwrap_or_else(|| "fact".to_string());
         for link in frontmatter_links_for_key(fm_yaml, "derived_from", 2) {
             if let Some(hit) =
-                derived_from_ignored_type(store, t, std::iter::once(link.target.as_str()))
+                derived_from_ignored_type(store, &meta_type, std::iter::once(link.target.as_str()))
             {
                 push(
                     issues,
@@ -702,7 +733,7 @@ fn check_frontmatter(
                     Some(link.line),
                     Some("derived_from".into()),
                     format!(
-                        "wiki-page derives from ignored-type record `{}` (type `{}`)",
+                        "conclusion record derives from ignored-type record `{}` (type `{}`)",
                         hit.target, hit.target_type
                     ),
                     Some(
@@ -936,7 +967,7 @@ fn check_wiki_link(
             line,
             key.map(str::to_string),
             format!("wiki-link target `{bare}` is not a safe store-relative path"),
-            Some("use a full store-relative path under sources/, records/, or wiki/".into()),
+            Some("use a full store-relative path under sources/ or records/".into()),
             vec![],
         ),
     }
@@ -1169,9 +1200,7 @@ fn check_schema_link(
                     line,
                     Some(field.to_string()),
                     format!("wiki-link target `{bare}` is not a safe store-relative path"),
-                    Some(
-                        "use a full store-relative path under sources/, records/, or wiki/".into(),
-                    ),
+                    Some("use a full store-relative path under sources/ or records/".into()),
                     vec![],
                 ),
             }
@@ -1438,7 +1467,6 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
             match layer {
                 "sources" => layers_present.insert("sources"),
                 "records" => layers_present.insert("records"),
-                "wiki" => layers_present.insert("wiki"),
                 _ => false,
             };
         }
@@ -1546,7 +1574,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
         let parent = rel.parent().unwrap_or(Path::new("")).to_path_buf();
         let parent_str = parent.to_string_lossy().to_string();
         let is_canonical = parent_str.is_empty() // root
-            || matches!(parent_str.as_str(), "sources" | "records" | "wiki")
+            || matches!(parent_str.as_str(), "sources" | "records")
             || type_folders.contains_key(&parent);
         if !is_canonical {
             push(
@@ -2386,7 +2414,7 @@ fn is_content_file(rel: &Path) -> bool {
     let Some(first) = rel.iter().next().and_then(|s| s.to_str()) else {
         return false;
     };
-    if !matches!(first, "sources" | "records" | "wiki") {
+    if !matches!(first, "sources" | "records") {
         return false;
     }
     let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -2821,7 +2849,7 @@ fn is_full_store_path(bare: &str) -> bool {
     let mut parts = bare.splitn(2, '/');
     let first = parts.next().unwrap_or("");
     let has_rest = parts.next().map(|r| !r.is_empty()).unwrap_or(false);
-    matches!(first, "sources" | "records" | "wiki") && has_rest
+    matches!(first, "sources" | "records") && has_rest
 }
 
 /// True if a path contains only normal relative components. Validator inputs
@@ -2915,7 +2943,7 @@ fn type_folder_of(rel: &Path) -> Option<PathBuf> {
     if comps.len() < 3 {
         return None; // need layer/type-folder/file at minimum
     }
-    if !matches!(comps[0], "sources" | "records" | "wiki") {
+    if !matches!(comps[0], "sources" | "records") {
         return None;
     }
     Some(PathBuf::from(comps[0]).join(comps[1]))
@@ -2937,7 +2965,7 @@ fn type_folder_of(rel: &Path) -> Option<PathBuf> {
 /// errors than the default working-set scope on the same store.
 fn walk_content_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for layer in ["sources", "records", "wiki"] {
+    for layer in ["sources", "records"] {
         let base = root.join(layer);
         if !base.is_dir() {
             continue;
@@ -2976,7 +3004,7 @@ fn walk_index_files(root: &Path) -> Vec<PathBuf> {
     if root.join("index.md").is_file() {
         out.push(PathBuf::from("index.md"));
     }
-    for layer in ["sources", "records", "wiki"] {
+    for layer in ["sources", "records"] {
         let base = root.join(layer);
         if !base.is_dir() {
             continue;
@@ -3305,14 +3333,14 @@ pub struct DerivedFromIgnored {
 /// resolution, and `ignored_types` membership — does not.
 pub fn derived_from_ignored_type<I, S>(
     store: &Store,
-    type_: &str,
+    meta_type: &str,
     derived_from_targets: I,
 ) -> Option<DerivedFromIgnored>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    if type_ != "wiki-page" || store.config.ignored_types.is_empty() {
+    if meta_type != "conclusion" || store.config.ignored_types.is_empty() {
         return None;
     }
     for target in derived_from_targets {
@@ -3703,7 +3731,7 @@ mod tests {
                 "---\ntype: db-md\nscope: company\nowner: Test\n---\n",
             )
             .unwrap();
-            for layer in ["sources", "records", "wiki"] {
+            for layer in ["sources", "records"] {
                 fs::create_dir_all(dir.path().join(layer)).unwrap();
             }
             Fixture {
@@ -3991,7 +4019,7 @@ mod tests {
     fn content_file_with_no_frontmatter_block_reports_type_and_summary() {
         let fx = Fixture::new();
         fx.write(
-            "wiki/people/a.md",
+            "records/profiles/a.md",
             "# Just a heading\n\nNo frontmatter here.\n",
         );
         let issues = fx.store_all();
@@ -4002,7 +4030,7 @@ mod tests {
     #[test]
     fn content_file_with_empty_frontmatter_reports_type_and_summary() {
         let fx = Fixture::new();
-        fx.write("wiki/people/a.md", "---\n---\n\nbody\n");
+        fx.write("records/profiles/a.md", "---\n---\n\nbody\n");
         let issues = fx.store_all();
         assert!(has(&issues, codes::FM_MISSING_TYPE), "{issues:#?}");
         assert!(has(&issues, codes::SUMMARY_MISSING), "{issues:#?}");
@@ -4074,23 +4102,23 @@ mod tests {
     fn summary_missing_empty_multiline_toolong() {
         let fx = Fixture::new();
         fx.write(
-            "wiki/people/missing.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\n---\n\nbody\n",
+            "records/profiles/missing.md",
+            "---\ntype: profile\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\n---\n\nbody\n",
         );
         fx.write(
-            "wiki/people/empty.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: \"   \"\n---\n\nbody\n",
+            "records/profiles/empty.md",
+            "---\ntype: profile\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: \"   \"\n---\n\nbody\n",
         );
         let long = "x".repeat(201);
         fx.write(
-            "wiki/people/long.md",
-            &format!("---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: \"{long}\"\n---\n\nbody\n"),
+            "records/profiles/long.md",
+            &format!("---\ntype: profile\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: \"{long}\"\n---\n\nbody\n"),
         );
         let issues = fx.store_all();
         assert!(has(&issues, codes::SUMMARY_MISSING));
         assert_eq!(
             find(&issues, codes::SUMMARY_MISSING).file,
-            PathBuf::from("wiki/people/missing.md")
+            PathBuf::from("records/profiles/missing.md")
         );
         assert!(has(&issues, codes::SUMMARY_EMPTY));
         assert!(has(&issues, codes::SUMMARY_TOO_LONG));
@@ -4105,8 +4133,8 @@ mod tests {
         let fx = Fixture::new();
         // A literal block scalar produces a value with a newline.
         fx.write(
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: |\n  line one\n  line two\n---\n\nbody\n",
+            "records/profiles/a.md",
+            "---\ntype: profile\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: |\n  line one\n  line two\n---\n\nbody\n",
         );
         let issues = fx.store_all();
         assert!(has(&issues, codes::SUMMARY_MULTILINE), "{issues:#?}");
@@ -4185,7 +4213,7 @@ mod tests {
         let fx = Fixture::new();
         let mut body = valid_contact("links to a short form");
         body.push_str("\nSee [[sarah-chen]] for details.\n");
-        fx.write("wiki/people/a.md", &body);
+        fx.write("records/contacts/a.md", &body);
         let issues = fx.store_all();
         let issue = find(&issues, codes::WIKI_LINK_SHORT_FORM);
         assert!(issue.is_error());
@@ -4204,7 +4232,7 @@ mod tests {
         let fx = Fixture::new();
         let mut body = valid_contact("links to a missing file");
         body.push_str("\nSee [[records/contacts/ghost]].\n");
-        fx.write("wiki/people/a.md", &body);
+        fx.write("records/contacts/a.md", &body);
         let issues = fx.store_all();
         let issue = find(&issues, codes::WIKI_LINK_BROKEN);
         assert!(issue.is_error());
@@ -4217,7 +4245,7 @@ mod tests {
         let fx = Fixture::new();
         let mut body = valid_contact("links with traversal");
         body.push_str("\nSee [[records/contacts/../../ghost]].\n");
-        fx.write("wiki/people/a.md", &body);
+        fx.write("records/contacts/a.md", &body);
         let issues = fx.store_all();
         let issue = find(&issues, codes::WIKI_LINK_BROKEN);
         assert!(issue.message.contains("not a safe store-relative path"));
@@ -4242,7 +4270,7 @@ mod tests {
         fx.write("records/contacts/target.md", &valid_contact("target"));
         let mut body = valid_contact("links with extension");
         body.push_str("\nSee [[records/contacts/target.md]].\n");
-        fx.write("wiki/people/a.md", &body);
+        fx.write("records/contacts/a.md", &body);
         let issues = fx.store_all();
         let issue = find(&issues, codes::WIKI_LINK_HAS_EXTENSION);
         assert_eq!(issue.severity, Severity::Warning);
@@ -4304,8 +4332,8 @@ mod tests {
         // `related` is a *custom* (non-schema) wiki-link field, so it goes
         // through the generic doctrine path → a short form is WIKI_LINK_SHORT_FORM.
         fx.write(
-            "wiki/people/a.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nrelated: \"[[sarah-chen]]\"\n---\n\n# A\n",
+            "records/synthesis/a.md",
+            "---\ntype: synthesis\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nrelated: \"[[sarah-chen]]\"\n---\n\n# A\n",
         );
         let issues = fx.store_all();
         let issue = find(&issues, codes::WIKI_LINK_SHORT_FORM);
@@ -4321,23 +4349,23 @@ mod tests {
         // full-path one with a missing target must report BROKEN.
         let fx = Fixture::new();
         fx.write(
-            "wiki/people/short.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nrelated: [[sarah-chen]]\n---\n\n# A\n",
+            "records/synthesis/short.md",
+            "---\ntype: synthesis\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nrelated: [[sarah-chen]]\n---\n\n# A\n",
         );
         fx.write(
-            "wiki/people/broken.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nrelated: [[records/contacts/ghost]]\n---\n\n# A\n",
+            "records/synthesis/broken.md",
+            "---\ntype: synthesis\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nrelated: [[records/contacts/ghost]]\n---\n\n# A\n",
         );
         let issues = fx.store_all();
         assert!(
             issues.iter().any(|i| i.code == codes::WIKI_LINK_SHORT_FORM
-                && i.file == Path::new("wiki/people/short.md")
+                && i.file == Path::new("records/synthesis/short.md")
                 && i.key.as_deref() == Some("related")),
             "unquoted short-form frontmatter link must be caught: {issues:#?}"
         );
         assert!(
             issues.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN
-                && i.file == Path::new("wiki/people/broken.md")),
+                && i.file == Path::new("records/synthesis/broken.md")),
             "unquoted full-path frontmatter link to a missing file must be caught: {issues:#?}"
         );
     }
@@ -4695,16 +4723,19 @@ mod tests {
     }
 
     #[test]
-    fn wiki_page_derived_from_ignored_type_warns() {
+    fn conclusion_record_derived_from_ignored_type_warns() {
         let mut fx = Fixture::new();
         fx.config.ignored_types.push("temp".into());
         fx.write(
             "records/temps/x.md",
             "---\ntype: temp\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: a temp\n---\n\n# x\n",
         );
+        // The policy now gates on `meta-type: conclusion` (not the retired
+        // `type: wiki-page`): a conclusion record that derives from an
+        // ignored-type record warns.
         fx.write(
-            "wiki/themes/t.md",
-            "---\ntype: wiki-page\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: derived\nderived_from: \"[[records/temps/x]]\"\n---\n\n# t\n",
+            "records/synthesis/t.md",
+            "---\ntype: synthesis\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: derived\nderived_from: \"[[records/temps/x]]\"\n---\n\n# t\n",
         );
         let issues = fx.store_all();
         let issue = find(&issues, codes::POLICY_IGNORED_TYPE_DERIVED);
@@ -4716,9 +4747,10 @@ mod tests {
     /// The shared `derived_from_ignored_type` entry point — the single
     /// policy-decision both `dbmd validate` (read) and `dbmd write` (write-time
     /// warning) now route through, so they cannot diverge. This pins its
-    /// contract directly: the type gate, the empty-ignored-types gate, a
-    /// positive match carrying the resolved target type, and a non-ignored
-    /// target rejected.
+    /// contract directly: the meta-type gate (now `meta-type: conclusion`, not
+    /// the retired `type: wiki-page`), the empty-ignored-types gate, a positive
+    /// match carrying the resolved target type, and a non-ignored target
+    /// rejected.
     #[test]
     fn derived_from_ignored_type_is_the_shared_policy_decision() {
         let mut fx = Fixture::new();
@@ -4735,25 +4767,26 @@ mod tests {
         );
         let store = fx.store();
 
-        // Positive: a wiki-page deriving from the ignored-type record matches,
-        // and the hit carries both the target (as written) and its resolved type.
+        // Positive: a conclusion record deriving from the ignored-type record
+        // matches, and the hit carries both the target (as written) and its
+        // resolved type.
         let hit =
-            derived_from_ignored_type(&store, "wiki-page", std::iter::once("records/secrets/s"))
-                .expect("wiki-page → ignored-type record must match");
+            derived_from_ignored_type(&store, "conclusion", std::iter::once("records/secrets/s"))
+                .expect("conclusion → ignored-type record must match");
         assert_eq!(hit.target, "records/secrets/s");
         assert_eq!(hit.target_type, "secret");
 
-        // Type gate: a non-`wiki-page` type never triggers, even with the same
-        // ignored-type target.
+        // Meta-type gate: a non-`conclusion` meta-type never triggers, even with
+        // the same ignored-type target.
         assert_eq!(
-            derived_from_ignored_type(&store, "contact", std::iter::once("records/secrets/s")),
+            derived_from_ignored_type(&store, "fact", std::iter::once("records/secrets/s")),
             None,
-            "only wiki-page derivation is policed"
+            "only conclusion derivation is policed"
         );
 
-        // Target gate: a wiki-page deriving from a non-ignored record is fine.
+        // Target gate: a conclusion deriving from a non-ignored record is fine.
         assert_eq!(
-            derived_from_ignored_type(&store, "wiki-page", std::iter::once("records/contacts/c")),
+            derived_from_ignored_type(&store, "conclusion", std::iter::once("records/contacts/c")),
             None,
             "deriving from a non-ignored type is allowed"
         );
@@ -4761,7 +4794,7 @@ mod tests {
         // First match wins across multiple targets (here the second is the hit).
         let hit = derived_from_ignored_type(
             &store,
-            "wiki-page",
+            "conclusion",
             ["records/contacts/c", "records/secrets/s"],
         )
         .expect("a later ignored-type target must still be found");
@@ -4771,7 +4804,7 @@ mod tests {
         fx.config.ignored_types.clear();
         let store = fx.store();
         assert_eq!(
-            derived_from_ignored_type(&store, "wiki-page", std::iter::once("records/secrets/s")),
+            derived_from_ignored_type(&store, "conclusion", std::iter::once("records/secrets/s")),
             None,
             "an empty ignored-types policy short-circuits"
         );

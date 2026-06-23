@@ -14,6 +14,6 @@ status: archived
 
 Plain-text extraction of the signed Northstar MSA. Governs the Acme PM
 contract, including the seat-based pricing and the volume-discount
-tiers referenced in the renewal — see [[wiki/projects/northstar-renewal]].
+tiers referenced in the renewal — see [[records/projects/northstar-renewal]].
 
 Original PDF in [the shared drive](/Volumes/share/contracts/northstar-msa.pdf).

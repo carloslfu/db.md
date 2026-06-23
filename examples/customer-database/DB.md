@@ -12,15 +12,16 @@ Lightweight, agent-queryable customer database. Sits alongside HubSpot
 layer: who do we know at company X, what was discussed last, where are
 we in their renewal cycle.
 
-The three layers compose for that recall:
+The two layers compose for that recall:
 
 - `sources/` — raw evidence pulled in from outside: Gong call
   transcripts and HubSpot exports, preserved verbatim.
 - `records/` — atomic typed data the team maintains: one `contact`
   record per person, one `company` record per account, one `call`
-  record per logged conversation, cross-linked.
-- `wiki/` — the curator's synthesis: one denormalized account page per
-  company for fast agent context, plus account-pulse signals.
+  record per logged conversation, cross-linked. The curator's synthesis
+  also lives here as `meta-type: conclusion` records: one denormalized
+  `account` record per company for fast agent context, plus
+  account-pulse signals as a `synthesis` record.
 
 ## Agent instructions
 
@@ -36,9 +37,10 @@ customer relationships.
   records, and link back to the transcript it was derived from.
 - Maintain `last_touch` on `contact` records — update it on every new
   email, call, or note.
-- Keep the per-account wiki page in `wiki/accounts/` current, and flag
-  account-level signals (expansion, churn risk, renewal countdown) in
-  `wiki/synthesis/account-pulse.md`.
+- Keep the per-account record in `records/accounts/`
+  (`meta-type: conclusion`) current, and flag account-level signals
+  (expansion, churn risk, renewal countdown) in
+  `records/synthesis/account-pulse.md`.
 - Keep `summary` fields one line and current — refresh a contact's
   summary when its role changes.
 
@@ -51,10 +53,10 @@ What you don't do:
 ## Policies
 
 ### Frozen pages
-- `wiki/synthesis/account-pulse.md` — RevOps-owned account signals; do not modify.
+- `records/synthesis/account-pulse.md` — RevOps-owned account signals; do not modify.
 
 ### Ignored types
-- `test` — read as ambient context but never synthesised into records or wiki pages.
+- `test` — read as ambient context but never synthesised into records or `meta-type: conclusion` records.
 
 ## Schemas
 

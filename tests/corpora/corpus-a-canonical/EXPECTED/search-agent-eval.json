@@ -1,13 +1,13 @@
 {
-  "_comment": "Golden-master for the Block 7 agent-eval `dbmd search` eval over corpus-a-canonical: 20 representative queries spanning --type, --in, and --updated-after (the plan's Block 7 search-eval requirement). Queries 1-10 mirror this corpus's own EXPECTED/search.json (already-audited goldens); queries 11-20 are additional intent-derived cases. `matches` is the complete set, sorted by store-relative path ascending, derived from corpus content + the SPEC search contract (embedded ripgrep over the frontmatter+body of every CONTENT file; meta files DB.md/index.md/index.jsonl/log.md never match; --type narrows by frontmatter type, --in by layer, --updated-after compares the frontmatter `updated` strictly-after). Query strings are ripgrep regexes, case-sensitive by default. Consumed by crates/dbmd-cli/tests/agent_eval.rs.",
+  "_comment": "Golden-master for the Block 7 agent-eval `dbmd search` eval over corpus-a-canonical: 20 representative queries spanning --type, --in, --where, and --updated-after (the plan's Block 7 search-eval requirement). Queries 1-10 mirror this corpus's own EXPECTED/search.json (already-audited goldens); queries 11-20 are additional intent-derived cases. `matches` is the complete set, sorted by store-relative path ascending, derived from corpus content + the SPEC search contract (embedded ripgrep over the frontmatter+body of every CONTENT file; meta files DB.md/index.md/index.jsonl/log.md never match; --type narrows by frontmatter type, --in by layer (sources/records — the wiki layer is gone, synthesis pages are now `meta-type: conclusion` records), --where by frontmatter key=value, --updated-after compares the frontmatter `updated` strictly-after). Query strings are ripgrep regexes, case-sensitive by default. Consumed by crates/dbmd-cli/tests/agent_eval.rs.",
   "queries": [
     {
       "query": "volume discount",
       "args": [],
-      "intent": "Plain phrase, no filter; appears in the renewal call record and the project wiki page.",
+      "intent": "Plain phrase, no filter; appears in the renewal call record and the project conclusion record.",
       "matches": [
         "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md",
-        "wiki/projects/northstar-renewal.md"
+        "records/projects/northstar-renewal.md"
       ]
     },
     {
@@ -21,24 +21,26 @@
     {
       "query": "async",
       "args": [],
-      "intent": "Case-sensitive default term in Elena's contact record and her wiki bio.",
+      "intent": "Case-sensitive default term in Elena's contact record and her profile conclusion.",
       "matches": [
         "records/contacts/elena-rodriguez.md",
-        "wiki/people/elena-rodriguez.md"
+        "records/profiles/elena-rodriguez.md"
       ]
     },
     {
       "query": "renewal",
       "args": [
         "--in",
-        "wiki"
+        "records",
+        "--where",
+        "meta-type=conclusion"
       ],
-      "intent": "Layer-scoped: only wiki/ content files containing `renewal`.",
+      "intent": "Meta-type-scoped: only `meta-type: conclusion` records (former wiki synthesis pages) containing `renewal`.",
       "matches": [
-        "wiki/people/elena-rodriguez.md",
-        "wiki/people/sarah-chen.md",
-        "wiki/projects/northstar-renewal.md",
-        "wiki/synthesis/2026-renewal-plan.md"
+        "records/profiles/elena-rodriguez.md",
+        "records/profiles/sarah-chen.md",
+        "records/projects/northstar-renewal.md",
+        "records/synthesis/2026-renewal-plan.md"
       ]
     },
     {
@@ -151,25 +153,31 @@
         "--in",
         "records"
       ],
-      "intent": "Layer-scoped to records; the Acme company, the Northstar account it owns, and the two contacts that name Acme.",
+      "intent": "Layer-scoped to records; the Acme company, the Northstar account it owns, the two contacts that name Acme, and the four conclusion records (the former wiki bios/project/plan) that all cite the Acme account.",
       "matches": [
         "records/companies/acme.md",
         "records/companies/northstar.md",
         "records/contacts/david-kim.md",
-        "records/contacts/sarah-chen.md"
+        "records/contacts/sarah-chen.md",
+        "records/profiles/elena-rodriguez.md",
+        "records/profiles/sarah-chen.md",
+        "records/projects/northstar-renewal.md",
+        "records/synthesis/2026-renewal-plan.md"
       ]
     },
     {
       "query": "175",
       "args": [
         "--in",
-        "wiki"
+        "records",
+        "--where",
+        "meta-type=conclusion"
       ],
-      "intent": "Layer-scoped to wiki; the three synthesis pages that cite the 175-seat figure.",
+      "intent": "Meta-type-scoped to conclusion records; the three synthesis pages that cite the 175-seat figure.",
       "matches": [
-        "wiki/people/sarah-chen.md",
-        "wiki/projects/northstar-renewal.md",
-        "wiki/synthesis/2026-renewal-plan.md"
+        "records/profiles/sarah-chen.md",
+        "records/projects/northstar-renewal.md",
+        "records/synthesis/2026-renewal-plan.md"
       ]
     },
     {
@@ -232,13 +240,13 @@
       "query": "renewal",
       "args": [
         "--type",
-        "wiki-page",
+        "synthesis",
         "--updated-after",
         "2026-05-23"
       ],
-      "intent": "Type + recency cutoff that excludes the 2026-05-22 bios/project, keeping only the 2026-05-23 synthesis page.",
+      "intent": "Type + recency cutoff: the lone `synthesis`-type conclusion record (2026-05-23), excluding the 2026-05-22 profiles/project.",
       "matches": [
-        "wiki/synthesis/2026-renewal-plan.md"
+        "records/synthesis/2026-renewal-plan.md"
       ]
     }
   ]

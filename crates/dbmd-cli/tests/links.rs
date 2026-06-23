@@ -118,12 +118,12 @@ fn target_with_no_backlinks_is_empty_success() {
 
 #[test]
 fn corpus_a_backlinks_resolve_md_only_never_jsonl() {
-    // The committed wiki page is linked from several files; the scan walks every
-    // `.md` (incl. catalogs + log.md) but never the `.jsonl` sidecars.
+    // The committed conclusion record is linked from several files; the scan walks
+    // every `.md` (incl. catalogs + log.md) but never the `.jsonl` sidecars.
     let out = dbmd()
         .arg("--json")
         .arg("links")
-        .arg("wiki/projects/northstar-renewal")
+        .arg("records/projects/northstar-renewal")
         .arg("--dir")
         .arg(corpus_a())
         .assert()
@@ -141,8 +141,8 @@ fn corpus_a_backlinks_resolve_md_only_never_jsonl() {
     for expected in [
         "records/companies/northstar.md",
         "records/contacts/sarah-chen.md",
-        "wiki/synthesis/2026-renewal-plan.md",
-        "wiki/projects/index.md",
+        "records/synthesis/2026-renewal-plan.md",
+        "records/projects/index.md",
         "log.md",
     ] {
         assert!(

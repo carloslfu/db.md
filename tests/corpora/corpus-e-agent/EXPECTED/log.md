@@ -40,13 +40,13 @@ vendor invoice paid
 ## [2026-05-29 17:11] create | records/expenses/2026/05/2026-05-06-helio-type-1188.md
 matching expense for the invoice
 
-## [2026-05-29 17:12] create | wiki/projects/tideform-rebrand.md
+## [2026-05-29 17:12] create | records/projects/tideform-rebrand.md
 flagship project synthesis
 
-## [2026-05-29 17:13] create | wiki/people/daniel-osei.md
+## [2026-05-29 17:13] create | records/profiles/daniel-osei.md
 buyer bio
 
-## [2026-05-29 17:14] create | wiki/people/mara-lindqvist.md
+## [2026-05-29 17:14] create | records/profiles/mara-lindqvist.md
 design-lead bio
 
 ## [2026-05-29 17:20] validate

@@ -18,4 +18,4 @@ status: done
 Quarterly business review with [[records/contacts/sarah-chen]]. Usage
 is healthy across the 120 seats; Sarah signalled intent to expand at
 renewal. Set the stage for the renewal conversation that followed in
-May — see [[wiki/projects/northstar-renewal]].
+May — see [[records/projects/northstar-renewal]].

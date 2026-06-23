@@ -27,7 +27,7 @@ validated, never operated. Do not synthesise, do not repair.
 
 ### Frozen pages
 - `records/decisions/2026-q1-strategy.md` — finalized, do not modify.
-- `wiki/synthesis/2026-annual-plan.md` — signed-off plan.
+- `records/synthesis/2026-annual-plan.md` — signed-off plan.
 
 ### Ignored types
 - `test`, `temp` — read but never synthesise.

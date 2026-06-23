@@ -41,7 +41,7 @@ db.md/
 │   ├── dbmd-core/      # the library — parser, store, graph, validate,
 │   │                   #   stats, query, index, log. All logic lives here.
 │   └── dbmd-cli/       # the `dbmd` binary — thin arg-parse/format wrappers
-├── examples/           # role-flavored example stores (sources/ records/ wiki/)
+├── examples/           # role-flavored example stores (sources/ records/)
 ├── tests/corpora/      # test stores (canonical, edges, formats, scale, agent)
 ├── SPEC.md             # the format spec + curator contract + validation codes
 └── TOOLS.md            # the toolkit reference (subcommand surface, install)

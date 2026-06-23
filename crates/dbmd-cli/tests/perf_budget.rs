@@ -356,7 +356,7 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 }
 
 /// Collect store-relative bare paths (no `.md`) of the first `limit` content
-/// `.md` files under `sources/`/`records/`/`wiki/`, in a deterministic
+/// `.md` files under `sources/`/`records/`, in a deterministic
 /// (sorted) order. Skips the `index.md` / `log.md` / `DB.md` meta files. Used to
 /// name real, existing, already-clean targets for the grown changed set so the
 /// working-set validate stays exit-0 (every named file is one the fixed-point
@@ -384,7 +384,7 @@ fn first_content_targets(store: &Path, limit: usize) -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    for layer in ["records", "sources", "wiki"] {
+    for layer in ["records", "sources"] {
         walk(&store.join(layer), store, &mut out);
     }
     out.sort();

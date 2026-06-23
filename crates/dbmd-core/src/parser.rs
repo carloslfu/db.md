@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, FixedOffset};
 use serde_norway::{Mapping, Value};
 
-/// The three canonical layer folder names. A path is "content" / a wiki-link is
+/// The two canonical layer folder names. A path is "content" / a wiki-link is
 /// "full-path" only when it resolves under one of these.
-const LAYER_DIRS: [&str; 3] = ["sources", "records", "wiki"];
+const LAYER_DIRS: [&str; 2] = ["sources", "records"];
 
 /// Errors produced while parsing a markdown file or the `DB.md` config.
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +77,10 @@ pub enum ParseError {
 pub struct Frontmatter {
     /// `type` — required on content files; the primary query key.
     pub type_: Option<String>,
+    /// `meta-type` — records-only; the epistemic class `fact`/`operational`/
+    /// `conclusion`. Absent ⇒ `fact` (the effective default is applied by the
+    /// index/query layer for record-layer files; sources carry none).
+    pub meta_type: Option<String>,
     /// `id` — optional; derived from the file path when absent.
     pub id: Option<String>,
     /// `created` — RFC3339; required and auto-set on content-file create.
@@ -182,6 +186,12 @@ impl Frontmatter {
                         fm.extra.insert(key, v);
                     }
                 },
+                "meta-type" => match scalar_string(&v) {
+                    Some(s) => fm.meta_type = Some(s),
+                    None => {
+                        fm.extra.insert(key, v);
+                    }
+                },
                 "id" => match scalar_string(&v) {
                     Some(s) => fm.id = Some(s),
                     None => {
@@ -225,7 +235,7 @@ impl Frontmatter {
     /// canonical key order. Round-trips [`extra`](Frontmatter::extra) verbatim.
     pub fn to_yaml(&self) -> String {
         // Build an order-preserving mapping in canonical key order:
-        //   type, id, created, updated, summary  (universal head)
+        //   type, meta-type, id, created, updated, summary  (universal head)
         //   <type-specific extra, BTreeMap-sorted>
         //   status, tags                          (universal tail)
         // serde_norway::Mapping preserves insertion order, so one serialize call
@@ -234,6 +244,9 @@ impl Frontmatter {
 
         if let Some(t) = &self.type_ {
             map.insert(Value::String("type".into()), Value::String(t.clone()));
+        }
+        if let Some(mt) = &self.meta_type {
+            map.insert(Value::String("meta-type".into()), Value::String(mt.clone()));
         }
         if let Some(id) = &self.id {
             map.insert(Value::String("id".into()), Value::String(id.clone()));
@@ -287,7 +300,7 @@ impl Frontmatter {
         serde_norway::to_string(&Value::Mapping(map)).unwrap_or_default()
     }
 
-    /// True if the file is content (under `sources/`, `records/`, or `wiki/`)
+    /// True if the file is content (under `sources/` or `records/`)
     /// and not an `index.md`. Used by validate to decide which files require a
     /// `summary`. Meta files (`DB.md`, `index.md`, `log.md`) return false.
     pub fn is_content_file(path: &Path) -> bool {
@@ -295,7 +308,7 @@ impl Frontmatter {
         if path.file_name().and_then(|n| n.to_str()) == Some("index.md") {
             return false;
         }
-        // Content iff some path component is one of the three layer dirs. This
+        // Content iff some path component is one of the two layer dirs. This
         // works for both store-relative (`sources/emails/x.md`) and absolute
         // (`/home/db/sources/emails/x.md`) paths. DB.md / log.md sit at the
         // root, under no layer, so they fall through to false.
@@ -322,11 +335,19 @@ impl Frontmatter {
             .to_string()
     }
 
+    /// The effective `meta-type` for a record: the declared value, or `fact`
+    /// when absent. Records only — sources carry no meta-type; callers apply
+    /// this only to record-layer files.
+    pub fn effective_meta_type(&self) -> &str {
+        self.meta_type.as_deref().unwrap_or("fact")
+    }
+
     /// Read a single frontmatter key as a raw YAML [`Value`], looking in the
     /// typed fields first and then [`extra`](Frontmatter::extra).
     pub fn get(&self, key: &str) -> Option<Value> {
         match key {
             "type" => self.type_.clone().map(Value::String),
+            "meta-type" => self.meta_type.clone().map(Value::String),
             "id" => self.id.clone().map(Value::String),
             "created" => self.created.map(|d| Value::String(d.to_rfc3339())),
             "updated" => self.updated.map(|d| Value::String(d.to_rfc3339())),
@@ -351,6 +372,7 @@ impl Frontmatter {
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), ParseError> {
         match key {
             "type" => self.type_ = Some(value.to_string()),
+            "meta-type" => self.meta_type = Some(value.to_string()),
             "id" => self.id = Some(value.to_string()),
             "created" => {
                 self.created = Some(parse_rfc3339(value, "created", Path::new("<fm set>"))?)
@@ -2506,7 +2528,12 @@ mod tests {
         assert!(Frontmatter::is_content_file(Path::new(
             "records/contacts/sarah-chen.md"
         )));
+        // A synthesis profile the agent authored lives under `records/` (the
+        // old `wiki/` layer is gone, so a `wiki/...` path is NOT content).
         assert!(Frontmatter::is_content_file(Path::new(
+            "records/profiles/sarah-chen.md"
+        )));
+        assert!(!Frontmatter::is_content_file(Path::new(
             "wiki/people/sarah-chen.md"
         )));
         // Absolute paths under a layer are still content.
@@ -2583,7 +2610,7 @@ mod tests {
 
     #[test]
     fn extract_wiki_links_flags_full_path_short_form_and_extension() {
-        let body = "See [[records/contacts/sarah-chen]] and [[sarah-chen]].\nAlso [[wiki/people/sarah-chen.md|Sarah]].\n";
+        let body = "See [[records/contacts/sarah-chen]] and [[sarah-chen]].\nAlso [[records/profiles/sarah-chen.md|Sarah]].\n";
         let links = extract_wiki_links(body, Path::new("doc.md"));
         assert_eq!(links.len(), 3);
 
@@ -2599,7 +2626,7 @@ mod tests {
         assert!(!links[1].is_full_path, "bare target is short-form");
 
         // Full path WITH .md extension and a display override on line 2.
-        assert_eq!(links[2].target, "wiki/people/sarah-chen.md");
+        assert_eq!(links[2].target, "records/profiles/sarah-chen.md");
         assert!(links[2].is_full_path);
         assert!(links[2].has_md_extension);
         assert_eq!(links[2].display.as_deref(), Some("Sarah"));

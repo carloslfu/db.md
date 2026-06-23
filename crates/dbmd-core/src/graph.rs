@@ -747,7 +747,6 @@ fn path_layer(rel: &Path) -> Option<Layer> {
     match first.as_os_str().to_str()? {
         "sources" => Some(Layer::Sources),
         "records" => Some(Layer::Records),
-        "wiki" => Some(Layer::Wiki),
         _ => None,
     }
 }
@@ -823,7 +822,6 @@ fn layer_dir_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Sources => "sources",
         Layer::Records => "records",
-        Layer::Wiki => "wiki",
     }
 }
 
@@ -1253,8 +1251,8 @@ Real link: [[records/contacts/robert]].
         fx.write("records/contacts/sarah.md", "contact", "Sarah Chen", "");
         // Three different incoming-link spellings, all to the same target.
         fx.write(
-            "wiki/people/sarah.md",
-            "wiki-page",
+            "records/profiles/sarah.md",
+            "profile",
             "bio",
             "See [[records/contacts/sarah]].",
         );
@@ -1272,8 +1270,8 @@ Real link: [[records/contacts/robert]].
         );
         // A file that links to a DIFFERENT contact must not be a backlink.
         fx.write(
-            "wiki/people/other.md",
-            "wiki-page",
+            "records/profiles/other.md",
+            "profile",
             "x",
             "[[records/contacts/sarah-2]]",
         );
@@ -1286,8 +1284,8 @@ Real link: [[records/contacts/robert]].
             paths(&got),
             vec![
                 "records/meetings/m1",
+                "records/profiles/sarah",
                 "sources/emails/e1",
-                "wiki/people/sarah",
             ]
         );
     }
@@ -1298,17 +1296,17 @@ Real link: [[records/contacts/robert]].
         // identical bare key, so neighborhood can dedup across directions.
         let fx = Fixture::new();
         fx.write(
-            "wiki/people/a.md",
-            "wiki-page",
+            "records/profiles/a.md",
+            "profile",
             "A",
-            "Knows [[wiki/people/b]].",
+            "Knows [[records/profiles/b]].",
         );
-        fx.write("wiki/people/b.md", "wiki-page", "B", "");
+        fx.write("records/profiles/b.md", "profile", "B", "");
         fx.reindex();
-        let fwd = forwardlinks(&fx.store, &fx.p("wiki/people/a.md")).unwrap();
-        let back = backlinks(&fx.store, &fx.p("wiki/people/b.md")).unwrap();
-        assert_eq!(paths(&fwd), vec!["wiki/people/b"]);
-        assert_eq!(paths(&back), vec!["wiki/people/a"]);
+        let fwd = forwardlinks(&fx.store, &fx.p("records/profiles/a.md")).unwrap();
+        let back = backlinks(&fx.store, &fx.p("records/profiles/b.md")).unwrap();
+        assert_eq!(paths(&fwd), vec!["records/profiles/b"]);
+        assert_eq!(paths(&back), vec!["records/profiles/a"]);
     }
 
     #[test]
@@ -1317,22 +1315,22 @@ Real link: [[records/contacts/robert]].
         fx.write("records/contacts/sam.md", "contact", "Sam", "");
         // `sam-smith` shares the `sam` prefix; must NOT count as a backlink to `sam`.
         fx.write(
-            "wiki/people/x.md",
-            "wiki-page",
+            "records/profiles/x.md",
+            "profile",
             "x",
             "[[records/contacts/sam-smith]]",
         );
         // The genuine backlink.
         fx.write(
-            "wiki/people/y.md",
-            "wiki-page",
+            "records/profiles/y.md",
+            "profile",
             "y",
             "[[records/contacts/sam]]",
         );
         fx.reindex();
 
         let got = backlinks(&fx.store, &fx.p("records/contacts/sam")).unwrap();
-        assert_eq!(paths(&got), vec!["wiki/people/y"]);
+        assert_eq!(paths(&got), vec!["records/profiles/y"]);
     }
 
     #[test]
@@ -1466,8 +1464,8 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
         fx.write(
-            "wiki/people/indexed.md",
-            "wiki-page",
+            "records/profiles/indexed.md",
+            "profile",
             "Indexed",
             "[[records/contacts/sarah]]",
         );
@@ -1476,8 +1474,8 @@ Real link: [[records/contacts/robert]].
         // Now drop a NEW linker on disk WITHOUT reindexing — it is on disk but in
         // no sidecar.
         fx.write(
-            "wiki/people/unindexed.md",
-            "wiki-page",
+            "records/profiles/unindexed.md",
+            "profile",
             "Unindexed",
             "[[records/contacts/sarah]]",
         );
@@ -1485,7 +1483,7 @@ Real link: [[records/contacts/robert]].
         let got = backlinks(&fx.store, &fx.p("records/contacts/sarah.md")).unwrap();
         assert_eq!(
             paths(&got),
-            vec!["wiki/people/indexed", "wiki/people/unindexed"],
+            vec!["records/profiles/indexed", "records/profiles/unindexed"],
             "unscoped backlinks ripgrep-scans the tree, so the on-disk-but-unindexed \
              linker is found too — not only the sidecar-catalogued one"
         );
@@ -1504,35 +1502,35 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
         fx.write(
-            "wiki/people/indexed.md",
-            "wiki-page",
+            "records/profiles/indexed.md",
+            "profile",
             "Indexed",
             "[[records/contacts/sarah]]",
         );
         fx.reindex(); // builds sidecars for sarah + the indexed linker
 
-        // Drop a NEW wiki-page linker on disk WITHOUT reindexing — on disk, in no
+        // Drop a NEW profile linker on disk WITHOUT reindexing — on disk, in no
         // sidecar.
         fx.write(
-            "wiki/people/unindexed.md",
-            "wiki-page",
+            "records/profiles/unindexed.md",
+            "profile",
             "Unindexed",
             "[[records/contacts/sarah]]",
         );
 
-        // Scoped to the `wiki-page` type: the candidate set is the sidecar's, so
+        // Scoped to the `profile` type: the candidate set is the sidecar's, so
         // only the catalogued linker is found — the unindexed one is invisible.
-        let only_wiki_pages = vec!["wiki-page".to_string()];
+        let only_profiles = vec!["profile".to_string()];
         let got = backlinks_filtered(
             &fx.store,
             &fx.p("records/contacts/sarah.md"),
-            &only_wiki_pages,
+            &only_profiles,
             None,
         )
         .unwrap();
         assert_eq!(
             paths(&got),
-            vec!["wiki/people/indexed"],
+            vec!["records/profiles/indexed"],
             "scoped backlinks reads the sidecar candidate set; the on-disk-but-unindexed \
              linker is not tree-walked"
         );
@@ -1552,8 +1550,8 @@ Real link: [[records/contacts/robert]].
             "[[records/contacts/sarah]]",
         );
         fx.write(
-            "wiki/people/bio.md",
-            "wiki-page",
+            "records/profiles/bio.md",
+            "profile",
             "Bio",
             "[[records/contacts/sarah]]",
         );
@@ -1570,17 +1568,22 @@ Real link: [[records/contacts/robert]].
         assert_eq!(
             paths(&got),
             vec!["records/meetings/m1"],
-            "--type meeting must exclude the wiki-page linker"
+            "--type meeting must exclude the profile linker"
         );
 
         // Unfiltered, both come back — proving the filter (not the data) dropped one.
         let all = backlinks(&fx.store, &fx.p("records/contacts/sarah.md")).unwrap();
-        assert_eq!(paths(&all), vec!["records/meetings/m1", "wiki/people/bio"]);
+        assert_eq!(
+            paths(&all),
+            vec!["records/meetings/m1", "records/profiles/bio"]
+        );
     }
 
     #[test]
     fn backlinks_filtered_layer_scopes_the_candidate_set() {
-        // `--in <layer>` narrows backlinks to linkers under that layer.
+        // `--in <layer>` narrows backlinks to linkers under that layer. The two
+        // linkers live in different layers (a sources email and a records
+        // meeting) so the scope genuinely separates them.
         let fx = Fixture::new();
         fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
         fx.write(
@@ -1590,9 +1593,9 @@ Real link: [[records/contacts/robert]].
             "[[records/contacts/sarah]]",
         );
         fx.write(
-            "wiki/people/bio.md",
-            "wiki-page",
-            "Bio",
+            "sources/emails/intro.md",
+            "email",
+            "Intro",
             "[[records/contacts/sarah]]",
         );
         fx.reindex();
@@ -1601,13 +1604,13 @@ Real link: [[records/contacts/robert]].
             &fx.store,
             &fx.p("records/contacts/sarah.md"),
             &[],
-            Some(Layer::Wiki),
+            Some(Layer::Sources),
         )
         .unwrap();
         assert_eq!(
             paths(&got),
-            vec!["wiki/people/bio"],
-            "--in wiki must keep only the wiki-layer linker"
+            vec!["sources/emails/intro"],
+            "--in sources must keep only the sources-layer linker"
         );
 
         let records_only = backlinks_filtered(
@@ -1623,52 +1626,54 @@ Real link: [[records/contacts/robert]].
     #[test]
     fn backlinks_scoped_type_spans_all_topic_folders_in_its_layer() {
         // REGRESSION (finding #12): a `type` can legitimately span several folders
-        // within one layer — `wiki-page` is filed under `wiki/<topic>/` for an
-        // arbitrary topic (SPEC). The scoped candidate set must read the whole
-        // `wiki/` layer and filter by type, NOT just the canonical-guess folder
-        // `wiki/topics/`. Before the fix, `find_by_type("wiki-page")` read ONLY
-        // `wiki/topics/index.jsonl` whenever that sidecar existed, silently
-        // dropping every wiki-page linker filed under any other topic folder — so
-        // `backlinks --type wiki-page` under-reported dependents (a wrong
-        // blast-radius check) the moment a `wiki/topics/` page also existed.
+        // within one layer — a `profile` is filed under its canonical
+        // `records/profiles/` folder, but an agent may also file a profile under
+        // another `records/<folder>/` (the type, not the folder, is authoritative).
+        // The scoped candidate set must read the whole `records/` layer and filter
+        // by type, NOT just the canonical-guess folder `records/profiles/`. Before
+        // the fix, `find_by_type("profile")` read ONLY `records/profiles/index.jsonl`
+        // whenever that sidecar existed, silently dropping every profile linker
+        // filed under any other folder — so `backlinks --type profile` under-reported
+        // dependents (a wrong blast-radius check) the moment a `records/profiles/`
+        // page also existed.
         //
-        // The trigger needs BOTH: a populated `wiki/topics/` (so its canonical
-        // sidecar exists) AND a wiki-page elsewhere in the layer that links the
+        // The trigger needs BOTH: a populated `records/profiles/` (so its canonical
+        // sidecar exists) AND a profile elsewhere in the layer that links the
         // target. The earlier
         // `backlinks_scoped_candidates_come_from_the_sidecar_not_a_tree_walk` test
-        // masks this bug precisely because its fixture has no `wiki/topics/`.
+        // masks this bug precisely because its fixture has no `records/profiles/`.
         let fx = Fixture::new();
         fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
-        // A wiki-page in the CANONICAL topic folder, NOT linking the target — its
-        // only purpose is to make `wiki/topics/index.jsonl` exist on disk.
+        // A profile in the CANONICAL type folder, NOT linking the target — its
+        // only purpose is to make `records/profiles/index.jsonl` exist on disk.
         fx.write(
-            "wiki/topics/glossary.md",
-            "wiki-page",
+            "records/profiles/glossary.md",
+            "profile",
             "Glossary",
             "No link to sarah here.",
         );
-        // A wiki-page in a NON-canonical topic folder that DOES link the target.
+        // A profile in a NON-canonical folder that DOES link the target.
         fx.write(
-            "wiki/people/sarah.md",
-            "wiki-page",
+            "records/people/sarah.md",
+            "profile",
             "Sarah bio",
             "Profile of [[records/contacts/sarah]].",
         );
-        fx.reindex(); // builds wiki/topics/index.jsonl AND wiki/people/index.jsonl
+        fx.reindex(); // builds records/profiles/index.jsonl AND records/people/index.jsonl
 
-        // Scoped to `wiki-page`: the off-canonical linker MUST be found. Pre-fix,
-        // the candidate set was only `wiki/topics/`'s sidecar, so this was empty.
+        // Scoped to `profile`: the off-canonical linker MUST be found. Pre-fix,
+        // the candidate set was only `records/profiles/`'s sidecar, so this was empty.
         let scoped = backlinks_filtered(
             &fx.store,
             &fx.p("records/contacts/sarah.md"),
-            &["wiki-page".to_string()],
+            &["profile".to_string()],
             None,
         )
         .unwrap();
         assert_eq!(
             paths(&scoped),
-            vec!["wiki/people/sarah"],
-            "a wiki-page filed outside wiki/topics/ must still be a scoped backlink"
+            vec!["records/people/sarah"],
+            "a profile filed outside records/profiles/ must still be a scoped backlink"
         );
 
         // Cross-check: the unscoped path (ripgrep tree scan) finds the same single
@@ -1677,7 +1682,7 @@ Real link: [[records/contacts/robert]].
         let unscoped = backlinks(&fx.store, &fx.p("records/contacts/sarah.md")).unwrap();
         assert_eq!(
             paths(&unscoped),
-            vec!["wiki/people/sarah"],
+            vec!["records/people/sarah"],
             "scoped and unscoped backlinks must agree on the edge set"
         );
     }
@@ -1733,22 +1738,22 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         // a -> seed (incoming to seed). seed -> c (outgoing from seed).
         fx.write(
-            "wiki/people/seed.md",
-            "wiki-page",
+            "records/profiles/seed.md",
+            "profile",
             "Seed",
-            "Out to [[wiki/people/c]].",
+            "Out to [[records/profiles/c]].",
         );
         fx.write(
-            "wiki/people/a.md",
-            "wiki-page",
+            "records/profiles/a.md",
+            "profile",
             "A",
-            "In to [[wiki/people/seed]].",
+            "In to [[records/profiles/seed]].",
         );
-        fx.write("wiki/people/c.md", "wiki-page", "C", "");
+        fx.write("records/profiles/c.md", "profile", "C", "");
         fx.reindex();
         let slice = neighborhood(
             &fx.store,
-            &fx.p("wiki/people/seed.md"),
+            &fx.p("records/profiles/seed.md"),
             1,
             &[],
             Direction::Incoming,
@@ -1763,11 +1768,11 @@ Real link: [[records/contacts/robert]].
                     .map(|n| n.path.clone())
                     .collect::<Vec<_>>()
             ),
-            vec!["wiki/people/a"]
+            vec!["records/profiles/a"]
         );
         assert_eq!(
             slice.nodes[0].via,
-            Some((fx.p("wiki/people/seed"), Direction::Incoming))
+            Some((fx.p("records/profiles/seed"), Direction::Incoming))
         );
     }
 
@@ -1949,15 +1954,20 @@ Real link: [[records/contacts/robert]].
         // the expensive path the cap exists to bound). The cap gates discovery in
         // any direction, so a hub linked from many nodes is still bounded.
         let fx = Fixture::new();
-        fx.write("wiki/h/hub.md", "wiki-page", "Hub", "");
+        fx.write("records/profiles/hub.md", "profile", "Hub", "");
         for n in ["a", "b", "c", "d", "e"] {
-            fx.write(&format!("wiki/h/{n}.md"), "wiki-page", n, "[[wiki/h/hub]]");
+            fx.write(
+                &format!("records/profiles/{n}.md"),
+                "profile",
+                n,
+                "[[records/profiles/hub]]",
+            );
         }
         fx.reindex();
 
         let capped = neighborhood_capped(
             &fx.store,
-            &fx.p("wiki/h/hub.md"),
+            &fx.p("records/profiles/hub.md"),
             1,
             &[],
             Direction::Both,
@@ -1972,8 +1982,14 @@ Real link: [[records/contacts/robert]].
 
         // Without the cap the same call returns all five backlinking nodes,
         // proving the cap (not the data) limited the set.
-        let uncapped =
-            neighborhood(&fx.store, &fx.p("wiki/h/hub.md"), 1, &[], Direction::Both).unwrap();
+        let uncapped = neighborhood(
+            &fx.store,
+            &fx.p("records/profiles/hub.md"),
+            1,
+            &[],
+            Direction::Both,
+        )
+        .unwrap();
         assert_eq!(uncapped.nodes.len(), 5);
     }
 
@@ -2024,14 +2040,14 @@ Real link: [[records/contacts/robert]].
         // Broken targets are validation issues, not graph edges to another
         // store file. A file whose only link points nowhere is still an orphan.
         fx.write(
-            "wiki/people/a.md",
-            "wiki-page",
+            "records/profiles/a.md",
+            "profile",
             "A",
             "[[records/contacts/ghost]]",
         );
         let got = orphans(&fx.store, None).unwrap();
         assert!(
-            paths(&got).contains(&"wiki/people/a.md".to_string()),
+            paths(&got).contains(&"records/profiles/a.md".to_string()),
             "broken outgoing links must not wire the graph: {got:?}"
         );
     }
@@ -2042,8 +2058,8 @@ Real link: [[records/contacts/robert]].
         // `target` has no outgoing links but IS linked to by `linker` — not an orphan.
         fx.write("records/contacts/target.md", "contact", "Target", "");
         fx.write(
-            "wiki/people/linker.md",
-            "wiki-page",
+            "records/profiles/linker.md",
+            "profile",
             "Linker",
             "[[records/contacts/target]]",
         );
@@ -2053,18 +2069,18 @@ Real link: [[records/contacts/robert]].
             "incoming-only is not an orphan: {got:?}"
         );
         // `linker` has outgoing, so also not an orphan.
-        assert!(!paths(&got).contains(&"wiki/people/linker.md".to_string()));
+        assert!(!paths(&got).contains(&"records/profiles/linker.md".to_string()));
     }
 
     #[test]
     fn orphans_incoming_link_from_other_layer_unorphans() {
         let fx = Fixture::new();
-        // Candidate in records/, only incoming edge comes from wiki/ — a
+        // Candidate in records/, only incoming edge comes from sources/ — a
         // cross-layer link must still un-orphan it even when scoped to records.
         fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
         fx.write(
-            "wiki/people/sarah.md",
-            "wiki-page",
+            "sources/emails/sarah.md",
+            "email",
             "bio",
             "[[records/contacts/sarah]]",
         );
@@ -2077,22 +2093,27 @@ Real link: [[records/contacts/robert]].
     #[test]
     fn orphans_layer_scope_filters_candidates() {
         let fx = Fixture::new();
-        // One orphan per layer.
+        // Orphans across both layers: one source, and two records (an atomic
+        // contact + a conclusion `profile`, the former wiki-page).
         fx.write("sources/emails/s.md", "email", "S", "no links");
         fx.write("records/contacts/r.md", "contact", "R", "");
-        fx.write("wiki/people/w.md", "wiki-page", "W", "");
-        let only_wiki = orphans(&fx.store, Some(Layer::Wiki)).unwrap();
-        assert_eq!(paths(&only_wiki), vec!["wiki/people/w.md"]);
+        fx.write("records/profiles/w.md", "profile", "W", "");
+        // The records scope keeps only the two records-layer orphans.
+        let only_records = orphans(&fx.store, Some(Layer::Records)).unwrap();
+        assert_eq!(
+            paths(&only_records),
+            vec!["records/contacts/r.md", "records/profiles/w.md"]
+        );
         let only_sources = orphans(&fx.store, Some(Layer::Sources)).unwrap();
         assert_eq!(paths(&only_sources), vec!["sources/emails/s.md"]);
-        // No scope: all three, sorted (records, sources, wiki).
+        // No scope: all three, sorted (records, records, sources).
         let all = orphans(&fx.store, None).unwrap();
         assert_eq!(
             paths(&all),
             vec![
                 "records/contacts/r.md",
+                "records/profiles/w.md",
                 "sources/emails/s.md",
-                "wiki/people/w.md",
             ]
         );
     }
@@ -2102,13 +2123,13 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         // A page that only links to itself has no real edges => still an orphan.
         fx.write(
-            "wiki/synthesis/solo.md",
-            "wiki-page",
+            "records/synthesis/solo.md",
+            "synthesis",
             "Solo",
-            "I reference [[wiki/synthesis/solo]] only.",
+            "I reference [[records/synthesis/solo]] only.",
         );
         let got = orphans(&fx.store, None).unwrap();
-        assert_eq!(paths(&got), vec!["wiki/synthesis/solo.md"]);
+        assert_eq!(paths(&got), vec!["records/synthesis/solo.md"]);
     }
 
     #[test]
@@ -2116,17 +2137,17 @@ Real link: [[records/contacts/robert]].
         let fx = Fixture::new();
         // A lone index.md / DB.md must never be reported as an orphan content file.
         fx.write_raw(
-            "wiki/index.md",
-            "---\ntype: index\nscope: layer\nfolder: wiki\n---\n# wiki\n",
+            "records/index.md",
+            "---\ntype: index\nscope: layer\nfolder: records\n---\n# records\n",
         );
         fx.write(
-            "wiki/people/real-orphan.md",
-            "wiki-page",
+            "records/profiles/real-orphan.md",
+            "profile",
             "Real",
             "no links",
         );
         let got = orphans(&fx.store, None).unwrap();
-        assert_eq!(paths(&got), vec!["wiki/people/real-orphan.md"]);
+        assert_eq!(paths(&got), vec!["records/profiles/real-orphan.md"]);
     }
 
     // ── frontmatter_block helper ─────────────────────────────────────────────
@@ -2174,21 +2195,21 @@ Real link: [[records/contacts/robert]].
             "the contact",
         );
         fx.write(
-            "wiki/people/a.md",
-            "wiki-page",
+            "records/profiles/a.md",
+            "profile",
             "A",
             "See [[ records/contacts/sarah ]] today.",
         );
         fx.reindex();
 
         assert_eq!(
-            paths(&forwardlinks(&fx.store, Path::new("wiki/people/a.md")).unwrap()),
+            paths(&forwardlinks(&fx.store, Path::new("records/profiles/a.md")).unwrap()),
             vec!["records/contacts/sarah"],
             "padded link is a forward edge"
         );
         assert_eq!(
             paths(&backlinks(&fx.store, Path::new("records/contacts/sarah.md")).unwrap()),
-            vec!["wiki/people/a"],
+            vec!["records/profiles/a"],
             "padded link is the SAME backward edge (forward and backward agree)"
         );
     }
@@ -2206,15 +2227,15 @@ Real link: [[records/contacts/robert]].
             "the contact",
         );
         fx.write(
-            "wiki/topics/howto.md",
-            "wiki-page",
+            "records/synthesis/howto.md",
+            "synthesis",
             "Howto",
             "```markdown\n[[records/contacts/sarah]] is how you link.\n```",
         );
         fx.reindex();
 
         assert!(
-            forwardlinks(&fx.store, Path::new("wiki/topics/howto.md"))
+            forwardlinks(&fx.store, Path::new("records/synthesis/howto.md"))
                 .unwrap()
                 .is_empty(),
             "a fenced example is not a forward edge"
@@ -2227,7 +2248,7 @@ Real link: [[records/contacts/robert]].
         );
         let orphan_set = paths(&orphans(&fx.store, None).unwrap());
         assert!(
-            orphan_set.contains(&"wiki/topics/howto.md".to_string()),
+            orphan_set.contains(&"records/synthesis/howto.md".to_string()),
             "a page whose only link is fenced has no real edges => orphan: {orphan_set:?}"
         );
     }
@@ -2298,8 +2319,8 @@ Trailing [[records/contacts/sarah]].
             "the contact",
         );
         fx.write(
-            "wiki/people/bio.md",
-            "wiki-page",
+            "records/profiles/bio.md",
+            "profile",
             "Bio",
             "See [[records/contacts/Sarah-Chen]].",
         );
@@ -2307,7 +2328,7 @@ Trailing [[records/contacts/sarah]].
 
         assert_eq!(
             paths(&backlinks(&fx.store, Path::new("records/contacts/sarah-chen.md")).unwrap()),
-            vec!["wiki/people/bio"],
+            vec!["records/profiles/bio"],
             "case-variant incoming link must be a backward edge"
         );
         let orphan_set = paths(&orphans(&fx.store, None).unwrap());

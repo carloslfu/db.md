@@ -9,22 +9,23 @@ computer_id: lumen-ops
 
 Company-scale institutional memory for Lumen Labs, a five-person
 product-design studio: clients, vendors, the people we deal with, the
-meetings we run, and the bills we pay, plus the synthesis wiki the
-curator maintains on top of them.
+meetings we run, and the bills we pay, plus the synthesis conclusion
+records the curator maintains on top of them.
 
 This is the **agent-eval store**. Only `sources/` is populated — a
 handful of emails, one call transcript, and two documents. `records/`,
-`wiki/`, `index.md`, and `log.md` are absent on purpose. A correct
-curator session, given `dbmd spec` and this `DB.md`, derives the
-records and wiki pages, populates the index hierarchy write-through,
-and leaves the store passing `dbmd validate`. See `NOTES.md` for the
-entities the structural eval expects.
+`index.md`, and `log.md` are absent on purpose. A correct curator
+session, given `dbmd spec` and this `DB.md`, derives the records
+(including `meta-type: conclusion` synthesis records), populates the
+index hierarchy write-through, and leaves the store passing
+`dbmd validate`. See `NOTES.md` for the entities the structural eval
+expects.
 
 ## Agent instructions
 
-Use British English spelling in `wiki/` pages (e.g. "organise",
-"synthesise", "centre"). `records/` field values stay verbatim from
-the source.
+Use British English spelling in `meta-type: conclusion` records (e.g.
+"organise", "synthesise", "centre"). Other `records/` field values stay
+verbatim from the source.
 
 Whenever a vendor invoice arrives (an `email` or `pdf-source` that
 states an amount due), create BOTH an `invoice` record and a matching
@@ -37,8 +38,8 @@ no human name attached (e.g. `billing@`, `no-reply@`, `notifications@`)
 is NOT a contact — treat it as ambient routing on the company, not a
 person.
 
-Do not synthesise wiki pages from any source whose `tags` include
-`transient`. Keep every `summary` to one line and current.
+Do not synthesise conclusion records from any source whose `tags`
+include `transient`. Keep every `summary` to one line and current.
 
 ## Policies
 
@@ -46,7 +47,7 @@ Do not synthesise wiki pages from any source whose `tags` include
 - `records/decisions/founding-rate-card.md` — the studio's signed rate card; never modify if it already exists.
 
 ### Ignored types
-- `newsletter` — read as ambient context but never synthesise into wiki pages or records.
+- `newsletter` — read as ambient context but never synthesise into conclusion records or records.
 
 ## Schemas
 

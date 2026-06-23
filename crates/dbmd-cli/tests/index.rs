@@ -136,7 +136,7 @@ fn live_index_artifacts(store: &Path) -> BTreeMap<String, Vec<u8>> {
     if root_index.is_file() {
         out.insert("index.md".to_string(), std::fs::read(&root_index).unwrap());
     }
-    for layer in ["sources", "records", "wiki"] {
+    for layer in ["sources", "records"] {
         let dir = store.join(layer);
         if dir.is_dir() {
             walk(store, &dir, &mut out);
@@ -479,31 +479,31 @@ fn show_root_prints_the_root_index() {
 #[test]
 fn show_scoped_prints_a_type_folder_index() {
     let out = dbmd()
-        .args(["index", "show", "wiki/people"])
+        .args(["index", "show", "records/profiles"])
         .arg("--dir")
         .arg(corpus_a())
         .assert()
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    assert!(stdout.contains("folder: wiki/people"));
-    assert!(stdout.contains("[[wiki/people/sarah-chen]]"));
+    assert!(stdout.contains("folder: records/profiles"));
+    assert!(stdout.contains("[[records/profiles/sarah-chen]]"));
 }
 
 #[test]
 fn show_json_wraps_path_and_contents() {
     let out = dbmd()
-        .args(["--json", "index", "show", "wiki/people"])
+        .args(["--json", "index", "show", "records/profiles"])
         .arg("--dir")
         .arg(corpus_a())
         .assert()
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(v["path"], "wiki/people/index.md");
+    assert_eq!(v["path"], "records/profiles/index.md");
     assert!(v["contents"]
         .as_str()
         .unwrap()
-        .contains("folder: wiki/people"));
+        .contains("folder: records/profiles"));
 }
 
 #[test]

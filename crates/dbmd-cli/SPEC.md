@@ -1,4 +1,4 @@
-# db.md — v0.2
+# db.md — v0.3
 
 `db.md` is **the open standard for databases in plain files**. Records are markdown
 files with YAML frontmatter. Relationships are wiki-links. The database
@@ -21,11 +21,12 @@ a curator contract. An agent wants files it can reshape, not a schema to
 migrate or a query language to wrap around. db.md is files. Simple and
 open by design.
 
-One directory, three folders, one config file. Raw evidence lives in
-`sources/`. Atomic typed data lives in `records/`. Curator-synthesized
-narrative lives in `wiki/`. The store's identity, agent instructions,
-policies, and custom schemas all live in a single `DB.md` file at the
-root.
+One directory, two folders, one config file. Raw evidence lives in
+`sources/`. Everything the agent authors lives in `records/` — atomic
+typed data and curator-synthesized narrative alike, separated by a
+`meta-type` field, not by folder. The store's identity, agent
+instructions, policies, and custom schemas all live in a single `DB.md`
+file at the root.
 
 This document is the format spec. The reference toolkit (`dbmd` CLI) ships
 in this same repo. Anyone can build a db.md-aware tool — the format is
@@ -35,13 +36,20 @@ open and intentionally simple.
 
 ## Status
 
-**Spec version:** `v0.2`. **v0.2 made the type model generic:** schema
-enforcement is now solely the store's own `DB.md ## Schemas` — the
-toolkit ships no built-in or implicit per-type schema, and the example
-types (`contact`, `expense`, …) are illustrative, not normative. See the
-[CHANGELOG](CHANGELOG.md) for the v0.1 → v0.2 migration.
-**Stable:** the three-folder layout, the `DB.md` config file, and the
-universal frontmatter contract are stable. From v0.2 on, the validation
+**Spec version:** `v0.3`. **v0.3 collapsed the layout to two folders:**
+`sources/` (evidence) + `records/` (everything the agent authors). The
+old `wiki/` layer is removed; its synthesis role moves onto a
+`meta-type: conclusion` field inside `records/`. This is a **breaking
+format change** from v0.2 — but additive from v0.3 forward. There is no
+migration command; an agent migrates a v0.2 store in place (see
+[Versioning](#versioning)). v0.2's generic type model carries forward
+unchanged: schema enforcement is solely the store's own `DB.md ##
+Schemas` — the toolkit ships no built-in or implicit per-type schema,
+and the example types (`contact`, `expense`, …) are illustrative, not
+normative. See the [CHANGELOG](CHANGELOG.md) for the v0.2 → v0.3
+migration.
+**Stable:** the two-folder layout, the `DB.md` config file, and the
+universal frontmatter contract are stable. From v0.3 on, the validation
 vocabulary is additive.
 **Tooling:** Apache-2.0 Rust `dbmd` CLI (one binary, subcommands for
 read / write / validate / extract ops, zero LLM dependencies). The
@@ -62,58 +70,75 @@ db/                          # any path; one db.md store per scope
 │   │   └── 2026/05/         # high-volume folders shard by date — no unbounded directory
 │   ├── transcripts/
 │   ├── docs/
-│   └── exports/
-├── records/                 # atomic typed data; event types shard by date, entity types flat
-│   ├── contacts/            # entity — flat (dedup-bounded)
-│   ├── companies/           # entity — flat
-│   ├── expenses/            # event — shards by date:
-│   │   └── 2026/05/         # …like sources, because event records track volume
-│   ├── meetings/            # event — shards by date
-│   ├── decisions/           # flat (no primary date field)
-│   └── invoices/            # event — shards by date
-└── wiki/                    # curator-synthesized narrative with cross-links
-    ├── people/
-    ├── projects/
-    ├── themes/
-    ├── playbooks/
-    └── synthesis/           # cross-cutting overview pages
+│   ├── exports/
+│   └── notes/               # testimonial sources — "a human told the agent X"
+│       └── 2026/05/         # a growing stream, so date-sharded like the rest
+└── records/                 # everything the agent authors; separated by meta-type, not folder
+    ├── contacts/            # meta-type: fact · entity — flat (dedup-bounded)
+    ├── companies/           # meta-type: fact · entity — flat
+    ├── expenses/            # meta-type: fact · event — shards by date:
+    │   └── 2026/05/         # …like sources, because event records track volume
+    ├── meetings/            # meta-type: fact · event — shards by date
+    ├── decisions/           # meta-type: fact · flat (no primary date field)
+    ├── invoices/            # meta-type: fact · event — shards by date
+    ├── profiles/            # meta-type: conclusion · synthesized entity narrative
+    ├── playbooks/           # meta-type: conclusion · how-we-do-X
+    ├── themes/              # meta-type: conclusion · cross-cutting patterns
+    └── synthesis/           # meta-type: conclusion · cross-cutting overview pages
 ```
 
-**Required:** the `DB.md` file + at minimum one of `sources/` / `records/` / `wiki/` (most stores have all three). Sub-folders by type are convention; tools may use other groupings.
+**Required:** the `DB.md` file + at minimum one of `sources/` / `records/` (most stores have both). Sub-folders by type are convention; tools may use other groupings. The synthesis narrative that lived in `wiki/` in v0.2 now lives in `records/` as files carrying `meta-type: conclusion` (see [Meta-type](#meta-type-fact-operational-conclusion)) — same store, distinguished by a queryable field, not a folder.
 
 **Curator-maintained (optional, created on first curator action):** `index.md` (catalog of the store) and `log.md` (chronological action log). Absent at store creation; populated by the curator as it works. Each non-empty **type-folder** additionally carries an `index.jsonl` — the complete, machine-readable twin of its `index.md` (the `.md` is the capped human browse view; the `.jsonl` is the uncapped structured catalog that backs `dbmd fm query` / `dbmd index query` / dedup). See [The `index.md` and `log.md` files](#the-indexmd-and-logmd-files).
 
 **Filename convention:** the config file is `DB.md` (uppercase), matching README / LICENSE / NOTICE conventions for "main file in a project root" and differentiating from the standard name `db.md` (lowercase, referring to the project / spec). `index.md` and `log.md` are lowercase — they're curator-maintained content, not config.
 
-### Three folders, three data models
+### Two folders, two data models
 
-A db.md store composes three data models in one directory:
+A db.md store composes two folders in one directory. The hard boundary
+is *evidence vs. agent-authored* — `sources/` vs. `records/`. Inside
+`records/`, a `meta-type` field carries the finer distinction (atomic
+data vs. synthesis) that v0.2 expressed as a separate `wiki/` folder.
 
-- **`sources/`** — **document store.** Raw artifacts from outside the
-  operator's hand: emails, transcripts, exports, PDFs, scrapes.
-  Preserved verbatim. Immutable. Frontmatter is metadata about the
-  artifact (where it came from, when it arrived) — the body is the
-  artifact itself. Because sources never change after ingest, the
-  toolkit processes each one once and never re-parses it; high-volume
-  source folders auto-shard by date (`sources/emails/2026/05/`) so no
-  directory grows unbounded. This is the layer built to reach millions
-  of files — see [Scale](#scale).
+- **`sources/`** — **document store.** Raw artifacts the agent did not
+  author. Two kinds:
+  - *Documentary* — external artifacts: emails, transcripts, exports,
+    PDFs, scrapes. Preserved verbatim. Frontmatter is metadata about
+    the artifact (where it came from, when it arrived); the body is the
+    artifact itself.
+  - *Testimonial* — a `note` source (with a `told_by` field) capturing
+    "a human told the agent X." This is the evidence record for a
+    chat-asserted fact that has no document behind it — written at the
+    moment the testimony is given, so the assertion has a source to
+    trace to.
 
-- **`records/`** — **relational-ish store.** Atomic typed data points:
-  expenses, meetings, decisions, invoices, contacts, companies.
-  Frontmatter-heavy (the structured "row"), body-light or empty (a
-  short note when useful). Originated by the operator (via chat),
-  by an agent extracting from sources, or by direct edit. Write-mostly,
-  occasionally amended. "Relational but not that much, it's still
-  markdown."
+  Sources are immutable and **carry no `meta-type`** — evidence is
+  mono-role. Because sources never change after ingest, the toolkit
+  processes each one once and never re-parses it; high-volume source
+  folders auto-shard by date (`sources/emails/2026/05/`,
+  `sources/notes/2026/05/`) so no directory grows unbounded. This is the
+  layer built to reach millions of files — see [Scale](#scale).
 
-- **`wiki/`** — **graph store.** Curator-synthesized narrative with
-  dense cross-references. Body-heavy markdown with wiki-links to
-  records, sources, and other wiki pages. The "understanding" layer
-  that emerges from atomic records and raw sources. Rewrite-and-grow.
+- **`records/`** — **everything the agent authors.** One folder, two
+  roles, separated by the `meta-type` frontmatter field:
+  - **`meta-type: fact`** (the default) — atomic typed data points:
+    expenses, meetings, decisions, invoices, contacts, companies.
+    Frontmatter-heavy (the structured "row"), body-light or empty.
+    Write-mostly, occasionally amended. "Relational but not that much,
+    it's still markdown."
+  - **`meta-type: operational`** — operating state the agent maintains:
+    a running counter, a task list, a status board, a config the agent
+    edits. Atomic like a fact, but mutated as state rather than appended
+    as a data point.
+  - **`meta-type: conclusion`** — curator-synthesized narrative with
+    dense cross-references: the old `wiki/` layer. Body-heavy markdown
+    with wiki-links to records and sources. The "understanding" that
+    emerges from atomic records and raw sources. Rewrite-and-grow, and
+    **single-voice** (see [Writers and readers](#writers-and-readers)).
 
-The pattern: *sources are evidence; records are facts; wiki is
-understanding.* Same store, three composed models.
+The pattern: *sources are evidence; `fact`/`operational` records are
+data; `conclusion` records are understanding.* Same store, two folders,
+one cross-cutting field.
 
 ### How an agent uses db.md — four moves, in order
 
@@ -128,7 +153,7 @@ understanding.* Same store, three composed models.
    per-store overrides (`## Agent instructions`, `## Policies`, `## Schemas`).
    Read on every operation on this store; it overrides the defaults, so read it
    before writing.
-4. **Operate.** The store itself — `sources/`, `records/`, `wiki/` — driven via
+4. **Operate.** The store itself — `sources/` and `records/` — driven via
    `dbmd` subcommands. See [The agent session](#the-agent-session) for the loop.
 
 ## The universal frontmatter contract
@@ -139,6 +164,7 @@ minimum:
 ```yaml
 ---
 type: <type>          # required — what kind of thing this is
+meta-type: <role>     # records only — fact | operational | conclusion (absent ⇒ fact)
 id: <id>              # optional; derived from path if absent
 created: <RFC3339>    # required for content files; auto-set on create
 updated: <RFC3339>    # required for content files; auto-maintained
@@ -152,7 +178,43 @@ Type-specific fields layer on top. A store declares any it wants enforced
 in `DB.md ## Schemas`; see [Example types](#example-types) for illustrative
 patterns to copy.
 
-**Content files** = everything under `sources/`, `records/`, `wiki/`. **Meta files** = `DB.md`, `index.md`, `log.md` (these have their own contracts; they do not need `summary`, `created`, or `updated`).
+**Content files** = everything under `sources/` and `records/`. **Meta files** = `DB.md`, `index.md`, `log.md` (these have their own contracts; they do not need `summary`, `created`, or `updated`).
+
+### Meta-type: fact, operational, conclusion
+
+`meta-type` is a **records-only, closed-enum** field that separates the
+roles a `records/` file can play. It is the field that carries what the
+v0.2 `wiki/` folder used to carry as a separate layer.
+
+```yaml
+meta-type: fact          # atomic typed data — the default
+meta-type: operational   # operating state the agent maintains
+meta-type: conclusion    # curator-synthesized narrative (the old wiki/)
+```
+
+- **Closed set.** The only valid values are `fact`, `operational`,
+  `conclusion`. Any other value is a hard error
+  (`FM_BAD_META_TYPE`). This is the one closed vocabulary in the
+  frontmatter contract — `type` stays open, `meta-type` does not.
+- **Default `fact`.** Absent ⇒ `fact`. The *effective* value (defaulted)
+  is what the index records and what `--where meta-type=fact` matches —
+  so an un-annotated record is a fact for every query, not a special
+  case. `operational` and `conclusion` are always explicit.
+- **Field, not folder.** Folders stay organized by `type` (the open
+  noun: `contacts`, `playbooks`, `synthesis`). `meta-type` is a
+  cross-cutting queryable field that can apply to any type. By
+  convention a store keeps its conclusion types in their own folders
+  (`records/synthesis/`, `records/profiles/`), but that is convention,
+  not enforcement: `meta-type`, not the path, is what makes a file a
+  conclusion.
+- **Sources have no `meta-type`.** Evidence is mono-role; the
+  documentary-vs-testimonial distinction inside `sources/` is a `type`
+  distinction (`email`, `pdf-source`, `note`), not a `meta-type`.
+- **`conclusion` is single-voice.** Records with `meta-type: conclusion`
+  carry the single-writer synthesis contract that v0.2 attached to the
+  `wiki/` layer; see [Writers and readers](#writers-and-readers) for
+  what that means now that it is a per-file property inside the
+  many-writer `records/` folder.
 
 **The `summary` field is canonical and required on every content file.** It is the **single source of truth** for what the file is about. Every hierarchical `index.md` reads this field directly to populate its catalog entries — no extraction rules, no recomputation. The agent writes a thoughtful summary when creating files (the curator's judgment), `dbmd fm init` writes a deterministic default if the agent doesn't (the type's `summary_template` from `DB.md ## Schemas`, or the file's first paragraph), and the agent can always override via `dbmd fm set <file> summary='...'`.
 
@@ -176,7 +238,7 @@ patterns to copy.
   hand.**
 - `type` is required and is the primary way tools query the store.
 - `id` is optional; if absent, it's derived from the file path (e.g.
-  `wiki/people/sarah-chen.md` → id `sarah-chen`).
+  `records/profiles/sarah-chen.md` → id `sarah-chen`).
 - Timestamps are ISO-8601 (`2026-05-27T08:00:00-07:00`).
 - Unknown fields pass through. Tools that don't recognize a field
   treat it as ambient context.
@@ -190,23 +252,36 @@ example domain** (a company / CRM brain) — copy what fits into your
 types the toolkit knows are the three meta files (`db-md`, `index`,
 `log`); every content type is yours.
 
-**Every content type (everything below except `db-md`, `index`, `log`) requires `summary` in frontmatter** — see the [universal frontmatter contract](#the-universal-frontmatter-contract). The "Type-specific fields" column lists fields *in addition to* the universal contract (`type`, `id`, `created`, `updated`, `summary`, `status`, `tags`).
+**Every content type (everything below except `db-md`, `index`, `log`) requires `summary` in frontmatter** — see the [universal frontmatter contract](#the-universal-frontmatter-contract). The "Type-specific fields" column lists fields *in addition to* the universal contract (`type`, `id`, `created`, `updated`, `summary`, `status`, `tags`). The `meta-type` column applies to `records/` only (`sources/` rows have none); absent ⇒ `fact`.
 
-| `type`         | Layer    | Default location         | Type-specific fields (in addition to the universal contract)          |
-|----------------|----------|--------------------------|-----------------------------------------------------------------------|
-| `db-md`        | root     | `DB.md` (the file)       | `scope`, `owner`, `computer_id` (if any). *Meta file: no `summary`.*  |
-| `index`        | any      | `index.md` (root / per-layer / per-type-folder) | `scope: root\|layer\|type-folder`, `folder: <path>` (on layer + type-folder). *Meta file: no `summary`.* |
-| `log`          | root     | `log.md` (single, global)| (none — body is the timeline). *Meta file: no `summary`.*             |
-| `email`        | sources  | `sources/emails/`        | `from`, `to`, `date`, `subject`, `thread`, `in_reply_to`              |
-| `transcript`   | sources  | `sources/transcripts/`   | `recorded_at`, `attendees`, `duration_min`, `language`                |
-| `pdf-source`   | sources  | `sources/docs/`          | `received_from`, `received_at`, `doc_type`                            |
-| `contact`      | records  | `records/contacts/`      | `name`, `email`, `company` (link → `records/companies/`), `role`, `first_touch`, `last_touch`|
-| `company`      | records  | `records/companies/`     | `name`, `domain`, `industry`, `relationship`                          |
-| `expense`      | records  | `records/expenses/`      | `date`, `amount`, `currency`, `category`, `vendor` (link → `records/companies/`), `contact` (link → `records/contacts/`)|
-| `meeting`      | records  | `records/meetings/`      | `date`, `attendees`, `location`, `duration_min`, `expense` (link → `records/expenses/`)|
-| `decision`     | records  | `records/decisions/`     | `decided_by`, `affects`, `alternatives_considered`                    |
-| `invoice`      | records  | `records/invoices/`      | `date`, `amount`, `vendor` (link → `records/companies/`), `status`, `paid_at`|
-| `wiki-page`    | wiki     | `wiki/<topic>/`          | `topic`, `derived_from` (list of record/source links)                 |
+| `type`         | Layer    | `meta-type`  | Default location         | Type-specific fields (in addition to the universal contract)          |
+|----------------|----------|--------------|--------------------------|-----------------------------------------------------------------------|
+| `db-md`        | root     | —            | `DB.md` (the file)       | `scope`, `owner`, `computer_id` (if any). *Meta file: no `summary`.*  |
+| `index`        | any      | —            | `index.md` (root / per-layer / per-type-folder) | `scope: root\|layer\|type-folder`, `folder: <path>` (on layer + type-folder). *Meta file: no `summary`.* |
+| `log`          | root     | —            | `log.md` (single, global)| (none — body is the timeline). *Meta file: no `summary`.*             |
+| `email`        | sources  | —            | `sources/emails/`        | `from`, `to`, `date`, `subject`, `thread`, `in_reply_to`              |
+| `transcript`   | sources  | —            | `sources/transcripts/`   | `recorded_at`, `attendees`, `duration_min`, `language`                |
+| `pdf-source`   | sources  | —            | `sources/docs/`          | `received_from`, `received_at`, `doc_type`                            |
+| `note`         | sources  | —            | `sources/notes/`         | `told_by`, `told_at` — testimonial source ("a human told the agent X")|
+| `contact`      | records  | `fact`       | `records/contacts/`      | `name`, `email`, `company` (link → `records/companies/`), `role`, `first_touch`, `last_touch`|
+| `company`      | records  | `fact`       | `records/companies/`     | `name`, `domain`, `industry`, `relationship`                          |
+| `expense`      | records  | `fact`       | `records/expenses/`      | `date`, `amount`, `currency`, `category`, `vendor` (link → `records/companies/`), `contact` (link → `records/contacts/`)|
+| `meeting`      | records  | `fact`       | `records/meetings/`      | `date`, `attendees`, `location`, `duration_min`, `expense` (link → `records/expenses/`)|
+| `decision`     | records  | `fact`       | `records/decisions/`     | `decided_by`, `affects`, `alternatives_considered`                    |
+| `invoice`      | records  | `fact`       | `records/invoices/`      | `date`, `amount`, `vendor` (link → `records/companies/`), `status`, `paid_at`|
+| `tasklist`     | records  | `operational`| `records/tasklists/`     | `items`, `owner` — operating state the agent mutates                  |
+| `concept`      | records  | `conclusion` | `records/concepts/`      | `derived_from` (list of record/source links)                          |
+| `profile`      | records  | `conclusion` | `records/profiles/`      | `derived_from` (list of record/source links)                          |
+| `playbook`     | records  | `conclusion` | `records/playbooks/`     | `derived_from` (list of record/source links)                          |
+| `theme`        | records  | `conclusion` | `records/themes/`        | `derived_from` (list of record/source links)                          |
+| `synthesis`    | records  | `conclusion` | `records/synthesis/`     | `derived_from` (list of record/source links)                          |
+| `account`      | records  | `conclusion` | `records/accounts/`      | `derived_from` (list of record/source links)                          |
+
+The `meta-type: conclusion` types (`concept`, `profile`, `playbook`,
+`theme`, `synthesis`, `account`) are the v0.2 `wiki-page` split into real
+types. `wiki-page` is **retired**: synthesis now carries a domain `type`
+in `records/` plus `meta-type: conclusion`, not a single generic
+`wiki-page` type in a `wiki/` folder.
 
 **Reading rules:**
 
@@ -214,11 +289,20 @@ types the toolkit knows are the three meta files (`db-md`, `index`,
   reader that doesn't know `type: proposal` (or `type: contact`) reads the
   file as ambient context.
 - The folder layout is convention, not enforcement. A `type: contact`
-  in `sources/foo/` is valid (though unusual).
+  in `sources/foo/` is valid (though unusual). `meta-type`, not the
+  folder, is what makes a record a fact, operational state, or a
+  conclusion.
 - A single entity (e.g. a person) can have both a `records/contacts/`
-  data row AND a `wiki/people/` narrative page. The record is the
-  atomic fact; the wiki page is the synthesis that cross-references
-  it.
+  data row (`meta-type: fact`) AND a `records/profiles/` narrative page
+  (`meta-type: conclusion`). The record is the atomic fact; the profile
+  is the synthesis that cross-references it. Both live under `records/`;
+  the `meta-type` field, not a separate folder, tells them apart.
+- A testimonial fact — something a human asserted in chat with no
+  document behind it — is captured as a `note` source under
+  `sources/notes/` with a `told_by` field, then the `records/` data it
+  drives can trace back to it. This is how a chat-asserted fact gets a
+  source (see [The curator contract](#the-curator-contract) →
+  source-first capture).
 - Every content type requires `summary` — the field is universal across
   content files, whatever the `type`.
 - **No type carries a built-in schema.** Field requirements, shapes, link
@@ -283,7 +367,7 @@ keeps agent-driven resolution deterministic.
 
 ```markdown
 [[records/contacts/sarah-chen]]
-[[wiki/people/sarah-chen|Sarah]]
+[[records/profiles/sarah-chen|Sarah]]
 [[sources/emails/2026-05-22-elena-renewal]]
 ```
 
@@ -403,7 +487,7 @@ queries, links), and a capable agent authors what a tool would otherwise
 generate. To make a fresh store, create the folders and write a `DB.md`:
 
 ```bash
-mkdir -p mystore/{sources,records,wiki}
+mkdir -p mystore/{sources,records}
 # then write mystore/DB.md yourself — minimally:
 #   ---
 #   type: db-md
@@ -443,15 +527,15 @@ Company-scale institutional memory for Acme.
 ## Agent instructions
 
 Prioritize creating `contact` records from new-sender emails. Use
-British English in wiki pages. When a vendor invoice arrives, also
-create an `expense` record linked to the invoice. Don't synthesize
-wiki pages from sources tagged `transient`.
+British English in `meta-type: conclusion` records. When a vendor
+invoice arrives, also create an `expense` record linked to the invoice.
+Don't synthesize conclusion records from sources tagged `transient`.
 
 ## Policies
 
 ### Frozen pages
 - `records/decisions/2026-q1-strategy.md` — finalized, do not modify.
-- `wiki/synthesis/2026-annual-plan.md` — signed-off plan.
+- `records/synthesis/2026-annual-plan.md` — signed-off plan.
 
 ### Ignored types
 - `test`, `temp` — read but never synthesize.
@@ -491,7 +575,7 @@ wiki pages from sources tagged `transient`.
     to remember).
   - **`### Ignored types`** — type list the curator never
     synthesizes (still readable as ambient context, but no
-    derived wiki pages, no new records).
+    derived `meta-type: conclusion` records, no new records).
 - **`## Schemas`** — the store's type definitions. This is the **only**
   source of schema enforcement; the toolkit ships no built-in or implicit
   per-type schema. Parseable and enforced by `dbmd validate`.
@@ -577,30 +661,28 @@ my-store/
 │   └── docs/
 │       ├── index.md          # TYPE-FOLDER
 │       └── (.pdf files)
-├── records/
-│   ├── index.md              # LAYER
-│   ├── contacts/
-│   │   ├── index.md          # TYPE-FOLDER — every contact record
-│   │   └── (.md files)
-│   ├── companies/
-│   │   ├── index.md
-│   │   └── ...
-│   └── ...
-└── wiki/
+└── records/
     ├── index.md              # LAYER
-    ├── people/
-    │   ├── index.md          # TYPE-FOLDER — every bio
+    ├── contacts/
+    │   ├── index.md          # TYPE-FOLDER — every contact record (meta-type: fact)
+    │   └── (.md files)
+    ├── companies/
+    │   ├── index.md
     │   └── ...
-    └── projects/
+    ├── profiles/
+    │   ├── index.md          # TYPE-FOLDER — every bio (meta-type: conclusion)
+    │   └── ...
+    └── synthesis/
+        ├── index.md          # TYPE-FOLDER — cross-cutting overviews (meta-type: conclusion)
         └── ...
 ```
 
 **The three levels:**
 
 - **Root `index.md`** — exists whenever the store has any files. Lightweight: lists each layer + each type folder under it with counts. One entry per type folder; does NOT enumerate every file. Wiki-links target the layer indexes.
-- **Layer `index.md`** (`sources/index.md`, `records/index.md`, `wiki/index.md`) — exists whenever that layer has any files. Lists each type folder under the layer with counts and brief summaries. Wiki-links target type-folder indexes.
+- **Layer `index.md`** (`sources/index.md`, `records/index.md`) — exists whenever that layer has any files. Lists each type folder under the layer with counts and brief summaries. Wiki-links target type-folder indexes.
 - **Type-folder `index.md`** — exists whenever the type folder has any files. The **human / recency browse view**: lists files in the type-folder, **across date-shards**, with a one-line summary, **capped at 500 entries** selected by recency (newest first by the frontmatter `updated` field — clone-stable, unlike filesystem mtime, which `git clone` resets — ties broken by store-relative path ascending). Above the cap it lists the 500 most-recent and ends with a `## More` section pointing to `dbmd fm query` / `dbmd index query --type <t> --in <layer>` (the complete twin below) for full enumeration. The cap keeps the browse view inside an LLM context budget and bounded in the write loop; completeness lives in the `index.jsonl` twin, not here.
-- **Type-folder `index.jsonl`** — the complete, **uncapped** machine twin of `index.md`: one JSON object per file in the folder (across date-shards), `{path, type, summary, tags, links, created, updated, <other frontmatter fields>}` — where **`tags` and `links` are the document's expansion** (`tags` = the LLM's flat semantic labels; `links` = wiki-links to concept pages + related records). Same kind of artifact as `index.md` — a derived, write-through, rebuildable **plain file** (JSONL, so it stays git-diffable line-by-line and ripgrep-able), not a database engine. The current toolkit keeps it compacted on write for byte-for-byte rebuild equivalence; readers also tolerate un-compacted append-style lines by applying last-write-wins by path. It is the **backing for structured reads**: `dbmd fm query`, `dbmd index query`, `dbmd search --type/--where`, the dedup pre-write checks, and `dbmd graph backlinks` read it (one sequential, complete read per type-folder — cold-cache-proof) instead of scanning frontmatter across the tree. This is what makes the catalog complete *and* fast with no engine; ad-hoc full-text body search stays ripgrep. **Tags ≠ concepts:** a tag is a flat label (the agent filters/aggregates it on demand from this sidecar; no page of its own); a concept is a wiki page the doc links to (`links`), navigated via `graph backlinks`. Both are LLM-authored, never inferred — they are the *doc-side* of query expansion, so the agent's expanded query and the document's tags/concepts meet lexically here, with no embeddings. (Root and layer levels stay markdown-only rollups — the `.jsonl` twin lives at the type-folder level, where the records are.)
+- **Type-folder `index.jsonl`** — the complete, **uncapped** machine twin of `index.md`: one JSON object per file in the folder (across date-shards), `{path, type, summary, tags, links, created, updated, <other frontmatter fields>}` — where **`tags` and `links` are the document's expansion** (`tags` = the LLM's flat semantic labels; `links` = wiki-links to concept pages + related records). Same kind of artifact as `index.md` — a derived, write-through, rebuildable **plain file** (JSONL, so it stays git-diffable line-by-line and ripgrep-able), not a database engine. The current toolkit keeps it compacted on write for byte-for-byte rebuild equivalence; readers also tolerate un-compacted append-style lines by applying last-write-wins by path. It is the **backing for structured reads**: `dbmd fm query`, `dbmd index query`, `dbmd search --type/--where`, the dedup pre-write checks, and `dbmd graph backlinks` read it (one sequential, complete read per type-folder — cold-cache-proof) instead of scanning frontmatter across the tree. This is what makes the catalog complete *and* fast with no engine; ad-hoc full-text body search stays ripgrep. **Tags ≠ concepts:** a tag is a flat label (the agent filters/aggregates it on demand from this sidecar; no page of its own); a concept is a `meta-type: conclusion` record the doc links to (`links`), navigated via `graph backlinks`. Both are LLM-authored, never inferred — they are the *doc-side* of query expansion, so the agent's expanded query and the document's tags/concepts meet lexically here, with no embeddings. (Root and layer levels stay markdown-only rollups — the `.jsonl` twin lives at the type-folder level, where the records are.)
 
 **Empty folders have no `index.md`.** Folders below the type-folder level (sub-sub-folders, if an operator creates them) are operator territory — not part of the canonical hierarchy, no auto-indexing.
 
@@ -620,31 +702,29 @@ updated: 2026-05-27T10:00:00Z
 - [[sources/docs/index|Docs]] (18 files) — PDFs, contracts, exports
 
 ## Records
-- [[records/contacts/index|Contacts]] (27 files) — people we've interacted with
-- [[records/companies/index|Companies]] (12 files) — vendor and customer orgs
-- [[records/meetings/index|Meetings]] (34 files)
-
-## Wiki
-- [[wiki/people/index|People]] (15 bios)
-- [[wiki/projects/index|Projects]] (5)
-- [[wiki/themes/index|Themes]] (3)
+- [[records/contacts/index|Contacts]] (27 files) — people we've interacted with · meta-type: fact
+- [[records/companies/index|Companies]] (12 files) — vendor and customer orgs · meta-type: fact
+- [[records/meetings/index|Meetings]] (34 files) · meta-type: fact
+- [[records/profiles/index|Profiles]] (15 bios) · meta-type: conclusion
+- [[records/themes/index|Themes]] (3) · meta-type: conclusion
+- [[records/synthesis/index|Synthesis]] (5) · meta-type: conclusion
 ```
 
-**Example — folder `index.md` (e.g. `wiki/people/index.md`):**
+**Example — folder `index.md` (e.g. `records/profiles/index.md`):**
 
 ```markdown
 ---
 type: index
 scope: folder
-folder: wiki/people
+folder: records/profiles
 updated: 2026-05-27T10:00:00Z
 ---
 
-# wiki/people
+# records/profiles
 
-- [[wiki/people/sarah-chen]] — Renewal-champion bio; Q2 timeline
-- [[wiki/people/elena-rodriguez]] — Acme VP; engineering relationship
-- [[wiki/people/marcus-okafor]] — New Northstar contact (May 2026)
+- [[records/profiles/sarah-chen]] — Renewal-champion bio; Q2 timeline
+- [[records/profiles/elena-rodriguez]] — Acme VP; engineering relationship
+- [[records/profiles/marcus-okafor]] — New Northstar contact (May 2026)
 ```
 
 **Conventions:**
@@ -682,14 +762,17 @@ Email received from Elena re: renewal expansion to 175 seats.
 ## [2026-05-27 10:05] create | records/meetings/2026-05-22-renewal-call
 From email thread; attendees: Elena, Sarah, the CTO.
 
+## [2026-05-27 10:08] ingest | sources/notes/2026/05/sarah-told-cto-name.md
+Sarah told the agent the CTO is Marcus Okafor (no document yet); told_by: Sarah.
+
 ## [2026-05-27 10:10] update | records/companies/northstar
 Seat count 120 → 175 (pending signature).
 
-## [2026-05-27 10:15] update | wiki/people/elena-rodriguez
+## [2026-05-27 10:15] update | records/profiles/elena-rodriguez
 Added Q2 renewal context. Linked records/meetings/2026-05-22-renewal-call.
 
 ## [2026-05-27 10:20] validate
-PASS — 0 errors, 2 warnings (unknown type `proposal` in records/proposals/x.md; orphan wiki/themes/draft.md).
+PASS — 0 errors, 2 warnings (unknown type `proposal` in records/proposals/x.md; orphan records/themes/draft.md).
 ```
 
 **Conventions:**
@@ -699,7 +782,7 @@ PASS — 0 errors, 2 warnings (unknown type `proposal` in records/proposals/x.md
 - Append-only. The curator never rewrites past entries; if a finding is wrong, append a corrective entry below it.
 - Parseable with `grep "^## \[" log.md | tail -5` or any similar pipeline (or `dbmd log tail`).
 - **Rotation.** `log.md` is the active timeline; `dbmd log` automatically rolls older months into `log/<YYYY-MM>.md` on append. The full history is the archives plus the active file — one timeline, paginated so the active file (and every read of it) stays small no matter how old the store gets. `dbmd log tail` / `dbmd log since` reverse-read from the active file and cross into archives only when the requested range does.
-- **Concurrent-clone merges.** A single-writer store (one agent, one clone — the v0.2 contract; see [Writers and readers](#writers-and-readers)) never has a merge. When two git clones of a store both append (multi-machine sync, a shared repo), git's line merge conflicts on the shared end-of-file region. Resolution is the agent's: a curator with this SPEC in context semantically merges — keep both entries, order by timestamp. For merges where no agent is in the loop (a human, CI), set `log.md merge=union` in `.gitattributes`: because every entry is timestamped, the union driver keeps both sides (never drops one) and a later agent pass reorders. The derived `index.md` needs no merge logic at all — on conflict, regenerate it with `dbmd index rebuild`.
+- **Concurrent-clone merges.** A single-writer store (one agent, one clone — the v0.3 contract; see [Writers and readers](#writers-and-readers)) never has a merge. When two git clones of a store both append (multi-machine sync, a shared repo), git's line merge conflicts on the shared end-of-file region. Resolution is the agent's: a curator with this SPEC in context semantically merges — keep both entries, order by timestamp. For merges where no agent is in the loop (a human, CI), set `log.md merge=union` in `.gitattributes`: because every entry is timestamped, the union driver keeps both sides (never drops one) and a later agent pass reorders. The derived `index.md` needs no merge logic at all — on conflict, regenerate it with `dbmd index rebuild`.
 
 ## The curator contract
 
@@ -727,46 +810,74 @@ user's choice. **db.md ships no LLM runtime and no API keys.**
    message, a webhook, a file-event script). On wake, the agent
    uses `dbmd log since <ts>` and `dbmd search --updated-after
    <ts>` to learn what's new.
-5. **Extracts atomic facts from new sources into `records/`** (e.g.
-   an email becomes a `meeting` record + a `contact` record).
-   **Every created content file gets a `summary` in its
-   frontmatter** — thoughtful summary if the agent has context for
-   one; `dbmd fm init` writes a deterministic default otherwise.
-6. **Creates or updates `wiki/` pages** reflecting entities,
-   projects, and themes — synthesizing across records and sources,
-   with dense wiki-links. **Same summary contract: every wiki page
-   has `summary` in frontmatter.**
-7. **Refreshes `summary` whenever the content meaningfully changes**
+5. **Extracts atomic facts from new sources into `records/`** as
+   `meta-type: fact` records (e.g. an email becomes a `meeting`
+   record + a `contact` record). **Every created content file gets a
+   `summary` in its frontmatter** — thoughtful summary if the agent
+   has context for one; `dbmd fm init` writes a deterministic default
+   otherwise.
+6. **Captures ephemeral testimony as a source, source-first.** When a
+   fact arrives only in conversation — a human asserts something with
+   no document behind it — the agent writes a `note` source under
+   `sources/notes/` (with `told_by`) *at the moment of the create or
+   update it drives*, so the asserted fact has an evidence record to
+   trace to. This is a curator **discipline**, not a toolkit-enforced
+   invariant: the toolkit does not refuse a source-less record. The
+   one thing that genuinely must be captured at write time is the
+   testimony itself, because — unlike a persistent document — an
+   unsaved conversation cannot be reconstructed later. See
+   *source-first provenance* below.
+7. **Synthesizes conclusion records** (`meta-type: conclusion`) —
+   `profile`, `concept`, `playbook`, `theme`, `synthesis`, `account`
+   records reflecting entities, projects, and themes — across records
+   and sources, with dense wiki-links. These are the old `wiki/`
+   pages, now real types under `records/`. **Same summary contract:
+   every conclusion record has `summary` in frontmatter.** Conclusion
+   records are **single-voice** — one curator reconciles them (see
+   [Writers and readers](#writers-and-readers)).
+8. **Refreshes `summary` whenever the content meaningfully changes**
    — e.g. if a contact's role changes, the agent updates both the
    `role` field and the `summary` field. Stale summaries are an
    anti-pattern the curator keeps in check by re-reading and
    refreshing the `summary` alongside any substantive body edit.
-8. **Maintains cross-references** (a wiki page about a person links
-   to the contact record, the company record, and meeting records).
-9. **Flags contradictions** (two sources disagree on a contact's
-   employer) without silently picking a winner. Canonical
-   mechanism: append a `## Open questions` section to the relevant
-   wiki page with both candidate facts cited via wiki-links to the
-   conflicting sources, then `dbmd log contradiction <object> -m
-   "<short description>"`. Surface the disagreement; let the
-   operator (or a later session with more evidence) resolve.
-10. **Relies on write-through indexes.** The write commands
+9. **Maintains cross-references** (a `profile` conclusion about a
+   person links to the contact record, the company record, and
+   meeting records).
+10. **Reconstructs provenance on demand.** Every record *should* trace
+    to a source — documentary or testimonial — but db.md does **not**
+    materialize that as a mandatory per-record link. The agent
+    reconstructs the chain when it is needed (audit, contradiction,
+    review) by matching record to source *by meaning* — which is what
+    the agent is good at and what makes per-record provenance links
+    premature. Persistent documentary sources are always
+    reconstructable; only ephemeral testimony must be captured up
+    front (step 6). This is a **discipline that keeps provenance
+    reconstructable**, not a mechanical guarantee that every record is
+    grounded — see [the honesty note below](#a-note-on-what-is-and-isnt-enforced).
+11. **Flags contradictions** (two sources disagree on a contact's
+    employer) without silently picking a winner. Canonical
+    mechanism: append a `## Open questions` section to the relevant
+    conclusion record with both candidate facts cited via wiki-links
+    to the conflicting sources, then `dbmd log contradiction <object>
+    -m "<short description>"`. Surface the disagreement; let the
+    operator (or a later session with more evidence) resolve.
+12. **Relies on write-through indexes.** The write commands
     (`dbmd write` / `dbmd fm init` / `dbmd fm set` /
     `dbmd rename`) keep the hierarchical `index.md` catalog (root,
     layer, type-folder) current as the agent works — there is no
     rebuild step in the normal loop. After a bulk external drop
     into `sources/` (rsync, mbsync), the agent runs `dbmd index
     rebuild` once to fold the new files in. See [Scale](#scale).
-11. **Appends to `log.md`** on every action — ingest, create,
+13. **Appends to `log.md`** on every action — ingest, create,
     update, delete, rename, link, validate, contradiction
     (`dbmd log <kind> <object> -m <note>` is the canonical
     append).
-12. **Respects `## Policies` in `DB.md`** — the toolkit refuses
+14. **Respects `## Policies` in `DB.md`** — the toolkit refuses
     writes to `### Frozen pages`, so the agent doesn't have to
     remember the list; the agent's part is knowing the policy
     exists and choosing alternate paths or escalating to the
     operator when blocked. `### Ignored types` are never
-    synthesized into derived wiki pages.
+    synthesized into derived `meta-type: conclusion` records.
 
 **The agent does not (in its curator role):**
 
@@ -784,6 +895,38 @@ user's choice. **db.md ships no LLM runtime and no API keys.**
   anyone can build a db.md-aware tool; the contract is the format and
   these invariants, not the binary.) The harness can do anything it
   wants outside the store.
+
+### Source-first provenance
+
+The discipline behind steps 6 and 10, stated once:
+
+- **Every record should trace to a source** — documentary (an email, a
+  PDF, an export under `sources/`) or testimonial (a `note` under
+  `sources/notes/`). Records are the agent's distillation of evidence;
+  the evidence is what makes a record defensible.
+- **Provenance is reconstructed, not linked.** db.md does not require a
+  per-record link back to its source, and ships no check that one
+  exists. The reconstruction tool is the agent: it matches a record to
+  its source by meaning when provenance is actually needed. A persistent
+  document is always there to be re-found, so materializing the link at
+  write time is premature.
+- **Testimony is the exception that must be captured.** An unsaved
+  conversation cannot be reconstructed. So when a fact arrives only in
+  chat, the agent writes the `note` source *coupled to* the create or
+  update it drives — source-first, at write time, before the testimony
+  is gone.
+
+#### A note on what is and isn't enforced
+
+"Every record traces to a source" is a **curator discipline, not a
+mechanically enforced invariant.** With no required link and no shipped
+check, the toolkit cannot itself tell a grounded record from an
+ungrounded one — `dbmd validate` will not fail a record that has no
+source. The discipline keeps provenance *reconstructable*; it does not
+*prove* groundedness. Treat it as a contract the curator upholds, not a
+guarantee the format gives you. (A future opt-in `RECORD_UNGROUNDED`
+info-level check could surface obviously source-less records, but v0.3
+ships no such check by default; see [Roadmap](#roadmap).)
 
 ### Pre-write checks
 
@@ -811,8 +954,8 @@ should:
    the vocabulary stays coherent. The catalog you're already reading is
    your memory of your own labels; there's no separate tag index to
    consult. For a concept that deserves explanation, create or link a
-   `wiki/` page rather than a tag — tags are flat labels, concepts are
-   pages.
+   `meta-type: conclusion` record (a `concept` page) rather than a tag —
+   tags are flat labels, concepts are pages.
 
 ### Post-write checks
 
@@ -879,7 +1022,7 @@ parseable object the agent branches on:
 {
   "severity": "error",
   "code": "WIKI_LINK_SHORT_FORM",
-  "file": "wiki/people/sarah-chen.md",
+  "file": "records/profiles/sarah-chen.md",
   "line": 12,
   "key": null,
   "message": "wiki-link '[[sarah-chen]]' is not a full store-relative path",
@@ -923,6 +1066,7 @@ see; grouped by category):
 | `FM_UNREADABLE` | error | content file can't be read (not valid UTF-8, or an I/O error) |
 | `FM_MALFORMED_YAML` | error | frontmatter block isn't valid YAML |
 | `FM_BAD_TIMESTAMP` | error | `created` or `updated` isn't ISO-8601 |
+| `FM_BAD_META_TYPE` | error | a record's `meta-type` is not one of `fact` / `operational` / `conclusion` |
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |
 | `SUMMARY_EMPTY` | error | `summary` present but empty |
 | `SUMMARY_MULTILINE` | error | `summary` contains newlines |
@@ -940,7 +1084,7 @@ see; grouped by category):
 | `SCHEMA_ENUM_VIOLATION` | error | value not in the schema's `enum` |
 | `POLICY_FROZEN_PAGE` | error | write attempted on a `### Frozen pages` path (write-time) |
 | `POLICY_IGNORED_TYPE_PRESENT` | info | a file with an `### Ignored types` type exists |
-| `POLICY_IGNORED_TYPE_DERIVED` | warning | a `wiki-page` derives from an ignored-type record |
+| `POLICY_IGNORED_TYPE_DERIVED` | warning | a `meta-type: conclusion` record derives from an ignored-type record |
 | `LOG_BAD_TIMESTAMP` | error | `log.md` entry header timestamp unparseable |
 | `LOG_UNKNOWN_KIND` | warning | `log.md` entry kind not recognized |
 | `LOG_OUT_OF_ORDER` | warning | `log.md` entries not in non-decreasing time order (possible rewrite) |
@@ -968,10 +1112,13 @@ passes. Byte presence and hash correctness are `dbmd assets verify`. See
 
 v0.2 reworked the type-driven codes — it dropped the six type-specific
 `DUP_*` collisions and `LAYER_TYPE_MISMATCH`, and added the generic
-`DUP_UNIQUE_KEY`. From v0.2 on the vocabulary is additive (new codes layer
-on; existing codes keep their meaning). Errors block; the agent resolves
-warnings and info at its discretion — usually via `dbmd rename`,
-`dbmd link`, `dbmd fm set`, or `dbmd index rebuild`.
+`DUP_UNIQUE_KEY`. v0.3 added `FM_BAD_META_TYPE` (the closed-enum check on
+`meta-type`) and retargeted `POLICY_IGNORED_TYPE_DERIVED` from the retired
+`wiki-page` type to `meta-type: conclusion` records. From v0.3 on the
+vocabulary is additive (new codes layer on; existing codes keep their
+meaning). Errors block; the agent resolves warnings and info at its
+discretion — usually via `dbmd rename`, `dbmd link`, `dbmd fm set`, or
+`dbmd index rebuild`.
 
 **`DB.md` structure.** The store's `DB.md` is the identity file, so its
 shape is checked directly (not as a content file — it carries no
@@ -995,8 +1142,8 @@ software over data had to be built as database, backend, frontend. The
 database held state, the backend encoded rules, and the frontend exposed
 fixed views and actions.
 
-Agents make another shape possible: markdown/wiki/files, an agent
-harness, and a generated surface. A modern computer can ripgrep a
+Agents make another shape possible: markdown files with wiki-links, an
+agent harness, and a generated surface. A modern computer can ripgrep a
 million files in seconds. An LLM reads markdown directly. Git gives
 curated plain-file layers a durable, inspectable history.
 
@@ -1045,13 +1192,32 @@ into agent-readable files, and never by adding vectors.
 
 ## Writers and readers
 
-By design, db.md is **many-writer for `sources/` and `records/`,
-single-writer for `wiki/`**. Anything can drop files into `sources/`
-(rsync, mbsync, manual cp). Anything can append atomic facts to
-`records/` (the agent, the operator via `dbmd write`, scripts).
-But `wiki/` — the synthesis layer — has a single voice. One curator
-agent reconciles it. Multiple agents writing to `wiki/`
+By design, db.md is **many-writer for `sources/` and for `fact` /
+`operational` records, single-writer for `meta-type: conclusion`
+records**. Anything can drop files into `sources/` (rsync, mbsync,
+manual cp). Anything can append atomic facts to `records/` (the agent,
+the operator via `dbmd write`, scripts). But conclusion records — the
+synthesis the old `wiki/` layer held — have a single voice. One curator
+agent reconciles them. Multiple agents writing conclusion records
 concurrently is an anti-pattern.
+
+**This is now a per-file, frontmatter-conditional rule — and that is a
+real weakening from v0.2.** In v0.2 the single-writer boundary was the
+`wiki/` *folder*: a path either was under `wiki/` or it wasn't, so the
+boundary was mechanically checkable and a tool could refuse a write by
+path. In v0.3 the synthesis lives *inside* the many-writer `records/`
+folder, distinguished only by `meta-type: conclusion` in frontmatter. So
+the single-voice contract is **prose, not a path check**: nothing in the
+layout stops an external script that appends to `records/` from touching
+a conclusion record, and `dbmd validate` does not enforce single-writer.
+We accept this knowingly. The mitigant is that db.md's contract is
+already **single-agent-per-store** (below): with one curator agent and
+one writer in practice, the realistic blast radius is narrow — an
+external script writing into `records/` is the only way to violate it,
+and that script is the operator's own. (If a mechanical guard is wanted
+later, the existing `### Frozen pages` machinery, or a `conclusion`-aware
+write refusal, can reintroduce a path-independent lock; v0.3 does not
+ship one.)
 
 Files dropped into `sources/` by an external tool join the catalog
 when the agent next seeds them with `dbmd fm init` (write-through) or
@@ -1060,13 +1226,14 @@ are on disk and findable by `dbmd search` (ripgrep doesn't need the
 catalog), but not yet listed in `index.md`. The agent reconciles a
 bulk drop once, not file-by-file in the loop.
 
-**Single-agent-per-store is the v0.2 contract.** db.md does not
+**Single-agent-per-store is the v0.3 contract.** db.md does not
 coordinate multiple curator agents writing to the same store
 concurrently. The operator runs one curator at a time. If multiple
 agents need to operate, give each its own store (and link the
 stores externally) or serialize via the operator's own tooling.
 Multi-agent coordination — locks, leases, conflict resolution —
-is out of scope at v0.2.
+is out of scope at v0.3. This contract is also what keeps the
+prose-only single-writer rule above tolerable in practice.
 
 ## Scale
 
@@ -1085,23 +1252,25 @@ are repair/audit operations, off the interactive path.
 
 Four properties deliver it:
 
-- **Sources and event-type records are date-sharded; entity records
-  and wiki stay flat.** Raw evidence never changes after ingest, so the
-  toolkit parses each source once and never again. When a conforming
-  writer uses `dbmd write`, high-volume source and event types
-  auto-partition by date (`sources/emails/2026/05/…`,
-  `records/expenses/2026/05/…`) so no directory holds an unbounded
-  number of entries and only the current shard is ever "hot."
-  **Sharding is a property of the type, not the layer:** event-driven
-  types (`email`, `transcript`, `expense`, `invoice`, `meeting`, +
-  custom event types) carry a primary date field and shard;
-  dedup-bounded *entity* types (`contact`, `company`) stay flat because
-  the entity set itself is bounded; `wiki/` stays flat
-  (curation-bounded). This is what lets a company's event records —
-  expenses, invoices, orders, which track business volume, not curation
-  effort — scale the same way sources do. The type-folder catalog
-  (`records/expenses/index.md`) aggregates across shards; the shards
-  themselves are storage, not catalog levels.
+- **Sources and event-type records are date-sharded; entity and
+  conclusion records stay flat.** Raw evidence never changes after
+  ingest, so the toolkit parses each source once and never again. When a
+  conforming writer uses `dbmd write`, high-volume source and event
+  types auto-partition by date (`sources/emails/2026/05/…`,
+  `sources/notes/2026/05/…`, `records/expenses/2026/05/…`) so no
+  directory holds an unbounded number of entries and only the current
+  shard is ever "hot."
+  **Sharding is a property of the type, not the layer or the
+  meta-type:** event-driven types (`email`, `transcript`, `note`,
+  `expense`, `invoice`, `meeting`, + custom event types) carry a primary
+  date field and shard; dedup-bounded *entity* types (`contact`,
+  `company`) stay flat because the entity set itself is bounded;
+  `meta-type: conclusion` records stay flat (curation-bounded). This is
+  what lets a company's event records — expenses, invoices, orders,
+  which track business volume, not curation effort — scale the same way
+  sources do. The type-folder catalog (`records/expenses/index.md`)
+  aggregates across shards; the shards themselves are storage, not
+  catalog levels.
 - **Structured reads hit the `index.jsonl` sidecar; full-text reads
   are ripgrep.** `dbmd fm query`, `dbmd index query`, `dbmd search
   --type/--where`, the entity-dedup pre-write checks, and `dbmd graph
@@ -1210,10 +1379,11 @@ prove the local copy is complete.*
 
 A **wrapper** is an ordinary content file that declares, in frontmatter, a
 binary it is about. Usually a source under `sources/`, but a `records/` entry (a
-receipt on an expense) or a `wiki/` page may declare one too — the asset layer
-spans all three layers. The wrapper carries the universal frontmatter and the
-agent-usable text (extracted text, a transcript, notes); it is small and
-version-controlled like any other content file.
+receipt on a `fact` expense, or a `meta-type: conclusion` record citing a signed
+plan) may declare one too — the asset layer spans both layers. The wrapper
+carries the universal frontmatter and the agent-usable text (extracted text, a
+transcript, notes); it is small and version-controlled like any other content
+file.
 
 A **raw asset** is the binary the wrapper is about, at a real store-relative
 path so the working copy is genuinely complete and openable by any tool. It is
@@ -1328,11 +1498,12 @@ codes are `ASSET_MANIFEST_MALFORMED`, `ASSET_UNDECLARED`, `ASSET_WRAPPER_BROKEN`
 
 ## Roadmap
 
-v0.2 is deliberately the simplest useful separated flavor: plain files,
-YAML frontmatter, wiki-links, embedded ripgrep. No daemon, no engine, no
-magic. It is built for the low millions of files; the packed engine is
-the path beyond the point where literal directories, whole-tree walks, or
-git over the raw store stop being the right physical shape.
+v0.3 is deliberately the simplest useful separated flavor: plain files,
+YAML frontmatter, wiki-links, embedded ripgrep, two folders + a
+`meta-type` field. No daemon, no engine, no magic. It is built for the
+low millions of files; the packed engine is the path beyond the point
+where literal directories, whole-tree walks, or git over the raw store
+stop being the right physical shape.
 
 Where db.md is going — additively, without breaking the "it's just
 files" contract or the format you read today:
@@ -1458,12 +1629,39 @@ prompt interactively.
 
 ## Versioning
 
-The spec is versioned with the repo tag (`v0.1`, `v0.2`, ...). v0.2
-generalized the type model (schema enforcement is solely the store's
-`## Schemas`; the example types are illustrative) and reworked the
-type-driven validation codes. From v0.2 on, changes are additive: old
-stores stay readable forever, new fields and new codes layer on top, and
-tools that don't recognize them ignore them.
+The spec is versioned with the repo tag (`v0.1`, `v0.2`, `v0.3`, ...).
+v0.2 generalized the type model (schema enforcement is solely the
+store's `## Schemas`; the example types are illustrative) and reworked
+the type-driven validation codes.
+
+**v0.3 is a breaking change** — the first since v0.2. It collapsed the
+three-folder layout to two (`sources/` + `records/`), removed the
+`wiki/` layer, and moved its synthesis role onto the closed-enum
+`meta-type` field (`fact` / `operational` / `conclusion`) inside
+`records/`. A v0.2 store does not validate unchanged against a v0.3
+toolkit: `wiki/` is no longer a recognized layer, and `type: wiki-page`
+is retired. **From v0.3 forward, changes are additive again** — old v0.3
+stores stay readable, new fields and codes layer on top, and tools that
+don't recognize them ignore them.
+
+**There is no migration command.** db.md is plumbing, not a scaffolder;
+migrating a v0.2 store is an agent's job, not a `dbmd` verb. A capable
+agent with this SPEC in context performs the in-place migration:
+
+- Move every `wiki/<topic>/*` file into `records/<type>/*`, assigning a
+  real `type` by topic (`people → profile`, `playbooks → playbook`,
+  `themes → theme`, `synthesis → synthesis`, concept pages → `concept`,
+  accounts → `account`) and setting `meta-type: conclusion` on each.
+- Leave `sources/` and `fact`/`operational` records as they are
+  (`meta-type` absent reads as `fact`); optionally annotate them
+  explicitly.
+- Update the store's `DB.md` — drop `wiki/` from any `### Frozen pages` /
+  schema paths, repoint them at `records/`.
+- Run `dbmd index rebuild` once to regenerate the catalog at the new
+  paths, then `dbmd validate --all`.
+
+The quick-start prompt that ships with the repo drives exactly this
+sequence; point an agent at it and the store migrates itself.
 
 ## License
 

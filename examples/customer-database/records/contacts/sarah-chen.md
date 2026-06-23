@@ -17,7 +17,7 @@ status: active
 
 Director of Operations at [[records/companies/northstar]] and the
 economic buyer on the Acme account. Drove the renewal expansion from
-120 to 175 seats — see [[wiki/accounts/northstar]] and the renewal call
+120 to 175 seats — see [[records/accounts/northstar]] and the renewal call
 [[records/calls/2026-05-22-northstar-renewal]].
 
 Decisive, asks specific commercial questions, prefers written

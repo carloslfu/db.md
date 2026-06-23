@@ -384,7 +384,7 @@ pub(crate) fn parse_layer(layer: &str) -> Result<Layer, CliError> {
             "BAD_LAYER",
             format!("unknown layer {layer:?}"),
         )
-        .with_hint("one of: sources, records, wiki")
+        .with_hint("one of: sources, records")
     })
 }
 

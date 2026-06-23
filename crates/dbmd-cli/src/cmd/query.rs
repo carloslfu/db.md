@@ -63,7 +63,7 @@ fn parse_layer(name: &str) -> Result<Layer, CliError> {
             "BAD_LAYER",
             format!("unknown layer `{name}`"),
         )
-        .with_hint("layer must be one of: sources, records, wiki")
+        .with_hint("layer must be one of: sources, records")
     })
 }
 

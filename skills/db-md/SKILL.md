@@ -10,10 +10,12 @@ license: Apache-2.0
 # db.md (the `dbmd` CLI)
 
 You have the `dbmd` binary on PATH. It operates a **db.md store**: a database
-that is a plain directory — raw evidence in `sources/`, atomic typed data in
-`records/`, curator-synthesized narrative in `wiki/`, all governed by a single
-`DB.md` at the root. `dbmd` is deterministic file/data plumbing; **you are the
-curator** — the reasoning, synthesis, and judgment are yours.
+that is a plain directory — evidence in `sources/` (documentary artifacts plus
+testimonial `note`s), everything the agent authors in `records/` (each tagged by
+a `meta-type` of `fact`, `operational`, or `conclusion`, where `conclusion` is
+the curator-synthesized narrative), all governed by a single `DB.md` at the
+root. `dbmd` is deterministic file/data plumbing; **you are the curator** — the
+reasoning, synthesis, and judgment are yours.
 
 ## How to use db.md — four moves, in order
 

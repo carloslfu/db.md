@@ -97,25 +97,21 @@ pub enum StoreError {
 ///
 /// `Ord`/`PartialOrd` are derived (additively) because sibling modules key
 /// `BTreeMap`s on `Layer` (e.g. `stats::Stats::files_per_layer`); the canonical
-/// declaration order (`Sources` < `Records` < `Wiki`) is the sort order.
+/// declaration order (`Sources` < `Records`) is the sort order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layer {
-    /// `sources/` — raw evidence; immutable; date-sharded at scale.
+    /// `sources/` — raw evidence (documentary + testimonial); immutable; date-sharded at scale.
     Sources,
-    /// `records/` — atomic typed data; entity types flat, event types sharded.
+    /// `records/` — everything the agent authors; meta-typed fact/operational/conclusion; entity types flat, event types sharded.
     Records,
-    /// `wiki/` — curator-synthesized narrative; flat.
-    Wiki,
 }
 
 impl Layer {
-    /// The on-disk folder name for this layer (`"sources"` / `"records"` /
-    /// `"wiki"`).
+    /// The on-disk folder name for this layer (`"sources"` / `"records"`).
     pub fn dir_name(self) -> &'static str {
         match self {
             Layer::Sources => "sources",
             Layer::Records => "records",
-            Layer::Wiki => "wiki",
         }
     }
 
@@ -124,14 +120,13 @@ impl Layer {
         match name {
             "sources" => Some(Layer::Sources),
             "records" => Some(Layer::Records),
-            "wiki" => Some(Layer::Wiki),
             _ => None,
         }
     }
 
     /// Every layer, in canonical order.
-    pub fn all() -> [Layer; 3] {
-        [Layer::Sources, Layer::Records, Layer::Wiki]
+    pub fn all() -> [Layer; 2] {
+        [Layer::Sources, Layer::Records]
     }
 }
 
@@ -312,8 +307,8 @@ impl Store {
         // Any type can override this via a `shard:` directive (above).
         matches!(
             type_,
-            // source types
-            "email" | "transcript" | "pdf-source"
+            // source types (documentary + testimonial)
+            "email" | "transcript" | "pdf-source" | "note"
             // event record types (canonical)
             | "expense" | "invoice" | "meeting"
             // event record types (recognized custom, per the plan)
@@ -1140,10 +1135,12 @@ fn ensure_md_extension(name: &str) -> String {
 /// guess) — see the store findings on the docstring's looser `<type>` phrasing.
 fn default_type_folder(type_: &str) -> PathBuf {
     let path = match type_ {
-        // sources
+        // sources — documentary
         "email" => "sources/emails",
         "transcript" => "sources/transcripts",
         "pdf-source" => "sources/docs",
+        // sources — testimonial (a human told the agent X)
+        "note" => "sources/notes",
         // records — entities
         "contact" => "records/contacts",
         "company" => "records/companies",
@@ -1152,17 +1149,8 @@ fn default_type_folder(type_: &str) -> PathBuf {
         "meeting" => "records/meetings",
         "decision" => "records/decisions",
         "invoice" => "records/invoices",
-        // wiki — the SPEC type table files a wiki-page under `wiki/<topic>/`,
-        // i.e. ALWAYS a sub-folder, never flat under `wiki/`. A 2-component
-        // `wiki/<file>` path is non-conforming: `index::type_folder_of` /
-        // `validate::type_folder_of` require `<layer>/<type-folder>/<file>` (3
-        // components), so a flat wiki page either crashes write-through
-        // (`on_write` tries to create `index.md` *inside* a file) or is silently
-        // dropped from every catalog by `rebuild_all`. `topic` is the page's
-        // canonical bucket; with only the bare type in hand here, `wiki/topics`
-        // is the deterministic default folder (matches the dogfood store).
-        "wiki-page" => "wiki/topics",
-        // unrecognized: bare type name under records/
+        // unrecognized: bare type name under records/ (conclusions and any
+        // custom type land here, e.g. `concept` → `records/concept`).
         other => return PathBuf::from("records").join(other),
     };
     PathBuf::from(path)
@@ -1206,7 +1194,7 @@ fn layer_of_folder(folder: &Path) -> Option<Layer> {
 pub fn infer_type_from_path(rel: &Path) -> Option<String> {
     let mut comps = rel.components().filter_map(|c| c.as_os_str().to_str());
     let layer = comps.next()?;
-    if !matches!(layer, "sources" | "records" | "wiki") {
+    if !matches!(layer, "sources" | "records") {
         return None;
     }
     let folder = comps.next()?;
@@ -1218,15 +1206,13 @@ pub fn infer_type_from_path(rel: &Path) -> Option<String> {
         ("sources", "emails") => "email",
         ("sources", "transcripts") => "transcript",
         ("sources", "docs") => "pdf-source",
+        ("sources", "notes") => "note",
         ("records", "contacts") => "contact",
         ("records", "companies") => "company",
         ("records", "expenses") => "expense",
         ("records", "meetings") => "meeting",
         ("records", "decisions") => "decision",
         ("records", "invoices") => "invoice",
-        // Every wiki page is filed under `wiki/<topic>/`; the type is always
-        // `wiki-page` regardless of the topic-folder name.
-        ("wiki", _) => "wiki-page",
         // Unrecognized folder: the bare name, verbatim. This is the inverse of
         // `default_type_folder`'s unrecognized fallback (`other → records/other`)
         // and the round-trip would break if we pluralized/singularized here.
@@ -1242,6 +1228,7 @@ fn primary_date_field(type_: &str) -> Option<&'static str> {
         "email" => Some("date"),
         "transcript" => Some("recorded_at"),
         "pdf-source" => Some("received_at"),
+        "note" => Some("told_at"),
         "expense" | "invoice" | "meeting" => Some("date"),
         // recognized custom event types have no canonical date field name; they
         // fall back to `created`.
@@ -1460,17 +1447,18 @@ mod tests {
         }
         assert_eq!(Layer::Sources.dir_name(), "sources");
         assert_eq!(Layer::Records.dir_name(), "records");
-        assert_eq!(Layer::Wiki.dir_name(), "wiki");
+        // `wiki` is no longer a layer (the wiki/ layer was removed); it parses to None.
+        assert_eq!(Layer::from_dir_name("wiki"), None);
         assert_eq!(Layer::from_dir_name("log"), None);
         assert_eq!(Layer::from_dir_name("Sources"), None); // case-sensitive
     }
 
     #[test]
     fn layer_order_is_canonical() {
-        // stats keys a BTreeMap on Layer; the sort order must be sources<records<wiki.
-        let mut v = [Layer::Wiki, Layer::Sources, Layer::Records];
+        // stats keys a BTreeMap on Layer; the sort order must be sources<records.
+        let mut v = [Layer::Records, Layer::Sources];
         v.sort();
-        assert_eq!(v, [Layer::Sources, Layer::Records, Layer::Wiki]);
+        assert_eq!(v, [Layer::Sources, Layer::Records]);
     }
 
     // ── is_db_md_store / open ────────────────────────────────────────────────
@@ -1560,7 +1548,7 @@ mod tests {
         );
         write(
             root,
-            "wiki/people/sarah.md",
+            "records/profiles/sarah.md",
             &content_md("2026-05-03T00:00:00Z"),
         );
         // Things walk() must SKIP:
@@ -1581,8 +1569,8 @@ mod tests {
             got,
             vec![
                 "records/contacts/sarah.md".to_string(),
+                "records/profiles/sarah.md".to_string(),
                 "sources/emails/2026/05/a.md".to_string(),
-                "wiki/people/sarah.md".to_string(),
             ]
         );
     }
@@ -1645,8 +1633,16 @@ mod tests {
             rels(&store.walk_layer(Layer::Records).unwrap()),
             vec!["records/contacts/sarah.md".to_string()]
         );
-        // A layer with no directory is empty, not an error.
-        assert!(store.walk_layer(Layer::Wiki).unwrap().is_empty());
+        // A layer with no directory is empty, not an error: a store with only a
+        // sources/ tree has no records/ dir, so walking Records is empty.
+        let only_sources = empty_store();
+        write(
+            only_sources.path(),
+            "sources/emails/2026/05/a.md",
+            &content_md("2026-05-01T00:00:00Z"),
+        );
+        let s2 = open(&only_sources);
+        assert!(s2.walk_layer(Layer::Records).unwrap().is_empty());
     }
 
     #[test]
@@ -1958,23 +1954,25 @@ mod tests {
             .unwrap();
         assert_eq!(p, PathBuf::from("records/contacts/sarah-chen.md"));
 
-        // wiki-page is flat (no date shard) but still files under a type-folder:
-        // `wiki/topics/<name>.md`, NEVER flat as `wiki/<name>.md`. A 2-component
-        // path is invisible to the index/validate type-folder model.
+        // wiki-page is now an unrecognized type: it is flat (no date shard) and
+        // lands under the records-layer fallback folder `records/<type>` —
+        // `records/wiki-page/<name>.md`, a conforming 3-component
+        // `<layer>/<type-folder>/<file>` path. A 2-component path would be
+        // invisible to the index/validate type-folder model.
         let p = store
             .shard_path_for("wiki-page", &Frontmatter::default(), "renewal-theme")
             .unwrap();
-        assert_eq!(p, PathBuf::from("wiki/topics/renewal-theme.md"));
+        assert_eq!(p, PathBuf::from("records/wiki-page/renewal-theme.md"));
     }
 
-    /// Regression: a wiki-page written through the toolkit's own path
-    /// computation must land at a path the index + validate type-folder model
-    /// accepts. `shard_path_for("wiki-page", …)` previously returned a
-    /// 2-component `wiki/<file>` path, which `type_folder_of` (in both `index`
-    /// and `validate`) treats as "no type-folder" — so the page either crashed
-    /// `Index::on_write` (it tried to create `index.md` inside a file) or was
-    /// silently dropped from every catalog by `Index::rebuild_all`. The
-    /// computed path must have 3 components: `<layer>/<type-folder>/<file>`.
+    /// Regression: a type written through the toolkit's own path computation
+    /// must land at a path the index + validate type-folder model accepts. A
+    /// 2-component `<layer>/<file>` path is one `type_folder_of` (in both `index`
+    /// and `validate`) treats as "no type-folder" — it would either crash
+    /// `Index::on_write` (it tried to create `index.md` inside a file) or be
+    /// silently dropped from every catalog by `Index::rebuild_all`. `wiki-page`
+    /// is now an unrecognized type, so it falls back to `records/wiki-page` —
+    /// still a conforming 3-component `<layer>/<type-folder>/<file>` path.
     #[test]
     fn shard_path_wiki_page_is_indexable_three_component_path() {
         let dir = empty_store();
@@ -1991,7 +1989,11 @@ mod tests {
             3,
             "wiki-page path must be <layer>/<type-folder>/<file>, got {p:?}"
         );
-        assert_eq!(comps[0], "wiki", "first component must be the wiki layer");
+        assert_eq!(
+            comps[0], "records",
+            "first component must be the records layer (wiki-page is now an \
+             unrecognized type, filed under the records fallback)"
+        );
         assert!(
             !comps[1].is_empty() && comps[1] != "renewal-theme.md",
             "second component must be a real type-folder, not the file: {p:?}"
@@ -2451,35 +2453,37 @@ mod tests {
     }
 
     #[test]
-    fn regression_find_by_type_wiki_page_spans_multiple_topic_folders() {
+    fn regression_find_by_type_profile_spans_multiple_topic_folders() {
         // Regression for the scoped-backlinks variant of the same bug
-        // (`graph backlinks --type wiki-page`): `wiki-page`'s canonical folder
-        // is `wiki/topics`, but the SPEC files wiki pages under `wiki/<topic>/`
-        // for ANY topic. With a `wiki/topics/index.jsonl` present, the old code
-        // read only that folder and dropped pages in `wiki/people/`,
-        // `wiki/projects/`, etc. — under-reporting dependents in a blast-radius
-        // check. The whole-`wiki/`-layer read must surface all of them.
+        // (`graph backlinks --type <conclusion-type>`): a conclusion type like
+        // `profile` has the canonical fallback folder `records/profile`, but the
+        // agent may file profiles under ANY records topic folder
+        // (`records/people/`, `records/clients/`, …). With a
+        // `records/profile/index.jsonl` present, the old code read only that
+        // folder and dropped profiles in the other topic folders —
+        // under-reporting dependents in a blast-radius check. The
+        // whole-`records/`-layer read must surface all of them.
         let dir = empty_store();
         let root = dir.path();
         write(
             root,
-            "wiki/topics/index.jsonl",
-            &jsonl_line("wiki/topics/billing.md", "wiki-page", "Billing", ""),
+            "records/profile/index.jsonl",
+            &jsonl_line("records/profile/billing.md", "profile", "Billing", ""),
         );
         write(
             root,
-            "wiki/people/index.jsonl",
-            &jsonl_line("wiki/people/sarah-chen.md", "wiki-page", "Sarah Chen", ""),
+            "records/people/index.jsonl",
+            &jsonl_line("records/people/sarah-chen.md", "profile", "Sarah Chen", ""),
         );
         write(
             root,
-            "wiki/projects/index.jsonl",
-            &jsonl_line("wiki/projects/atlas.md", "wiki-page", "Atlas", ""),
+            "records/clients/index.jsonl",
+            &jsonl_line("records/clients/atlas.md", "profile", "Atlas", ""),
         );
 
         let store = open(&dir);
         let got: std::collections::BTreeSet<String> = store
-            .find_by_type("wiki-page")
+            .find_by_type("profile")
             .unwrap()
             .into_iter()
             .map(|r| r.path.to_string_lossy().into_owned())
@@ -2487,15 +2491,15 @@ mod tests {
         assert_eq!(
             got,
             [
-                "wiki/people/sarah-chen.md",
-                "wiki/projects/atlas.md",
-                "wiki/topics/billing.md",
+                "records/clients/atlas.md",
+                "records/people/sarah-chen.md",
+                "records/profile/billing.md",
             ]
             .into_iter()
             .map(String::from)
             .collect::<std::collections::BTreeSet<_>>(),
-            "a wiki-page query must return pages from every topic folder, not \
-             just the canonical wiki/topics/"
+            "a profile query must return records from every topic folder, not \
+             just the canonical records/profile/"
         );
     }
 
@@ -2749,11 +2753,11 @@ mod tests {
         );
         let store = open(&dir);
 
-        // `wiki/` was never created.
-        let in_wiki = store
-            .find_by_where_in("city", "denver", Some(Layer::Wiki))
+        // `sources/` was never created.
+        let in_sources = store
+            .find_by_where_in("city", "denver", Some(Layer::Sources))
             .expect("missing layer subtree is empty, not an error");
-        assert!(in_wiki.is_empty());
+        assert!(in_sources.is_empty());
 
         // Same query scoped to the layer that has the record still finds it.
         let in_records = store
@@ -2788,15 +2792,13 @@ mod tests {
             ("sources/emails/x.md", "email"),
             ("sources/transcripts/x.md", "transcript"),
             ("sources/docs/x.md", "pdf-source"),
+            ("sources/notes/x.md", "note"),
             ("records/contacts/x.md", "contact"),
             ("records/companies/x.md", "company"),
             ("records/expenses/x.md", "expense"),
             ("records/meetings/x.md", "meeting"),
             ("records/decisions/x.md", "decision"),
             ("records/invoices/x.md", "invoice"),
-            // Any wiki sub-folder infers `wiki-page` regardless of the topic name.
-            ("wiki/topics/x.md", "wiki-page"),
-            ("wiki/pricing/x.md", "wiki-page"),
         ];
         for (path, expected) in cases {
             assert_eq!(

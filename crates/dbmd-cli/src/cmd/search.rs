@@ -478,7 +478,7 @@ fn parse_layer(value: Option<&str>) -> Result<Option<Layer>, CliError> {
                 "BAD_LAYER",
                 format!("unknown layer `{name}`"),
             )
-            .with_hint("valid layers are: sources, records, wiki")
+            .with_hint("valid layers are: sources, records")
         }),
     }
 }
@@ -625,7 +625,7 @@ fn path_in_layer(rel: &Path, layer: Layer) -> bool {
 /// live at the root, outside every layer, and never reach here.)
 fn is_content_file(rel: &Path) -> bool {
     let first = rel.components().next().and_then(|c| c.as_os_str().to_str());
-    if !matches!(first, Some("sources" | "records" | "wiki")) {
+    if !matches!(first, Some("sources" | "records")) {
         return false;
     }
     if rel.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -741,12 +741,12 @@ mod tests {
 
     #[test]
     fn golden_plain_phrase_no_filter() {
-        // Body-only phrase in the renewal call record and the project wiki page.
+        // Body-only phrase in the renewal call record and the project record.
         assert_eq!(
             search_files("volume discount", &[]),
             set(&[
                 "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md",
-                "wiki/projects/northstar-renewal.md",
+                "records/projects/northstar-renewal.md",
             ])
         );
     }
@@ -761,25 +761,30 @@ mod tests {
 
     #[test]
     fn golden_case_sensitive_default() {
-        // `async` is present in Elena's contact record and her wiki bio.
+        // `async` is present in Elena's contact record and her profile.
         assert_eq!(
             search_files("async", &[]),
             set(&[
                 "records/contacts/elena-rodriguez.md",
-                "wiki/people/elena-rodriguez.md",
+                "records/profiles/elena-rodriguez.md",
             ])
         );
     }
 
     #[test]
-    fn golden_layer_scope_in_wiki() {
+    fn golden_layer_scope_conclusions() {
+        // Scoped to conclusion records (the former wiki/ synthesis), "renewal"
+        // hits the two profiles, the project, and the synthesis plan.
         assert_eq!(
-            search_files("renewal", &["--in", "wiki"]),
+            search_files(
+                "renewal",
+                &["--in", "records", "--where", "meta-type=conclusion"]
+            ),
             set(&[
-                "wiki/people/elena-rodriguez.md",
-                "wiki/people/sarah-chen.md",
-                "wiki/projects/northstar-renewal.md",
-                "wiki/synthesis/2026-renewal-plan.md",
+                "records/profiles/elena-rodriguez.md",
+                "records/profiles/sarah-chen.md",
+                "records/projects/northstar-renewal.md",
+                "records/synthesis/2026-renewal-plan.md",
             ])
         );
     }
@@ -1035,7 +1040,8 @@ mod tests {
         assert_eq!(parse_layer(None).unwrap(), None);
         assert_eq!(parse_layer(Some("sources")).unwrap(), Some(Layer::Sources));
         assert_eq!(parse_layer(Some("records")).unwrap(), Some(Layer::Records));
-        assert_eq!(parse_layer(Some("wiki")).unwrap(), Some(Layer::Wiki));
+        // `wiki` is no longer a layer (the wiki/ layer was removed) — it is rejected.
+        assert!(parse_layer(Some("wiki")).is_err());
         assert!(parse_layer(Some("Sources")).is_err(), "case-sensitive");
         assert!(parse_layer(Some("log")).is_err());
     }
@@ -1091,10 +1097,13 @@ mod tests {
 
     #[test]
     fn path_in_layer_keys_off_first_component() {
-        assert!(path_in_layer(Path::new("wiki/people/x.md"), Layer::Wiki));
-        assert!(!path_in_layer(
-            Path::new("wiki/people/x.md"),
+        assert!(path_in_layer(
+            Path::new("records/projects/x.md"),
             Layer::Records
+        ));
+        assert!(!path_in_layer(
+            Path::new("records/projects/x.md"),
+            Layer::Sources
         ));
         assert!(path_in_layer(
             Path::new("records/contacts/c.md"),
@@ -1106,7 +1115,7 @@ mod tests {
         ));
         assert!(!path_in_layer(
             Path::new("records/contacts/c.md"),
-            Layer::Wiki
+            Layer::Sources
         ));
     }
 
@@ -1114,7 +1123,7 @@ mod tests {
     fn is_content_file_excludes_meta_and_non_layer() {
         assert!(is_content_file(Path::new("records/contacts/sarah.md")));
         assert!(is_content_file(Path::new("sources/emails/2026/05/e.md")));
-        assert!(is_content_file(Path::new("wiki/people/x.md")));
+        assert!(is_content_file(Path::new("records/profiles/x.md")));
         // Meta + non-content:
         assert!(!is_content_file(Path::new("records/contacts/index.md")));
         assert!(!is_content_file(Path::new("records/contacts/index.jsonl")));

@@ -1,0 +1,161 @@
+---
+source: crates/dbmd-cli/tests/json_snapshots.rs
+expression: out
+---
+[
+  {
+    "file": "records/profiles/elena-rodriguez.md",
+    "line": 10,
+    "text": "  - \"[[sources/emails/2026/05/2026-05-22-elena-renewal]]\""
+  },
+  {
+    "file": "records/profiles/elena-rodriguez.md",
+    "line": 23,
+    "text": "contract. She coordinated the renewal expansion from the operations"
+  },
+  {
+    "file": "records/profiles/elena-rodriguez.md",
+    "line": 25,
+    "text": "[[sources/emails/2026/05/2026-05-22-elena-renewal]] and the project page"
+  },
+  {
+    "file": "records/profiles/elena-rodriguez.md",
+    "line": 26,
+    "text": "[[records/projects/northstar-renewal]]."
+  },
+  {
+    "file": "records/profiles/sarah-chen.md",
+    "line": 6,
+    "text": "summary: \"Sarah Chen bio; Northstar renewal champion and economic buyer on the Acme account\""
+  },
+  {
+    "file": "records/profiles/sarah-chen.md",
+    "line": 10,
+    "text": "  - \"[[records/meetings/2026/05/2026-05-22-northstar-renewal-call]]\""
+  },
+  {
+    "file": "records/profiles/sarah-chen.md",
+    "line": 12,
+    "text": "tags: [customer, renewal, people]"
+  },
+  {
+    "file": "records/profiles/sarah-chen.md",
+    "line": 22,
+    "text": "## Role in the renewal"
+  },
+  {
+    "file": "records/profiles/sarah-chen.md",
+    "line": 27,
+    "text": "closed it on the May renewal call"
+  },
+  {
+    "file": "records/profiles/sarah-chen.md",
+    "line": 28,
+    "text": "([[records/meetings/2026/05/2026-05-22-northstar-renewal-call]]). The"
+  },
+  {
+    "file": "records/profiles/sarah-chen.md",
+    "line": 29,
+    "text": "full narrative lives in [[records/projects/northstar-renewal]]."
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 6,
+    "text": "summary: \"Northstar renewal; 120 → 175 seats, volume discount confirmed at 150, closed May 2026\""
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 7,
+    "text": "topic: Northstar renewal"
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 13,
+    "text": "  - \"[[records/meetings/2026/05/2026-05-22-northstar-renewal-call]]\""
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 14,
+    "text": "  - \"[[sources/emails/2026/05/2026-05-22-elena-renewal]]\""
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 16,
+    "text": "tags: [customer, renewal, projects]"
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 20,
+    "text": "# Northstar renewal"
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 22,
+    "text": "The renewal of [[records/companies/northstar]]'s Acme PM contract,"
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 33,
+    "text": "  email [[sources/emails/2026/05/2026-05-22-elena-renewal]]; the"
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 34,
+    "text": "  renewal call"
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 35,
+    "text": "  [[records/meetings/2026/05/2026-05-22-northstar-renewal-call]] settles"
+  },
+  {
+    "file": "records/projects/northstar-renewal.md",
+    "line": 41,
+    "text": "signed-off plan is [[records/synthesis/2026-renewal-plan]]."
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 6,
+    "text": "summary: \"Signed-off 2026 Northstar renewal plan; frozen page — the toolkit refuses writes here\""
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 7,
+    "text": "topic: 2026 renewal plan"
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 9,
+    "text": "  - \"[[records/projects/northstar-renewal]]\""
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 10,
+    "text": "  - \"[[records/meetings/2026/05/2026-05-22-northstar-renewal-call]]\""
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 11,
+    "text": "tags: [renewal, plan, frozen]"
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 15,
+    "text": "# 2026 renewal plan"
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 17,
+    "text": "The signed-off plan for the [[records/projects/northstar-renewal]]. This"
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 28,
+    "text": "  [[records/meetings/2026/05/2026-05-22-northstar-renewal-call]]."
+  },
+  {
+    "file": "records/synthesis/2026-renewal-plan.md",
+    "line": 31,
+    "text": "[[records/projects/northstar-renewal]], not here."
+  }
+]

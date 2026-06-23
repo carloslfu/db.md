@@ -171,7 +171,7 @@ overrides come from `DB.md` on every operation.
 
 ## Status
 
-The format (SPEC.md) is at v0.2. The single-binary all-Rust
+The format (SPEC.md) is at v0.3. The single-binary all-Rust
 `dbmd` described here is the active build target — treat this
 document as the toolkit contract the binary implements. The
 workspace is `crates/dbmd-core` (library) + `crates/dbmd-cli`

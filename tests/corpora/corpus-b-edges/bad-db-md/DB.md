@@ -8,7 +8,7 @@ scope: company
 This sibling store exists solely to trip the three `DB_MD_*` codes in
 ONE pass, via a separate `dbmd validate` invocation pointed straight at
 it. It is NOT part of the corpus-b root sweep (the root sweep only
-checks `<root>/DB.md` and walks `sources/`/`records/`/`wiki/` under the
+checks `<root>/DB.md` and walks `sources/`/`records/` under the
 root — never this folder). See EXPECTED/bad-db-md.json.
 
 ## Agent instructions

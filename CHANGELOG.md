@@ -6,11 +6,65 @@ All notable changes to db.md are documented here. The format follows
 
 Two things version independently:
 
-- **The format** (`SPEC.md`) — **v0.2** (v0.1 was the first tagged release).
+- **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.3.10**.
+  `Cargo.toml`, currently **v0.4.0**.
 
 ## [Unreleased]
+
+## [0.4.0] — 2026-06-23
+
+### Format — v0.3 (breaking: three layers collapse to two, plus a `meta-type` field)
+
+The store model drops from three layers to two. The `wiki/` layer is **removed**;
+its synthesis content becomes ordinary `records/` files carrying a new frontmatter
+field, `meta-type`. Breaking is acceptable here because the only migrator is an
+agent and db.md is pre-adoption — the blast radius is small, and the migration is
+agent-driven (there is no `dbmd migrate` command; an agent moves the files and
+rewrites links per the new contract).
+
+#### Changed
+
+- **Two layers, not three.** `sources/` (evidence) + `records/` (everything the
+  agent authors). The hard boundary that earns its place — evidence vs.
+  agent-authored — stays as the only folder-level layer split; the soft
+  records-vs-wiki split dissolves into a field.
+- **`meta-type` carries what `wiki/` used to.** A new closed-enum record field:
+  `fact | operational | conclusion`. Absent ⇒ `fact` (additive: old records read
+  as facts, and `--where meta-type=fact` matches an un-annotated record).
+  `conclusion` is the old wiki synthesis. Folders stay organized by `type` (the
+  open noun); `meta-type` is a cross-cutting queryable field, not a folder. Query
+  the synthesis layer with `dbmd query --in records --where meta-type=conclusion`
+  (replacing the old `--in wiki`). New validation code `FM_BAD_META_TYPE` rejects
+  a value outside the closed set; sources carry no `meta-type`.
+- **Sources gain a testimonial kind.** Alongside documentary sources (emails,
+  PDFs, imports) there is a new `note` source type with a `told_by` field, for
+  "a person told the agent X." This closes the gap where chat-asserted facts had
+  no captured evidence. `note` date-shards like other source streams
+  (`sources/notes/<YYYY>/<MM>/`).
+- **Source-first provenance is a discipline, not an enforced invariant.** Every
+  record *should* trace to a source (documentary or testimonial), reconstructed
+  on demand by the agent rather than materialized as mandatory per-record links.
+  Ephemeral testimony is the one thing captured at write time (you cannot
+  reconstruct an unsaved conversation) — as a `note`, coupled to the create/edit
+  it drives. The toolkit ships no source-less-record check, so this is a curator
+  contract the agent keeps, not a mechanical guarantee.
+- **Single-writer moves onto `meta-type: conclusion` records.** The single-voice
+  synthesis contract was a path-checkable layer boundary (the `wiki/` layer); it
+  is now a per-file, frontmatter-conditional, prose-only rule inside the
+  many-writer `records/` layer. This is a deliberate enforceability downgrade,
+  mitigated by db.md's single-agent-per-store assumption. `dbmd` does not
+  path-guard it; the agent honors it.
+- **Migration shape.** Move `wiki/<topic>/*` → `records/<realtype>/*` with
+  `meta-type: conclusion` and a real `type` (e.g. `concept`, `profile`,
+  `playbook`, `theme`, `synthesis`, `account`) in place of the retired
+  `wiki-page` type; update each `DB.md` (agent instructions, frozen-page paths,
+  schemas) to drop `wiki/` and reference `records/` + `meta-type`. An agent does
+  this; there is no migration command.
+
+Toolkit impact: this is a breaking 0.x change; the crate is bumped to **0.4.0**
+for this release (from 0.3.10), and the cli's `dbmd-core` cross-dependency is
+raised to match. The format header moves v0.2 → v0.3.
 
 ## [0.3.10] - 2026-06-17
 

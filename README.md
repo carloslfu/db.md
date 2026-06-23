@@ -57,7 +57,7 @@ For a large class of semantic, evolving, workflow-heavy software, the new shape
 is:
 
 ```
-Markdown/wiki/files -> Agent harness -> Generated surface
+Markdown files -> Agent harness -> Generated surface
 db.md + agent harness -> voice, chat, canvas, forms, approvals, dashboards
 ```
 
@@ -159,16 +159,25 @@ models.
 
 ## How it works
 
-One directory. Three folders for your data, and one file that runs the place.
+One directory. Two folders for your data, and one file that runs the place.
 
 ```
 db/
 ├── DB.md          # identity, agent instructions, policies, schemas
 ├── index.md       # a catalog the agent keeps current
-├── sources/       # raw evidence, kept as it arrived: emails, PDFs, exports
-├── records/       # atomic typed data: contacts, companies, expenses, meetings
-└── wiki/          # the agent's synthesis, linked back to the rest
+├── sources/       # evidence, kept as it arrived: emails, PDFs, exports, and
+│                  #   notes that capture what someone told the agent
+└── records/       # everything the agent authors: contacts, companies, expenses,
+                   #   meetings, and synthesis — tagged by a meta-type field
 ```
+
+`sources/` holds evidence in two kinds: documentary (artifacts from outside the
+operator's hand — emails, PDFs, exports) and testimonial (a `note` that records
+what a person told the agent, with a `told_by` field). `records/` holds
+everything the agent writes, and a `meta-type` frontmatter field marks what kind
+of record it is: `fact` (the default), `operational`, or `conclusion`. A
+`conclusion` is the synthesis layer — the linked narrative the agent compiles
+from the rest.
 
 `DB.md` is the file that matters most. It holds the store's identity, the
 instructions for the agent, the policies it has to follow, and the schemas your
@@ -179,7 +188,7 @@ writes `DB.md` for you and keeps it honest.
 Bring any agent runtime. Claude Code, Codex, or your own. It plays the curator:
 reading the files, writing new ones, keeping the links and the catalog in order,
 following the contract in `DB.md` and the [spec](SPEC.md). The format is at
-v0.2, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
+v0.3, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
 | Old stack part | db.md shape |
 |---|---|
@@ -200,7 +209,7 @@ the world improves, and what has to stay true for it to work. **db.md puts nothi
 | Approach | What sits between you and your data | What it rides on | The bet / What has to stay true |
 |---|---|---|---|
 | **Karpathy's LLM Wiki** | nothing. Plain markdown the model reads directly | the model curve. Better models = better file reading, no index rebuild needed | Models improve fast enough to read context directly. This is the foundational idea |
-| **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index | Agents improve faster than infrastructure. Three semantic layers + schema repair work because models are smart enough. Files outlast all tools |
+| **db.md** | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index | Agents improve faster than infrastructure. Two layers (sources + records) plus a meta-type field and schema repair work because models are smart enough. Files outlast all tools |
 | **Open Knowledge Format (OKF)** | nothing. The data is files; linking is standard markdown | format standardization, not model improvement. Works at any capability level | Format simplicity is the bottleneck, not model capability. Standardized format enables exchange across orgs/systems regardless of who produces or consumes |
 | **GBrain** | a Postgres + pgvector engine and reranker in front of the files | both the model curve AND a maintained graph+embedding stack | Files alone aren't enough; you need a graph engine and vector index for good answers. The graph is load-bearing, not the files |
 | **Vector RAG** | a store of embeddings you cannot read or edit, reached only through a retrieval service | a separate retrieval stack you maintain. Recall bounded by embeddings, rerankers, tuning | Embeddings + reranking solve retrieval better than raw file reading. You own the machinery; better models help but don't eliminate the stack |
@@ -222,8 +231,9 @@ keep the facts as dated files and skip the vector store.
 
 GBrain and db.md are two readings of Karpathy's LLM Wiki, the 2026 pattern where
 an agent compiles raw notes into a linked markdown wiki the model reads directly.
-db.md is the faithful one: raw and wiki layers, index and log, plain markdown,
-answered by index and grep with no vector store. GBrain is the big build, the
+db.md is the faithful one: sources and records, conclusions linked back to the
+evidence, index and log, plain markdown, answered by index and grep with no
+vector store. GBrain is the big build, the
 same files with Postgres, pgvector, and a reranker in front of them, the
 "embedding-based RAG infrastructure" the pattern set out to avoid. Its own
 benchmark says the graph carries the result and the embeddings add almost
@@ -271,7 +281,7 @@ changed, not how big the store has grown.
   automatically: an email lands in `sources/emails/2026/05/`, an expense in
   `records/expenses/2026/05/`. The agent supplies the type and date; `dbmd`
   does the folder math. No directory grows unbounded, and only the current shard
-  is ever hot. Entity records and the wiki stay flat, because those sets are
+  is ever hot. Entity records and conclusions stay flat, because those sets are
   bounded by reality: you have only so many customers, however much mail they
   send.
 - **The measured 10k tier is interactive; the million-file tier is an opt-in
@@ -289,9 +299,9 @@ The first practical ceiling you hit is often git, not the format. Large working
 trees need tuning (`fsmonitor`, `feature.manyFiles`, sparse/partial checkout,
 or Scalar-style tooling) because git's index is still one structure with an
 entry for every tracked path. Git is optional tooling over db.md, not part of
-the format. At that point, version the curated layers (`records/`, `wiki/`) and
-let high-volume sources ride filesystem snapshots. The files keep working
-exactly the same.
+the format. At that point, version `records/` (where the agent's curated data
+and conclusions live) and let high-volume sources ride filesystem snapshots. The
+files keep working exactly the same.
 
 What still wants a real engine: heavy write concurrency, ACID transactions,
 sub-millisecond reads, aggregates over billions of rows. That territory is
@@ -321,9 +331,10 @@ offer to wire a remote (a folder I already sync is also fine). Only skip version
 control if I explicitly tell you I want a throwaway, unversioned store. If I
 already have notes, exports, or a knowledge base to bring in (a folder of files,
 an Obsidian vault, a Notion export, anything), evaluate it first and show me a
-migration plan that maps it into the store's sources, records, and wiki with
-frontmatter and links, then migrate it once I approve, preserving each source's
-provenance and verifying nothing was lost. Moving the data is only half of it:
+migration plan that maps it into the store's sources and records (with synthesis
+written as records carrying meta-type: conclusion) with frontmatter and links,
+then migrate it once I approve, preserving each source's provenance and verifying
+nothing was lost. Moving the data is only half of it:
 also find whatever already connects to that knowledge base (my skills, commands,
 and scripts) and update them to point at the new store, so nothing keeps reading
 the old location. Don't create long-lived migration-map pages or temporary
@@ -333,9 +344,10 @@ store lives and how it is backed up before you scaffold.
 
 The agent reads [llms.txt](llms.txt), installs the binary, and loads the
 contract. If you have existing data, it evaluates it and proposes a migration
-into the three layers (sources, records, and wiki) with frontmatter and
-links, then moves it once you approve. If you are starting fresh, it
-scaffolds an empty store. Either way it writes `DB.md` and curates from there.
+into the two layers (sources and records, synthesis written as records with
+meta-type: conclusion) with frontmatter and links, then moves it once you
+approve. If you are starting fresh, it scaffolds an empty store. Either way it
+writes `DB.md` and curates from there.
 
 Want to confirm it is safe before trusting it? You do not have to verify
 anything to install, but you can: [Safe to paste](#safe-to-paste) below has
@@ -462,7 +474,7 @@ and MCP for tools. Different layers, not rivals.
 
 ```
 db.md/
-├── SPEC.md          # the format, the curator contract, the validation codes (v0.2)
+├── SPEC.md          # the format, the curator contract, the validation codes (v0.3)
 ├── TOOLS.md         # the toolkit: every subcommand, install, agent bootstrap
 ├── crates/
 │   ├── dbmd-core/   # the library: parser, store, graph, validate, query, index, log

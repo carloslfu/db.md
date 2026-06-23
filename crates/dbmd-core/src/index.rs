@@ -941,7 +941,16 @@ impl IndexRecord {
 /// Build an [`IndexRecord`] from a file on disk. Missing `summary` →
 /// [`MISSING_SUMMARY`] placeholder (the index never invents a summary).
 fn record_from_file(abs: &Path, rel: PathBuf) -> crate::Result<IndexRecord> {
-    let meta = read_frontmatter(abs)?;
+    let mut meta = read_frontmatter(abs)?;
+    // Records carry an effective `meta-type` in the catalog: the declared value
+    // (already spilled into `fields` by `read_frontmatter`), or the default
+    // `fact` when absent — so `--where meta-type=fact` sees un-annotated records.
+    // Sources are evidence and carry no meta-type.
+    if rel.starts_with("records") {
+        meta.fields
+            .entry("meta-type".to_string())
+            .or_insert_with(|| Value::String("fact".to_string()));
+    }
     Ok(IndexRecord {
         path: rel,
         type_: meta.type_.unwrap_or_default(),
@@ -1405,7 +1414,6 @@ fn layer_dir_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Sources => "sources",
         Layer::Records => "records",
-        Layer::Wiki => "wiki",
     }
 }
 
@@ -1415,7 +1423,6 @@ fn layer_from_dir_name(name: &str) -> Option<Layer> {
     match name {
         "sources" => Some(Layer::Sources),
         "records" => Some(Layer::Records),
-        "wiki" => Some(Layer::Wiki),
         _ => None,
     }
 }
@@ -1964,9 +1971,12 @@ mod tests {
             "jsonl key order not stable:\n{}",
             lines[1]
         );
-        // The flattened extras come in BTreeMap (sorted) order.
+        // The flattened extras come in BTreeMap (sorted) order. The catalog
+        // injects `meta-type: fact` into every records-layer file that does not
+        // declare one, so it appears among the sorted extras (between `company`
+        // and `related`).
         assert!(
-            lines[1].ends_with(r#""amount":42,"company":"[[records/companies/acme]]","related":["[[wiki/themes/spend]]"],"status":"paid"}"#),
+            lines[1].ends_with(r#""amount":42,"company":"[[records/companies/acme]]","meta-type":"fact","related":["[[wiki/themes/spend]]"],"status":"paid"}"#),
             "extras must be sorted:\n{}",
             lines[1]
         );
@@ -2212,8 +2222,8 @@ mod tests {
                 "status: active\n",
             ),
             (
-                "wiki/people/sarah.md",
-                "wiki-page",
+                "records/profiles/sarah.md",
+                "profile",
                 "Sarah bio",
                 "2026-05-21T10:00:00Z",
                 "",
@@ -2377,16 +2387,18 @@ mod tests {
         );
     }
 
-    /// Regression: a wiki-page filed at the path the toolkit ITSELF computes
-    /// (`Store::shard_path_for`) must be indexable end-to-end. The bug was that
-    /// `shard_path_for("wiki-page", …)` returned a 2-component `wiki/<file>`
-    /// path, which `type_folder_of` treats as having no type-folder. That made
-    /// the producer (path computation) disagree with the consumer (index): the
-    /// loop path crashed (`on_write` → `Err`, it tried to write `index.md`
-    /// *inside* a file) while the sweep path silently dropped the page from
-    /// every catalog. This test drives both paths through the real
-    /// `shard_path_for` output and asserts (1) `on_write` succeeds, (2) the page
-    /// appears in the rebuilt catalog, and (3) write-through == rebuild.
+    /// Regression: a type filed at the path the toolkit ITSELF computes
+    /// (`Store::shard_path_for`) must be indexable end-to-end. The class of bug
+    /// is a 2-component `<layer>/<file>` path, which `type_folder_of` treats as
+    /// having no type-folder — making the producer (path computation) disagree
+    /// with the consumer (index): the loop path crashes (`on_write` → `Err`, it
+    /// tries to write `index.md` *inside* a file) while the sweep path silently
+    /// drops the page from every catalog. `wiki-page` is now an unrecognized
+    /// type, so `shard_path_for` files it under the records-layer fallback
+    /// `records/wiki-page/<file>` — a conforming 3-component path. This test
+    /// drives both paths through the real `shard_path_for` output and asserts
+    /// (1) `on_write` succeeds, (2) the page appears in the rebuilt catalog, and
+    /// (3) write-through == rebuild.
     #[test]
     fn wiki_page_at_shard_path_for_is_indexable_end_to_end() {
         let (_d1, wt) = mk_store();
@@ -2434,27 +2446,29 @@ mod tests {
         // (2) The page is present in the rebuilt catalog (the old flat-path bug
         // silently omitted it from every artifact). The individual page link
         // lives in the *type-folder* index; the *layer* index rolls the
-        // type-folder up — assert both, since the bug erased both.
-        let page_link = wiki_target(&rel); // wiki/topics/renewal-theme
-        let tf_md = read(&rb, "wiki/topics/index.md");
+        // type-folder up — assert both, since the bug erased both. `wiki-page`
+        // is now an unrecognized type, so its canonical folder is the
+        // records-layer fallback `records/wiki-page`.
+        let page_link = wiki_target(&rel); // records/wiki-page/renewal-theme
+        let tf_md = read(&rb, "records/wiki-page/index.md");
         assert!(
             tf_md.contains(&format!("[[{page_link}]]")),
             "type-folder index must list the page link, got:\n{tf_md}"
         );
         assert!(
-            exists(&rb, "wiki/topics/index.jsonl"),
+            exists(&rb, "records/wiki-page/index.jsonl"),
             "type-folder jsonl must exist"
         );
         assert!(
-            read(&rb, "wiki/topics/index.jsonl").contains(&rel_str),
+            read(&rb, "records/wiki-page/index.jsonl").contains(&rel_str),
             "type-folder jsonl must contain the page row"
         );
         // The layer index rolls the type-folder up (proves the page's folder is
         // visible to the layer catalog, not dropped).
-        let layer_md = read(&rb, "wiki/index.md");
+        let layer_md = read(&rb, "records/index.md");
         assert!(
-            layer_md.contains("wiki/topics/index"),
-            "layer index must roll up the wiki/topics type-folder, got:\n{layer_md}"
+            layer_md.contains("records/wiki-page/index"),
+            "layer index must roll up the records/wiki-page type-folder, got:\n{layer_md}"
         );
 
         // (3) Write-through equals rebuild byte-for-byte — loop and sweep agree.
@@ -2779,8 +2793,8 @@ mod tests {
             (seed >> 33) as u32
         };
 
-        let folders = ["sources/emails", "records/contacts", "wiki/people"];
-        let types = ["email", "contact", "wiki-page"];
+        let folders = ["sources/emails", "records/contacts", "records/profiles"];
+        let types = ["email", "contact", "profile"];
         let mut live: Vec<String> = Vec::new(); // store-relative paths that exist
 
         for step in 0..120u32 {

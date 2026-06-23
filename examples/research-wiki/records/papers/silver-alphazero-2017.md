@@ -13,10 +13,10 @@ url: https://arxiv.org/abs/1712.01815
 tags: [reinforcement-learning, self-play, mcts, deepmind]
 source: [[sources/papers/silver-alphazero-2017]]
 concepts:
-  - [[wiki/concepts/self-play]]
-  - [[wiki/concepts/mcts]]
-  - [[wiki/concepts/policy-iteration]]
-  - [[wiki/concepts/value-network]]
+  - [[records/concepts/self-play]]
+  - [[records/concepts/mcts]]
+  - [[records/concepts/policy-iteration]]
+  - [[records/concepts/value-network]]
 ---
 
 # AlphaZero
@@ -26,5 +26,5 @@ shogi using the same self-play + MCTS + neural-net recipe with no
 domain knowledge beyond rules. Reached superhuman strength in all
 three games within 24 hours.
 
-See [[wiki/concepts/self-play]] for the technique, [[wiki/concepts/mcts]]
+See [[records/concepts/self-play]] for the technique, [[records/concepts/mcts]]
 for the search component.

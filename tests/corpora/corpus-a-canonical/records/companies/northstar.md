@@ -15,7 +15,7 @@ status: active
 
 Logistics-software customer on the Acme PM product. Originally signed a
 120-seat contract in Q1 2026; expanding to 175 seats in the current
-renewal — see [[wiki/projects/northstar-renewal]].
+renewal — see [[records/projects/northstar-renewal]].
 
 Primary contacts: [[records/contacts/sarah-chen]] (Director of Ops,
 renewal champion) and [[records/contacts/elena-rodriguez]] (Director of

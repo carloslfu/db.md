@@ -718,16 +718,19 @@ fn run_curator_session(s: &mut Session) {
         "matching expense for the invoice",
     );
 
-    // ── 5. Operate: wiki synthesis (British English per DB.md) ───────────────
+    // ── 5. Operate: conclusion records (synthesis; British English per DB.md) ─
+    // The former wiki pages are now `meta-type: conclusion` records under
+    // records/: the project synthesis is a `project`, the people bios `profile`s.
     let project_body = "# Tideform rebrand\n\nPhase-one mobile rebrand for [[records/companies/tideform]]: a new visual language, a reusable component library, a marketing-site refresh, and motion design. The studio organised the work around an eight-week term with a **$45,000** fixed fee; the first design review is the week of 5 May.\n\nThe economic buyer is [[records/contacts/daniel-osei]]; [[records/contacts/mara-lindqvist]] is the day-to-day design lead and [[records/contacts/theo-vance]] handles motion. Scope and budget were confirmed at the kickoff [[records/meetings/2026/04/2026-04-14-tideform-kickoff]].\n\nDerived from [[sources/emails/2026/04/2026-04-09-tideform-project-intro]], [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]], and [[sources/docs/2026-04-14-tideform-sow]].\n";
     let wp = s.body_file(project_body);
     write_record(
         s,
         "2026-05-29T17:12:00Z",
-        "wiki/projects/tideform-rebrand",
-        "wiki-page",
+        "records/projects/tideform-rebrand",
+        "project",
         "Tideform phase-one mobile rebrand; $45k fixed fee, eight-week term",
         &[
+            "meta-type=conclusion",
             "topic=Tideform rebrand",
             "derived_from=[[[sources/emails/2026/04/2026-04-09-tideform-project-intro]], [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]], [[sources/docs/2026-04-14-tideform-sow]]]",
         ],
@@ -737,19 +740,20 @@ fn run_curator_session(s: &mut Session) {
         s,
         "2026-05-29T17:12:00Z",
         "create",
-        "wiki/projects/tideform-rebrand.md",
+        "records/projects/tideform-rebrand.md",
         "flagship project synthesis",
     );
 
-    let daniel_body = "# Daniel Osei\n\nHead of Product at [[records/companies/tideform]] and the economic buyer for the Lumen rebrand. He set the phase-one scope and budget, then delegated the day-to-day to [[records/contacts/mara-lindqvist]]. See the kickoff [[records/meetings/2026/04/2026-04-14-tideform-kickoff]] and the project [[wiki/projects/tideform-rebrand]].\n\nDerived from [[sources/emails/2026/04/2026-04-09-tideform-project-intro]], [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]], and [[sources/docs/2026-04-14-tideform-sow]].\n";
+    let daniel_body = "# Daniel Osei\n\nHead of Product at [[records/companies/tideform]] and the economic buyer for the Lumen rebrand. He set the phase-one scope and budget, then delegated the day-to-day to [[records/contacts/mara-lindqvist]]. See the kickoff [[records/meetings/2026/04/2026-04-14-tideform-kickoff]] and the project [[records/projects/tideform-rebrand]].\n\nDerived from [[sources/emails/2026/04/2026-04-09-tideform-project-intro]], [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]], and [[sources/docs/2026-04-14-tideform-sow]].\n";
     let dp = s.body_file(daniel_body);
     write_record(
         s,
         "2026-05-29T17:13:00Z",
-        "wiki/people/daniel-osei",
-        "wiki-page",
+        "records/profiles/daniel-osei",
+        "profile",
         "Tideform Head of Product; economic buyer on the Lumen rebrand",
         &[
+            "meta-type=conclusion",
             "topic=Daniel Osei",
             "derived_from=[[[sources/emails/2026/04/2026-04-09-tideform-project-intro]], [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]], [[sources/docs/2026-04-14-tideform-sow]]]",
         ],
@@ -759,19 +763,20 @@ fn run_curator_session(s: &mut Session) {
         s,
         "2026-05-29T17:13:00Z",
         "create",
-        "wiki/people/daniel-osei.md",
+        "records/profiles/daniel-osei.md",
         "buyer bio",
     );
 
-    let mara_body = "# Mara Lindqvist\n\nDesign Lead at [[records/companies/tideform]] and Lumen Labs day-to-day contact on the rebrand. She prioritised the component library and organised the brand-asset handover. See the kickoff [[records/meetings/2026/04/2026-04-14-tideform-kickoff]] and the project [[wiki/projects/tideform-rebrand]].\n\nDerived from [[sources/emails/2026/04/2026-04-09-tideform-project-intro]] and [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]].\n";
+    let mara_body = "# Mara Lindqvist\n\nDesign Lead at [[records/companies/tideform]] and Lumen Labs day-to-day contact on the rebrand. She prioritised the component library and organised the brand-asset handover. See the kickoff [[records/meetings/2026/04/2026-04-14-tideform-kickoff]] and the project [[records/projects/tideform-rebrand]].\n\nDerived from [[sources/emails/2026/04/2026-04-09-tideform-project-intro]] and [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]].\n";
     let mp = s.body_file(mara_body);
     write_record(
         s,
         "2026-05-29T17:14:00Z",
-        "wiki/people/mara-lindqvist",
-        "wiki-page",
+        "records/profiles/mara-lindqvist",
+        "profile",
         "Tideform design lead; Lumen's day-to-day contact on the rebrand",
         &[
+            "meta-type=conclusion",
             "topic=Mara Lindqvist",
             "derived_from=[[[sources/emails/2026/04/2026-04-09-tideform-project-intro]], [[sources/transcripts/2026/04/2026-04-14-tideform-kickoff]]]",
         ],
@@ -781,7 +786,7 @@ fn run_curator_session(s: &mut Session) {
         s,
         "2026-05-29T17:14:00Z",
         "create",
-        "wiki/people/mara-lindqvist.md",
+        "records/profiles/mara-lindqvist.md",
         "design-lead bio",
     );
 
@@ -868,11 +873,13 @@ const REQUIRED_EVENT_RECORDS: &[&str] = &[
     "records/expenses/2026/05/2026-05-06-helio-type-1188.md",
 ];
 
-/// The wiki pages the eval REQUIRES.
-const REQUIRED_WIKI: &[&str] = &[
-    "wiki/projects/tideform-rebrand.md",
-    "wiki/people/daniel-osei.md",
-    "wiki/people/mara-lindqvist.md",
+/// The conclusion records (former wiki pages) the eval REQUIRES, each as
+/// `(path, type)` — the project synthesis is a `project`, the bios `profile`s.
+/// All carry `meta-type: conclusion`.
+const REQUIRED_CONCLUSIONS: &[(&str, &str)] = &[
+    ("records/projects/tideform-rebrand.md", "project"),
+    ("records/profiles/daniel-osei.md", "profile"),
+    ("records/profiles/mara-lindqvist.md", "profile"),
 ];
 
 /// Addresses that must NOT become contacts (NOTES.md negative cases): bare
@@ -903,8 +910,14 @@ fn corpus_e_agent_session_produces_the_expected_store() {
     assert_file_type(&store, REQUIRED_EVENT_RECORDS[0], "meeting");
     assert_file_type(&store, REQUIRED_EVENT_RECORDS[1], "invoice");
     assert_file_type(&store, REQUIRED_EVENT_RECORDS[2], "expense");
-    for rel in REQUIRED_WIKI {
-        assert_file_type(&store, rel, "wiki-page");
+    for (rel, expect_type) in REQUIRED_CONCLUSIONS {
+        assert_file_type(&store, rel, expect_type);
+        // Each conclusion record carries `meta-type: conclusion`.
+        let body = read(&store, rel);
+        assert!(
+            body.contains("meta-type: conclusion"),
+            "{rel} must carry `meta-type: conclusion`; got:\n{body}"
+        );
     }
 
     // The invoice is `paid` with `paid_at` the receipt date (NOTES requires it).
@@ -935,9 +948,9 @@ fn corpus_e_agent_session_produces_the_expected_store() {
         );
     }
 
-    // The flagship project wiki page links its evidence (records + sources) and
-    // states the $45k fee, in British English ("organised").
-    let project = read(&store, REQUIRED_WIKI[0]);
+    // The flagship project conclusion record links its evidence (records +
+    // sources) and states the $45k fee, in British English ("organised").
+    let project = read(&store, REQUIRED_CONCLUSIONS[0].0);
     for needle in [
         "[[records/companies/tideform]]",
         "[[records/contacts/daniel-osei]]",
@@ -948,7 +961,7 @@ fn corpus_e_agent_session_produces_the_expected_store() {
     ] {
         assert!(
             project.contains(needle),
-            "the Tideform project wiki page must contain {needle:?}; got:\n{project}"
+            "the Tideform project conclusion record must contain {needle:?}; got:\n{project}"
         );
     }
 
@@ -963,16 +976,12 @@ fn corpus_e_agent_session_produces_the_expected_store() {
         );
     }
 
-    // NEGATIVE: nothing in records/ or wiki/ is derived from the newsletter, and
-    // the Tideform $45k fee is never modelled as an expense.
-    let records_wiki = format!(
-        "{}{}",
-        read_all_md(&store.join("records")),
-        read_all_md(&store.join("wiki"))
-    );
+    // NEGATIVE: nothing in records/ (incl. the conclusion records) is derived
+    // from the newsletter, and the Tideform $45k fee is never modelled as an expense.
+    let records_blob = read_all_md(&store.join("records"));
     assert!(
-        !records_wiki.contains("designweekly") && !records_wiki.contains("Design Weekly"),
-        "no record or wiki page may be derived from the newsletter (Ignored type + transient)"
+        !records_blob.contains("designweekly") && !records_blob.contains("Design Weekly"),
+        "no record (incl. conclusion records) may be derived from the newsletter (Ignored type + transient)"
     );
     // No expense names Tideform (the $45k SOW fee is a receivable, not a cost).
     let expenses_blob = read_all_md(&store.join("records/expenses"));
@@ -982,13 +991,7 @@ fn corpus_e_agent_session_produces_the_expected_store() {
     );
 
     // The full index hierarchy + a well-formed log exist.
-    for rel in [
-        "index.md",
-        "log.md",
-        "sources/index.md",
-        "records/index.md",
-        "wiki/index.md",
-    ] {
+    for rel in ["index.md", "log.md", "sources/index.md", "records/index.md"] {
         assert!(
             store.join(rel).is_file(),
             "{rel} must exist after the session"
@@ -1003,8 +1006,8 @@ fn corpus_e_agent_session_produces_the_expected_store() {
         "records/meetings",
         "records/invoices",
         "records/expenses",
-        "wiki/people",
-        "wiki/projects",
+        "records/profiles",
+        "records/projects",
     ] {
         assert!(
             store.join(type_folder).join("index.md").is_file(),
@@ -1060,9 +1063,9 @@ fn corpus_e_agent_session_produces_the_expected_store() {
 }
 
 /// Compare the produced store against `corpus-e-agent/EXPECTED/` byte-for-byte.
-/// Only the agent-produced files are golden (records/, wiki/, the index
-/// hierarchy, log.md); `DB.md` + `sources/**` content files are inputs and are
-/// excluded from the golden tree, so we compare exactly the set EXPECTED ships.
+/// Only the agent-produced files are golden (records/, the index hierarchy,
+/// log.md); `DB.md` + `sources/**` content files are inputs and are excluded
+/// from the golden tree, so we compare exactly the set EXPECTED ships.
 fn assert_store_matches_golden(store: &Path) {
     let expected = corpora_dir().join("corpus-e-agent").join("EXPECTED");
     assert!(
@@ -1097,7 +1100,7 @@ fn assert_store_matches_golden(store: &Path) {
         );
     }
 
-    // Converse: the store must not have produced any records/wiki/index/log file
+    // Converse: the store must not have produced any records/index/log file
     // the golden does NOT account for (a stray extra write is a regression too).
     // We scope this to the agent-produced surface (skip DB.md + source CONTENT).
     for rel in walk_rel(store) {
@@ -1107,10 +1110,10 @@ fn assert_store_matches_golden(store: &Path) {
             .and_then(|n| n.to_str())
             .map(|n| n == "index.md" || n == "index.jsonl" || n == "log.md")
             .unwrap_or(false);
-        let in_records_or_wiki = first == "records" || first == "wiki";
+        let in_records = first == "records";
         // Source CONTENT files are inputs; only the source INDEX files are golden.
         let is_source_index = first == "sources" && is_index_or_log;
-        let golden_governed = in_records_or_wiki
+        let golden_governed = in_records
             || is_source_index
             || (rel == Path::new("index.md"))
             || (rel == Path::new("log.md"));

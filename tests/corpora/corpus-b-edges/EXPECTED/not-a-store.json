@@ -1,5 +1,5 @@
 {
-  "_comment": "Hand-derived. Running `dbmd validate --json tests/corpora/corpus-b-edges/not-a-store` (a directory with no DB.md) MUST emit exactly this single NOT_A_STORE error and exit non-zero, rather than guessing. It is a separate invocation from the corpus-b --all run; `dbmd validate --all` on the corpus-b store does NOT descend into this sibling non-store (it is outside the canonical sources/records/wiki layers).",
+  "_comment": "Hand-derived. Running `dbmd validate --json tests/corpora/corpus-b-edges/not-a-store` (a directory with no DB.md) MUST emit exactly this single NOT_A_STORE error and exit non-zero, rather than guessing. It is a separate invocation from the corpus-b --all run; `dbmd validate --all` on the corpus-b store does NOT descend into this sibling non-store (it is outside the canonical sources/records layers). The test compares only the stable fields (severity / code / line / key / related and that file names the sibling); message/suggestion prose is intent-derived, not snapshotted.",
   "invocation": "dbmd validate --json tests/corpora/corpus-b-edges/not-a-store",
   "exit_code_nonzero": true,
   "issues": [
@@ -10,7 +10,7 @@
       "line": null,
       "key": null,
       "message": "path has no DB.md; not a db.md store",
-      "suggestion": "initialize a store: mkdir -p <dir>/{sources,records,wiki} && dbmd fm init <dir>/DB.md",
+      "suggestion": "initialize a store: mkdir -p <dir>/{sources,records} && dbmd fm init <dir>/DB.md",
       "related": []
     }
   ]

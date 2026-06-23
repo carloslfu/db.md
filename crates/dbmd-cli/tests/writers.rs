@@ -244,74 +244,81 @@ fn write_source_email_auto_shards_by_date_and_prints_sharded_path() {
 }
 
 #[test]
-fn write_wiki_page_honours_explicit_subfolder() {
-    // The SPEC files a `wiki-page` under `wiki/<topic>/` — ANY topic sub-folder
-    // (`wiki/people/`, `wiki/projects/`, `wiki/synthesis/`, …), as corpus-a uses.
-    // An explicit conforming `wiki/<sub>/<file>` path must be honoured verbatim,
-    // not rewritten to the `wiki/topics` default — otherwise those folders are
-    // unreachable via `dbmd write`.
-    for sub in ["people", "projects", "synthesis"] {
+fn write_conclusion_record_honours_explicit_subfolder() {
+    // Conclusion records (the former wiki pages) live in the records layer with a
+    // real type + `meta-type: conclusion`: a `synthesis` is filed under
+    // `records/synthesis/`, but corpus-a also files conclusions as `profile`s under
+    // `records/profiles/` and `project`s under `records/projects/`. An explicit
+    // conforming `records/<sub>/<file>` path (right layer for the type) must be
+    // honoured verbatim, not rewritten to the type's canonical default — otherwise
+    // those folders are unreachable via `dbmd write`.
+    for sub in ["profiles", "projects", "synthesis"] {
         let store = Store::new();
-        let path = format!("wiki/{sub}/page.md");
+        let path = format!("records/{sub}/page.md");
         let out = store.run(&[
             "write",
             &path,
             "--type",
-            "wiki-page",
+            "synthesis",
             "--summary",
             "s",
             "--fm",
-            "topic=T",
+            "meta-type=conclusion",
         ]);
         assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
         assert_eq!(
             out.stdout.trim(),
             path,
-            "explicit wiki/{sub}/ must be honoured"
+            "explicit records/{sub}/ must be honoured"
         );
-        assert!(store.abs(&path).exists(), "file must land in wiki/{sub}/");
+        assert!(
+            store.abs(&path).exists(),
+            "file must land in records/{sub}/"
+        );
     }
 }
 
 #[test]
-fn write_wiki_page_bare_filename_falls_back_to_topics_default() {
+fn write_conclusion_record_bare_filename_falls_back_to_type_default() {
     // An under-specified path (no conforming type-folder) still resolves to the
-    // deterministic `wiki/topics` default — the fallback the dogfood store uses.
+    // type's deterministic canonical default — for the `synthesis` conclusion type
+    // that is `records/synthesis/` (an unrecognized type maps to `records/<type>`).
     let store = Store::new();
     let out = store.run(&[
         "write",
         "just-a-name.md",
         "--type",
-        "wiki-page",
+        "synthesis",
         "--summary",
         "s",
         "--fm",
-        "topic=T",
+        "meta-type=conclusion",
     ]);
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
-    assert_eq!(out.stdout.trim(), "wiki/topics/just-a-name.md");
-    assert!(store.abs("wiki/topics/just-a-name.md").exists());
+    assert_eq!(out.stdout.trim(), "records/synthesis/just-a-name.md");
+    assert!(store.abs("records/synthesis/just-a-name.md").exists());
 }
 
 #[test]
-fn write_wiki_page_wrong_layer_path_falls_back_to_default_folder() {
+fn write_conclusion_record_wrong_layer_path_falls_back_to_default_folder() {
     // A path whose layer doesn't match the type's canonical layer is not an
-    // honoured type-folder: a `wiki-page` handed a `sources/…` path falls back to
-    // the `wiki/topics` default rather than landing in the wrong layer.
+    // honoured type-folder: a records-layer `synthesis` conclusion handed a
+    // `sources/…` path falls back to the `records/synthesis` default rather than
+    // landing in the wrong layer.
     let store = Store::new();
     let out = store.run(&[
         "write",
         "sources/emails/weird.md",
         "--type",
-        "wiki-page",
+        "synthesis",
         "--summary",
         "s",
         "--fm",
-        "topic=T",
+        "meta-type=conclusion",
     ]);
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
-    assert_eq!(out.stdout.trim(), "wiki/topics/weird.md");
-    assert!(store.abs("wiki/topics/weird.md").exists());
+    assert_eq!(out.stdout.trim(), "records/synthesis/weird.md");
+    assert!(store.abs("records/synthesis/weird.md").exists());
 }
 
 #[test]
@@ -628,30 +635,34 @@ fn write_and_rename_refuse_an_extensionless_frozen_entry_identically() {
 // ── write: ignored-type derivation warning (non-blocking) ──────────────────────
 
 #[test]
-fn write_wiki_page_deriving_from_ignored_type_warns_but_writes() {
+fn write_conclusion_record_deriving_from_ignored_type_warns_but_writes() {
     let store = Store::with_db_md(
         "---\ntype: db-md\n---\n\n# S\n\n## Policies\n\n### Ignored types\n- secret\n",
     );
-    // A record of an ignored type the wiki-page will derive from.
+    // A record of an ignored type the conclusion record will derive from.
     store.seed(
         "records/secrets/s.md",
         "---\ntype: secret\nsummary: hush\n---\n\n# secret\n",
     );
 
+    // The policy (POLICY_IGNORED_TYPE_DERIVED) gates on a `meta-type: conclusion`
+    // record whose `derived_from` points at an ignored-type record.
     let out = store.run(&[
         "write",
-        "topics/derived.md",
+        "records/synthesis/derived.md",
         "--type",
-        "wiki-page",
+        "synthesis",
         "--summary",
         "A synthesis",
+        "--fm",
+        "meta-type=conclusion",
         "--fm",
         "derived_from=[[records/secrets/s]]",
     ]);
 
     // The write SUCCEEDS (ignored-type derivation is a warning, not a block) …
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
-    assert!(store.abs("wiki/topics/derived.md").exists());
+    assert!(store.abs("records/synthesis/derived.md").exists());
     // … and a warning naming the policy is surfaced on stderr.
     assert!(
         out.stderr.contains("ignored-type") && out.stderr.contains("records/secrets/s"),

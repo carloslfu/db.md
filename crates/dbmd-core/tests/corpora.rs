@@ -21,9 +21,10 @@
 //!
 //! Every golden below is hand-derived from the corpus files + the SPEC, then
 //! chosen so a *plausible* regression flips it:
-//! - **walk**: the exact `sources/` (6) and `wiki/` (4) content sets are listed
-//!   in full and the whole-store content count is pinned (515). A walk that
-//!   leaked an `index.md` / `index.jsonl` catalog, dropped a date-shard, or
+//! - **walk**: the exact `sources/` (6) content set is listed in full, the four
+//!   `meta-type: conclusion` records (former wiki pages) are confirmed in the
+//!   `records/` layer, and the whole-store content count is pinned (515). A walk
+//!   that leaked an `index.md` / `index.jsonl` catalog, dropped a date-shard, or
 //!   descended a hidden dir would change the set or the count.
 //! - **find_links_to / backlinks**: the incoming-edge set for the central
 //!   `records/contacts/sarah-chen` node is enumerated by hand from the five
@@ -111,50 +112,59 @@ fn corpus_a_walk_sources_layer_is_the_six_known_files() {
     );
 }
 
-/// `Store::walk_layer(Wiki)` over `corpus-a` returns exactly the four
-/// curator-authored wiki pages across the three topic folders.
+/// The four curator-authored synthesis pages are `meta-type: conclusion`
+/// records under `records/` (the `wiki/` layer was removed). They live across
+/// three conclusion topic-folders (`profiles/`, `projects/`, `synthesis/`) and
+/// are surfaced by the Records-layer walk alongside the atomic records.
 #[test]
-fn corpus_a_walk_wiki_layer_is_the_four_known_pages() {
+fn corpus_a_conclusion_records_are_in_the_records_layer() {
     let store = open_corpus_a();
-    let got = as_sorted_strings(&store.walk_layer(Layer::Wiki).expect("walk wiki"));
-    assert_eq!(
-        got,
-        owned(&[
-            "wiki/people/elena-rodriguez.md",
-            "wiki/people/sarah-chen.md",
-            "wiki/projects/northstar-renewal.md",
-            "wiki/synthesis/2026-renewal-plan.md",
-        ]),
-        "wiki walk must list every topic-folder page and nothing else"
+    let records = as_sorted_strings(&store.walk_layer(Layer::Records).expect("walk records"));
+    for conclusion in [
+        "records/profiles/elena-rodriguez.md",
+        "records/profiles/sarah-chen.md",
+        "records/projects/northstar-renewal.md",
+        "records/synthesis/2026-renewal-plan.md",
+    ] {
+        assert!(
+            records.contains(&conclusion.to_string()),
+            "the records-layer walk must surface the conclusion record {conclusion}"
+        );
+    }
+    // There is no longer a `wiki/` directory at all — the walk never yields one.
+    assert!(
+        !records.iter().any(|p| p.starts_with("wiki/")),
+        "no path under a `wiki/` layer may appear; the layer was removed"
     );
 }
 
-/// `Store::walk` over `corpus-a` returns the full content set across all three
+/// `Store::walk` over `corpus-a` returns the full content set across both
 /// layers and **never** a meta file (`DB.md` / `index.md` / `log.md`), a
 /// sidecar (`index.jsonl`), or anything under `log/`.
 ///
-/// The count (515 = 6 sources + 505 records + 4 wiki) is pinned because it is
-/// the single number a broad class of walk bugs would move: a leaked catalog
-/// (+N), a dropped shard subtree (−N), or a descended hidden dir (+N). The
-/// explicit exclusion checks name the specific files a correct walk must omit.
+/// The count (515 = 6 sources + 509 records) is pinned because it is the single
+/// number a broad class of walk bugs would move: a leaked catalog (+N), a
+/// dropped shard subtree (−N), or a descended hidden dir (+N). The 509 records
+/// include the four `meta-type: conclusion` synthesis records (the former wiki
+/// pages, now under `records/`). The explicit exclusion checks name the specific
+/// files a correct walk must omit.
 #[test]
 fn corpus_a_walk_is_content_only_no_meta_no_sidecar_no_log() {
     let store = open_corpus_a();
     let all = store.walk().expect("walk corpus-a");
     let set: BTreeSet<String> = as_sorted_strings(&all).into_iter().collect();
 
-    // Cardinality: every content .md across the three layers, nothing else.
+    // Cardinality: every content .md across both layers, nothing else.
     assert_eq!(
         all.len(),
         515,
-        "expected 6 sources + 505 records + 4 wiki content files"
+        "expected 6 sources + 509 records content files"
     );
 
     // Per-layer split matches the layer walks (so a leak/drop in one layer is
     // localized, not just absorbed into the total).
     assert_eq!(store.walk_layer(Layer::Sources).unwrap().len(), 6);
-    assert_eq!(store.walk_layer(Layer::Records).unwrap().len(), 505);
-    assert_eq!(store.walk_layer(Layer::Wiki).unwrap().len(), 4);
+    assert_eq!(store.walk_layer(Layer::Records).unwrap().len(), 509);
 
     // Meta files at root and per-folder catalogs must be absent.
     for excluded in [
@@ -165,7 +175,7 @@ fn corpus_a_walk_is_content_only_no_meta_no_sidecar_no_log() {
         "records/contacts/index.jsonl",
         "sources/emails/index.md",
         "sources/emails/index.jsonl",
-        "wiki/people/index.md",
+        "records/profiles/index.md",
     ] {
         assert!(
             !set.contains(excluded),
@@ -173,12 +183,13 @@ fn corpus_a_walk_is_content_only_no_meta_no_sidecar_no_log() {
         );
     }
 
-    // A representative content file from each layer (incl. a sharded one) must
-    // be present — proves the walk reached into the shards, not just the roots.
+    // A representative content file from each layer (incl. a sharded one and a
+    // conclusion record) must be present — proves the walk reached into the
+    // shards, not just the roots.
     for included in [
         "sources/emails/2026/05/2026-05-22-elena-renewal.md",
         "records/contacts/sarah-chen.md",
-        "wiki/projects/northstar-renewal.md",
+        "records/projects/northstar-renewal.md",
     ] {
         assert!(
             set.contains(included),
@@ -197,11 +208,11 @@ fn corpus_a_walk_is_content_only_no_meta_no_sidecar_no_log() {
 ///
 /// The six-file set is enumerated by hand from the corpus:
 /// - `records/companies/northstar.md` — body mention,
+/// - `records/contacts/index.md` — the type-folder catalog,
 /// - `records/meetings/2026/04/…quarterly-review.md` — `attendees:` + body,
 /// - `records/meetings/2026/05/…renewal-call.md` — `attendees:` + body,
-/// - `wiki/people/sarah-chen.md` — the person page,
-/// - `wiki/projects/northstar-renewal.md` — the project synthesis,
-/// - `records/contacts/index.md` — the type-folder catalog.
+/// - `records/profiles/sarah-chen.md` — the profile conclusion record,
+/// - `records/projects/northstar-renewal.md` — the project conclusion record.
 ///
 /// `find_links_to`'s scan is "every `.md`, skip hidden + `log/`", so it also
 /// reaches `corpus-a`'s `EXPECTED/` golden-mirror tree (a fixture-metadata
@@ -209,7 +220,7 @@ fn corpus_a_walk_is_content_only_no_meta_no_sidecar_no_log() {
 /// of the link). That is the method behaving correctly — `EXPECTED/` is neither
 /// hidden nor `log/` — but it is fixture metadata, not store content, so we make
 /// the exact-equality assertion over the semantically-meaningful region: the
-/// three content layers. The two separate checks below pin both facts: (1) the
+/// two content layers. The two separate checks below pin both facts: (1) the
 /// content-layer hits are *exactly* the six, and (2) the catalog `index.md` is
 /// included while the `index.jsonl` sidecar (not a `.md`) never is.
 ///
@@ -230,9 +241,7 @@ fn corpus_a_find_links_to_sarah_chen_includes_catalog() {
     // about the fixture's golden-mirror layout.
     let in_layers: Vec<String> = all_set
         .iter()
-        .filter(|p| {
-            p.starts_with("sources/") || p.starts_with("records/") || p.starts_with("wiki/")
-        })
+        .filter(|p| p.starts_with("sources/") || p.starts_with("records/"))
         .cloned()
         .collect();
     assert_eq!(
@@ -242,8 +251,8 @@ fn corpus_a_find_links_to_sarah_chen_includes_catalog() {
             "records/contacts/index.md",
             "records/meetings/2026/04/2026-04-15-northstar-quarterly-review.md",
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call.md",
-            "wiki/people/sarah-chen.md",
-            "wiki/projects/northstar-renewal.md",
+            "records/profiles/sarah-chen.md",
+            "records/projects/northstar-renewal.md",
         ]),
         "find_links_to scans every .md (catalogs included) for the literal link"
     );
@@ -315,8 +324,8 @@ fn corpus_a_backlinks_sarah_chen_is_content_only_bare_form() {
             "records/companies/northstar",
             "records/meetings/2026/04/2026-04-15-northstar-quarterly-review",
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call",
-            "wiki/people/sarah-chen",
-            "wiki/projects/northstar-renewal",
+            "records/profiles/sarah-chen",
+            "records/projects/northstar-renewal",
         ]),
         "backlinks: content files only (no index.md catalog), bare no-.md paths"
     );
@@ -325,7 +334,7 @@ fn corpus_a_backlinks_sarah_chen_is_content_only_bare_form() {
 /// `graph::forwardlinks(records/contacts/sarah-chen.md)` over `corpus-a` returns
 /// the three distinct outgoing targets the file links to — across both
 /// frontmatter (`company: [[records/companies/northstar]]`) and body
-/// (`[[wiki/projects/northstar-renewal]]`, the renewal-call meeting). The
+/// (`[[records/projects/northstar-renewal]]`, the renewal-call meeting). The
 /// duplicate `northstar` reference (once in frontmatter, once in the body) is
 /// deduped to a single edge.
 ///
@@ -344,7 +353,7 @@ fn corpus_a_forwardlinks_sarah_chen_spans_frontmatter_and_body_deduped() {
         owned(&[
             "records/companies/northstar",
             "records/meetings/2026/05/2026-05-22-northstar-renewal-call",
-            "wiki/projects/northstar-renewal",
+            "records/projects/northstar-renewal",
         ]),
         "forwardlinks must include the frontmatter `company` link, deduped"
     );
@@ -562,7 +571,7 @@ fn corpus_a_db_md_schemas_and_policies_parse_per_spec() {
     // ## Policies → ### Frozen pages / ### Ignored types.
     assert_eq!(
         cfg.frozen_pages,
-        vec![PathBuf::from("wiki/synthesis/2026-renewal-plan.md")],
+        vec![PathBuf::from("records/synthesis/2026-renewal-plan.md")],
         "the one frozen page must parse from its bullet"
     );
     assert_eq!(
