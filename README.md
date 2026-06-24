@@ -191,7 +191,7 @@ db/
 │   │   ├── northwind-msa.pdf
 │   │   └── lumen-sow-q2.pdf
 │   ├── emails/
-│   │   └── lumen-invoice-question-2026-06-02.md
+│   │   └── 2026/06/2026-06-02-lumen-invoice-question.md
 │   └── notes/
 │       └── 2026/06/northwind-wants-weekly-updates.md   # told_by: Dan Ruiz
 └── records/
@@ -206,7 +206,7 @@ db/
     ├── invoices/
     │   ├── 2026-039-northwind.md
     │   └── 2026-041-lumen.md
-    ├── profiles/
+    ├── accounts/
     │   └── northwind.md     # meta-type: conclusion — the account, synthesized
     └── synthesis/
         └── pipeline.md      # meta-type: conclusion — every client, status, next step
@@ -215,7 +215,7 @@ db/
 Each client is some evidence in `sources/` and a spread of records in
 `records/`: the contact, the project, the invoices, each linking back to the
 contract or call that produced it. The agent's read on an account
-(`profiles/northwind.md`) and on the whole book of business
+(`accounts/northwind.md`) and on the whole book of business
 (`synthesis/pipeline.md`) are `conclusion`s it keeps current as the facts move
 under them. Add a client and the shape repeats. Nothing new to stand up.
 
