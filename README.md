@@ -179,6 +179,46 @@ of record it is: `fact` (the default), `operational`, or `conclusion`. A
 `conclusion` is the synthesis layer — the linked narrative the agent compiles
 from the rest.
 
+Picture a one-person agency running a couple of clients. The same two folders
+fill in like this:
+
+```
+db/
+├── DB.md
+├── index.md
+├── sources/
+│   ├── contracts/
+│   │   ├── northwind-msa.pdf
+│   │   └── lumen-sow-q2.pdf
+│   ├── emails/
+│   │   └── lumen-invoice-question-2026-06-02.md
+│   └── notes/
+│       └── 2026/06/northwind-wants-weekly-updates.md   # told_by: Dan Ruiz
+└── records/
+    ├── clients/
+    │   ├── northwind.md     # meta-type: fact — retainer, renewal, status
+    │   └── lumen-health.md
+    ├── contacts/
+    │   ├── dan-ruiz.md      # Northwind, founder
+    │   └── priya-shah.md    # Lumen, billing
+    ├── projects/
+    │   └── northwind-site-redesign.md
+    ├── invoices/
+    │   ├── 2026-039-northwind.md
+    │   └── 2026-041-lumen.md
+    ├── profiles/
+    │   └── northwind.md     # meta-type: conclusion — the account, synthesized
+    └── synthesis/
+        └── pipeline.md      # meta-type: conclusion — every client, status, next step
+```
+
+Each client is some evidence in `sources/` and a spread of records in
+`records/`: the contact, the project, the invoices, each linking back to the
+contract or call that produced it. The agent's read on an account
+(`profiles/northwind.md`) and on the whole book of business
+(`synthesis/pipeline.md`) are `conclusion`s it keeps current as the facts move
+under them. Add a client and the shape repeats. Nothing new to stand up.
+
 `DB.md` is the file that matters most. It holds the store's identity, the
 instructions for the agent, the policies it has to follow, and the schemas your
 records conform to. The agent reads `DB.md` first and curates everything else
