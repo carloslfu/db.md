@@ -995,6 +995,15 @@ fn archive_year_month(path: &Path) -> Option<(i32, u32)> {
     }
     let year: i32 = stem[..4].parse().ok()?;
     let month: u32 = stem[5..7].parse().ok()?;
+    // The month must be a real calendar month. A hand-created / externally-
+    // produced `log/2026-00.md` or `log/2026-13.md` parses as two digits but
+    // names no month; returning `Some((year, 0))` would sort it below every
+    // legitimate month, so the newest-month-first early-break in `since`/`tail`
+    // could prune it and silently drop its entries. Out-of-range → `None`, so the
+    // caller scans the file instead of risk-skipping it (the safe fallback).
+    if !(1..=12).contains(&month) {
+        return None;
+    }
     Some((year, month))
 }
 
@@ -1284,6 +1293,35 @@ mod tests {
             config: Config::default(),
         };
         (dir, store)
+    }
+
+    /// Regression (adversarial review): a hand-created / externally-produced
+    /// archive with an out-of-range month (`00`, `13`..`99`) must NOT parse as a
+    /// real month archive — otherwise its `(year, 0)` bucket sorts below every
+    /// legitimate month and the newest-first early-break in `since`/`tail` can
+    /// silently prune it. Out-of-range → `None` (the caller scans it instead).
+    #[test]
+    fn archive_year_month_rejects_out_of_range_months() {
+        use std::path::Path;
+        assert_eq!(
+            archive_year_month(Path::new("log/2026-05.md")),
+            Some((2026, 5))
+        );
+        assert_eq!(
+            archive_year_month(Path::new("log/2026-01.md")),
+            Some((2026, 1))
+        );
+        assert_eq!(
+            archive_year_month(Path::new("log/2026-12.md")),
+            Some((2026, 12))
+        );
+        for bad in ["log/2026-00.md", "log/2026-13.md", "log/2026-99.md"] {
+            assert_eq!(
+                archive_year_month(Path::new(bad)),
+                None,
+                "{bad} has an out-of-range month and must not parse as an archive"
+            );
+        }
     }
 
     /// A timestamp at UTC from `YYYY-MM-DD HH:MM` components.

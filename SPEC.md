@@ -715,7 +715,7 @@ updated: 2026-05-27T10:00:00Z
 ```markdown
 ---
 type: index
-scope: folder
+scope: type-folder
 folder: records/profiles
 updated: 2026-05-27T10:00:00Z
 ---
@@ -1645,7 +1645,7 @@ prompt interactively.
 |-----------|-------------|
 | Open      | `dbmd spec`, `dbmd fm get DB.md <key>` |
 | Warm up   | `dbmd log tail [N]`, `dbmd log since <ts>` |
-| Read      | `dbmd search <q> [--type --in --where --linked-from --linked-to --updated-after --updated-before]`, `dbmd fm query <k>=<v>`, `dbmd fm get <file> <key>`, `dbmd graph <backlinks\|forwardlinks\|neighborhood\|orphans>`, `dbmd tree`, `dbmd outline <file>`, `dbmd stats`, `dbmd extract <file>`, `dbmd index show [<path>]` |
+| Read      | `dbmd search <q> [--type --in --where --linked-from --linked-to --updated-after --updated-before]`, `dbmd query [--type --in --where --limit]` (frontmatter filter over the sidecar), `dbmd fm query <k>=<v>`, `dbmd fm get <file> <key>`, `dbmd graph <backlinks\|forwardlinks\|neighborhood\|orphans>`, `dbmd tree`, `dbmd outline <file>`, `dbmd stats`, `dbmd extract <file>`, `dbmd index show [<path>]` |
 | Write     | `dbmd write <path> --type <t> [--summary --fm --body-file]`, `dbmd fm set <file> <k>=<v>`, `dbmd fm init <file>`, `dbmd link <from> <to>`, `dbmd rename <old> <new>`, `dbmd format <file>` |
 | Validate  | `dbmd validate [--json]` (working set), `dbmd validate --all` (full sweep) |
 | Maintain  | indexes are write-through; `dbmd index rebuild [--layer --folder --dry-run]` repairs / folds in bulk drops |

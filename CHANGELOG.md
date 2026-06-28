@@ -33,6 +33,51 @@ Two things version independently:
   only. The tool only *surfaces* curator-authored text; it never composes a
   folder description from the folder's contents.
 
+#### Fixed
+
+- **`extract` no longer panics or fabricates a date on a crafted `.xlsx`.** An
+  out-of-range Excel date serial (e.g. a hostile `1e308` cell) overflowed
+  calamine's date math — a panic in debug, a bogus far-past date in release.
+  Such serials now keep their raw value, upholding "never panics on untrusted
+  input, never hallucinated text."
+- **`extract` bounds HTML block-nesting depth.** A tiny but deeply-nested HTML
+  file made html2text's layout run for minutes (O(depth²)); the adapter now
+  refuses pathological nesting, matching the bounds the docx/epub/spreadsheet
+  adapters already enforce. EPUB chapters are covered too.
+- **`validate` rejects a non-scalar `meta-type`.** A `meta-type:` whose value is
+  a YAML list or mapping slipped past the closed-enum check and was silently
+  treated as the default `fact`; it now reports `FM_BAD_META_TYPE`.
+- **`assets status` honors store containment.** It resolved manifest paths
+  without the guard `scan`/`verify` use, so a poisoned/hand-edited manifest could
+  report an out-of-store file as `present` (and disagree with `verify`). Status
+  now resolves through `ensure_path_within_store` like the other asset ops.
+- **Asset paths fold a leading `./` to one canonical record.** `./sources/x.pdf`
+  and `sources/x.pdf` are the same file; they no longer split into duplicate
+  manifest records (doubled byte counts, false "untracked"). Traversal/absolute
+  paths are still hard-rejected.
+- **`log since` / `log tail` no longer risk dropping entries from a malformed
+  archive name.** A hand-created `log/2026-00.md` / `2026-13.md` (out-of-range
+  month) could be pruned by the newest-first early-break; such names are now
+  scanned, not parsed as a real month.
+- **`rename`'s "N files rewritten" count excludes the derived `index.md`
+  catalog** (it was inflating the count with a regenerated artifact).
+- **Removed the stale `wiki` layer from agent-facing surfaces** — eight `--help`
+  strings, the `graph --in` error, and the CLI README still advertised `wiki`,
+  removed in v0.4.0, so an agent trusting them constructed a hard-rejected
+  `--in wiki`.
+- **SPEC fixes:** the worked index example used `scope: folder` (not in the
+  normative `root|layer|type-folder` enum) → `type-folder`; documented the
+  shipped top-level `dbmd query`.
+
+#### Security
+
+- **`rename`, `link`, and `fm set` / `fm init` now enforce store containment**
+  like `write` does. A destination or target reached through an in-store symlink
+  pointing outside the store passed the lexical-only gate and could move or
+  rewrite a file **outside the store root** (plus catalog a stale entry pointing
+  at it). They now resolve the path through `ensure_path_within_store` and refuse
+  with `PATH_OUTSIDE_STORE`.
+
 ## [0.4.0] — 2026-06-23
 
 ### Format — v0.3 (breaking: three layers collapse to two, plus a `meta-type` field)

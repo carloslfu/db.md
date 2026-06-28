@@ -207,7 +207,7 @@ pub struct QueryArgs {
     #[arg(long, value_name = "TYPE")]
     pub r#type: Option<String>,
 
-    /// Scope to a single layer: `sources`, `records`, or `wiki`.
+    /// Scope to a single layer: `sources` or `records`.
     #[arg(long, value_name = "LAYER")]
     pub r#in: Option<String>,
 
@@ -285,7 +285,7 @@ pub struct SearchArgs {
     #[arg(long, value_name = "TYPE")]
     pub r#type: Option<String>,
 
-    /// Scope to a single layer: `sources`, `records`, or `wiki`.
+    /// Scope to a single layer: `sources` or `records`.
     #[arg(long, value_name = "LAYER")]
     pub r#in: Option<String>,
 
@@ -370,7 +370,7 @@ pub struct GraphTargetArgs {
     #[arg(long, value_name = "TYPE")]
     pub r#type: Option<String>,
 
-    /// Restrict to a single layer: `sources`, `records`, or `wiki`. For
+    /// Restrict to a single layer: `sources` or `records`. For
     /// `backlinks` this scopes the sidecar walk to that layer; for
     /// `forwardlinks` it filters the returned targets by layer.
     #[arg(long, value_name = "LAYER")]
@@ -419,7 +419,7 @@ pub struct NeighborhoodArgs {
 /// `dbmd graph orphans`.
 #[derive(Debug, Args)]
 pub struct OrphansArgs {
-    /// Restrict to a single layer: `sources`, `records`, or `wiki`.
+    /// Restrict to a single layer: `sources` or `records`.
     #[arg(long, value_name = "LAYER")]
     pub r#in: Option<String>,
 
@@ -500,7 +500,7 @@ pub struct FmQueryArgs {
     #[arg(long, value_name = "TYPE")]
     pub r#type: Option<String>,
 
-    /// Restrict to a single layer: `sources`, `records`, or `wiki`.
+    /// Restrict to a single layer: `sources` or `records`.
     #[arg(long, value_name = "LAYER")]
     pub r#in: Option<String>,
 
@@ -532,7 +532,7 @@ pub struct FmInitArgs {
 /// `dbmd tree` — pretty-print the store.
 #[derive(Debug, Args)]
 pub struct TreeArgs {
-    /// Restrict to a single layer: `sources`, `records`, or `wiki`.
+    /// Restrict to a single layer: `sources` or `records`.
     #[arg(long, value_name = "LAYER")]
     pub layer: Option<String>,
 
@@ -606,7 +606,7 @@ pub enum IndexCommand {
 /// `dbmd index rebuild`.
 #[derive(Debug, Args)]
 pub struct IndexRebuildArgs {
-    /// Scope the rebuild to a single layer: `sources`, `records`, or `wiki`.
+    /// Scope the rebuild to a single layer: `sources` or `records`.
     #[arg(long, value_name = "LAYER")]
     pub layer: Option<String>,
 
@@ -644,7 +644,7 @@ pub struct IndexQueryArgs {
     #[arg(long, value_name = "TYPE")]
     pub r#type: Option<String>,
 
-    /// Restrict to a single layer: `sources`, `records`, or `wiki`.
+    /// Restrict to a single layer: `sources` or `records`.
     #[arg(long, value_name = "LAYER")]
     pub r#in: Option<String>,
 

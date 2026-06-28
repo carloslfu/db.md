@@ -416,3 +416,54 @@ fn regression_rename_moved_file_without_frontmatter_is_not_restamped() {
         "a frontmatter-less moved file must survive byte-for-byte (no re-stamp)"
     );
 }
+
+/// Adversarial review — `rename` MUST enforce store containment like `write`.
+/// A destination whose parent is an in-store symlink pointing OUTSIDE the store
+/// (the store legitimately accepts externally-dropped content carrying symlinks)
+/// must be refused, not silently moved out of the store. Pre-fix `rename` ran
+/// only the lexical `require_store_relative` gate (which follows symlinks), so
+/// `create_dir_all` + `fs::rename` landed the moved file — and a stale index
+/// entry pointing at it — outside the store root.
+#[cfg(unix)]
+#[test]
+fn regression_rename_refuses_destination_through_in_store_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let store = Store::new();
+    store.seed(
+        "records/contacts/sarah.md",
+        "---\ntype: contact\nsummary: x\n---\n# Sarah\n",
+    );
+    // A directory OUTSIDE the store, plus an in-store symlink pointing at it.
+    let outside = TempDir::new().expect("outside tempdir");
+    std::fs::create_dir_all(store.abs("records/links")).unwrap();
+    symlink(outside.path(), store.abs("records/links/escape")).unwrap();
+
+    let out = store.run(&[
+        "rename",
+        "records/contacts/sarah.md",
+        "records/links/escape/pwned.md",
+    ]);
+
+    assert_ne!(
+        out.code,
+        Some(0),
+        "rename through a symlinked-out dir must be refused; code={:?} stderr={}",
+        out.code,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("PATH_OUTSIDE_STORE") || out.stderr.to_lowercase().contains("outside"),
+        "the refusal should name the containment failure; stderr: {}",
+        out.stderr
+    );
+    // The file must NOT have escaped the store, and the source must survive.
+    assert!(
+        !outside.path().join("pwned.md").exists(),
+        "the moved file escaped the store root"
+    );
+    assert!(
+        store.abs("records/contacts/sarah.md").exists(),
+        "the source must survive a refused rename"
+    );
+}

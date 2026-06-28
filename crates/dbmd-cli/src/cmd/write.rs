@@ -298,7 +298,10 @@ fn path_outside_store_error(raw: &str) -> CliError {
 /// gate cannot see a symlinked parent directory; this is the post-resolution
 /// containment failure. `resolved` is the store-relative path as the agent's
 /// spelling produced it; `cause` is the containment helper's diagnostic.
-fn path_escapes_store_error(resolved: &str, cause: &std::io::Error) -> CliError {
+///
+/// Shared by every mutating write surface (`write`, `rename`, `link`, `fm
+/// set`/`init`) so they enforce store containment identically.
+pub(crate) fn path_escapes_store_error(resolved: &str, cause: &std::io::Error) -> CliError {
     CliError::new(
         ExitCode::Runtime,
         "PATH_OUTSIDE_STORE",

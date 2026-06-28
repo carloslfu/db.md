@@ -703,9 +703,18 @@ fn render_cell(cell: &calamine::Data) -> String {
 /// elapsed-time format) is not a calendar date, so it keeps its raw serial form
 /// (the prior behavior) rather than being misrendered as a date.
 fn render_excel_datetime(dt: &calamine::ExcelDateTime) -> String {
-    if dt.is_duration() {
-        // Elapsed-time value, not a point on the calendar — leave as the serial.
-        return dt.as_f64().to_string();
+    // Guard the serial BEFORE calling `to_ymd_hms_milli`. A date cell carries an
+    // arbitrary (attacker-controlled in `sources/`) f64; calamine's conversion is
+    // only defined over its calendar window (~1899-12-31..9999-12-31, i.e. serial
+    // 0..=2_958_465). Outside it, calamine saturates `floor() as u64` and then
+    // overflows on `days += 109_571` — a panic in debug (abort, exit 101) and a
+    // fabricated far-past date in release (`1e308` → `1899-12-29`), both of which
+    // violate the module contract ("never panics on untrusted input, never
+    // hallucinated text"). A duration is likewise not a calendar point. In every
+    // such case keep the raw serial, exactly as the duration branch always did.
+    let serial = dt.as_f64();
+    if dt.is_duration() || !(0.0..=2_958_465.0).contains(&serial) {
+        return serial.to_string();
     }
     let (y, mo, d, h, mi, s, _ms) = dt.to_ymd_hms_milli();
     if h == 0 && mi == 0 && s == 0 {
@@ -1019,12 +1028,113 @@ fn extract_html(path: &Path) -> Result<Extracted> {
 /// the renderer; paragraph structure comes from the source's block elements, and
 /// final layout is canonicalized by [`normalize_text`].
 fn html_to_text(html: &[u8]) -> Result<String> {
+    // Bound block-element nesting BEFORE handing the bytes to html2text. The
+    // layout engine is super-linear in nesting depth (O(depth^2) observed), so a
+    // tiny crafted file (`<div>`×40_000 …`</div>`×40_000`, ~440 KB) hangs
+    // extraction for tens of seconds. `sources/` is untrusted, and every other
+    // adapter bounds its untrusted input (MAX_ZIP_ENTRY_BYTES, MAX_SPREADSHEET_
+    // CELLS); the HTML path is the lone unbounded one. This is the missing bound.
+    // A pure byte cap can't distinguish a 440 KB bomb from a 440 KB legitimate
+    // article, so we bound the structural cause (depth) rather than size. EPUB
+    // chapters route through here too, so the guard covers them as well.
+    if let Some(depth) = html_block_nesting_exceeds(html, MAX_HTML_NESTING_DEPTH) {
+        return Err(ExtractError::Parse {
+            format: "html",
+            message: format!(
+                "HTML block nesting depth exceeds the {MAX_HTML_NESTING_DEPTH} cap (reached {depth}; \
+                 malformed or hostile input)"
+            ),
+        });
+    }
     html2text::config::with_decorator(PlainContentDecorator)
         .string_from_read(html, 10_000)
         .map_err(|e| ExtractError::Parse {
             format: "html",
             message: e.to_string(),
         })
+}
+
+/// The deepest block-element nesting `html_to_text` tolerates. No legitimate
+/// document nests containers anywhere near this deep; the cap exists purely to
+/// refuse the deeply-nested bomb that makes html2text's layout pass run for
+/// minutes. Set with large headroom so it can only fire on pathological input.
+const MAX_HTML_NESTING_DEPTH: usize = 4_096;
+
+/// HTML5 void elements — they have no closing tag, so they must NOT increment
+/// the nesting depth (a document of many sibling `<br>`/`<img>` is flat, not
+/// deep). Kept lowercase; the scan lowercases the tag name before matching.
+const HTML_VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Scan an HTML byte stream once and return `Some(depth)` if open-tag nesting
+/// ever exceeds `limit`, else `None`. This is a deliberately crude, allocation-
+/// free tag scanner — NOT a parser. It tracks only nesting *depth* to bound
+/// html2text's super-linear layout cost; correctness of the depth count past the
+/// limit does not matter (we only care whether it is exceeded). Closing tags
+/// decrement (saturating at 0), void/self-closing tags and comments/doctype/PI
+/// are ignored, and a `<` not followed by a tag-ish character is treated as
+/// literal text rather than a tag open (so `a < b` in prose does not inflate it).
+fn html_block_nesting_exceeds(html: &[u8], limit: usize) -> Option<usize> {
+    let mut depth: usize = 0;
+    let mut i = 0usize;
+    let n = html.len();
+    while i < n {
+        if html[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        // Look at the byte after `<` to classify the tag.
+        let Some(&c) = html.get(i + 1) else { break };
+        if c == b'!' || c == b'?' {
+            // Comment, doctype, CDATA, or processing instruction — skip to `>`.
+            i = memchr_gt(html, i + 1);
+            continue;
+        }
+        if c == b'/' {
+            depth = depth.saturating_sub(1);
+            i = memchr_gt(html, i + 1);
+            continue;
+        }
+        if !c.is_ascii_alphabetic() {
+            // A stray `<` in text (`a < b`) — not a tag open.
+            i += 1;
+            continue;
+        }
+        // Find the tag's end `>` and whether it self-closes (`... />`).
+        let end = memchr_gt(html, i + 1);
+        let self_closing = end > 0 && end <= n && html.get(end - 1) == Some(&b'/');
+        // Extract the tag name (letters/digits after `<`).
+        let name_end = (i + 1..end.min(n))
+            .find(|&j| !html[j].is_ascii_alphanumeric())
+            .unwrap_or(end.min(n));
+        let name = html[i + 1..name_end].to_ascii_lowercase();
+        let is_void = std::str::from_utf8(&name)
+            .map(|s| HTML_VOID_ELEMENTS.contains(&s))
+            .unwrap_or(false);
+        if !self_closing && !is_void {
+            depth += 1;
+            if depth > limit {
+                return Some(depth);
+            }
+        }
+        i = end;
+    }
+    None
+}
+
+/// Index just past the next `>` at or after `from` (or `len` if none). Small
+/// helper so [`html_block_nesting_exceeds`] always makes forward progress.
+fn memchr_gt(hay: &[u8], from: usize) -> usize {
+    let mut j = from;
+    while j < hay.len() {
+        if hay[j] == b'>' {
+            return j + 1;
+        }
+        j += 1;
+    }
+    hay.len()
 }
 
 /// A `html2text` decorator that flattens HTML to plain text WITHOUT emitting the
@@ -1284,6 +1394,78 @@ mod tests {
         let mut v: Vec<String> = s.lines().map(tokens).filter(|l| !l.is_empty()).collect();
         v.sort();
         v
+    }
+
+    // ── untrusted-input guards (adversarial review) ──────────────────────────
+
+    /// A crafted spreadsheet date cell carries an arbitrary f64 serial. An
+    /// out-of-range serial must NOT panic (debug `attempt to add with overflow`)
+    /// and must NOT fabricate a calendar date (release `1e308` → `1899-12-29`);
+    /// it keeps the raw serial, exactly like the duration fallback.
+    #[test]
+    fn excel_datetime_out_of_range_serial_stays_raw_and_never_panics() {
+        use calamine::{ExcelDateTime, ExcelDateTimeType};
+        // In-range serial → a real calendar date (contains a `-`).
+        let in_range = render_excel_datetime(&ExcelDateTime::new(
+            46_188.0,
+            ExcelDateTimeType::DateTime,
+            false,
+        ));
+        assert!(
+            in_range.contains('-'),
+            "an in-range serial should render a calendar date, got {in_range}"
+        );
+        // Out-of-range / hostile serials keep the raw serial string, no panic.
+        for serial in [1e308_f64, 3_000_000.0, 9e18, -5.0] {
+            let out = render_excel_datetime(&ExcelDateTime::new(
+                serial,
+                ExcelDateTimeType::DateTime,
+                false,
+            ));
+            assert_eq!(
+                out,
+                serial.to_string(),
+                "out-of-range serial {serial} must stay raw, got {out}"
+            );
+        }
+    }
+
+    /// The HTML adapter's block-nesting guard refuses a deeply-nested bomb (the
+    /// O(depth^2) html2text blowup) while passing flat documents — including ones
+    /// with tens of thousands of sibling VOID elements (which must not count as
+    /// depth) and prose containing a literal `<`.
+    #[test]
+    fn html_nesting_guard_refuses_deep_bomb_passes_flat() {
+        let deep = format!(
+            "<html><body>{}x{}</body></html>",
+            "<div>".repeat(8_000),
+            "</div>".repeat(8_000)
+        );
+        assert!(
+            html_block_nesting_exceeds(deep.as_bytes(), MAX_HTML_NESTING_DEPTH).is_some(),
+            "an 8000-deep nest must trip the guard"
+        );
+        assert!(
+            html_to_text(deep.as_bytes()).is_err(),
+            "html_to_text must refuse the bomb (typed error), not hang"
+        );
+
+        let flat = format!("<html><body>{}</body></html>", "<br>".repeat(50_000));
+        assert!(
+            html_block_nesting_exceeds(flat.as_bytes(), MAX_HTML_NESTING_DEPTH).is_none(),
+            "50k sibling void <br> are flat, not deep — must pass"
+        );
+
+        let normal =
+            "<html><body><div><p>hi <a href=\"u\">link</a>; a < b in prose</p></div></body></html>";
+        assert!(
+            html_block_nesting_exceeds(normal.as_bytes(), MAX_HTML_NESTING_DEPTH).is_none(),
+            "ordinary nesting (and a stray `<`) must pass"
+        );
+        assert!(
+            html_to_text(normal.as_bytes()).is_ok(),
+            "a normal document must still flatten fine"
+        );
     }
 
     // ── format detection ────────────────────────────────────────────────────

@@ -28,7 +28,7 @@ tarball from the [GitHub releases](https://github.com/carloslfu/db.md/releases).
 
 ```sh
 # create a store — you write DB.md (the agent authors it; there is no `dbmd init`)
-mkdir -p db/{sources,records,wiki}
+mkdir -p db/{sources,records}
 printf -- '---\ntype: db-md\nscope: personal\nowner: me\n---\n' > db/DB.md
 
 # operate it

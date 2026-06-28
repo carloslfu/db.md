@@ -544,9 +544,18 @@ fn check_frontmatter(
     // `fact`). Sources don't normally carry one, but validating the value when
     // present is layer-agnostic and harmless.
     if is_content {
-        if let Some(mt) = fm.get("meta-type").and_then(scalar_string) {
-            if !matches!(mt.as_str(), "fact" | "operational" | "conclusion") {
-                push(
+        // Branch on the raw value, NOT `and_then(scalar_string)`. Pre-filtering
+        // through `scalar_string` made a list/mapping value (which returns `None`)
+        // short-circuit the whole check, so a structurally-wrong `meta-type`
+        // slipped through clean AND was silently reclassified as the default
+        // `fact` by the rest of the toolkit. Absent or explicit-`null` is fine
+        // (effective default `fact`); a present non-null value must be a scalar in
+        // the closed enum. This mirrors the sibling timestamp check below, which
+        // was already hardened against the same non-scalar escape.
+        if let Some(v) = fm.get("meta-type").filter(|v| !v.is_null()) {
+            match scalar_string(v) {
+                Some(mt) if matches!(mt.as_str(), "fact" | "operational" | "conclusion") => {}
+                Some(mt) => push(
                     issues,
                     Severity::Error,
                     codes::FM_BAD_META_TYPE,
@@ -559,7 +568,23 @@ fn check_frontmatter(
                             .into(),
                     ),
                     vec![],
-                );
+                ),
+                None => push(
+                    issues,
+                    Severity::Error,
+                    codes::FM_BAD_META_TYPE,
+                    rel,
+                    fm_key_line_or_top(fm_yaml, "meta-type"),
+                    Some("meta-type".into()),
+                    "`meta-type` is not one of fact / operational / conclusion: expected a scalar \
+                     string, found a list or mapping"
+                        .to_string(),
+                    Some(
+                        "use one of: fact, operational, conclusion (or omit for the default `fact`)"
+                            .into(),
+                    ),
+                    vec![],
+                ),
             }
         }
     }
@@ -3835,6 +3860,55 @@ mod tests {
             issues.is_empty(),
             "expected a clean store, got: {issues:#?}"
         );
+    }
+
+    // ── meta-type closed enum ─────────────────────────────────────────────────
+
+    /// Regression (adversarial review): a NON-SCALAR `meta-type` (a YAML list or
+    /// mapping) must be rejected with `FM_BAD_META_TYPE`, not silently slip past
+    /// the enum check (and then get reclassified as the default `fact`). Pre-fix
+    /// the check was gated on `and_then(scalar_string)`, which returned `None`
+    /// for a sequence/mapping and short-circuited the whole branch.
+    #[test]
+    fn meta_type_enum_is_closed_for_scalars_and_non_scalars() {
+        let fx = Fixture::new();
+        let body = |mt: &str| {
+            format!(
+                "---\ntype: profile\nmeta-type: {mt}\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n"
+            )
+        };
+
+        // Valid enum members + absent (default fact) → no FM_BAD_META_TYPE.
+        for ok in ["fact", "operational", "conclusion"] {
+            fx.write("records/profiles/ok.md", &body(ok));
+            let issues = validate_working_set(&fx.store(), None).unwrap();
+            assert!(
+                !has(&issues, codes::FM_BAD_META_TYPE),
+                "`meta-type: {ok}` must be accepted; got {issues:#?}"
+            );
+        }
+        fx.write(
+            "records/profiles/absent.md",
+            "---\ntype: profile\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n",
+        );
+        assert!(
+            !has(
+                &validate_working_set(&fx.store(), None).unwrap(),
+                codes::FM_BAD_META_TYPE
+            ),
+            "an absent meta-type is the default `fact` and must be accepted"
+        );
+
+        // Scalar-but-wrong, AND non-scalar (list / mapping) → FM_BAD_META_TYPE.
+        for bad in ["xyz", "Fact", "[fact, conclusion]", "{kind: conclusion}"] {
+            let fx2 = Fixture::new();
+            fx2.write("records/profiles/bad.md", &body(bad));
+            let issues = validate_working_set(&fx2.store(), None).unwrap();
+            assert!(
+                has(&issues, codes::FM_BAD_META_TYPE),
+                "`meta-type: {bad}` must be rejected with FM_BAD_META_TYPE; got {issues:#?}"
+            );
+        }
     }
 
     // ── DB.md structure ───────────────────────────────────────────────────────

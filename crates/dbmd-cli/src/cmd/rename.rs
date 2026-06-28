@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::RenameArgs;
 use crate::cmd::write::{
-    core_err, enforce_frozen, index_on_rename, index_on_write, open_store, policy_frozen_error,
-    require_store_relative,
+    core_err, enforce_frozen, index_on_rename, index_on_write, open_store,
+    path_escapes_store_error, policy_frozen_error, require_store_relative,
 };
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
@@ -57,6 +57,19 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     let new_rel = require_store_relative(&store, &args.new)?;
     let old_abs = store.abs_path(&old_rel);
     let new_abs = store.abs_path(&new_rel);
+
+    // ── containment: the destination must stay inside the store ──────────────
+    // `require_store_relative` only rejects `..`/root LEXICALLY; it follows
+    // symlinks. A `<new>` whose parent is an in-store symlink to a directory
+    // outside the store (the store deliberately accepts externally-dropped
+    // content, which can carry symlinks) passes that lexical gate, and the
+    // `create_dir_all` + `fs::rename` below would move the file — plus catalog it
+    // in the source folder's `index.md`/`index.jsonl` — OUTSIDE the store root.
+    // Resolve the parent chain and require it stay under the canonical root, the
+    // same load-bearing guard `dbmd write` applies (write.rs).
+    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &new_abs) {
+        return Err(path_escapes_store_error(&path_to_unix(&new_rel), &e));
+    }
 
     if !old_abs.exists() {
         return Err(missing_old_error(&old_rel));
@@ -131,15 +144,23 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
         let linker_abs = store.abs_path(linker_rel);
         match rewrite_links_in_file(&linker_abs, &old_rel, &new_rel) {
             Ok(true) => {
-                rewritten += 1;
+                // Count only real authored rewrites toward the user-facing "N
+                // files rewritten" total. A derived index artifact (`index.md` /
+                // `index.jsonl`) can legitimately contain `[[old]]` and gets its
+                // link text rewritten in place above, but it is regenerated
+                // write-through by `on_rename` below — counting it would inflate
+                // the total with a catalog the operator never authored. The
+                // self-link (the moved file itself) IS a real edit and stays
+                // counted; it is only excluded from the re-index queue.
+                if !is_index_artifact(linker_rel) {
+                    rewritten += 1;
+                }
                 // The self-link (the moved file itself) is handled by
                 // `on_rename` below — do not queue it as an `on_write` too.
-                // A derived index artifact (`index.md` / `index.jsonl`) can
-                // legitimately contain `[[old]]` and gets its link text
-                // rewritten in place above, but it must NEVER be re-indexed *as
-                // content* — `Index::on_write` would catalog the index file as a
-                // row in its own type-folder. The catalog owns those files;
-                // `on_rename` / `on_write` already keep them current.
+                // A derived index artifact must NEVER be re-indexed *as content*
+                // — `Index::on_write` would catalog the index file as a row in
+                // its own type-folder. The catalog owns those files; `on_rename`
+                // / `on_write` already keep them current.
                 if linker_rel != &old_rel && !is_index_artifact(linker_rel) {
                     rewritten_linkers.push(linker_rel.clone());
                 }

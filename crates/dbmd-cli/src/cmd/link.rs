@@ -16,7 +16,8 @@ use dbmd_core::Store;
 
 use crate::cli::LinkArgs;
 use crate::cmd::write::{
-    core_err, enforce_frozen, index_on_write, open_store, require_store_relative,
+    core_err, enforce_frozen, index_on_write, open_store, path_escapes_store_error,
+    require_store_relative,
 };
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
@@ -34,6 +35,15 @@ pub fn run(ctx: &Context, args: &LinkArgs) -> CliResult {
 
     let from_rel = require_store_relative(&store, &args.from)?;
     let from_abs = store.abs_path(&from_rel);
+
+    // Containment: `<from>` is a write target; `require_store_relative` is lexical
+    // only and follows symlinks, so a `<from>` reached through an in-store symlink
+    // to a directory outside the store would have its body rewritten OUTSIDE the
+    // store root. Enforce the same resolved-path guard `dbmd write`/`rename` use.
+    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &from_abs) {
+        return Err(path_escapes_store_error(&path_to_unix(&from_rel), &e));
+    }
+
     if !from_abs.exists() {
         return Err(missing_from_error(&from_rel));
     }

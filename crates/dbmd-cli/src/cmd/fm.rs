@@ -18,7 +18,7 @@ use serde_norway::Value as YamlValue;
 
 use crate::cli::{FmArgs, FmCommand, FmGetArgs, FmInitArgs, FmQueryArgs, FmSetArgs};
 use crate::cmd::log::{into_cli, open_store};
-use crate::cmd::write::{apply_schema_defaults, require_store_relative};
+use crate::cmd::write::{apply_schema_defaults, path_escapes_store_error, require_store_relative};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -71,6 +71,14 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     let store = locate_store_from_cwd()?;
     let rel = require_store_relative(&store, &args.file)?;
     let file = store.abs_path(&rel);
+
+    // Containment: `fm set` rewrites the file in place; `require_store_relative`
+    // is lexical and follows symlinks, so a `<file>` reached through an in-store
+    // symlink to a directory outside the store would be written OUTSIDE the root.
+    // Same resolved-path guard `dbmd write`/`rename`/`link` apply.
+    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &file) {
+        return Err(path_escapes_store_error(&rel.to_string_lossy(), &e));
+    }
 
     // Frozen-page policy: refuse before any mutation.
     enforce_not_frozen(&store, &rel)?;
@@ -141,6 +149,12 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
     let store = locate_store_from_cwd()?;
     let rel = require_store_relative(&store, &args.file)?;
     let file = store.abs_path(&rel);
+
+    // Containment: `fm init` writes the (possibly seeded) file in place — guard
+    // against a symlinked-out `<file>` the same way `fm set`/`write`/`rename` do.
+    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &file) {
+        return Err(path_escapes_store_error(&rel.to_string_lossy(), &e));
+    }
 
     enforce_not_frozen(&store, &rel)?;
 

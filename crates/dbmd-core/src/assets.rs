@@ -28,7 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_norway::Value;
@@ -401,7 +401,16 @@ pub fn status(store: &Store) -> crate::Result<StatusReport> {
 
     for rec in &records {
         bytes_total += rec.bytes;
-        let is_present = store.root.join(&rec.path).is_file();
+        // Resolve through the same containment guard `scan` and `verify` use:
+        // the module contract is that the guard applies "wherever a path is read
+        // or resolved", and an unguarded `is_file()` here let a poisoned/hand-
+        // edited manifest path (`../outside.txt`) report `present` (and count its
+        // bytes) while `verify` reported it `corrupt` — two read commands on the
+        // same store disagreeing, plus a path-existence oracle outside the store.
+        // An escaping record is treated as not-present (missing), matching verify.
+        let is_present = store::ensure_path_within_store(&store.root, &store.root.join(&rec.path))
+            .map(|p| p.is_file())
+            .unwrap_or(false);
         let state = if is_present {
             present += 1;
             "present"
@@ -519,10 +528,17 @@ fn collect_declarations(v: &Value, out: &mut Vec<Declaration>) {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Normalize a declared asset path to a store-relative forward-slash string,
-/// rejecting absolute paths and any `..` / root component. This is the lexical
-/// guard; [`crate::store::ensure_path_within_store`] is the resolved-path guard
-/// applied before any disk read.
+/// Normalize a declared asset path to a CANONICAL store-relative forward-slash
+/// string, rejecting absolute paths and any `..` / root component. This is the
+/// lexical guard; [`crate::store::ensure_path_within_store`] is the resolved-path
+/// guard applied before any disk read.
+///
+/// The result is the record key, so it MUST be canonical: `./sources/x.pdf`,
+/// `sources/x.pdf`, and `sources/./x.pdf` all denote the same file and must fold
+/// to the same key `sources/x.pdf`. The path is rebuilt from `Normal` components
+/// only (dropping `CurDir`); hostile `..`/root/prefix components are still hard
+/// errors (never silently sanitized), so a leading `./` is normalized away while
+/// a traversal attempt is rejected.
 pub fn normalize_asset_path(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -532,16 +548,25 @@ pub fn normalize_asset_path(raw: &str) -> Result<String, String> {
     if p.is_absolute() {
         return Err(format!("absolute asset path not allowed: {raw}"));
     }
+    let mut normal: Vec<&std::ffi::OsStr> = Vec::new();
     for c in p.components() {
         match c {
             Component::ParentDir => return Err(format!("`..` not allowed in asset path: {raw}")),
             Component::Prefix(_) | Component::RootDir => {
                 return Err(format!("asset path escapes the store: {raw}"))
             }
-            _ => {}
+            // A `.` (CurDir) carries no path information — drop it so the key is
+            // canonical and `./x` does not split into a second record from `x`.
+            Component::CurDir => {}
+            Component::Normal(seg) => normal.push(seg),
         }
     }
-    Ok(trimmed.replace('\\', "/").trim_end_matches('/').to_string())
+    if normal.is_empty() {
+        // The path was only `.`/`./` — no actual target.
+        return Err(format!("asset path names no file: {raw}"));
+    }
+    let joined: PathBuf = normal.into_iter().collect();
+    Ok(joined.to_string_lossy().replace('\\', "/"))
 }
 
 fn is_markdown(path: &str) -> bool {
@@ -665,4 +690,43 @@ fn find_untracked(store: &Store, declared: &BTreeSet<String>) -> crate::Result<V
 
 fn is_hidden(name: &str) -> bool {
     name.starts_with('.') && name != "." && name != ".."
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (adversarial review): `normalize_asset_path` must fold a
+    /// leading/interior `.` (CurDir) into the canonical key, so `./sources/x.pdf`
+    /// and `sources/x.pdf` are ONE record (not duplicated, byte-double-counted,
+    /// and falsely reported untracked). Traversal / absolute / root stay hard
+    /// errors — folding must never silently sanitize a hostile path.
+    #[test]
+    fn normalize_asset_path_folds_curdir_and_rejects_traversal() {
+        assert_eq!(
+            normalize_asset_path("./sources/x.pdf").unwrap(),
+            "sources/x.pdf"
+        );
+        assert_eq!(
+            normalize_asset_path("sources/x.pdf").unwrap(),
+            "sources/x.pdf"
+        );
+        assert_eq!(
+            normalize_asset_path("sources/./x.pdf").unwrap(),
+            "sources/x.pdf"
+        );
+        assert_eq!(
+            normalize_asset_path("sources/x.pdf/").unwrap(),
+            "sources/x.pdf"
+        );
+
+        // Hostile / structural inputs are still rejected, not sanitized.
+        assert!(normalize_asset_path("../outside.txt").is_err());
+        assert!(normalize_asset_path("sources/../../etc/passwd").is_err());
+        assert!(normalize_asset_path("/abs/x.pdf").is_err());
+        // A `.`-only path (or empty) names no file.
+        assert!(normalize_asset_path(".").is_err());
+        assert!(normalize_asset_path("./").is_err());
+        assert!(normalize_asset_path("").is_err());
+    }
 }
