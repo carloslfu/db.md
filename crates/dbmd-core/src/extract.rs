@@ -734,11 +734,26 @@ fn render_excel_datetime(dt: &calamine::ExcelDateTime) -> String {
 // (already dependencies) read the container/OPF, and html2text (already a
 // dependency for `.html`) flattens each chapter. Same machinery, no GPL.
 
+/// Max spine itemrefs an `.epub` may declare before extraction refuses it. The
+/// spine is attacker-controlled (`parse_opf` pushes every `<itemref>`), so a
+/// few-KB file can declare millions; this bounds the read loop. Far above any
+/// real book (which has well under a few hundred reading-order items).
+const MAX_EPUB_SPINE_ITEMS: usize = 10_000;
+
+/// Hard cap on the accumulated extracted-text bytes (EPUB chapter concatenation).
+/// The backstop for spine amplification: a long spine of distinct chapters, or a
+/// near-cap chapter referenced many times, can't balloon output without bound.
+const MAX_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Extract an EPUB's reading-order text:
 /// 1. read `META-INF/container.xml` → the OPF package path;
 /// 2. parse the OPF `manifest` (id→href) and `spine` (ordered idref list);
 /// 3. for each spine item, read its XHTML and flatten it with [`html_to_text`];
 /// 4. join chapters with a blank line.
+///
+/// Bounded against spine amplification: the spine length is capped, each
+/// distinct chapter is rendered at most once (memoized), and the total output is
+/// capped — so a tiny crafted `.epub` can neither peg a core nor balloon memory.
 ///
 /// Metadata carries `title` (the OPF `dc:title`) and `chapters` (spine length).
 fn extract_epub(path: &Path) -> Result<Extracted> {
@@ -754,19 +769,47 @@ fn extract_epub(path: &Path) -> Result<Extracted> {
     let parsed = parse_opf(&opf)?;
     let base = opf_base_dir(&opf_path);
 
+    // Bound the spine length BEFORE the loop: `parse_opf` pushes every
+    // attacker-controlled `<itemref idref>` verbatim, so a tiny crafted .epub can
+    // declare millions of items. Even spine entries that render to empty text
+    // still cost a zip read each, so the output cap below can't bound the loop on
+    // its own — this guard does. Real books have well under a few hundred items.
+    if parsed.spine.len() > MAX_EPUB_SPINE_ITEMS {
+        return Err(ExtractError::Parse {
+            format: "epub",
+            message: format!(
+                "spine declares {} items, exceeding the {} cap",
+                parsed.spine.len(),
+                MAX_EPUB_SPINE_ITEMS
+            ),
+        });
+    }
+
     // 3. Spine items in order → flattened chapter text.
     let mut text = String::new();
     let mut chapters = 0u64;
+    // Memoize rendered chapters by zip-entry path: a spine that references the
+    // SAME manifest item repeatedly must re-render it in O(1), not re-decode the
+    // zip entry and re-flatten its XHTML each time (the dominant CPU cost of the
+    // spine-amplification DoS — a few-KB file could peg a core indefinitely).
+    let mut rendered: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for idref in &parsed.spine {
         let Some(href) = parsed.manifest.get(idref) else {
             continue; // dangling spine ref; skip rather than fail
         };
         let entry = join_zip_path(&base, href);
-        // A missing spine target is skipped (best-effort), not fatal.
-        let Ok(chapter_xhtml) = read_zip_entry(&mut archive, &entry, "epub") else {
-            continue;
+        let chapter_text = match rendered.get(&entry) {
+            Some(cached) => cached.clone(),
+            None => {
+                // A missing spine target is skipped (best-effort), not fatal.
+                let Ok(chapter_xhtml) = read_zip_entry(&mut archive, &entry, "epub") else {
+                    continue;
+                };
+                let t = html_to_text(chapter_xhtml.as_bytes())?;
+                rendered.insert(entry.clone(), t.clone());
+                t
+            }
         };
-        let chapter_text = html_to_text(chapter_xhtml.as_bytes())?;
         if !chapter_text.trim().is_empty() {
             if chapters > 0 {
                 text.push('\n');
@@ -774,6 +817,18 @@ fn extract_epub(path: &Path) -> Result<Extracted> {
             text.push_str(&chapter_text);
             text.push('\n');
             chapters += 1;
+            // Hard output backstop: a long spine of DISTINCT items, or a near-cap
+            // chapter referenced many times, must not balloon the extracted text
+            // (and stdout) without bound.
+            if text.len() > MAX_EXTRACT_OUTPUT_BYTES {
+                return Err(ExtractError::Parse {
+                    format: "epub",
+                    message: format!(
+                        "extracted text exceeds the {} byte cap",
+                        MAX_EXTRACT_OUTPUT_BYTES
+                    ),
+                });
+            }
         }
     }
 
@@ -1103,8 +1158,13 @@ fn html_block_nesting_exceeds(html: &[u8], limit: usize) -> Option<usize> {
             continue;
         }
         // Find the tag's end `>` and whether it self-closes (`... />`).
+        // `memchr_gt` returns the index ONE PAST the `>`, so the `>` byte is at
+        // `end - 1` and the self-closing `/` (`<div/>`, `<div />`) is at `end - 2`.
+        // (Reading `end - 1` here always saw the `>`, so the check was dead and
+        // every self-closing NON-void element was miscounted as an open tag —
+        // tripping the depth cap on a flat, valid document.)
         let end = memchr_gt(html, i + 1);
-        let self_closing = end > 0 && end <= n && html.get(end - 1) == Some(&b'/');
+        let self_closing = end >= 2 && html.get(end - 2) == Some(&b'/');
         // Extract the tag name (letters/digits after `<`).
         let name_end = (i + 1..end.min(n))
             .find(|&j| !html[j].is_ascii_alphanumeric())
@@ -1465,6 +1525,32 @@ mod tests {
         assert!(
             html_to_text(normal.as_bytes()).is_ok(),
             "a normal document must still flatten fine"
+        );
+    }
+
+    #[test]
+    fn regression_html_self_closing_non_void_is_flat_not_deep() {
+        // Adversarial review #17: a self-closing NON-void element (`<div/>`,
+        // `<section />`) is flat, not a nesting increment. The off-by-one read the
+        // `>` byte (always present) instead of the `/` (at end-2), so the
+        // self-closing check was dead and N such elements miscounted as depth N,
+        // falsely tripping the cap on a valid, flat document (XHTML/EPUB chapters
+        // commonly self-close).
+        let flat = "<div/>".repeat(MAX_HTML_NESTING_DEPTH + 1000);
+        assert!(
+            html_block_nesting_exceeds(flat.as_bytes(), MAX_HTML_NESTING_DEPTH).is_none(),
+            "a flat run of self-closing <div/> must not trip the nesting cap"
+        );
+        let spaced = "<section />".repeat(MAX_HTML_NESTING_DEPTH + 1000);
+        assert!(
+            html_block_nesting_exceeds(spaced.as_bytes(), MAX_HTML_NESTING_DEPTH).is_none(),
+            "`<section />` (space before slash) is self-closing too"
+        );
+        // Defense intact: genuine deep nesting of the SAME tag still trips it.
+        let deep = "<div>".repeat(MAX_HTML_NESTING_DEPTH + 1);
+        assert!(
+            html_block_nesting_exceeds(deep.as_bytes(), MAX_HTML_NESTING_DEPTH).is_some(),
+            "real deep nesting must still trip the cap"
         );
     }
 
@@ -1922,6 +2008,63 @@ media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
         );
         // The chapter still extracts.
         assert_eq!(got.metadata["chapters"], MetaValue::Num(1));
+    }
+
+    /// Build an `.epub` whose spine references the single chapter `spine_count`
+    /// times — the spine-amplification shape.
+    fn write_epub_with_spine(dest: &Path, spine_count: usize) {
+        use std::io::Write;
+        let container = "<?xml version=\"1.0\"?>\
+<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\
+<rootfiles><rootfile full-path=\"OEBPS/content.opf\" \
+media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
+        let itemrefs = "<itemref idref=\"c1\"/>".repeat(spine_count);
+        let opf = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"id\">\
+<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Bomb</dc:title></metadata>\
+<manifest><item id=\"c1\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>\
+<spine>{itemrefs}</spine></package>"
+        );
+        let chapter = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Repeated chapter body.</p></body></html>";
+        let file = std::fs::File::create(dest).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("mimetype", stored).unwrap();
+        writer.write_all(b"application/epub+zip").unwrap();
+        writer.start_file("META-INF/container.xml", stored).unwrap();
+        writer.write_all(container.as_bytes()).unwrap();
+        writer.start_file("OEBPS/content.opf", stored).unwrap();
+        writer.write_all(opf.as_bytes()).unwrap();
+        writer.start_file("OEBPS/chapter.xhtml", stored).unwrap();
+        writer.write_all(chapter.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn regression_epub_spine_amplification_is_bounded() {
+        // Adversarial review #8: a tiny .epub whose spine references the same
+        // chapter a huge number of times pegged a CPU core (re-decoding +
+        // re-rendering the chapter each time) and ballooned output. The spine
+        // length is now capped, so an over-cap spine is REFUSED — fast, never
+        // hung.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bomb = tmp.path().join("bomb.epub");
+        write_epub_with_spine(&bomb, MAX_EPUB_SPINE_ITEMS + 1);
+        let err = extract(&bomb).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Parse { message, .. } if message.contains("spine")),
+            "an over-cap spine must be refused with a spine error; got {err:?}"
+        );
+
+        // A legitimate small repeat-spine still extracts: memoization renders the
+        // shared chapter once, but each reading-order reference is still counted.
+        let ok = tmp.path().join("ok.epub");
+        write_epub_with_spine(&ok, 5);
+        let got = extract(&ok).unwrap();
+        assert_eq!(got.metadata["chapters"], MetaValue::Num(5));
     }
 
     #[test]

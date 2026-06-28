@@ -564,15 +564,25 @@ fn read_file_timestamps(
 
 /// The YAML between a leading `---` fence and the next `---`, or `None` when the
 /// file does not open with a fence. Local mirror of the parser's split so the
-/// handler stays self-contained (matches the same helper in `dbmd-core`).
+/// handler stays self-contained.
+///
+/// Fence matching tolerates trailing whitespace (`trim_end`), matching the
+/// canonical parser (`parser.rs` / `index.rs`'s `extract_frontmatter_block`): a
+/// fence line `--- ` / `---\t` (trailing space/tab, invisible in an editor) is
+/// still a fence. The strict `strip_prefix("---\n")` / `== "---"` form missed
+/// it, so `read_file_timestamps` returned `(None, None)` and the all-content
+/// time-window filter silently DROPPED a valid, indexed file — disagreeing with
+/// the structured (sidecar) path, which tolerates the same fence.
 fn frontmatter_block(text: &str) -> Option<&str> {
     let body = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let rest = body
-        .strip_prefix("---\n")
-        .or_else(|| body.strip_prefix("---\r\n"))?;
+    let first = body.split_inclusive('\n').next()?;
+    if first.trim_end() != "---" {
+        return None;
+    }
+    let rest = &body[first.len()..];
     let mut idx = 0usize;
     for line in rest.split_inclusive('\n') {
-        if line.trim_end_matches(['\r', '\n']) == "---" {
+        if line.trim_end() == "---" {
             return Some(&rest[..idx]);
         }
         idx += line.len();
@@ -1153,6 +1163,44 @@ mod tests {
         assert!(!yaml.contains("body"));
         // No leading fence → None.
         assert!(frontmatter_block("no frontmatter\n").is_none());
+        // Adversarial review #18: trailing whitespace on the opening AND closing
+        // fence is tolerated (matches the canonical parser); a `--- ` fence still
+        // delimits frontmatter.
+        let ws = "--- \ntype: contact\nupdated: 2026-05-01T00:00:00Z\n--- \nbody\n";
+        let ws_yaml = frontmatter_block(ws).unwrap();
+        assert!(
+            ws_yaml.contains("type: contact"),
+            "trailing-ws open fence must parse"
+        );
+        assert!(
+            !ws_yaml.contains("body"),
+            "trailing-ws close fence must terminate the block"
+        );
+    }
+
+    #[test]
+    fn regression_read_file_timestamps_tolerates_trailing_whitespace_fence() {
+        // Adversarial review #18: a valid file whose opening/closing fence carries
+        // trailing whitespace (`--- `, invisible in an editor) must still yield
+        // its timestamps — matching the canonical parser + the sidecar. Pre-fix
+        // the strict `strip_prefix("---\n")` returned None -> (None, None), so the
+        // all-content time-window filter silently dropped a real, indexed file.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("n.md");
+        std::fs::write(
+            &f,
+            "--- \ntype: note\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-02T00:00:00Z\n--- \nbody\n",
+        )
+        .unwrap();
+        let (created, updated) = read_file_timestamps(&f);
+        assert!(
+            created.is_some(),
+            "created must parse despite a trailing-ws fence"
+        );
+        assert!(
+            updated.is_some(),
+            "updated must parse despite a trailing-ws fence"
+        );
     }
 
     // ── Security: poisoned sidecar paths cannot escape the store ──────────────

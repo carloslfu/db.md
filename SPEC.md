@@ -619,6 +619,15 @@ Don't synthesize conclusion records from sources tagged `transient`.
     custom event type opts into sharding with `shard: by-date`, and any type
     can force flat with `shard: flat`. An unrecognized value is ignored.
 
+    **Built-in shard defaults** (absent a `shard:` directive): db.md
+    date-shards the source types (`email`, `transcript`, `pdf-source`,
+    `note`) and the event record types (`expense`, `invoice`, `meeting`, plus
+    the recognized custom event types `order`, `ticket`, `transaction`). Every
+    other type is flat by default — entity records (`contact`, `company`,
+    `decision`), conclusion records (`profile`, `concept`, `synthesis`), and
+    any unlisted custom type. A custom event type outside that set opts into
+    sharding with `shard: by-date`.
+
   Unknown modifiers are ignored (read as ambient context, no error). A
   type with no `### <type>` block is unconstrained — any frontmatter is
   valid for it.
@@ -627,6 +636,16 @@ Don't synthesize conclusion records from sources tagged `transient`.
   `SCHEMA_MISSING_REQUIRED`, `SCHEMA_SHAPE_MISMATCH`,
   `SCHEMA_LINK_PREFIX_MISMATCH`, `SCHEMA_ENUM_VIOLATION`,
   `DUP_UNIQUE_KEY`) so the agent can read and remediate them via `--json`.
+- **`## Folders`** — optional display overrides for the generated rollup
+  `index.md` files (the root and layer levels). Bullets sit directly under the
+  H2 (no `### <type>` sub-sections), one per type-folder:
+  `- <folder-path>[|<display name>][ — <description>]`. The optional
+  `|<display>` overrides the rollup's derived folder name (the wiki-link
+  `|display` convention); the text after the first em-dash (`—`, or a ` - `
+  fallback) is a one-line description. Surrounding backticks on the path are
+  tolerated. `dbmd index` reads these to fill each rollup entry's name and
+  description; absent, the name is derived from the folder basename and no
+  description is shown.
 
 Absence of a section = use canonical defaults. The `DB.md` file is the
 single point of configuration; there is no separate `rules/` folder.

@@ -235,13 +235,34 @@ fn record_matches_where(record: &IndexRecord, key: &str, value: &str) -> bool {
 fn json_value_matches(value: &Value, target: &str) -> bool {
     match value {
         Value::String(s) => s == target,
-        Value::Number(n) => n.to_string() == target,
+        Value::Number(n) => number_matches(n, target),
         Value::Bool(b) => b.to_string() == target,
         Value::Array(items) => items.iter().any(|item| json_value_matches(item, target)),
         Value::Null => false,
         // Objects have no scalar form a `key=value` predicate can match.
         Value::Object(_) => false,
     }
+}
+
+/// Match a JSON number against a `key=value` predicate. A FLOAT-valued field is
+/// compared NUMERICALLY, not textually: serde_json's canonical f64 render in the
+/// sidecar discards the file's source spelling (`1234.00` -> `1234.0`, `1e3` ->
+/// `1000.0`), so a `to_string()` compare missed the spelling a human reads in
+/// the file. Restricted to the float case so a large INTEGER field keeps exact
+/// matching. MUST stay byte-identical in behavior to [`crate::store`]'s
+/// `number_matches` (the sidecar pre-filter and this in-memory post-filter have
+/// to agree, or a `--where n=…` query returns different rows than `--type X
+/// --where n=…`).
+fn number_matches(n: &serde_json::Number, target: &str) -> bool {
+    if n.to_string() == target {
+        return true;
+    }
+    if n.is_f64() {
+        if let (Some(stored), Ok(q)) = (n.as_f64(), target.parse::<f64>()) {
+            return stored == q;
+        }
+    }
+    false
 }
 
 /// Match a stored instant against a `key=value` predicate by parsing `value` as

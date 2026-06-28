@@ -8,9 +8,102 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.4.1**.
+  `Cargo.toml`, currently **v0.4.2**.
 
 ## [Unreleased]
+
+## [0.4.2] — 2026-06-28
+
+### Toolkit
+
+A second parallel adversarial-review pass over the toolkit. Every defect below
+was reproduced against the real binary and confirmed by an independent
+refute-by-default panel, each with a regression test.
+
+#### Fixed (security / containment)
+
+- **`rename` now contains the `<old>` SOURCE and every rewritten linker, not
+  only `<new>`.** An `<old>` (or an incoming linker) reached through an in-store
+  symlink leaving the store root passed the lexical gate, so `fs::rename` MOVED
+  an out-of-store file into the store (unlinking the original) and link rewrites
+  wrote bytes outside the root. Both paths now pass `ensure_path_within_store`
+  (completing the prior containment fix, which guarded only the destination).
+- **`dbmd validate` no longer reads files OUTSIDE the store via a `..` log
+  object.** A `records/../../leaky` object in a `log.md` header was inserted into
+  the working set verbatim, so the default validate read and frontmatter-
+  reported a file above the store root (a containment escape + existence oracle +
+  field disclosure). The log-derived changed set now passes the same
+  path-safety gate every other validator path uses.
+
+#### Fixed (data loss / correctness)
+
+- **`write` / `rename` / `link` reject a dot-prefixed INTERMEDIATE directory.**
+  `records/.hidden/c.md --type contact` was honored as the type-folder; the
+  record and its write-through sidecars were then invisible to every
+  `.hidden(true)` sweep — silent primary-data loss that `validate --all` and
+  `index rebuild` could not heal. The path gate now rejects any dot-prefixed
+  component, not just the leaf.
+- **`format` / `fm set` / `link` preserve large integer frontmatter.** A bare
+  integer beyond `i64`/`u64` range was silently truncated to a lossy float
+  (`999…9` → `1e39`) or rejected as malformed (the `(u64, u128]` band). Oversized
+  literals now round-trip verbatim as strings (the import path for big numeric
+  IDs).
+- **Log rotation preserves genuinely-distinct same-minute entries.** A backdated
+  entry byte-identical (at minute precision) to one already archived was dropped
+  by a set-membership re-roll dedup. A crash-recovery marker now gates the dedup,
+  so a true re-roll is still idempotent while a distinct repeat survives.
+- **Log rotation no longer erases lines before the first VALID entry header.** A
+  `## [`-shaped line `parse_header` rejects (a merge orphan) ahead of the first
+  real entry was dropped on re-emit; it is now folded into the preserved header.
+- **`log tail` / `log since` return distinct same-minute entries.** A global
+  content key over-reached from the active↔archive crash-retry overlap to
+  same-file duplicates; the dedup is now scoped to that overlap only.
+- **`query` / `fm query` / `search --where` match float fields by value.** The
+  sidecar's canonical-`f64` render discards the file spelling (`1234.00` →
+  `1234.0`, `1e3` → `1000.0`), so a textual compare missed; float fields now
+  compare numerically (integers keep exact matching).
+- **`INDEX_SUMMARY_MISMATCH` no longer false-positives on internal whitespace.**
+  A valid one-line summary with a double space / tab collapses in the rendered
+  `index.md` but was compared against the raw file value — a permanent,
+  rebuild-immune error. Both sides now normalize identically.
+- **`extract` bounds EPUB spine amplification.** A few-KB `.epub` whose spine
+  references one chapter many times pegged a CPU core and ballooned output; the
+  spine length is capped, chapters are memoized, and total output is bounded.
+- **`extract` counts a self-closing non-void element as flat, not nested.** An
+  off-by-one read the `>` byte instead of the `/`, so `<div/>`×N tripped the
+  nesting cap on a valid flat document.
+- **`graph` (scoped backlinks / orphans / neighborhood) keeps edges on a
+  non-UTF-8 file.** `forwardlinks`/`orphans` used an intolerant read and dropped
+  every `[[…]]` edge on a stray byte (disagreeing with the lossy unscoped
+  scanner); they now read lossily like the rest of the toolkit.
+- **`search` time-window filter tolerates a trailing-whitespace frontmatter
+  fence.** A `--- ` fence made the all-content path yield no timestamps and
+  silently drop a valid, indexed file; fence matching now `trim_end()`s like the
+  canonical parser (the strict `store` reader is aligned too).
+- **`assets status` / `scan` saturate a poisoned manifest byte total** instead of
+  aborting (debug) or wrapping (release) on an absurd `bytes` value.
+- **`validate` (default scope) reports a stale `index.md` entry consistently.** A
+  catalog entry pointing at a deleted file surfaced as `WIKI_LINK_BROKEN`
+  ("create the target" — steering an agent to recreate deleted data) in the loop
+  default while `--all` correctly reported `INDEX_STALE_ENTRY`; the loop no longer
+  body-link-checks the derived catalog (index integrity is the `--all` sweep's
+  job).
+- **`rename` fails fast on a non-creatable destination.** A destination whose
+  parent component is an existing file made `create_dir_all` fail AFTER the
+  linker rewrites; the destination parent is now created up-front, so a failed
+  rename leaves zero authored mutations.
+
+#### Changed
+
+- **`validate --all` follows symlinks like the loop default.** The sweep walked
+  with no `follow_links`, so it SKIPPED a symlinked-in content file the loop
+  scope checks — the authoritative superset reported fewer issues than the loop.
+  Both sweep walkers now follow symlinks.
+- **`validate` recognizes the `## Folders` DB.md section** (shipped in 0.4.1 in
+  the parser + index, but flagged `DB_MD_UNKNOWN_SECTION` with a "delete this
+  heading" remedy). `SPEC.md` now documents `## Folders` and the built-in
+  date-shard defaults (the source types plus `expense`/`invoice`/`meeting`/
+  `order`/`ticket`/`transaction`).
 
 ## [0.4.1] — 2026-06-28
 

@@ -292,3 +292,138 @@ fn regression_fm_init_still_imports_headerless_file() {
         "the raw headerless body must be preserved verbatim:\n{written}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Adversarial review — a dot-prefixed INTERMEDIATE directory must be refused on
+// every write surface. `ensure_safe_store_relative` dot-checked only the LEAF,
+// so `records/.hidden/c.md --type contact` was honored as the type-folder. All
+// store walkers run `.hidden(true)`, so the record + its write-through sidecars
+// were invisible: `validate --all` reported 0 issues, `query` returned nothing,
+// and `index rebuild` neither catalogued the record nor deleted the orphan
+// sidecars — silent primary-data loss no sweep could heal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn regression_write_refuses_dot_prefixed_intermediate_directory() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = tmp.path();
+    write_db_md(store);
+
+    // The bug's exact trigger: a dot-prefixed intermediate directory.
+    let out = dbmd()
+        .current_dir(store)
+        .args([
+            "write",
+            "records/.hidden/c.md",
+            "--type",
+            "contact",
+            "--fm",
+            "name=Carol",
+            "--summary",
+            "Carol",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a dot-prefixed intermediate dir must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("DOTFILE_NOT_ALLOWED") || stderr.to_lowercase().contains("hidden"),
+        "the refusal must name the dotfile rule; stderr: {stderr}"
+    );
+    // Nothing landed on disk — not under the dot-dir, and it did NOT silently
+    // collapse to the canonical type-folder either.
+    assert!(
+        !store.join("records/.hidden/c.md").exists(),
+        "no record may land under the dot-dir"
+    );
+    assert!(
+        !store.join("records/contacts/c.md").exists(),
+        "the refused write must not collapse to the canonical folder"
+    );
+
+    // Control: a dot-prefixed LEAF remains refused (pre-existing behavior).
+    dbmd()
+        .current_dir(store)
+        .args([
+            "write",
+            "records/notes/.draft.md",
+            "--type",
+            "note",
+            "--summary",
+            "Draft",
+        ])
+        .assert()
+        .failure();
+
+    // Control: an ordinary path under an ordinary folder still succeeds and is
+    // visible to a query (proving the guard rejects only dot-components).
+    dbmd()
+        .current_dir(store)
+        .args([
+            "write",
+            "records/contacts/carol.md",
+            "--type",
+            "contact",
+            "--fm",
+            "name=Carol",
+            "--summary",
+            "Carol",
+        ])
+        .assert()
+        .success();
+    assert!(
+        store.join("records/contacts/carol.md").exists(),
+        "a normal write must still work"
+    );
+}
+
+#[test]
+fn regression_rename_refuses_dot_prefixed_destination_directory() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = tmp.path();
+    write_db_md(store);
+
+    // A real, queryable record.
+    dbmd()
+        .current_dir(store)
+        .args([
+            "write",
+            "records/contacts/dana.md",
+            "--type",
+            "contact",
+            "--fm",
+            "name=Dana",
+            "--summary",
+            "Dana",
+        ])
+        .assert()
+        .success();
+
+    // Renaming it INTO a dot-prefixed directory must be refused — the same hole
+    // the write surface had, reached through `require_store_relative`.
+    let out = dbmd()
+        .current_dir(store)
+        .args([
+            "rename",
+            "records/contacts/dana.md",
+            "records/.stash/dana.md",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "rename into a dot-prefixed dir must be refused"
+    );
+    // The record stays queryable at its original visible path.
+    assert!(
+        store.join("records/contacts/dana.md").exists(),
+        "the record must not be hidden by a refused rename"
+    );
+    assert!(
+        !store.join("records/.stash/dana.md").exists(),
+        "nothing may land under the dot-dir"
+    );
+}

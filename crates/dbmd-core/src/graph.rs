@@ -58,7 +58,6 @@
 //! truth the sidecar is derived from; never stale).
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
@@ -231,11 +230,15 @@ pub fn forwardlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreErr
         Some(a) => a,
         None => return Ok(Vec::new()),
     };
-    let body = match std::fs::read_to_string(&abs) {
-        Ok(b) => b,
-        // A file that isn't valid UTF-8 (e.g. a binary source) carries no
-        // wiki-links we can extract.
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(Vec::new()),
+    // Decode the body LOSSILY (bytes -> `from_utf8_lossy`): wiki-link syntax
+    // (`[[...]]`) is ASCII, so a non-UTF8 byte elsewhere on a line cannot hide an
+    // edge. This mirrors the unscoped backlink scanner
+    // ([`Store::find_links_to_any`], which reads bytes + lossy by design) so
+    // SCOPED backlinks (which ride `forwardlinks`) agree with unscoped backlinks
+    // on a Latin-1-imported file instead of silently dropping its edges — a
+    // `read_to_string` that errored on `InvalidData` returned NO edges.
+    let body = match std::fs::read(&abs) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => return Err(StoreError::Io(e)),
     };
 
@@ -494,9 +497,12 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
         };
         let self_key = edge_key(&normalize_target(&rel));
 
-        let body = match std::fs::read_to_string(abs) {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => String::new(),
+        // Lossy decode (see `forwardlinks`): a non-UTF8 byte must not hide a
+        // `[[...]]` edge, or `orphans` would over-report BOTH endpoints of a live
+        // edge as orphans (and `stats` would inflate the orphan count) on a file
+        // with a stray Latin-1 byte beside a valid ASCII link line.
+        let body = match std::fs::read(abs) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => return Err(StoreError::Io(e)),
         };
 
@@ -836,8 +842,10 @@ fn read_summary_and_type(store: &Store, rel: &Path) -> (String, Option<String>) 
         Some(a) => a,
         None => return (String::new(), None),
     };
-    let text = match std::fs::read_to_string(&abs) {
-        Ok(t) => t,
+    // Lossy decode so a node's summary/type still resolve when the file carries
+    // a stray non-UTF8 byte (consistent with the edge readers above).
+    let text = match std::fs::read(&abs) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => return (String::new(), None),
     };
     let yaml = match frontmatter_block(&text) {
@@ -2439,6 +2447,62 @@ Trailing [[records/contacts/sarah]].
                 .all(|n| !n.path.to_string_lossy().contains("outside")),
             "neighborhood must not read/traverse the external file: {:?}",
             slice.nodes
+        );
+    }
+
+    #[test]
+    fn regression_non_utf8_linker_edges_survive_scoped_backlinks_and_orphans() {
+        // Adversarial review #10: a content file with a stray non-UTF8 byte beside
+        // a valid ASCII `[[...]]` line must still expose its edges. The unscoped
+        // backlink scanner reads bytes lossily, but `forwardlinks`/`orphans` used
+        // `read_to_string` and dropped EVERY edge on `InvalidData` — so scoped
+        // backlinks under-reported vs unscoped, and `orphans` flagged BOTH
+        // endpoints of a live edge.
+        let fx = Fixture::new();
+        fx.write("records/contacts/sarah.md", "contact", "Sarah", "# Sarah");
+        // bio.md: valid UTF-8 frontmatter, but a BODY line with a 0xE9 byte
+        // (Latin-1 'é', invalid as standalone UTF-8) beside the link to sarah.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(
+            b"---\ntype: profile\nmeta-type: conclusion\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: Bio\n---\n",
+        );
+        bytes.extend_from_slice(b"See [[records/contacts/sarah]] caf");
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b"\n");
+        let bio_abs = fx.store.root.join("records/profiles/bio.md");
+        fs::create_dir_all(bio_abs.parent().unwrap()).unwrap();
+        fs::write(&bio_abs, &bytes).unwrap();
+        fx.reindex();
+
+        let sarah = fx.p("records/contacts/sarah");
+
+        // forwardlinks reads the non-UTF8 file and still finds the edge.
+        let fwd = paths(&forwardlinks(&fx.store, &fx.p("records/profiles/bio")).unwrap());
+        assert!(
+            fwd.iter().any(|p| p.contains("sarah")),
+            "forwardlinks must extract the edge from a non-UTF8 file: {fwd:?}"
+        );
+
+        // Scoped backlinks (rides `forwardlinks`) must AGREE with unscoped.
+        let unscoped = paths(&backlinks(&fx.store, &sarah).unwrap());
+        let scoped =
+            paths(&backlinks_filtered(&fx.store, &sarah, &["profile".to_string()], None).unwrap());
+        assert!(
+            unscoped.iter().any(|p| p.contains("bio")),
+            "unscoped backlinks must include bio: {unscoped:?}"
+        );
+        assert!(
+            scoped.iter().any(|p| p.contains("bio")),
+            "scoped backlinks must agree with unscoped on the non-UTF8 linker: {scoped:?}"
+        );
+
+        // Neither endpoint of the live edge may be reported as an orphan.
+        let orph = paths(&orphans(&fx.store, None).unwrap());
+        assert!(
+            !orph
+                .iter()
+                .any(|p| p.contains("bio") || p.contains("sarah")),
+            "neither endpoint of a live edge may be an orphan: {orph:?}"
         );
     }
 }

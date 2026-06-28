@@ -494,18 +494,28 @@ fn check_content_file(
         check_frontmatter(store, rel, map, &fm_yaml, basenames, issues, is_content);
     }
 
-    // Wiki-link doctrine checks run on the body of content files (and on
-    // `index.md` files, whose entries are wiki-links too). They are NOT run on
-    // the root append-only meta files `log.md`/`DB.md`: those reach this
-    // function only via the working-set incoming-linker scan (`walk_all_md`
-    // includes them), and `validate --all` never link-checks their bodies
-    // (`walk_content_files` skips them; `check_log`/`check_db_md` do no body
-    // link checks). Without this guard the two scopes disagree — a historical
-    // `[[deleted-page]]` mention in a `log.md` note, or a `[[…]]` in DB.md's
-    // `## Agent instructions`, is flagged `WIKI_LINK_BROKEN` by the default
-    // working set but is clean under `--all`. The log is append-only by spec, so
-    // the suggested "fix the link" remedy can't even be applied.
-    if !is_root_meta_file(rel) {
+    // Wiki-link doctrine checks run on the body of content files. They are NOT
+    // run on:
+    //   - the root append-only meta files `log.md`/`DB.md` — they reach this
+    //     function only via the working-set incoming-linker scan (`walk_all_md`
+    //     includes them), and `validate --all` never link-checks their bodies. A
+    //     historical `[[deleted-page]]` mention in a `log.md` note, or a `[[…]]`
+    //     in DB.md's `## Agent instructions`, must not be `WIKI_LINK_BROKEN`; the
+    //     log is append-only, so "fix the link" can't even be applied.
+    //   - the derived catalogs `index.md`/`index.jsonl` — their "links" are
+    //     GENERATED catalog entries, not authored body wiki-links. A folder's
+    //     `index.md` is pulled into the working set as an incoming linker (an
+    //     entry `[[records/contacts/a]]` IS a wiki-link to a member, so touching
+    //     or deleting any member drags its folder `index.md` in). Its integrity
+    //     is the job of `check_indexes` under `--all`, which reports a dangling
+    //     entry as `INDEX_STALE_ENTRY` ("run `dbmd index rebuild`"). Body-link-
+    //     checking it here instead emitted `WIKI_LINK_BROKEN` ("create the
+    //     target") for the SAME condition — a different code with the OPPOSITE
+    //     remedy across the loop default vs the sweep, steering an agent to
+    //     recreate deleted data. `walk_content_files` skips `index.md` under
+    //     `--all` for exactly this reason; the working-set scope must match.
+    // Without these guards the two scopes disagree on the same store.
+    if !is_root_meta_file(rel) && !is_index_catalog_file(rel) {
         check_body_wiki_links(store, rel, &body, fm_end_line, basenames, issues);
     }
 
@@ -1689,7 +1699,20 @@ fn check_type_folder_index_md(
         // compare.
         if let Some(expected) = read_summary(&target_abs) {
             match &entry.summary_text {
-                Some(text_part) if text_part.trim() != expected.trim() => {
+                // Compare with the SAME whitespace normalization the renderer
+                // applies when it writes the `index.md` browse line
+                // (`format_md_entry` -> `collapse_whitespace`). `text_part` is the
+                // already-collapsed text parsed back out of `index.md`; `expected`
+                // is the RAW file summary. Comparing a collapsed value against a
+                // raw one falsely flagged any valid one-line summary that carries
+                // internal whitespace (a double space, a tab) — a permanent,
+                // rebuild-immune INDEX_SUMMARY_MISMATCH that wedged the store, since
+                // `index rebuild` regenerates the byte-identical collapsed line.
+                // Normalizing both sides makes the check compare like with like.
+                Some(text_part)
+                    if crate::summary::collapse_whitespace(text_part)
+                        != crate::summary::collapse_whitespace(&expected) =>
+                {
                     push(
                         issues,
                         Severity::Error,
@@ -2264,17 +2287,27 @@ fn check_db_md(store: &Store, issues: &mut Vec<Issue>) {
     }
 
     // ── recognized `##` section headers only ─────────────────────────────────
-    // The body's H2 headings must be one of the three the toolkit reads; any
+    // The body's H2 headings must be one of the four the toolkit reads; any
     // other is a likely typo / misplacement (warning — the parser ignores it,
     // so the config is not corrupted, but the operator wrote a section that will
     // never be read). H3 sub-headings (Frozen pages, Ignored types, `### <type>`
     // schema blocks) live under their H2 and are not flagged here.
+    //
+    // `## Folders` is recognized: `parse_db_md` reads it into `Config.folders`
+    // (parser.rs) and the index renders folder display names + descriptions from
+    // it (index.rs `render_*_md_from_stats`). Flagging it `DB_MD_UNKNOWN_SECTION`
+    // with "remove this heading" told the operator to delete a working,
+    // round-tripped config block — destroying curator-authored rollup names. It
+    // is a real, shipped section; SPEC.md documents it alongside the other three.
     for section in crate::parser::extract_sections(&body) {
         if section.level != 2 {
             continue;
         }
         let name = section.heading.trim().to_ascii_lowercase();
-        if matches!(name.as_str(), "agent instructions" | "policies" | "schemas") {
+        if matches!(
+            name.as_str(),
+            "agent instructions" | "policies" | "schemas" | "folders"
+        ) {
             continue;
         }
         // `Section::line` is 1-based within the body; the body begins at file
@@ -2292,8 +2325,8 @@ fn check_db_md(store: &Store, issues: &mut Vec<Issue>) {
                 section.heading.trim()
             ),
             Some(
-                "DB.md sections are `## Agent instructions`, `## Policies`, `## Schemas` — \
-                 remove or rename this heading"
+                "DB.md sections are `## Agent instructions`, `## Policies`, `## Schemas`, \
+                 `## Folders` — remove or rename this heading"
                     .into(),
             ),
             vec![],
@@ -2437,6 +2470,14 @@ fn not_a_store_issue(store: &Store) -> Issue {
 /// True if a store-relative path is a content file: under `sources/` or
 /// `records/` and not an `index.md`/`index.jsonl`/`log.md`.
 fn is_content_file(rel: &Path) -> bool {
+    // Defense in depth: a real content file is always a forward (Normal-only)
+    // store-relative path. Reject any `..`/absolute/prefix component so a
+    // malformed object slot judged only by its FIRST component (`records/../..`)
+    // can never turn a per-file read into a store escape, even if a future caller
+    // forgets the path-safety gate `changed_objects_since` now applies.
+    if !is_safe_store_relative_path(rel) {
+        return false;
+    }
     let Some(first) = rel.iter().next().and_then(|s| s.to_str()) else {
         return false;
     };
@@ -2470,6 +2511,20 @@ fn is_root_meta_file(rel: &Path) -> bool {
         return false; // has a parent dir → not a root file
     }
     matches!(only.to_str(), Some("DB.md") | Some("log.md"))
+}
+
+/// True for a derived index-catalog file (`index.md` / `index.jsonl`) at any
+/// depth. Its entries are GENERATED wiki-links to type-folder members, not
+/// authored body links: in the working-set scope it is pulled in as an incoming
+/// linker, but its integrity belongs to `check_indexes` under `--all` (which
+/// reports a dangling entry as `INDEX_STALE_ENTRY`, not `WIKI_LINK_BROKEN`). So
+/// `check_content_file` never body-link-checks it, matching `walk_content_files`
+/// (which skips `index.md` under `--all`).
+fn is_index_catalog_file(rel: &Path) -> bool {
+    matches!(
+        rel.file_name().and_then(|n| n.to_str()),
+        Some("index.md") | Some("index.jsonl")
+    )
 }
 
 /// Split a file into `(frontmatter_yaml, body, closing_fence_line)`. The block
@@ -2997,6 +3052,17 @@ fn walk_content_files(root: &Path) -> Vec<PathBuf> {
             continue;
         }
         for entry in walkdir::WalkDir::new(&base)
+            // Follow symlinks, matching the loop-default `md_walker`
+            // (store.rs `follow_links(true)`): a content file that is a symlink
+            // into the store, or that lives in a symlinked-in type-folder, is
+            // checked by `dbmd validate` (the loop default rides `Store::walk` /
+            // `walk_all_md`, both following symlinks). Without this the `--all`
+            // sweep silently SKIPPED such files, so the authoritative superset
+            // reported FEWER issues than the loop scope on the same store —
+            // inverting the `--all`-is-the-superset contract. walkdir's loop
+            // detection drops a symlink cycle (yields an Err that `.flatten()`
+            // discards), so this cannot hang.
+            .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_str().unwrap_or("");
@@ -3036,6 +3102,17 @@ fn walk_index_files(root: &Path) -> Vec<PathBuf> {
             continue;
         }
         for entry in walkdir::WalkDir::new(&base)
+            // Follow symlinks, matching the loop-default `md_walker`
+            // (store.rs `follow_links(true)`): a content file that is a symlink
+            // into the store, or that lives in a symlinked-in type-folder, is
+            // checked by `dbmd validate` (the loop default rides `Store::walk` /
+            // `walk_all_md`, both following symlinks). Without this the `--all`
+            // sweep silently SKIPPED such files, so the authoritative superset
+            // reported FEWER issues than the loop scope on the same store —
+            // inverting the `--all`-is-the-superset contract. walkdir's loop
+            // detection drops a symlink cycle (yields an Err that `.flatten()`
+            // discards), so this cannot hang.
+            .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_str().unwrap_or("");
@@ -3323,7 +3400,18 @@ fn changed_objects_since(
                 if bare.is_empty() {
                     continue;
                 }
-                out.insert(PathBuf::from(format!("{bare}.md")));
+                // Containment: the object slot is a log-header field that can
+                // carry a `..`/absolute/prefix path (a hand-edited or
+                // merge-malformed log line). Route it through the same safety gate
+                // every other disk-touching validator path uses
+                // (`safe_md_target_rel`, which `link_target_type` already applies)
+                // so a `records/../../leaky` object cannot make
+                // `validate_working_set` read + frontmatter-report on a file
+                // OUTSIDE the store root. An unsafe object is dropped from the
+                // changed set rather than probed.
+                if let Some(rel) = safe_md_target_rel(&bare) {
+                    out.insert(rel);
+                }
             }
         }
     }
@@ -5807,19 +5895,23 @@ mod tests {
     }
 
     #[test]
-    fn incoming_linker_scan_pulls_in_catalog_index_md() {
-        // CONTRACT: the working-set incoming-linker scan rides the embedded-
-        // ripgrep `Store::find_links_to`, which scans EVERY `.md` (including
-        // `index.md` catalogs) — NOT the walk-and-read over `walk_content_files`,
-        // which excludes `index.md`. A type-folder `index.md` that lists a now-
-        // deleted target must be pulled into the working set so its dangling
-        // catalog entry is flagged `WIKI_LINK_BROKEN`. The old walk-and-read
-        // implementation skipped `index.md` and let this broken link survive the
-        // loop silently; this test fails if anyone reverts to that path.
+    fn working_set_does_not_flag_stale_catalog_index_as_wiki_link_broken() {
+        // The working-set incoming-linker scan rides embedded-ripgrep
+        // `Store::find_links_to`, which scans EVERY `.md` — so a type-folder
+        // `index.md` listing a now-deleted target IS pulled into the working set.
+        // But its entries are GENERATED catalog entries, not authored body links:
+        // a dangling one is an `INDEX_STALE_ENTRY` ("run `dbmd index rebuild`"),
+        // the job of `check_indexes` under `--all` — NOT a `WIKI_LINK_BROKEN`
+        // ("create the target"), whose remedy would steer an agent to recreate
+        // the very data it just deleted. The loop default must therefore NOT
+        // body-link-check the derived catalog (index integrity is an O(store)
+        // sweep concern, not an O(changed) loop concern). Adversarial review #11:
+        // the prior behavior gave WIKI_LINK_BROKEN here while `--all` gave
+        // INDEX_STALE_ENTRY for the identical condition — two codes, opposite
+        // remedies, across the loop default vs the sweep.
         let fx = Fixture::new();
         // A catalog that still lists the deleted contact (a real, common stale
-        // state after a `delete`). No other file references the target, so the
-        // catalog is the ONLY incoming linker — if it isn't scanned, nothing is.
+        // state after an out-of-band `delete`).
         fx.write(
             "records/contacts/index.md",
             "---\ntype: index\n---\n\n- [[records/contacts/sarah-chen]] — Sarah Chen\n",
@@ -5831,14 +5923,12 @@ mod tests {
         );
         let issues = validate_working_set(&fx.store(), None).unwrap();
         assert!(
-            issues
+            !issues
                 .iter()
                 .any(|i| i.file == Path::new("records/contacts/index.md")
                     && i.code == codes::WIKI_LINK_BROKEN),
-            "the catalog `index.md` linking to the deleted target must be pulled \
-             into the working set and flagged WIKI_LINK_BROKEN (proves the scan \
-             uses embedded-ripgrep `Store::find_links_to`, not the index-skipping \
-             walk-and-read): {issues:#?}"
+            "a stale catalog `index.md` entry must NOT be WIKI_LINK_BROKEN in the \
+             working set (it is an INDEX_STALE_ENTRY under `--all`): {issues:#?}"
         );
     }
 

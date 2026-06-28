@@ -1306,9 +1306,13 @@ fn frontmatter_block(text: &str) -> Option<&str> {
     // Tolerate a UTF-8 BOM and CRLF, but the fence must be the very first line.
     let body = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut rest = body;
-    // First line must be exactly `---` (allowing trailing CR).
+    // First line must be exactly `---`, tolerating trailing whitespace (CR, but
+    // also spaces/tabs) — matching the canonical parser (`parser.rs` /
+    // `index.rs`'s `extract_frontmatter_block`). A strict `\r`-only trim missed a
+    // `--- ` fence, so `read_updated` returned None and date-sharding silently
+    // fell back, disagreeing with the sidecar the rest of the toolkit builds.
     let (first, after_first) = split_first_line(rest);
-    if first.trim_end_matches('\r') != "---" {
+    if first.trim_end() != "---" {
         return None;
     }
     rest = after_first;
@@ -1316,7 +1320,7 @@ fn frontmatter_block(text: &str) -> Option<&str> {
     let mut scanned = 0usize;
     loop {
         let (line, after) = split_first_line(rest);
-        if line.trim_end_matches('\r') == "---" {
+        if line.trim_end() == "---" {
             return Some(&block_start[..scanned]);
         }
         if after.is_empty() && line.is_empty() {
@@ -1377,6 +1381,30 @@ fn timestamp_matches(stored: Option<DateTime<FixedOffset>>, value: &str) -> bool
     }
 }
 
+/// Match a JSON number against a query string.
+///
+/// A FLOAT-valued field is compared NUMERICALLY, not textually: the sidecar
+/// stores a YAML float through serde_json's canonical f64 rendering, which
+/// discards the file's source spelling (`1234.00` -> `1234.0`, `12.50` ->
+/// `12.5`, `1e3` -> `1000.0`). A raw `to_string()` compare therefore made the
+/// spelling a human reads in the file fail to match (and disagreed with
+/// free-text `search`), while requiring a canonical form often absent from the
+/// file. We parse the query as f64 and compare values. Restricted to the float
+/// case so a large INTEGER field never loses exactness to f64 rounding (integers
+/// render canonically and round-trip exactly through the textual compare).
+/// Mirrors the parse-then-compare pattern [`timestamp_matches`] already uses.
+fn number_matches(n: &serde_json::Number, value: &str) -> bool {
+    if n.to_string() == value {
+        return true;
+    }
+    if n.is_f64() {
+        if let (Some(stored), Ok(q)) = (n.as_f64(), value.parse::<f64>()) {
+            return stored == q;
+        }
+    }
+    false
+}
+
 /// Compare a JSON field value against a query string. A string matches
 /// verbatim; scalars match their textual form; an array matches if any element
 /// matches (so a list-valued frontmatter field is membership-queried).
@@ -1384,7 +1412,7 @@ fn json_value_matches(v: &serde_json::Value, value: &str) -> bool {
     match v {
         serde_json::Value::String(s) => s == value,
         serde_json::Value::Bool(b) => b.to_string() == value,
-        serde_json::Value::Number(n) => n.to_string() == value,
+        serde_json::Value::Number(n) => number_matches(n, value),
         serde_json::Value::Array(items) => items.iter().any(|i| json_value_matches(i, value)),
         // A present-but-null field never matches — consistent with the in-memory
         // post-filter (`query::json_value_matches`, which the first `where`
@@ -2683,6 +2711,64 @@ mod tests {
             .find_by_where("created", "2026-05-01")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn find_by_where_matches_floats_across_serialized_spellings() {
+        // Adversarial review #5: a float field is stored in index.jsonl via
+        // serde_json's canonical f64 render, which DISCARDS the file's source
+        // spelling (`1234.00` -> `1234.0`, `1e3` -> `1000.0`). A textual compare
+        // made the spelling a human reads in the file miss (and disagree with
+        // free-text `search`); numeric compare fixes it. `fm query`/`index query`
+        // is the SPEC pre-write dedup primitive, so a miss here silently writes a
+        // duplicate record.
+        let dir = empty_store();
+        let root = dir.path();
+        write(
+            root,
+            "records/invoices/index.jsonl",
+            "{\"path\":\"records/invoices/inv.md\",\"type\":\"invoice\",\
+\"summary\":\"inv\",\"amount\":1234.0,\"score\":1000.0,\"count\":42}\n",
+        );
+        let store = open(&dir);
+
+        // Every spelling of the same numeric value matches the canonical-f64 store.
+        for spelling in ["1234.00", "1234.0", "1234"] {
+            assert_eq!(
+                store.find_by_where("amount", spelling).unwrap().len(),
+                1,
+                "amount spelling `{spelling}` must match the stored 1234.0"
+            );
+        }
+        for spelling in ["1e3", "1000", "1000.0"] {
+            assert_eq!(
+                store.find_by_where("score", spelling).unwrap().len(),
+                1,
+                "score spelling `{spelling}` must match the stored 1000.0"
+            );
+        }
+        // A genuinely different value does not match.
+        assert!(store.find_by_where("amount", "1234.5").unwrap().is_empty());
+        // Integer fields keep exact textual matching (unaffected by the fix).
+        assert_eq!(store.find_by_where("count", "42").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn number_matches_is_numeric_for_floats_but_exact_for_integers() {
+        use serde_json::Number;
+        // Float-valued field: any equal spelling matches (the bug fix).
+        let f: Number = serde_json::from_str("1234.0").unwrap();
+        assert!(number_matches(&f, "1234.00"));
+        assert!(number_matches(&f, "1234"));
+        assert!(number_matches(&f, "1234.0"));
+        assert!(!number_matches(&f, "1234.5"));
+        // Integer-valued field: EXACT textual compare, never f64-rounded — two
+        // adjacent large integers that round to the same f64 must NOT collide
+        // (the safety property that motivates restricting numeric compare to
+        // floats).
+        let big: Number = serde_json::from_str("18446744073709551615").unwrap(); // u64::MAX
+        assert!(number_matches(&big, "18446744073709551615"));
+        assert!(!number_matches(&big, "18446744073709551614"));
     }
 
     #[test]

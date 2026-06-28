@@ -251,7 +251,25 @@ fn ensure_safe_store_relative(rel: &Path, raw: &str) -> Result<(), CliError> {
     let mut saw_component = false;
     for component in rel.components() {
         match component {
-            Component::Normal(_) => saw_component = true,
+            Component::Normal(name) => {
+                saw_component = true;
+                // Refuse ANY dot-prefixed component, not just the leaf. The store
+                // walkers run with `.hidden(true)`, so a record under a
+                // dot-prefixed directory (`records/.hidden/c.md`) — or a
+                // dot-prefixed leaf (`records/notes/.draft.md`) — is accepted and
+                // write-through-indexed here, then silently dropped by the next
+                // `index rebuild` and never validated: a record that exists on
+                // disk but is invisible to every sweep, leaving an orphan sidecar
+                // no rebuild reconciles. A dot-dir also lets `records/.git/` or
+                // `sources/.obsidian/` shadow real tooling state. Reject at the
+                // write surface — this funnel is shared by write / rename / link /
+                // fm-set / fm-init via `require_store_relative`, and for `write`
+                // it runs before `explicit_type_folder` ever sees the path — so the
+                // conflict can never arise on any surface.
+                if name.to_str().is_some_and(|n| n.starts_with('.')) {
+                    return Err(dotfile_name_error(raw));
+                }
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(path_outside_store_error(raw));
@@ -260,17 +278,6 @@ fn ensure_safe_store_relative(rel: &Path, raw: &str) -> Result<(), CliError> {
     }
     if !saw_component {
         return Err(path_outside_store_error(raw));
-    }
-    // Refuse a dot-prefixed leaf name. The store walkers run with `.hidden(true)`,
-    // so a record written to a dot-named file (e.g. `records/notes/.draft.md`) is
-    // accepted and write-through-indexed here, then silently dropped by the next
-    // `index rebuild` and never validated — a record that exists on disk but is
-    // invisible to every sweep. Reject it at the write surface so the conflict
-    // can never arise (intermediate dot-dirs are caught the same way).
-    if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
-        if name.starts_with('.') {
-            return Err(dotfile_name_error(raw));
-        }
     }
     Ok(())
 }

@@ -223,14 +223,29 @@ impl Log {
                 }
             }
 
+            // A rotation is two non-atomic durable writes (archive append, then
+            // active trim). The marker disambiguates a crash-retry re-roll from a
+            // fresh rotation so a genuinely-distinct same-minute entry is never
+            // dropped (see `rotation_marker_path`). `recovering` is captured
+            // BEFORE we (re)write the marker, so the current attempt's archive
+            // append uses the right mode; the marker only changes what a LATER
+            // retry sees.
+            let marker = rotation_marker_path(store);
+            let recovering = marker.exists();
+
             if !by_month.is_empty() {
                 // Roll each prior month into its archive (atomic per-file),
                 // appending to any existing archive for that month.
                 let dir = archive_dir(store);
                 fs::create_dir_all(&dir)?;
+                // Mark the rotation in-flight so a crash before the active trim
+                // is recoverable as a re-roll (deduped), not re-appended.
+                if !recovering {
+                    fs::write(&marker, b"")?;
+                }
                 for ((y, m), month_entries) in &by_month {
                     let path = archive_path(store, *y, *m);
-                    append_to_archive(&path, month_entries)?;
+                    append_to_archive(&path, month_entries, recovering)?;
                 }
 
                 // Rewrite the active file to the kept (current-month) entries
@@ -242,10 +257,18 @@ impl Log {
                 body.push_str(&entry.render());
                 let full = compose_active(&header, &body);
                 crate::fsx::write_atomic(&active, full.as_bytes())?;
+                // Rotation committed (active trimmed): clear the in-flight marker.
+                let _ = fs::remove_file(&marker);
                 return Ok(());
             }
 
-            // No rotation needed: plain atomic append of the rendered entry.
+            // No rotation needed. If a stale marker lingers (a crash that trimmed
+            // the active file but never deleted the marker), clear it so the next
+            // real rotation is treated as fresh, not stuck in recovery mode.
+            if recovering {
+                let _ = fs::remove_file(&marker);
+            }
+            // Plain atomic append of the rendered entry.
             let mut full = content;
             if !full.ends_with('\n') {
                 full.push('\n');
@@ -297,19 +320,26 @@ impl Log {
         // within-file early stop: out-of-order entries mean a newer entry can
         // sit physically before an older one, so each file is read fully.
         let mut window = NewestWindow::new(n);
-        // Cross-file identity dedup (see `since`): an interrupted rotation can
-        // leave the same entry in both the untrimmed active file and the
-        // archive; without this the duplicate would occupy two window slots and
-        // surface twice. The active copy (scanned first) is the one kept.
-        let mut seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
+        // Active↔archive overlap dedup, narrowly scoped (see `since`): an
+        // interrupted rotation can leave the SAME entry in both the untrimmed
+        // active file and its month archive; without suppression it would occupy
+        // two window slots and surface twice. We record every ACTIVE entry's
+        // identity and suppress only an ARCHIVE entry that matches one — NEVER an
+        // active entry against another active entry, nor an archive entry against
+        // another archive entry. A global content key over-reaches: on-disk
+        // headers are minute-precision, so two genuinely-distinct same-minute
+        // appends share an identity and a global dedup silently dropped the
+        // second on read.
+        let mut active_seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
-        // Active file: scan fully (current-month-bounded by rotation).
+        // Active file: scan fully (current-month-bounded by rotation). Record
+        // every identity for overlap detection, but consider every entry — a
+        // same-minute duplicate WITHIN the active file is two distinct appends.
         let active = active_log_path(store);
         if active.exists() {
             reverse_collect(&active, |e| {
-                if seen.insert(entry_key(&e)) {
-                    window.consider(e);
-                }
+                active_seen.insert(entry_key(&e));
+                window.consider(e);
                 false
             })?;
         }
@@ -329,7 +359,10 @@ impl Log {
                 }
             }
             reverse_collect(&archive, |e| {
-                if seen.insert(entry_key(&e)) {
+                // Suppress only the active↔archive crash-retry overlap; keep
+                // every distinct same-minute archive entry (archives are never
+                // deduped against each other).
+                if !active_seen.contains(&entry_key(&e)) {
                     window.consider(e);
                 }
                 false
@@ -363,19 +396,25 @@ impl Log {
     /// month is entirely at or before `time`'s.
     pub fn since(store: &Store, time: DateTime<FixedOffset>) -> crate::Result<Vec<LogEntry>> {
         let mut collected: Vec<LogEntry> = Vec::new();
-        // Cross-file identity dedup. An interrupted rotation (archive write
-        // committed, active rewrite not) leaves the same entries in BOTH the
-        // untrimmed active file and the archive; without dedup every such entry
-        // comes back twice. Keyed on the full entry identity, so only a
-        // byte-identical duplicate is suppressed (the active copy, scanned first,
-        // is the one kept); two genuinely-distinct entries never collide.
-        let mut seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
+        // Active↔archive overlap dedup, narrowly scoped. An interrupted rotation
+        // (archive write committed, active rewrite not) leaves the same entries
+        // in BOTH the untrimmed active file and the archive; without suppression
+        // each comes back twice. We record ACTIVE identities and suppress only an
+        // ARCHIVE entry that matches one — never active-vs-active or
+        // archive-vs-archive. A global content key would over-reach: on-disk
+        // headers are minute-precision, so two genuinely-distinct same-minute
+        // appends share an identity, and a global dedup silently under-reported
+        // the second.
+        let mut active_seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
-        // Active file: scan fully, no early stop (out-of-order safe).
+        // Active file: scan fully, no early stop (out-of-order safe). Collect
+        // every in-window entry (a same-minute duplicate within the active file
+        // is two distinct appends), recording identities for overlap detection.
         let active = active_log_path(store);
         if active.exists() {
             reverse_collect(&active, |e| {
-                if e.timestamp > time && seen.insert(entry_key(&e)) {
+                if e.timestamp > time {
+                    active_seen.insert(entry_key(&e));
                     collected.push(e);
                 }
                 false
@@ -405,7 +444,9 @@ impl Log {
             // Scan this archive fully — within a month, entries may still be
             // out of order, so no within-file early stop.
             reverse_collect(&archive, |e| {
-                if e.timestamp > time && seen.insert(entry_key(&e)) {
+                // Suppress only the active↔archive crash-retry overlap; keep
+                // every distinct same-minute archive entry.
+                if e.timestamp > time && !active_seen.contains(&entry_key(&e)) {
                     collected.push(e);
                 }
                 false
@@ -737,6 +778,29 @@ fn archive_path(store: &Store, year: i32, month: u32) -> PathBuf {
     archive_dir(store).join(format!("{:04}-{:02}.md", year, month))
 }
 
+/// The crash-recovery marker for an in-progress rotation.
+///
+/// Its **presence** at the start of [`Log::append`] means a prior rotation
+/// appended prior-month entries to their archives but may not have trimmed the
+/// active file (a crash, or an active-rewrite error, between the two non-atomic
+/// durable writes). The retry must then DEDUP the re-rolled entries against the
+/// archive so it adds nothing.
+///
+/// Its **absence** means a fresh rotation: every prior-month entry being rolled
+/// is genuinely new to its archive and is appended UNCONDITIONALLY. This is the
+/// load-bearing distinction — a content-only dedup cannot tell an idempotent
+/// re-roll of one physical entry from a genuinely-distinct same-minute repeat
+/// (on-disk headers are minute-precision, so two real appends to the same object
+/// in the same minute with the same note render byte-identically). Gating the
+/// dedup on "are we recovering a crashed rotation?" lets a backdated duplicate
+/// survive while still suppressing a true re-roll.
+///
+/// Lives in `log/` (toolkit-managed; a dotfile, so never walked, indexed, or
+/// validated as content — `list_archives_desc` matches only `YYYY-MM.md`).
+fn rotation_marker_path(store: &Store) -> PathBuf {
+    archive_dir(store).join(".rotating")
+}
+
 /// Parse a `YYYY-MM-DD HH:MM` header timestamp, reattaching UTC. `None` on any
 /// malformed shape.
 fn parse_timestamp(s: &str) -> Option<DateTime<FixedOffset>> {
@@ -760,13 +824,27 @@ fn parse_active(content: &str) -> (String, Vec<LogEntry>) {
     }
 }
 
-/// Byte offset of the first entry header (`## [` at the start of a line), or
-/// `None`.
+/// Byte offset of the first **valid** entry header — a `## [` line-start that
+/// [`Log::parse_header`] accepts — or `None`.
+///
+/// Crucially this skips `## [`-SHAPED lines that `parse_header` REJECTS (a
+/// merge-orphaned note, an exporter-malformed line) appearing before the first
+/// real entry: everything up to the first valid header becomes the preserved
+/// `header` block in [`parse_active`], so a rotation re-emits it verbatim.
+/// Returning the first `## [`-shaped line instead (as this once did) put those
+/// pre-entry lines into the entries region, where [`parse_entries`] — which
+/// opens an entry only on a parseable header — dropped them on the floor,
+/// silently erasing append-only content on the next rotation.
 fn find_first_header(content: &str) -> Option<usize> {
-    if content.starts_with("## [") {
-        return Some(0);
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let line_str = line.trim_end_matches(['\r', '\n']);
+        if line_str.starts_with("## [") && Log::parse_header(line_str).is_some() {
+            return Some(offset);
+        }
+        offset += line.len();
     }
-    content.match_indices("\n## [").next().map(|(i, _)| i + 1)
+    None
 }
 
 /// Whether `line` is a note line that — left unescaped — could be mistaken for
@@ -878,33 +956,59 @@ fn compose_active(header: &str, body: &str) -> String {
 /// if absent. Atomic (temp-file rename). Entries are appended in the given
 /// order (callers pass them already chronological within the month).
 ///
-/// **Idempotent re-roll.** Rotation in [`Log::append`] is two non-atomic durable
-/// writes — roll prior-month entries into the archive, *then* rewrite the active
-/// file. If the process crashes or the active rewrite errors (e.g. ENOSPC,
-/// permission) *after* the archive write commits, the prior-month entries remain
-/// in the still-untrimmed active file, and `Log::append` surfaces the error so
-/// the agent retries. The retry re-partitions the same prior-month entries and
-/// re-rolls them here — so a naive concatenate would duplicate every entry in
-/// the month archive, amplifying on each retry, with no validate check to detect
-/// or repair it (the log is primary, no-rewrite data). To make the re-roll a
-/// no-op, we skip any incoming entry already present verbatim in the archive,
-/// keyed on the full entry identity `(timestamp, kind, object, note)`.
-fn append_to_archive(path: &Path, entries: &[LogEntry]) -> crate::Result<()> {
+/// **`recovering` — the re-roll gate.** Rotation in [`Log::append`] is two
+/// non-atomic durable writes: roll prior-month entries into the archive, then
+/// rewrite (trim) the active file. If the process crashes or the active rewrite
+/// errors *after* the archive write commits, the prior-month entries remain in
+/// the still-untrimmed active file and the agent's retry re-rolls them here. A
+/// naive concatenate would then duplicate every entry, amplifying on each retry.
+///
+/// We CANNOT dedup that away by content alone: on-disk headers are
+/// minute-precision, so two genuinely-distinct appends to the same object in the
+/// same minute with the same note render byte-identically — indistinguishable
+/// from a re-roll of one physical entry. Deduping unconditionally therefore
+/// silently destroyed a legitimately-distinct backdated duplicate (the bug).
+///
+/// So the caller passes `recovering`: `true` only when an in-progress-rotation
+/// marker was found (a crash-retry), where we dedup the incoming batch against
+/// the archive **by multiplicity** (skip an incoming entry only while the
+/// archive still holds an unconsumed copy of its identity) so a re-roll of the
+/// SAME physical entries adds nothing. On a fresh rotation (`false`) every entry
+/// is genuinely new to the archive and is appended unconditionally, so a
+/// distinct same-minute repeat survives.
+fn append_to_archive(path: &Path, entries: &[LogEntry], recovering: bool) -> crate::Result<()> {
     if path.exists() {
         let existing = fs::read_to_string(path)?;
-        // Identities already on disk in this archive, so an interrupted-then-
-        // retried rotation re-rolling identical entries adds nothing.
-        let (_header, existing_entries) = parse_active(&existing);
-        let present: std::collections::HashSet<EntryKey> =
-            existing_entries.iter().map(entry_key).collect();
 
         let mut body = String::new();
-        for e in entries {
-            if present.contains(&entry_key(e)) {
-                continue;
+        if recovering {
+            // Crash-retry: the prior (crashed) attempt may already have appended
+            // some/all of these. Dedup by MULTIPLICITY, not set-membership, so a
+            // partial-then-retried roll converges exactly and a re-roll of the
+            // full batch is a no-op.
+            let (_header, existing_entries) = parse_active(&existing);
+            let mut remaining: std::collections::HashMap<EntryKey, usize> =
+                std::collections::HashMap::new();
+            for e in &existing_entries {
+                *remaining.entry(entry_key(e)).or_insert(0) += 1;
             }
-            body.push_str(&e.render());
+            for e in entries {
+                match remaining.get_mut(&entry_key(e)) {
+                    // An archived copy is still unconsumed: this incoming entry is
+                    // that re-roll, suppress it.
+                    Some(count) if *count > 0 => *count -= 1,
+                    _ => body.push_str(&e.render()),
+                }
+            }
+        } else {
+            // Fresh rotation: append every entry. A same-minute, same-fields
+            // entry that already exists in the archive is a DISTINCT append, not
+            // a re-roll, and must be preserved.
+            for e in entries {
+                body.push_str(&e.render());
+            }
         }
+
         // Nothing new to add (a fully-duplicate re-roll): leave the archive
         // byte-for-byte untouched (append-only: don't rewrite identical data).
         if body.is_empty() {
@@ -2300,15 +2404,16 @@ Second.
         let apr2 = entry(2026, 4, 20, 9, 0, LogKind::Create, Some("apr-b"), "apr two");
         let month = [apr1.clone(), apr2.clone()];
 
-        // First roll (the committed step-(1) write before the crash).
+        // First roll: a FRESH rotation (no in-progress marker) appends both.
         fs::create_dir_all(&dir).unwrap();
-        append_to_archive(&arch, &month).unwrap();
+        append_to_archive(&arch, &month, false).unwrap();
 
-        // The retry re-rolls the identical prior-month entries. Pre-fix this
-        // blindly concatenated, doubling every entry; do it twice to prove the
-        // amplification a real retry loop would cause is fully suppressed.
-        append_to_archive(&arch, &month).unwrap();
-        append_to_archive(&arch, &month).unwrap();
+        // The retries are crash-RECOVERIES (the in-progress-rotation marker is
+        // present), so they dedup the re-rolled identical entries to a no-op.
+        // Pre-fix this blindly concatenated, doubling every entry; do it twice to
+        // prove the amplification a real retry loop would cause is suppressed.
+        append_to_archive(&arch, &month, true).unwrap();
+        append_to_archive(&arch, &month, true).unwrap();
 
         let archived = fs::read_to_string(&arch).unwrap();
         // Each entry header must appear EXACTLY once despite the re-rolls.
@@ -2361,6 +2466,11 @@ Second.
         // Simulate the crash/error: the active rewrite never persisted, so the
         // active file still contains the (now also archived) April entries.
         fs::write(&active_path, &pre_rotation_active).unwrap();
+        // A real crash leaves the in-progress-rotation marker behind too — it is
+        // deleted only AFTER the active trim commits. Restore it so the retry is
+        // recognized as a crash-recovery re-roll (deduped), not a fresh rotation
+        // (which would correctly append a genuinely-distinct repeat).
+        fs::write(rotation_marker_path(&store), b"").unwrap();
 
         // The agent retries the append. Re-partitioning sees April as prior
         // months again and re-rolls them — which must NOT duplicate the archive.
@@ -2377,6 +2487,122 @@ Second.
             count_occurrences(&archived, "## [2026-04-20 09:00] create | apr-b"),
             1,
             "retried rotation duplicated an April entry in the archive; got:\n{archived}"
+        );
+    }
+
+    /// Adversarial review (#7) — two GENUINELY-DISTINCT appends that render
+    /// byte-identically at minute precision (same minute/kind/object/note) must
+    /// BOTH survive rotation. The backdated-duplicate case: apr1 rotates in May;
+    /// the backdated apr2 lands in the active file later and rotates in June as a
+    /// FRESH roll (no in-progress marker), so it must be appended even though the
+    /// April archive already holds the byte-identical apr1. Pre-fix the
+    /// set-membership dedup dropped apr2 — silent, unrecoverable audit-log loss.
+    #[test]
+    fn regression_distinct_same_minute_entries_both_survive_rotation() {
+        let (_d, store) = temp_store();
+        let apr1 = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("x"), "dup");
+        let apr2 = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("x"), "dup");
+
+        Log::append(&store, &apr1).unwrap();
+        // A May append rotates apr1 into the April archive and COMPLETES (no
+        // marker left behind).
+        Log::append(
+            &store,
+            &entry(2026, 5, 2, 8, 0, LogKind::Ingest, Some("may"), "m"),
+        )
+        .unwrap();
+        // The backdated apr2 lands in the active file beside the May entry.
+        Log::append(&store, &apr2).unwrap();
+        // A June append rotates the May entry AND apr2 out. apr2 is a fresh roll.
+        Log::append(
+            &store,
+            &entry(2026, 6, 1, 8, 0, LogKind::Ingest, Some("jun"), "j"),
+        )
+        .unwrap();
+
+        let archived = fs::read_to_string(archive_path(&store, 2026, 4)).unwrap();
+        assert_eq!(
+            count_occurrences(&archived, "## [2026-04-10 09:00] ingest | x"),
+            2,
+            "two distinct same-minute April appends must BOTH survive rotation; got:\n{archived}"
+        );
+        // The reader must return both too (read-dedup must not collapse distinct
+        // same-minute archive entries).
+        let got = Log::since(&store, ts(2026, 4, 1, 0, 0)).unwrap();
+        let dups = got
+            .iter()
+            .filter(|e| e.object.as_deref() == Some("x"))
+            .count();
+        assert_eq!(
+            dups, 2,
+            "since must return both distinct same-minute entries; got {got:#?}"
+        );
+    }
+
+    /// Adversarial review (#12) — `tail`/`since` must return two byte-identical
+    /// same-minute entries that both live in the ACTIVE log (no archive). Pre-fix
+    /// a global content-keyed `seen` set suppressed the second on read, so the
+    /// reader under-reported what was on disk (`grep` saw 2, `tail` saw 1).
+    #[test]
+    fn regression_tail_since_return_distinct_same_minute_active_entries() {
+        let (_d, store) = temp_store();
+        Log::append(
+            &store,
+            &entry(2026, 6, 10, 9, 0, LogKind::Ingest, Some("x"), "dup"),
+        )
+        .unwrap();
+        Log::append(
+            &store,
+            &entry(2026, 6, 10, 9, 0, LogKind::Ingest, Some("x"), "dup"),
+        )
+        .unwrap();
+
+        let tail = Log::tail(&store, 20).unwrap();
+        assert_eq!(
+            tail.len(),
+            2,
+            "tail must return both same-minute active entries; got {tail:#?}"
+        );
+        let since = Log::since(&store, ts(2026, 6, 1, 0, 0)).unwrap();
+        assert_eq!(
+            since.len(),
+            2,
+            "since must return both same-minute active entries; got {since:#?}"
+        );
+    }
+
+    /// Adversarial review (#15) — rotation must NOT erase lines before the first
+    /// VALID entry header. An active log whose entries region opens with a
+    /// `## [`-shaped line that `parse_header` rejects (a merge orphan / malformed
+    /// export) before the first real entry: pre-fix `find_first_header` landed on
+    /// it, `parse_entries` dropped it (no open entry yet), and the rotation
+    /// re-emitted without it — silently erasing append-only content. The fix
+    /// folds everything before the first valid header into the preserved header
+    /// block, which rotation re-emits verbatim.
+    #[test]
+    fn regression_rotation_preserves_lines_before_first_valid_header() {
+        let (_d, store) = temp_store();
+        let active = active_log_path(&store);
+        let content = "---\ntype: log\n---\n\n## [orphan from a merge] stray text\n## [2026-04-10 09:00] ingest | x\nbody line\n";
+        fs::write(&active, content).unwrap();
+
+        // A June append rotates the April entry out and rewrites the active file.
+        Log::append(
+            &store,
+            &entry(2026, 6, 1, 8, 0, LogKind::Ingest, Some("jun"), "j"),
+        )
+        .unwrap();
+
+        let active_after = fs::read_to_string(&active).unwrap();
+        let arch_after = fs::read_to_string(archive_path(&store, 2026, 4)).unwrap_or_default();
+        assert!(
+            active_after.contains("orphan from a merge") || arch_after.contains("orphan from a merge"),
+            "the pre-first-valid-header line was erased by rotation;\nactive:\n{active_after}\narchive:\n{arch_after}"
+        );
+        // Sanity: the real April entry still rotated into its archive.
+        assert!(
+            arch_after.contains("## [2026-04-10 09:00] ingest | x"),
+            "the valid April entry must still rotate to its archive; got:\n{arch_after}"
         );
     }
 

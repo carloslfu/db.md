@@ -239,3 +239,207 @@ fn regression_working_set_cutoff_reads_archived_validate_entry() {
         "pre-validate change (before the archived cutoff) must be excluded: {issues:#?}"
     );
 }
+
+// ── Adversarial review (second pass) ─────────────────────────────────────────
+
+/// INDEX_SUMMARY_MISMATCH must not false-positive on a valid one-line summary
+/// that carries INTERNAL whitespace (a double space, a tab). The index renderer
+/// collapses whitespace runs when it writes the `index.md` browse line; pre-fix
+/// the validator compared that collapsed text against the RAW file summary and
+/// flagged a mismatch — permanently, since `index rebuild` regenerates the same
+/// collapsed line (the store wedges at exit 6). The fix normalizes BOTH sides
+/// with the renderer's `collapse_whitespace` before comparing.
+#[test]
+fn regression_index_summary_internal_whitespace_does_not_false_positive() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    fresh_store(root);
+
+    // Internal DOUBLE SPACE — a legal one-line summary (only a newline is
+    // forbidden by SUMMARY_MULTILINE).
+    write(
+        root,
+        "records/companies/acme.md",
+        &contact("Partner;  our operating co"),
+    );
+    // Internal TAB — same class.
+    write(root, "records/companies/beta.md", &contact("Ops\tlead co"));
+
+    let store = open(root);
+    Index::rebuild_all(&store).unwrap();
+
+    let issues = validate_all(&store).unwrap();
+    assert!(
+        !has(&issues, codes::INDEX_SUMMARY_MISMATCH),
+        "internal-whitespace summaries on a freshly-rebuilt store must not desync: {issues:#?}"
+    );
+    assert!(
+        !issues.iter().any(Issue::is_error),
+        "a clean store with internal-whitespace summaries must have no errors: {issues:#?}"
+    );
+}
+
+/// `## Folders` is a real, shipped DB.md section: `parse_db_md` reads it into
+/// `Config.folders` and the index renders folder display names + descriptions
+/// from it. It must NOT be flagged `DB_MD_UNKNOWN_SECTION` (whose remedy is to
+/// delete the heading — which would destroy curator-authored rollup names). A
+/// genuinely unknown section must still warn.
+#[test]
+fn regression_db_md_folders_section_is_recognized() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("DB.md"),
+        "---\ntype: db-md\nscope: company\nowner: Test\n---\n\n# Store\n\n## Folders\n\n- records/contacts|Contacts — people we have met\n",
+    )
+    .unwrap();
+    for layer in ["sources", "records"] {
+        std::fs::create_dir_all(root.join(layer)).unwrap();
+    }
+    write(root, "records/contacts/a.md", &contact("a contact"));
+
+    let store = open(root);
+    Index::rebuild_all(&store).unwrap();
+    let issues = validate_all(&store).unwrap();
+    assert!(
+        !has(&issues, codes::DB_MD_UNKNOWN_SECTION),
+        "`## Folders` is a recognized DB.md section and must not be flagged: {issues:#?}"
+    );
+
+    // Control: a genuinely unknown section still warns (the fix added exactly
+    // `folders`, it did not disable the check).
+    std::fs::write(
+        root.join("DB.md"),
+        "---\ntype: db-md\nscope: company\nowner: Test\n---\n\n# Store\n\n## Bogus\n\n- nope\n",
+    )
+    .unwrap();
+    let store2 = open(root);
+    let issues2 = validate_all(&store2).unwrap();
+    assert!(
+        has(&issues2, codes::DB_MD_UNKNOWN_SECTION),
+        "an unrecognized DB.md section must still warn: {issues2:#?}"
+    );
+}
+
+/// Default `dbmd validate` (working set) must never read or report on a file
+/// OUTSIDE the store via a `..` object in a `log.md` header. Pre-fix
+/// `changed_objects_since` inserted the object verbatim, so a
+/// `records/../../leaky` header made `validate_working_set` read + frontmatter-
+/// report a file two dirs above the store root (a containment escape + an
+/// existence oracle + frontmatter disclosure). The fix routes the object through
+/// `safe_md_target_rel`, dropping any `..`/absolute/prefix path from the changed
+/// set.
+#[test]
+fn regression_validate_working_set_does_not_escape_store_via_log_object() {
+    // Store nested below a host root; the secret sits OUTSIDE the store root at
+    // exactly the location `records/../../leaky.md` resolves to from the root.
+    // root = host/mid/store; root.join("records/../../leaky.md") walks
+    // records → .. → store → .. → mid → leaky.md, i.e. host/mid/leaky.md
+    // (= root.parent()), which is outside the store root.
+    let host = tempfile::TempDir::new().unwrap();
+    let root = host.path().join("mid").join("store");
+    std::fs::create_dir_all(&root).unwrap();
+    fresh_store(&root);
+    std::fs::write(
+        root.parent().unwrap().join("leaky.md"),
+        "---\ntype: contact\ncreated: TOP-SECRET\nsummary: secret\nname: X\n---\n\n# x\n",
+    )
+    .unwrap();
+
+    // A real in-store change keeps the working set non-empty (so the empty-set
+    // vacuous-fallback sweep does not mask the result), beside the escaping one.
+    write(&root, "records/contacts/real.md", &contact("real one"));
+    write(
+        &root,
+        "log.md",
+        "---\ntype: log\n---\n\n## [2026-06-01 08:00] create | records/contacts/real\n## [2026-06-01 08:01] update | records/../../leaky\n",
+    );
+
+    let store = open(&root);
+    let issues = validate_working_set(&store, None).unwrap();
+    assert!(
+        !issues
+            .iter()
+            .any(|i| i.file.to_string_lossy().contains("leaky")),
+        "validate must not read/report a file outside the store via a `..` log object: {issues:#?}"
+    );
+}
+
+/// `validate --all` must follow symlinks like the loop default (`md_walker`
+/// `follow_links(true)`). A content file symlinked into a type-folder is checked
+/// by `dbmd validate` (the loop default), but pre-fix `walk_content_files` used a
+/// no-follow `WalkDir`, so `--all` silently SKIPPED it — the authoritative
+/// superset reporting FEWER issues than the loop scope on the same store.
+#[cfg(unix)]
+#[test]
+fn regression_validate_all_follows_symlinked_content_file() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    fresh_store(root);
+
+    // A real content file OUTSIDE the layers, carrying a broken full-path
+    // wiki-link, symlinked INTO records/profiles/.
+    let real = root.join("external/bio.md");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(
+        &real,
+        "---\ntype: profile\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: \"bio\"\n---\n\nSee [[records/contacts/does-not-exist]].\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("records/profiles")).unwrap();
+    symlink(&real, root.join("records/profiles/bio.md")).unwrap();
+
+    let store = open(root);
+    let ws = validate_working_set(&store, None).unwrap();
+    let all = validate_all(&store).unwrap();
+    assert!(
+        ws.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
+        "the loop default must flag the symlinked-in file's broken link: {ws:#?}"
+    );
+    assert!(
+        all.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
+        "`validate --all` must also follow the symlink and flag it (superset contract): {all:#?}"
+    );
+}
+
+/// A stale `index.md` entry must be reported with the SAME code in both scopes.
+/// Pre-fix the working-set path body-link-checked `index.md` (pulled in as an
+/// incoming linker) and reported a dangling entry as `WIKI_LINK_BROKEN` with the
+/// remedy "create the target" — the OPPOSITE of `--all`'s `INDEX_STALE_ENTRY`
+/// ("run `dbmd index rebuild`"). The fix excludes the derived catalog from
+/// working-set body-link checks, deferring index integrity to `check_indexes`.
+#[test]
+fn regression_working_set_stale_index_entry_is_not_wiki_link_broken() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    fresh_store(root);
+
+    write(root, "records/contacts/a.md", &contact("a"));
+    write(root, "records/contacts/c.md", &contact("c"));
+    let store = open(root);
+    Index::rebuild_all(&store).unwrap();
+
+    // Delete c.md out of band (index.md keeps its stale `[[…/c]]` entry) and log
+    // the delete so c.md — and its index.md linker — enter the working set.
+    std::fs::remove_file(root.join("records/contacts/c.md")).unwrap();
+    write(
+        root,
+        "log.md",
+        "---\ntype: log\n---\n\n## [2026-06-01 08:00] delete | records/contacts/c\n",
+    );
+
+    let store = open(root);
+    let ws = validate_working_set(&store, None).unwrap();
+    assert!(
+        !ws.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN
+            && i.file.file_name().and_then(|n| n.to_str()) == Some("index.md")),
+        "a stale index.md entry must NOT be WIKI_LINK_BROKEN in the working set: {ws:#?}"
+    );
+    let all = validate_all(&store).unwrap();
+    assert!(
+        has(&all, codes::INDEX_STALE_ENTRY),
+        "`validate --all` must report the stale index entry as INDEX_STALE_ENTRY: {all:#?}"
+    );
+}

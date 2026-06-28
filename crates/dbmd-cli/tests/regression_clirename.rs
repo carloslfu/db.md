@@ -467,3 +467,170 @@ fn regression_rename_refuses_destination_through_in_store_symlink() {
         "the source must survive a refused rename"
     );
 }
+
+/// Adversarial review (incomplete d14d182 fix) — `rename` must contain the
+/// `<old>` SOURCE, not only the destination. An `<old>` reached through an
+/// in-store symlink to a directory OUTSIDE the store resolves out of the root;
+/// the pre-fix handler guarded only `<new>`, so `fs::rename(old_abs, new_abs)`
+/// MOVED the out-of-store file into the store and unlinked its origin —
+/// irreversible data loss outside the root. The source guard must refuse it.
+#[cfg(unix)]
+#[test]
+fn regression_rename_refuses_source_through_in_store_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let store = Store::new();
+    // A precious file OUTSIDE the store, reachable through an in-store symlink.
+    let outside = TempDir::new().expect("outside tempdir");
+    let precious = outside.path().join("precious.md");
+    std::fs::write(
+        &precious,
+        "---\ntype: contact\nsummary: secret\n---\n# Precious\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(store.abs("records")).unwrap();
+    symlink(outside.path(), store.abs("records/linkdir")).unwrap();
+
+    let out = store.run(&[
+        "rename",
+        "records/linkdir/precious.md",
+        "records/contacts/moved.md",
+    ]);
+
+    assert_ne!(
+        out.code,
+        Some(0),
+        "rename of a symlinked-out <old> must be refused; code={:?} stderr={}",
+        out.code,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("PATH_OUTSIDE_STORE") || out.stderr.to_lowercase().contains("outside"),
+        "the refusal should name the containment failure; stderr: {}",
+        out.stderr
+    );
+    // The out-of-store file must be untouched (not moved, not unlinked) and the
+    // destination must not exist.
+    assert!(
+        precious.exists(),
+        "the out-of-store source must NOT be moved/destroyed by a refused rename"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&precious).unwrap(),
+        "---\ntype: contact\nsummary: secret\n---\n# Precious\n",
+        "the out-of-store source bytes must survive verbatim"
+    );
+    assert!(
+        !store.abs("records/contacts/moved.md").exists(),
+        "nothing must land at the destination"
+    );
+}
+
+/// Adversarial review (incomplete d14d182 fix) — the linker-rewrite loop must
+/// contain each linker too. `find_links_to` walks with `follow_links(true)`, so
+/// ripgrep can match a `[[old]]` line in a file that physically lives OUTSIDE
+/// the store via a symlinked-in directory; the pre-fix loop `write_atomic`'d the
+/// rewrite, mutating bytes outside the root. The fix skips+warns such a linker
+/// while the in-store rename still completes.
+#[cfg(unix)]
+#[test]
+fn regression_rename_does_not_rewrite_out_of_store_linker() {
+    use std::os::unix::fs::symlink;
+
+    let store = Store::new();
+    store.seed(
+        "records/contacts/old-name.md",
+        "---\ntype: contact\nsummary: x\n---\n# Old\n",
+    );
+    // An out-of-store linker referencing the in-store record, reachable through
+    // an in-store symlinked directory.
+    let outside = TempDir::new().expect("outside tempdir");
+    let outside_linker = outside.path().join("linker.md");
+    std::fs::write(
+        &outside_linker,
+        "---\ntype: note\nsummary: s\n---\nSee [[records/contacts/old-name]].\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(store.abs("sources")).unwrap();
+    symlink(outside.path(), store.abs("sources/extlink")).unwrap();
+
+    let out = store.run(&[
+        "rename",
+        "records/contacts/old-name.md",
+        "records/contacts/new-name.md",
+    ]);
+
+    // The in-store rename still succeeds (one stray out-of-store linker must not
+    // abort it).
+    assert_eq!(
+        out.code,
+        Some(0),
+        "the in-store rename must complete; stderr: {}",
+        out.stderr
+    );
+    assert!(store.abs("records/contacts/new-name.md").exists());
+    assert!(!store.abs("records/contacts/old-name.md").exists());
+
+    // The OUT-OF-STORE linker must be left byte-for-byte unchanged — never
+    // rewritten outside the store root — and the skip surfaced as a warning.
+    assert_eq!(
+        std::fs::read_to_string(&outside_linker).unwrap(),
+        "---\ntype: note\nsummary: s\n---\nSee [[records/contacts/old-name]].\n",
+        "the out-of-store linker must NOT be rewritten"
+    );
+    assert!(
+        out.stderr.to_lowercase().contains("out-of-store")
+            || out.stderr.to_lowercase().contains("symlink"),
+        "a skipped out-of-store linker should surface a warning; stderr: {}",
+        out.stderr
+    );
+}
+
+/// Adversarial review — `rename` must fail fast on a non-creatable destination
+/// BEFORE mutating any authored linker. A destination whose parent component is
+/// an existing FILE (`records/contacts/blocker.md/inner.md`) passes the lexical +
+/// containment gates but makes `create_dir_all` fail. The pre-fix handler ran
+/// `create_dir_all` AFTER the rewrite loop, so every incoming linker was already
+/// rewritten to a `<new>` that never got created — stranding dangling links in
+/// authored content. The fix creates the destination parent up-front; on failure
+/// the store is left completely untouched.
+#[test]
+fn regression_rename_non_creatable_destination_leaves_linkers_untouched() {
+    let store = Store::new();
+    store.seed(
+        "records/contacts/sarah.md",
+        "---\ntype: contact\nsummary: x\n---\n# Sarah\n",
+    );
+    // An incoming linker whose body must NOT be mutated by the failed rename.
+    let linker_before = "---\ntype: note\nsummary: s\n---\nMet [[records/contacts/sarah]] today.\n";
+    store.seed("records/meetings/2026/06/m.md", linker_before);
+    // An existing FILE that will be the (invalid) parent component of <new>.
+    store.seed(
+        "records/contacts/blocker.md",
+        "---\ntype: contact\nsummary: b\n---\n# Blocker\n",
+    );
+
+    let out = store.run(&[
+        "rename",
+        "records/contacts/sarah.md",
+        "records/contacts/blocker.md/inner.md",
+    ]);
+
+    assert_ne!(
+        out.code,
+        Some(0),
+        "a rename onto a file-as-parent destination must fail; stderr: {}",
+        out.stderr
+    );
+    // Zero authored mutations: the linker body is byte-for-byte unchanged.
+    assert_eq!(
+        std::fs::read_to_string(store.abs("records/meetings/2026/06/m.md")).unwrap(),
+        linker_before,
+        "a failed rename must not rewrite any authored linker"
+    );
+    // The source survives in place.
+    assert!(
+        store.abs("records/contacts/sarah.md").exists(),
+        "the source must survive a failed rename"
+    );
+}

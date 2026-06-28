@@ -293,7 +293,9 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
     }
     records.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let bytes: u64 = records.iter().map(|r| r.bytes).sum();
+    // Saturating: poisoned-manifest `bytes` can overflow a plain `.sum()` (debug
+    // abort / release wrap); see `status`.
+    let bytes: u64 = records.iter().fold(0u64, |a, r| a.saturating_add(r.bytes));
     let cataloged = records.len();
 
     let untracked_list = if untracked {
@@ -400,7 +402,11 @@ pub fn status(store: &Store) -> crate::Result<StatusReport> {
     let mut assets = Vec::with_capacity(records.len());
 
     for rec in &records {
-        bytes_total += rec.bytes;
+        // Saturating: `rec.bytes` is deserialized verbatim from a hand-editable /
+        // poisoned `assets.jsonl` with no clamp. An absurd value (~u64::MAX)
+        // summed with unchecked `+=` ABORTS in debug (overflow-checks) and
+        // silently WRAPS in release — and `status` is contractually non-failing.
+        bytes_total = bytes_total.saturating_add(rec.bytes);
         // Resolve through the same containment guard `scan` and `verify` use:
         // the module contract is that the guard applies "wherever a path is read
         // or resolved", and an unguarded `is_file()` here let a poisoned/hand-
@@ -416,7 +422,7 @@ pub fn status(store: &Store) -> crate::Result<StatusReport> {
             "present"
         } else {
             missing += 1;
-            bytes_missing += rec.bytes;
+            bytes_missing = bytes_missing.saturating_add(rec.bytes);
             if rec.required {
                 required_missing += 1;
             } else {
@@ -728,5 +734,47 @@ mod tests {
         assert!(normalize_asset_path(".").is_err());
         assert!(normalize_asset_path("./").is_err());
         assert!(normalize_asset_path("").is_err());
+    }
+
+    /// Regression (adversarial review #16): a poisoned / hand-edited
+    /// `assets.jsonl` whose `bytes` sum past u64::MAX must NOT abort `status`
+    /// (debug overflow-checks) or silently WRAP (release). `status`/`scan` are
+    /// non-failing reports over an editable manifest, so the byte totals SATURATE.
+    #[test]
+    fn status_and_scan_saturate_on_overflowing_manifest_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n# store\n").unwrap();
+        // Two in-store records whose byte sizes sum past u64::MAX.
+        std::fs::write(
+            root.join("assets.jsonl"),
+            "{\"path\":\"records/a.bin\",\"sha256\":\"x\",\"bytes\":18446744073709551615,\
+\"media_type\":\"application/octet-stream\",\"wrappers\":[\"records/w.md\"],\"required\":true}\n\
+{\"path\":\"records/b.bin\",\"sha256\":\"y\",\"bytes\":1,\
+\"media_type\":\"application/octet-stream\",\"wrappers\":[\"records/w.md\"],\"required\":true}\n",
+        )
+        .unwrap();
+        let store = Store {
+            root: root.to_path_buf(),
+            config: crate::parser::Config::default(),
+        };
+
+        // status: must not panic; totals saturate at u64::MAX (both assets are
+        // missing from disk, so bytes_missing accumulates them too).
+        let report = status(&store).expect("status is non-failing on a poisoned manifest");
+        assert_eq!(
+            report.bytes_total,
+            u64::MAX,
+            "byte total must saturate, not wrap"
+        );
+        assert_eq!(
+            report.bytes_missing,
+            u64::MAX,
+            "missing bytes must saturate too"
+        );
+        assert_eq!(report.total, 2);
+
+        // scan's `.sum()` over the same records must likewise not overflow.
+        scan(&store, true, false).expect("scan must not overflow on a poisoned manifest");
     }
 }

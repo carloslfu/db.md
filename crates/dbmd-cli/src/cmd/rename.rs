@@ -6,11 +6,14 @@
 //! has succeeded, then update both affected type-folder indexes write-through
 //! (`dbmd_core::index::on_rename`). Report the rewrite count (text or `--json`).
 //!
-//! **Failure ordering (no half-renamed store).** The file move is the *last*
-//! disk mutation, performed only after every linker rewrite committed. So a
-//! rewrite that fails (a non-UTF8 linker, a transient I/O error) leaves the
-//! source file in place at `<old>` and every linker still pointing at `<old>` —
-//! a self-consistent store, never a moved-file-with-dangling-links half-state.
+//! **Failure ordering (no half-renamed store).** The destination's parent
+//! directory is created up-front (a fail-fast precheck, before any linker is
+//! touched) so a non-creatable destination aborts with zero authored mutations.
+//! The file move itself is the *last* disk mutation, performed only after every
+//! linker rewrite committed. So a rewrite that fails (a non-UTF8 linker, a
+//! transient I/O error) leaves the source file in place at `<old>` and every
+//! linker still pointing at `<old>` — a self-consistent store, never a
+//! moved-file-with-dangling-links half-state.
 //! This is not a transaction (no rollback of the linkers already rewritten when
 //! a *later* linker fails), but it is **monotone toward consistency**: the only
 //! linkers changed before an abort already point at the surviving `<old>` file,
@@ -71,6 +74,20 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
         return Err(path_escapes_store_error(&path_to_unix(&new_rel), &e));
     }
 
+    // ── containment: the SOURCE must also stay inside the store ──────────────
+    // Symmetric to the `<new>` guard above, and load-bearing for the same
+    // reason. `require_store_relative` gates `<old>` only lexically and follows
+    // symlinks: an `<old>` reached through an in-store symlink to a directory
+    // OUTSIDE the root (the store accepts externally-dropped content, which can
+    // carry symlinks) passes that gate, and the `fs::rename` below would MOVE
+    // the out-of-store file into the store and unlink its origin — irreversible
+    // data loss outside the root. Resolve the source's parent chain and require
+    // it stay under the canonical root before any `exists()`/`is_dir()`/move.
+    // (The prior containment fix, d14d182, guarded only the destination.)
+    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &old_abs) {
+        return Err(path_escapes_store_error(&path_to_unix(&old_rel), &e));
+    }
+
     if !old_abs.exists() {
         return Err(missing_old_error(&old_rel));
     }
@@ -111,6 +128,21 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
         return Err(policy_frozen_error(&frozen));
     }
 
+    // ── Destination parent must be creatable BEFORE any authored mutation ────
+    // Create the destination's parent directory chain NOW, before rewriting any
+    // linker. A destination whose parent component is an existing non-directory
+    // (e.g. `records/contacts/blocker.md/inner.md` where `blocker.md` is a file)
+    // makes `create_dir_all` fail — and if that failure happened AFTER the
+    // rewrite loop (as it once did), every incoming linker would already be
+    // rewritten to point at a `<new>` that never gets created, stranding dangling
+    // links in authored content and diverging the index. Failing fast here keeps
+    // the "no half-renamed store" contract: zero authored mutations on a
+    // non-creatable destination. The move itself is still performed last.
+    if let Some(parent) = new_abs.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::runtime(format!("cannot create destination folder: {e}")))?;
+    }
+
     // Find every incoming linker BEFORE the move (the on-disk `[[old]]` text is
     // what ripgrep matches). Embedded ripgrep, loop-fast — no whole-store parse.
     let linkers = store.find_links_to(&old_rel).map_err(core_err)?;
@@ -142,6 +174,21 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
         // The linker is rewritten at its CURRENT path (`<old>` for a self-link),
         // because the move has not happened yet.
         let linker_abs = store.abs_path(linker_rel);
+        // Containment: a linker reached through an in-store symlink that leaves
+        // the store root must NOT be rewritten outside the store. `find_links_to`
+        // walks with `follow_links(true)` (store.rs), so ripgrep can match a
+        // `[[old]]` line in a file that physically lives outside the root via a
+        // symlinked-in directory; `write_atomic` below would then rewrite bytes
+        // outside the store. Skip+warn such a linker (same recovery doctrine as a
+        // non-UTF8 linker) rather than mutating an out-of-store file.
+        if dbmd_core::store::ensure_path_within_store(&store.root, &linker_abs).is_err() {
+            skip_warnings.push(format!(
+                "skipped out-of-store linker {} (reached via an in-store symlink; its `[[{}]]` link was not rewritten)",
+                path_to_unix(linker_rel),
+                path_to_unix(&old_rel)
+            ));
+            continue;
+        }
         match rewrite_links_in_file(&linker_abs, &old_rel, &new_rel) {
             Ok(true) => {
                 // Count only real authored rewrites toward the user-facing "N
@@ -183,12 +230,10 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     }
 
     // ── Move the file LAST, only after every rewrite committed ───────────────
-    // Create the destination's parent, then rename. Reaching here means no
-    // linker rewrite hard-failed, so the move cannot strand a dangling link.
-    if let Some(parent) = new_abs.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CliError::runtime(format!("cannot create destination folder: {e}")))?;
-    }
+    // The destination parent was created up-front (before the rewrite loop) so a
+    // non-creatable destination could not strand rewritten links; reaching here
+    // means no linker rewrite hard-failed either, so the move cannot strand a
+    // dangling link.
     std::fs::rename(&old_abs, &new_abs)
         .map_err(|e| CliError::runtime(format!("cannot move file: {e}")))?;
 

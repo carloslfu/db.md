@@ -100,6 +100,181 @@ pub struct Frontmatter {
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Does `s` contain a run of at least `min` consecutive ASCII digits? A cheap
+/// guard so [`quote_oversized_integers`] only does real work when an oversized
+/// literal is even possible (`i64::MAX` is 19 digits, `u64::MAX` is 20).
+fn has_long_digit_run(s: &str, min: usize) -> bool {
+    let mut run = 0usize;
+    for b in s.bytes() {
+        if b.is_ascii_digit() {
+            run += 1;
+            if run >= min {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// True if `s` is a bare decimal integer literal whose magnitude exceeds the
+/// `i64`/`u64` range `serde_norway` can represent losslessly — exactly the
+/// literals it either rejects (`(u64::MAX, u128::MAX]`) or silently truncates to
+/// `f64` (`> u128::MAX`). A canonical (no leading zero) decimal only, so an
+/// octal/leading-zero/typed scalar is never reinterpreted.
+fn is_oversized_int_literal(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit() || b == b'_') {
+        return false;
+    }
+    let digits: String = body
+        .bytes()
+        .filter(|b| *b != b'_')
+        .map(|b| b as char)
+        .collect();
+    if digits.is_empty() {
+        return false; // all underscores
+    }
+    // Leading-zero decimals (`007`) are version-ambiguous (octal vs int vs
+    // string); never touch them.
+    if digits.len() > 1 && digits.starts_with('0') {
+        return false;
+    }
+    let canon = if neg { format!("-{digits}") } else { digits };
+    // Fits i64 / u64 → handled losslessly; leave untouched.
+    if canon.parse::<i64>().is_ok() || (!neg && canon.parse::<u64>().is_ok()) {
+        return false;
+    }
+    true
+}
+
+/// Byte index where the scalar VALUE begins on a simple block line
+/// (`key: <value>`, `- <value>`, or `- key: <value>`), or `None` when the line
+/// bears no inline value (a bare `key:` / lone `-` / indent-only line).
+fn scalar_value_start(content: &str) -> Option<usize> {
+    let mut base = content.len() - content.trim_start().len();
+    let mut rest = &content[base..];
+    // Consume leading `- ` block-sequence markers (possibly nested: `- - x`).
+    while let Some(after) = rest.strip_prefix("- ") {
+        base += rest.len() - after.len();
+        let trimmed = after.trim_start_matches(' ');
+        base += after.len() - trimmed.len();
+        rest = trimmed;
+    }
+    if rest.is_empty() || rest == "-" {
+        return None;
+    }
+    // `key: value` — first `:` followed by a space/tab introduces the value.
+    if let Some(colon) = rest.find(':') {
+        let after = &rest[colon + 1..];
+        if after.starts_with(' ') || after.starts_with('\t') {
+            let val = after.trim_start_matches([' ', '\t']);
+            return Some(base + colon + 1 + (after.len() - val.len()));
+        }
+        if after.is_empty() {
+            return None; // `key:` with the value on following (block) lines
+        }
+    }
+    // A bare sequence-item scalar: the value is the whole remainder.
+    Some(base)
+}
+
+/// True if `content` introduces a YAML block scalar (`key: |`, `- >2`, …): the
+/// value region begins with a `|` or `>` indicator. Its body must be skipped by
+/// [`quote_oversized_integers`] so a digit line inside literal text is untouched.
+fn introduces_block_scalar(content: &str) -> bool {
+    match scalar_value_start(content) {
+        Some(start) => {
+            let v = content[start..].trim_start();
+            v.starts_with('|') || v.starts_with('>')
+        }
+        None => false,
+    }
+}
+
+/// Quote an oversized bare-integer value on a single block line, returning the
+/// rewritten line, or `None` if the line carries no such value.
+fn quote_int_value_in_line(content: &str) -> Option<String> {
+    let value_start = scalar_value_start(content)?;
+    let region = &content[value_start..];
+    let value = region.trim_end();
+    if !is_oversized_int_literal(value) {
+        return None;
+    }
+    // A pure digit literal contains no `'`, so single-quoting needs no escaping.
+    let trailing = &region[value.len()..];
+    Some(format!(
+        "{}'{}'{}",
+        &content[..value_start],
+        value,
+        trailing
+    ))
+}
+
+/// Pre-quote bare integer literals beyond the `i64`/`u64` range so they parse as
+/// STRING scalars and round-trip verbatim.
+///
+/// `serde_norway` (no arbitrary-precision) cannot represent such an integer: it
+/// rejects `(u64::MAX, u128::MAX]` as a hard parse error and silently truncates
+/// `> u128::MAX` to `f64` (`999…9` → `1e39` on the next re-emit) — corrupting an
+/// imported numeric ID and breaking the SPEC guarantee that unknown fields
+/// round-trip byte-for-byte. Quoting them up front makes them string-valued (the
+/// type narrows from number to string, but no data is destroyed).
+///
+/// Conservative: only a single-line `key: <int>` / `- <int>` / `- key: <int>`
+/// value that is a canonical decimal integer beyond `i64`/`u64` is quoted; block
+/// scalars are tracked and never touched; anything already in range, quoted, or
+/// not a bare integer is left exactly as written.
+fn quote_oversized_integers(yaml: &str) -> std::borrow::Cow<'_, str> {
+    if !has_long_digit_run(yaml, 19) {
+        return std::borrow::Cow::Borrowed(yaml);
+    }
+    let mut out = String::with_capacity(yaml.len());
+    let mut changed = false;
+    let mut block_indent: Option<usize> = None;
+    for line in yaml.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let term = &line[content.len()..];
+        let indent = content.len() - content.trim_start().len();
+
+        // Inside a block scalar: emit verbatim until a non-blank line dedents to
+        // at or before the introducer's key indent.
+        if let Some(key_indent) = block_indent {
+            if content.trim().is_empty() || indent > key_indent {
+                out.push_str(line);
+                continue;
+            }
+            block_indent = None; // block ended; process this line normally
+        }
+        if introduces_block_scalar(content) {
+            block_indent = Some(indent);
+            out.push_str(line);
+            continue;
+        }
+        match quote_int_value_in_line(content) {
+            Some(rewritten) => {
+                out.push_str(&rewritten);
+                out.push_str(term);
+                changed = true;
+            }
+            None => out.push_str(line),
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(yaml)
+    }
+}
+
 impl Frontmatter {
     /// Parse a YAML frontmatter block (the text between the opening and closing
     /// `---` fences, exclusive) into a [`Frontmatter`].
@@ -112,7 +287,12 @@ impl Frontmatter {
         let value: Value = if yaml.trim().is_empty() {
             Value::Mapping(Mapping::new())
         } else {
-            serde_norway::from_str(yaml).map_err(|source| ParseError::MalformedYaml {
+            // Preserve integer literals beyond i64/u64 range: serde_norway would
+            // otherwise reject `(u64,u128]` or silently truncate `>u128` to f64,
+            // corrupting imported numeric IDs. Quoting them up front makes them
+            // round-trip verbatim as strings.
+            let prepared = quote_oversized_integers(yaml);
+            serde_norway::from_str(&prepared).map_err(|source| ParseError::MalformedYaml {
                 file: file.to_path_buf(),
                 source,
             })?
@@ -2389,6 +2569,76 @@ mod tests {
         );
         // The body is preserved verbatim.
         assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn regression_format_round_trip_preserves_oversized_integer_frontmatter() {
+        // Adversarial review #6: a bare integer literal beyond i64/u64 range must
+        // survive `dbmd format` (read_file -> write_file) byte-for-byte. Before
+        // the fix, serde_norway silently truncated `> u128::MAX` to f64 (`999…9`
+        // -> `1e39`) and hard-rejected `(u64::MAX, u128::MAX]` — corrupting an
+        // imported numeric ID and breaking the unknown-field round-trip contract.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("x.md");
+        let big = "999999999999999999999999999999999999999"; // 39 digits, > u128::MAX
+        let mid = "99999999999999999999"; // 20 digits, in (u64::MAX, u128::MAX]
+        let original = format!(
+            "---\ntype: contact\nsummary: x\naccount_number: {big}\nid_num: {mid}\n---\nbody\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        // Two round-trips: the value must survive verbatim AND be idempotent.
+        for _ in 0..2 {
+            let (fm, body) = read_file(&path).expect("oversized-int frontmatter must parse");
+            write_file(&path, &fm, &body).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                after.contains(big),
+                "39-digit integer corrupted by format:\n{after}"
+            );
+            assert!(
+                after.contains(mid),
+                "20-digit integer corrupted by format:\n{after}"
+            );
+            assert!(
+                !after.to_lowercase().contains("1e39"),
+                "integer was truncated to a float:\n{after}"
+            );
+            assert_eq!(body, "body\n", "body must be preserved verbatim");
+        }
+    }
+
+    #[test]
+    fn oversized_int_literal_detection_is_precise() {
+        // In range (serde_norway handles losslessly) → never quoted.
+        for ok in [
+            "0",
+            "42",
+            "-17",
+            "9223372036854775807",
+            "18446744073709551615",
+            "12.5",
+            "007",
+            "abc",
+            "",
+        ] {
+            assert!(
+                !is_oversized_int_literal(ok),
+                "must NOT be flagged oversized: {ok:?}"
+            );
+        }
+        // Beyond i64/u64 → quoted to preserve the literal.
+        for big in [
+            "18446744073709551616",                    // u64::MAX + 1
+            "99999999999999999999",                    // 20 digits
+            "999999999999999999999999999999999999999", // 39 digits
+            "-9999999999999999999999",                 // very negative
+        ] {
+            assert!(
+                is_oversized_int_literal(big),
+                "must be flagged oversized: {big:?}"
+            );
+        }
     }
 
     // ── Regression: BOM-prefixed files parse like store/index (finding #19) ────
