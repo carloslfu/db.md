@@ -1,7 +1,7 @@
 ---
 type: db-md
 scope: company
-owner: Sarah Chen
+owner: Priya Nair
 computer_id: acme-ops
 ---
 
@@ -69,7 +69,7 @@ Style:
 
 ### Frozen pages
 
-- `records/contacts/sarah-chen.md` — Sarah maintains her own record.
+- `records/contacts/priya-nair.md` — Priya maintains her own record.
 - `records/synthesis/board-deck.md` — leadership-curated, do not auto-edit.
 - `records/synthesis/hr-confidential.md` — compensation details only; never auto-edit.
 
@@ -90,6 +90,13 @@ Style:
 
 ## Schemas
 
+### company
+
+- name (required)
+- domain (required)
+- industry (string)
+- relationship (enum: customer, vendor, partner, prospect)
+
 ### contact
 
 - name (required)
@@ -99,6 +106,7 @@ Style:
 - first_touch (date)
 - last_touch (date)
 - status (enum: active, inactive)
+- unique: email
 
 ### expense
 
@@ -109,3 +117,19 @@ Style:
 - vendor (required, link to records/companies/)
 - contact (link to records/contacts/)
 - source (link to sources/)
+- unique: date, amount, vendor
+
+### meeting
+
+- date (required, date)
+- attendees (required, link to records/contacts/)
+- location (string)
+- duration_min (int)
+- unique: date, attendees
+
+### decision
+
+- decided_by (required, link to records/contacts/)
+- affects (link to records/companies/)
+- alternatives_considered (string)
+

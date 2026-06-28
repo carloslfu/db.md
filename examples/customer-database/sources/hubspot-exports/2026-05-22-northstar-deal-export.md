@@ -1,7 +1,7 @@
 ---
 type: hubspot-export
 created: 2026-05-22T08:00:00-07:00
-updated: 2026-05-22T08:00:00-07:00
+updated: 2026-06-18T10:00:00-07:00
 summary: "HubSpot deal export for the Northstar renewal; 175 seats, stage Contract Sent"
 exported_at: 2026-05-22T08:00:00-07:00
 object: deal
@@ -20,6 +20,8 @@ are synced from exports like this one; HubSpot is never written back to.
 | ------------- | --------------------- |
 | Deal name     | Northstar — Renewal   |
 | Stage         | Contract Sent         |
+| Pipeline      | Sales                 |
 | Seats         | 175                   |
+| Amount (ARR)  | USD 63,000            |
 | Owner         | David Kim             |
 | Close date    | 2026-05-29            |

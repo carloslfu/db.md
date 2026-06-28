@@ -3,7 +3,7 @@ type: concept
 meta-type: conclusion
 id: policy-iteration
 created: 2026-05-21T10:30:00Z
-updated: 2026-05-22T11:25:00Z
+updated: 2026-05-23T16:45:00Z
 summary: "Classic dynamic-programming loop alternating policy evaluation and policy improvement; AlphaZero realizes it with MCTS as the improvement operator"
 topic: policy-iteration
 tags: [reinforcement-learning, dynamic-programming, policy-iteration]
@@ -23,7 +23,12 @@ value function).
 
 Generalized policy iteration interleaves the two steps at any
 granularity rather than running each to convergence. Most modern RL
-algorithms are an instance of it.
+algorithms are an instance of it:
+[[records/concepts/actor-critic]] runs evaluation (the critic, by
+[[records/concepts/temporal-difference-learning]]) and improvement (the
+actor's [[records/concepts/policy-gradient]] step) continuously and in
+parallel; [[records/concepts/q-learning]] interleaves a one-step
+evaluation with an implicit greedy improvement.
 
 ## In AlphaZero
 
@@ -36,4 +41,6 @@ is driven entirely by [[records/concepts/self-play]].
 ## Related concepts
 
 - [[records/concepts/value-network]]
+- [[records/concepts/actor-critic]]
+- [[records/concepts/temporal-difference-learning]]
 - [[records/concepts/markov-decision-process]]

@@ -2,9 +2,10 @@
 type: index
 scope: layer
 folder: sources
-updated: 2026-05-15T22:18:00-07:00
+updated: 2026-06-14T13:40:00-07:00
 ---
 
 # sources
 
-- [[sources/reading/index|Reading]] (2) — Highlights from Mollick ch. 3 — "always invite AI to the table"; the "worst AI y
+- [[sources/journal/index|Journal]] (3)
+- [[sources/reading/index|Reading]] (6)

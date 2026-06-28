@@ -1,14 +1,15 @@
 ---
 type: index
 scope: root
-updated: 2026-05-22T11:30:00Z
+updated: 2026-05-23T16:45:00Z
 ---
 
 # Knowledge base index
 
-## Sources (2)
-- [[sources/papers/index|Papers]] (2)
+## Sources (10)
+- [[sources/papers/index|Papers]] (10)
 
-## Records (7)
-- [[records/concepts/index|Concepts]] (5)
-- [[records/papers/index|Papers]] (2)
+## Records (24)
+- [[records/concepts/index|Concepts]] (13)
+- [[records/papers/index|Papers]] (10)
+- [[records/synthesis/index|Synthesis]] (1)

@@ -2,9 +2,11 @@
 type: index
 scope: layer
 folder: records
-updated: 2026-05-15T22:30:00-07:00
+updated: 2026-06-27T00:00:00-07:00
 ---
 
 # records
 
-- [[records/themes/index|Themes]] (1) — Treating an LLM as a thinking partner invited in from the start of a task, not a
+- [[records/people/index|People]] (2)
+- [[records/projects/index|Projects]] (2)
+- [[records/themes/index|Themes]] (4)

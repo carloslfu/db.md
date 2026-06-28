@@ -1,7 +1,7 @@
 ---
 type: db-md
 scope: research
-owner: Karpathy-style researcher
+owner: Maya Krishnan
 ---
 
 # Reinforcement-learning research wiki
@@ -80,4 +80,10 @@ None — this wiki processes everything it sees.
 - arxiv_id (string)
 - doi (string)
 - url (url)
+- source (link to sources/papers/)
 - concepts (link to records/concepts/)
+
+### concept
+- topic (string)
+- derived_from
+

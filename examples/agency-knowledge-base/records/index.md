@@ -2,9 +2,13 @@
 type: index
 scope: layer
 folder: records
-updated: 2026-05-10T09:30:00-04:00
+updated: 2026-05-21T11:30:00-04:00
 ---
 
 # records
 
-- [[records/playbooks/index|Playbooks]] (1) — Agency playbook for scope creep: detect via Linear/Notion, surface within 24h wi
+- [[records/clients/index|Clients]] (3)
+- [[records/contacts/index|Contacts]] (6)
+- [[records/meetings/index|Meetings]] (3)
+- [[records/playbooks/index|Playbooks]] (3)
+- [[records/projects/index|Projects]] (3)

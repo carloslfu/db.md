@@ -2,7 +2,7 @@
 type: index
 scope: type-folder
 folder: records/synthesis
-updated: 2026-05-22T12:30:00-07:00
+updated: 2026-06-18T11:00:00-07:00
 ---
 
 # records/synthesis

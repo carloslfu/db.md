@@ -12,10 +12,16 @@ Lightweight, agent-queryable customer database. Sits alongside HubSpot
 layer: who do we know at company X, what was discussed last, where are
 we in their renewal cycle.
 
+It spans the live book of business across every motion — expansion
+(Northstar, Meridian), churn risk (Brightwave), renewal countdowns
+(Northstar, Brightwave), and new pipeline (Cohort Labs) — so the RevOps
+team can walk into any account conversation already in context.
+
 The two layers compose for that recall:
 
 - `sources/` — raw evidence pulled in from outside: Gong call
-  transcripts and HubSpot exports, preserved verbatim.
+  transcripts, HubSpot deal exports, product `usage-export` snapshots,
+  and customer emails, preserved verbatim.
 - `records/` — atomic typed data the team maintains: one `contact`
   record per person, one `company` record per account, one `call`
   record per logged conversation, cross-linked. The curator's synthesis
@@ -82,3 +88,9 @@ What you don't do:
 - recording (url)
 - next_step (string)
 - category (enum: discovery, demo, technical, renewal, other)
+
+### account
+- topic (required, string)
+- derived_from (required)
+- status (enum: active, archived)
+

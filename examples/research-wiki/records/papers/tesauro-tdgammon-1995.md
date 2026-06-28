@@ -2,7 +2,7 @@
 type: paper
 id: tesauro-tdgammon-1995
 created: 2026-05-21T09:30:00Z
-updated: 2026-05-21T09:30:00Z
+updated: 2026-05-23T16:30:00Z
 summary: "Tesauro's TD-Gammon: a neural-network backgammon player trained by self-play with TD learning that reached world-class strength — the first famous self-play success"
 title: "Temporal Difference Learning and TD-Gammon"
 authors: [Tesauro]
@@ -15,6 +15,8 @@ source: [[sources/papers/tesauro-tdgammon-1995]]
 concepts:
   - [[records/concepts/self-play]]
   - [[records/concepts/value-network]]
+  - [[records/concepts/temporal-difference-learning]]
+  - [[records/concepts/function-approximation]]
 ---
 
 # TD-Gammon
@@ -22,7 +24,10 @@ concepts:
 Tesauro trained a backgammon-playing neural network by self-play with
 temporal-difference learning, no human game records and no hand-coded
 evaluation. It reached world-class strength and is the canonical early
-demonstration that self-play alone can produce a strong player.
+demonstration that self-play alone can produce a strong player, and an
+early proof that nonlinear [[records/concepts/function-approximation]]
+works in RL.
 
 See [[records/concepts/self-play]] for the training regime,
-[[records/concepts/value-network]] for the function it learned.
+[[records/concepts/value-network]] for the function it learned, and
+[[records/concepts/temporal-difference-learning]] for the update rule.
