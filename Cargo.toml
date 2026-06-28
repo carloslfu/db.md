@@ -41,7 +41,7 @@ thiserror = "2"
 sha2 = "0.10"
 # Document text extraction (dbmd extract). All MIT — recorded in THIRD_PARTY_NOTICES.
 # Zero AI/LLM, zero embeddings: these are deterministic format decoders.
-pdf-extract = "0.10"      # PDF text layer (MIT)
+pdf-extract = "0.12"      # PDF text layer (MIT); 0.12 pulls lopdf >=0.42 (RUSTSEC-2026-0187 fix)
 calamine = "0.35"         # XLSX/ODS spreadsheet reader (MIT)
 html2text = "0.17"        # HTML → plain text (MIT)
 quick-xml = "0.40"        # docx/epub OOXML + XHTML parse (MIT)
