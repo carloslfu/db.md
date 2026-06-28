@@ -1605,6 +1605,50 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
         }
     }
 
+    // ── Loose files: content directly at a layer root (no type-folder). ──────
+    // They are catalogued in the layer's own `index.jsonl` (the layer `index.md`
+    // stays a type-folder rollup), so structured reads — `query`, dedup, `graph`
+    // — see them the same way they see canonical files. Require that sidecar and
+    // sync-check it, so a loose file is never silently absent from the catalog.
+    // Only genuinely-loose files land here: `type_folder_of` already grouped
+    // every file two-or-more levels under a layer into its type-folder above.
+    let mut loose_by_layer: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    for rel in files {
+        if !is_content_file(rel) || type_folder_of(rel).is_some() {
+            continue;
+        }
+        if let Some(layer_dir) = loose_layer_dir(rel) {
+            loose_by_layer
+                .entry(layer_dir)
+                .or_default()
+                .push(rel.clone());
+        }
+    }
+    for (layer_dir, members) in &loose_by_layer {
+        let jsonl_rel = layer_dir.join("index.jsonl");
+        if !store.root.join(&jsonl_rel).is_file() {
+            push(
+                issues,
+                Severity::Error,
+                codes::INDEX_JSONL_MISSING,
+                &jsonl_rel,
+                None,
+                None,
+                format!(
+                    "loose files at `{}/` are not catalogued — the layer has no `index.jsonl`",
+                    layer_dir.display()
+                ),
+                Some("run `dbmd index rebuild`".into()),
+                members.clone(),
+            );
+        } else {
+            // `check_type_folder_index_jsonl` ignores its `tf` arg (`let _ = tf`)
+            // and only checks jsonl-vs-files-vs-frontmatter — exactly the layer
+            // sidecar's contract, so it is reused verbatim.
+            check_type_folder_index_jsonl(store, layer_dir, &jsonl_rel, members, issues);
+        }
+    }
+
     // ── Orphan index.md: an index file in a folder with no content. ──────────
     for rel in walk_index_files(&store.root) {
         let parent = rel.parent().unwrap_or(Path::new("")).to_path_buf();
@@ -3028,6 +3072,18 @@ fn type_folder_of(rel: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(comps[0]).join(comps[1]))
+}
+
+/// The layer dir a *loose* content file sits directly in (`records`/`sources`):
+/// exactly two path components, the first a known layer. `None` for a file
+/// inside a type-folder or outside any layer. Counterpart to the index crate's
+/// `loose_layer_of`, kept local so `validate` needs no index internals.
+fn loose_layer_dir(rel: &Path) -> Option<PathBuf> {
+    let comps: Vec<&str> = rel.iter().filter_map(|s| s.to_str()).collect();
+    if comps.len() != 2 || !matches!(comps[0], "sources" | "records") {
+        return None;
+    }
+    Some(PathBuf::from(comps[0]))
 }
 
 /// **SWEEP.** Walk every `.md` content file under `sources/`/`records/`,
@@ -6336,6 +6392,39 @@ mod tests {
             missing.is_empty(),
             "validation codes emitted by the engine but absent from SPEC.md \
              § Validation (the declared complete vocabulary): {missing:?}"
+        );
+    }
+
+    // ── loose files (directly at a layer root, no type-folder) ───────────────
+
+    const LOOSE_ALICE: &str = "---\ntype: contact\nid: alice\ncreated: 2026-06-01T08:00:00-07:00\nupdated: 2026-06-01T08:00:00-07:00\nsummary: Alice\n---\nbody\n";
+    const LOOSE_BOB: &str = "---\ntype: contact\nid: bob\ncreated: 2026-06-01T08:00:00-07:00\nupdated: 2026-06-01T08:00:00-07:00\nsummary: Bob loose\n---\nbody\n";
+
+    #[test]
+    fn loose_file_catalogued_in_layer_jsonl_validates_clean() {
+        let fx = Fixture::new();
+        fx.write("records/contacts/alice.md", LOOSE_ALICE);
+        fx.write("records/bob.md", LOOSE_BOB); // loose, directly under records/
+        fx.rebuild_indexes();
+        let issues = fx.store_all();
+        assert!(
+            issues.is_empty(),
+            "a rebuilt store with a catalogued loose file must validate clean, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn loose_file_with_missing_layer_jsonl_is_index_jsonl_missing() {
+        let fx = Fixture::new();
+        fx.write("records/contacts/alice.md", LOOSE_ALICE);
+        fx.write("records/bob.md", LOOSE_BOB);
+        fx.rebuild_indexes();
+        // Simulate the layer sidecar going missing (a hand-deletion / bad sync).
+        fs::remove_file(fx.dir.path().join("records/index.jsonl")).unwrap();
+        let issues = fx.store_all();
+        assert!(
+            has(&issues, codes::INDEX_JSONL_MISSING),
+            "a loose file with no layer index.jsonl must raise INDEX_JSONL_MISSING, got: {issues:?}"
         );
     }
 }

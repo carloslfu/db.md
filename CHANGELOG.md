@@ -8,9 +8,49 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.4.3**.
+  `Cargo.toml`, currently **v0.4.4**.
 
 ## [Unreleased]
+
+## [0.4.4] — 2026-06-28
+
+### Toolkit
+
+Loose files — content placed directly at a layer root (`records/<file>.md`,
+`sources/<file>.md`) with no type-folder between it and the layer — are now
+catalogued in the layer's own `index.jsonl`, so structured reads see them.
+
+Folder layout is convention, not enforcement (§ Layers), so a loose file is a
+valid store state: a bulk import or a hand-edit can produce one, though
+`dbmd write` never does (it routes every type to a canonical type-folder). The
+index was previously built only at type-folder granularity, so a loose file was
+**silently absent** from every structured surface — `dbmd query` / `index query`
+could not return it, the dedup pre-write checks and `dbmd graph` did not see it,
+and `dbmd validate --all` did not flag it — while `dbmd search` (ripgrep) and
+`dbmd stats` (a walk) *did* see it, so the surfaces silently disagreed.
+
+- **`dbmd index rebuild` and write-through** (`fm init` / `fm set` / `rename`)
+  now catalogue loose files in a layer-level `index.jsonl` — the same complete,
+  uncapped structured twin a type-folder carries, anchored at the layer dir, and
+  byte-identical between the loop and sweep paths. The layer `index.md` stays a
+  type-folder rollup; a layer with no loose files carries no `index.jsonl`, so
+  canonical stores are byte-for-byte unchanged.
+- **`dbmd query` / `index query` / `search --type` / dedup / `graph`** now see
+  loose files exactly as canonical ones, with no whole-store walk (the
+  sidecar-only read contract holds — `find_type_index_files_in` already walks
+  the whole layer for `index.jsonl` sidecars).
+- **`dbmd validate --all`** reports `INDEX_JSONL_MISSING` for a loose file
+  absent from its layer `index.jsonl` (and `INDEX_JSONL_DESYNC` /
+  `INDEX_JSONL_STALE` for a sidecar out of sync), so a loose file is never
+  *silently* uncatalogued.
+- `dbmd fm set` / `fm init` / `rename` on a loose file no longer fails with
+  "file is not inside a layer/type-folder".
+
+### Format
+
+`SPEC.md` gains a **Loose files** subsection specifying the layer `index.jsonl`
+(the corner was previously undefined). Additive and backward-compatible — no
+existing store becomes invalid — so the format stays **v0.3**.
 
 ## [0.4.3] — 2026-06-28
 

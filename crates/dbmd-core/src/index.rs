@@ -165,7 +165,13 @@ impl Index {
     }
 
     /// Build a layer catalog: every non-empty type-folder under the layer with
-    /// `(N)` counts and a newest-file `summary` preview (≤ 80 chars).
+    /// `(N)` counts and a newest-file `summary` preview (≤ 80 chars), plus the
+    /// **loose records** that live directly at the layer root (files with no
+    /// type-folder between them and the layer). The type-folder rollup is the
+    /// `index.md`; the loose records are the layer's own `index.jsonl` (so
+    /// structured reads — `query`, dedup, `graph` — see a loose file the same
+    /// way they see a canonical one). A layer with no loose files carries no
+    /// `index.jsonl`, so existing stores are byte-unchanged.
     pub fn build_layer(store: &Store, layer: Layer) -> crate::Result<Index> {
         let mut child_counts = BTreeMap::new();
         for tf in type_folders_in_layer(store, layer) {
@@ -175,9 +181,20 @@ impl Index {
                 child_counts.insert(tf, n);
             }
         }
+        let mut records = Vec::new();
+        for file_abs in loose_files_in_layer(store, layer) {
+            let rel_path =
+                rel_to_store(&store.root, &file_abs).expect("walked file is under the store root");
+            // Abort on a malformed loose file rather than skip it, mirroring
+            // `build_type_folder`: a skipped file is still a content member the
+            // validator requires to be catalogued, so dropping it would leave a
+            // permanently-invalid index. The loud `?` names the file to fix.
+            records.push(record_from_file(&file_abs, rel_path)?);
+        }
+        sort_records(&mut records);
         Ok(Index {
             level: IndexLevel::Layer(layer),
-            records: Vec::new(),
+            records,
             child_counts,
         })
     }
@@ -211,9 +228,11 @@ impl Index {
         }
     }
 
-    /// Render this type-folder catalog as the complete `index.jsonl` (one JSON
-    /// object per file, stable key order so diffs stay minimal). Type-folder
-    /// level only — root and layer stay markdown rollups.
+    /// Render this catalog's `records` as the complete `index.jsonl` (one JSON
+    /// object per file, stable key order so diffs stay minimal). Used at the
+    /// type-folder level for its files, and at the layer level for the loose
+    /// files that live directly at the layer root. The root rollup carries no
+    /// records, so it never produces a jsonl.
     pub fn to_jsonl(&self) -> String {
         let mut out = String::new();
         for rec in &self.records {
@@ -337,6 +356,12 @@ impl Index {
         if is_index_artifact(&file_rel) {
             return Ok(());
         }
+        // A loose file (directly at a layer root, no type-folder) is catalogued
+        // in its layer's own `index.jsonl`; the layer `index.md` rollup is
+        // unaffected (loose files do not change type-folder counts).
+        if let Some(layer) = loose_layer_of(&file_rel) {
+            return apply_loose_change(store, layer, &file_rel, false);
+        }
         let file_abs = store.root.join(&file_rel);
         let folder = type_folder_of(&file_rel)
             .ok_or_else(|| bad_index(&file_rel, "file is not inside a layer/type-folder"))?;
@@ -365,6 +390,16 @@ impl Index {
         // is not a content move (same reasoning as `on_write`). Skip rather than
         // insert a phantom self-row.
         if is_index_artifact(&old_rel) || is_index_artifact(&new_rel) {
+            return Ok(());
+        }
+        // If either side is a loose file (layer root, no type-folder), decompose
+        // into remove-old + add-new: each entry point routes to the correct
+        // catalog (the layer `index.jsonl` for a loose side, the type-folder for
+        // the other), giving the same end state as the cross-folder path below
+        // while reusing the tested single-file paths.
+        if loose_layer_of(&old_rel).is_some() || loose_layer_of(&new_rel).is_some() {
+            Self::on_remove(store, &old_rel)?;
+            Self::on_write(store, &new_rel)?;
             return Ok(());
         }
         let old_folder = type_folder_of(&old_rel)
@@ -422,6 +457,10 @@ impl Index {
         if is_index_artifact(&file_rel) {
             return Ok(());
         }
+        // Loose file → drop its row from the layer `index.jsonl`.
+        if let Some(layer) = loose_layer_of(&file_rel) {
+            return apply_loose_change(store, layer, &file_rel, true);
+        }
         let folder = type_folder_of(&file_rel)
             .ok_or_else(|| bad_index(&file_rel, "file is not inside a layer/type-folder"))?;
         // Serialize the sidecar read-modify-write (see `on_write`).
@@ -462,6 +501,10 @@ impl Index {
                     render_layer_md_with_store(store, &layer_idx),
                 )?;
             }
+            // The layer's own `index.jsonl` — present iff the layer has loose
+            // files directly at its root. Independent of the rollup above: a
+            // layer can have loose files but no type-folders, or vice versa.
+            write_layer_jsonl(store, layer, &layer_idx.records)?;
         }
         let root_idx = Index::build_root(store)?;
         let root_index_md = store.root.join("index.md");
@@ -504,6 +547,7 @@ impl Index {
                 } else {
                     write_atomic(&p, render_layer_md_with_store(store, &idx))?;
                 }
+                write_layer_jsonl(store, *layer, &idx.records)?;
             }
             IndexLevel::Root => {
                 let idx = Index::build_root(store)?;
@@ -1354,6 +1398,90 @@ fn type_folders_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// The layer a *loose* content file sits directly in: `<layer>/<file>.md` with
+/// no type-folder between them — exactly two path components, the first a known
+/// layer. `None` for a file inside a type-folder (`<layer>/<type>/…`, the common
+/// case) or one outside any layer. A loose file is catalogued in the layer's own
+/// `index.jsonl`, not a type-folder's.
+fn loose_layer_of(file_rel: &Path) -> Option<Layer> {
+    let mut comps = file_rel.components();
+    let layer = layer_from_dir_name(comps.next()?.as_os_str().to_str()?)?;
+    comps.next()?; // the file segment must exist…
+    if comps.next().is_some() {
+        return None; // …and be the last one (else it's inside a type-folder)
+    }
+    Some(layer)
+}
+
+/// The `.md` content files that live directly at a layer root (loose files),
+/// excluding `index.md` and any subdirectory (type-folders are walked
+/// separately). Non-recursive: only the layer's immediate children.
+fn loose_files_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
+    let layer_dir = store.root.join(layer_dir_name(layer));
+    let mut out = Vec::new();
+    let rd = match fs::read_dir(&layer_dir) {
+        Ok(rd) => rd,
+        Err(_) => return out,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        if p.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        if is_index_artifact(&p) || is_hidden(entry.file_name().as_os_str()) {
+            continue;
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// Write (or remove, when empty) a layer's own `index.jsonl` — the complete twin
+/// for the loose files that live directly at the layer root. The single funnel
+/// both write-through (`on_write`/`on_remove`/`on_rename`) and the sweeps
+/// (`rebuild_all`/`write_level`) go through, so their output is byte-identical.
+fn write_layer_jsonl(store: &Store, layer: Layer, records: &[IndexRecord]) -> crate::Result<()> {
+    let path = store.root.join(layer_dir_name(layer)).join("index.jsonl");
+    if records.is_empty() {
+        remove_if_exists(&path)?;
+        return Ok(());
+    }
+    let idx = Index {
+        level: IndexLevel::Layer(layer),
+        records: records.to_vec(),
+        child_counts: BTreeMap::new(),
+    };
+    write_atomic(&path, idx.to_jsonl())
+}
+
+/// Upsert (`removing` = false) or remove (`removing` = true) a loose file's row
+/// in its layer `index.jsonl`, serialising the read-modify-write under a folder
+/// lock (same discipline as the type-folder write-through). The layer `index.md`
+/// rollup is untouched — loose files do not change type-folder counts.
+fn apply_loose_change(
+    store: &Store,
+    layer: Layer,
+    file_rel: &Path,
+    removing: bool,
+) -> crate::Result<()> {
+    let layer_dir = store.root.join(layer_dir_name(layer));
+    let _lock = FolderLock::acquire(&layer_dir);
+    let jsonl = layer_dir.join("index.jsonl");
+    let mut records = read_jsonl_records(&jsonl)?;
+    records.retain(|r| r.path != file_rel);
+    if !removing {
+        records.push(record_from_file(
+            &store.root.join(file_rel),
+            file_rel.to_path_buf(),
+        )?);
+    }
+    sort_records(&mut records);
+    write_layer_jsonl(store, layer, &records)
 }
 
 /// The type-folder a content file belongs to: `<layer>/<type>` (the first two
@@ -3434,6 +3562,127 @@ mod tests {
         assert!(
             unix.starts_with("sources/emails/caf"),
             "the lossy leaf must remain under its folder: {unix}"
+        );
+    }
+
+    // ── loose files (directly at a layer root, no type-folder) ───────────────
+
+    #[test]
+    fn loose_file_is_catalogued_in_layer_jsonl_not_type_folder() {
+        let (_d, store) = mk_store();
+        // One canonical file (in a type-folder) and one loose file at the root.
+        write_doc(
+            &store,
+            "records/contacts/alice.md",
+            "contact",
+            Some("Alice"),
+            Some("2026-06-01T08:00:00Z"),
+            "id: alice\n",
+        );
+        write_doc(
+            &store,
+            "records/loose.md",
+            "contact",
+            Some("Loose"),
+            Some("2026-06-01T08:00:00Z"),
+            "id: loose\n",
+        );
+        Index::rebuild_all(&store).unwrap();
+
+        // The layer carries its own jsonl listing exactly the loose file —
+        // disjoint from the type-folder jsonl, so no double-count.
+        assert!(
+            exists(&store, "records/index.jsonl"),
+            "layer jsonl must exist when loose files are present"
+        );
+        let layer_jsonl = read(&store, "records/index.jsonl");
+        assert!(
+            layer_jsonl.contains("records/loose.md"),
+            "layer jsonl must list the loose file, got:\n{layer_jsonl}"
+        );
+        assert!(
+            !layer_jsonl.contains("records/contacts/alice.md"),
+            "layer jsonl must NOT list type-folder files"
+        );
+        let tf_jsonl = read(&store, "records/contacts/index.jsonl");
+        assert!(tf_jsonl.contains("records/contacts/alice.md"));
+        assert!(!tf_jsonl.contains("records/loose.md"));
+
+        // The layer index.md stays a pure type-folder rollup — no loose entry.
+        let layer_md = read(&store, "records/index.md");
+        assert!(
+            layer_md.contains("records/contacts/index"),
+            "layer md must roll up the type-folder, got:\n{layer_md}"
+        );
+        assert!(
+            !layer_md.contains("records/loose"),
+            "layer md must stay a rollup, not list loose files, got:\n{layer_md}"
+        );
+    }
+
+    #[test]
+    fn loose_file_write_through_equals_rebuild() {
+        let (_d1, wt) = mk_store();
+        let (_d2, rb) = mk_store();
+        for s in [&wt, &rb] {
+            write_doc(
+                s,
+                "records/contacts/alice.md",
+                "contact",
+                Some("Alice"),
+                Some("2026-06-01T08:00:00Z"),
+                "id: alice\n",
+            );
+            write_doc(
+                s,
+                "records/loose.md",
+                "contact",
+                Some("Loose"),
+                Some("2026-06-02T08:00:00Z"),
+                "id: loose\n",
+            );
+        }
+        // wt: write-through (loop); rb: full rebuild (sweep). Must agree byte-wise.
+        Index::on_write(&wt, Path::new("records/contacts/alice.md")).unwrap();
+        Index::on_write(&wt, Path::new("records/loose.md")).unwrap();
+        Index::rebuild_all(&rb).unwrap();
+
+        let a = snapshot_artifacts(&wt);
+        let b = snapshot_artifacts(&rb);
+        assert_eq!(
+            a.keys().collect::<Vec<_>>(),
+            b.keys().collect::<Vec<_>>(),
+            "loose-file loop and sweep must produce the same artifact set"
+        );
+        for (k, v) in &a {
+            assert_eq!(
+                v, &b[k],
+                "loose-file artifact {k} differs between loop and sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_last_loose_file_clears_layer_jsonl() {
+        let (_d, store) = mk_store();
+        write_doc(
+            &store,
+            "records/loose.md",
+            "contact",
+            Some("Loose"),
+            Some("2026-06-01T08:00:00Z"),
+            "id: loose\n",
+        );
+        Index::on_write(&store, Path::new("records/loose.md")).unwrap();
+        assert!(
+            exists(&store, "records/index.jsonl"),
+            "layer jsonl present after a loose write"
+        );
+        fs::remove_file(store.root.join("records/loose.md")).unwrap();
+        Index::on_remove(&store, Path::new("records/loose.md")).unwrap();
+        assert!(
+            !exists(&store, "records/index.jsonl"),
+            "layer jsonl must be removed once the last loose file is gone"
         );
     }
 }
