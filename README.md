@@ -202,7 +202,7 @@ db/
     │   ├── dan-ruiz.md      # Northwind, founder
     │   └── priya-shah.md    # Lumen, billing
     ├── projects/
-    │   └── northwind-site-redesign.md
+    │   └── northwind-site-redesign.md   # meta-type: operational — live status, next step
     ├── invoices/
     │   ├── 2026-039-northwind.md
     │   └── 2026-041-lumen.md
@@ -214,8 +214,9 @@ db/
 
 Each client is some evidence in `sources/` and a spread of records in
 `records/`: the contact, the project, the invoices, each linking back to the
-contract or call that produced it. The agent's read on an account
-(`accounts/northwind.md`) and on the whole book of business
+contract or call that produced it. A `project` is `operational`: its body is the
+live state, rewritten as the work moves, not a log. The agent's read on an
+account (`accounts/northwind.md`) and on the whole book of business
 (`synthesis/pipeline.md`) are `conclusion`s it keeps current as the facts move
 under them. Add a client and the shape repeats. Nothing new to stand up.
 
