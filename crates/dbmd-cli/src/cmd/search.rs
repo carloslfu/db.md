@@ -99,7 +99,7 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
         // verbatim from a type-folder `index.jsonl` sidecar, which is an
         // attacker-influenceable artifact (db.md stores are shared/cloned/
         // received). The sidecar `path` must name a real content file under one
-        // of the three layers; anything else — a top-level file inside the store
+        // of the two layers; anything else — a top-level file inside the store
         // root (`<root>/outside-secret.txt`), a non-`.md` extension, an
         // `index.md` twin — is not a searchable content body and is skipped
         // before it is ever opened. This is the gate that catches an in-root but
@@ -310,7 +310,7 @@ fn resolve_link_targets(store: &Store, targets: &[PathBuf]) -> BTreeSet<PathBuf>
     out
 }
 
-/// Every content `.md` file under the three layers, as store-relative paths.
+/// Every content `.md` file under the two layers, as store-relative paths.
 ///
 /// The no-filter candidate set. Uses the `ignore` walker (the ripgrep directory
 /// engine) over the layer roots only, so root meta files (`DB.md`, `log.md`,

@@ -2938,7 +2938,7 @@ fn path_under_prefix(bare: &str, prefix: &str) -> bool {
 
 /// The type-folder for a store-relative content path: `<layer>/<type-folder>`
 /// (the folder directly under the layer; date-shards roll up to it). `None` for
-/// files directly in a layer folder or outside the three layers.
+/// files directly in a layer folder or outside the two layers.
 fn type_folder_of(rel: &Path) -> Option<PathBuf> {
     let comps: Vec<&str> = rel.iter().filter_map(|s| s.to_str()).collect();
     if comps.len() < 3 {
@@ -2959,7 +2959,7 @@ fn type_folder_of(rel: &Path) -> Option<PathBuf> {
 ///
 /// **`log/` is NOT pruned here.** Only the *root-level* `log/` rotation archive
 /// is reserved (`Store::is_in_log_dir` checks only the first path component);
-/// the walk roots are the three layers, so the root archive is already out of
+/// the walk roots are the two layers, so the root archive is already out of
 /// scope. A `log`-named folder *inside* a layer (e.g. `records/log/` — a
 /// decision log) is real content (see `is_content_file`), so pruning every
 /// `name == "log"` made `--all` silently skip those files — reporting fewer
@@ -2998,7 +2998,7 @@ fn walk_content_files(root: &Path) -> Vec<PathBuf> {
 /// store-relative paths. Used to detect orphan indexes. Like
 /// [`walk_content_files`], a `log`-named folder *inside* a layer is real content
 /// and its `index.md` is not pruned (only the root-level `log/` archive is
-/// reserved, and the walk roots are the three layers, so it is already
+/// reserved, and the walk roots are the two layers, so it is already
 /// out of scope).
 fn walk_index_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -3722,7 +3722,7 @@ mod tests {
 
     impl Fixture {
         /// A fresh store with a **valid** `DB.md` (the identity contract:
-        /// `type: db-md` + `scope` + `owner`) and the three layer dirs. A valid
+        /// `type: db-md` + `scope` + `owner`) and the two layer dirs. A valid
         /// DB.md keeps `check_db_md` silent so a "clean store" fixture is truly
         /// clean; tests that want a broken DB.md write their own via `write`.
         fn new() -> Self {

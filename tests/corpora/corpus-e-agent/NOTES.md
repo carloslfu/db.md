@@ -1,8 +1,7 @@
 # corpus-e-agent — expected agent output (structural eval guide)
 
 This corpus is the **end-to-end agent eval** fixture (plan Block 6, line
-498; eval wiring in Block 7, line 536). Only `sources/` ships. `records/`,
-`wiki/`, `index.md`, and `log.md` are **absent on purpose** — producing
+498; eval wiring in Block 7, line 536). Only `sources/` ships. `records/`, `index.md`, and `log.md` are **absent on purpose** — producing
 them is the agent's lift. This file documents what a *correct* curator
 session should derive, so the structural eval can diff the agent's output
 against an expected entity set. It is the human-readable companion to the
@@ -12,7 +11,7 @@ is authored, it must agree with this file.
 The agent is given `dbmd spec` (the SPEC, in its system prompt) plus this
 store's `DB.md`. Nothing else. The store-specific `## Agent instructions`,
 `## Policies`, and `## Schemas` in `DB.md` are part of the lift — schema
-enforcement, the invoice→expense rule, the British-English-in-wiki rule,
+enforcement, the invoice→expense rule, the British-English-in-conclusions rule,
 the "bare role address is not a contact" rule, and the `newsletter`
 Ignored-types rule are all things the agent must honour from `DB.md`, not
 from the SPEC alone.
@@ -27,7 +26,7 @@ from the SPEC alone.
 | `sources/emails/2026/04/2026-04-15-theo-contractor-onboarding.md` | email | Theo Vance, freelance motion designer; $95/hr, 60h cap; joining the Tideform project |
 | `sources/emails/2026/04/2026-04-22-helio-type-invoice.md` | email | Helio Type Foundry invoice HT-2026-0417, $1,188 USD, due 6 May; vendor = heliotype.com; **automated `billing@` sender (not a contact)** |
 | `sources/emails/2026/05/2026-05-04-northgate-coffee-enquiry.md` | email | Sofia Reyes, founder of Northgate Coffee (northgatecoffee.co); packaging-redesign prospect, ~$12k |
-| `sources/emails/2026/05/2026-05-06-designweekly-digest.md` | **newsletter** | Marketing digest. `newsletter` is an **Ignored type** + tagged `transient` → produces NO record and NO wiki page |
+| `sources/emails/2026/05/2026-05-06-designweekly-digest.md` | **newsletter** | Marketing digest. `newsletter` is an **Ignored type** + tagged `transient` → produces NO record and NO conclusion |
 | `sources/transcripts/2026/04/2026-04-14-tideform-kickoff.md` | transcript | Tideform kickoff call; attendees Priya, Daniel, Mara, Theo; confirms **$45k** phase-one fee, 8-week term, first review week of 5 May |
 | `sources/docs/2026-04-14-tideform-sow.md` | pdf-source | Countersigned SOW; parties Lumen Labs × Tideform; **$45,000 fixed fee**, 50% on signature / 50% on delivery |
 | `sources/docs/2026-05-06-helio-type-receipt.md` | pdf-source | Receipt: invoice HT-2026-0417 **paid $1,188 on 6 May** via company card; category Software / type licences |
@@ -160,29 +159,29 @@ still parse `## Policies` without tripping.
 
 ---
 
-## Expected `wiki/`
+## Expected conclusion records (`meta-type: conclusion`)
 
-Synthesis layer, British English (per `DB.md`). Dense full-path wiki-links
+Synthesis records (`meta-type: conclusion`), British English (per `DB.md`). Dense full-path wiki-links
 back to the records and sources. The required set is small and entity/
 project-oriented; extra coherent pages are acceptable.
 
-### People (`wiki/people/`) — bios for the substantive relationships
+### People (`records/profiles/`) — bios for the substantive relationships
 
-- **`wiki/people/daniel-osei.md`** — `wiki-page`, `topic: Daniel Osei` —
+- **`records/profiles/daniel-osei.md`** — `profile` (`meta-type: conclusion`), `topic: Daniel Osei` —
   Tideform's Head of Product and the Lumen engagement's economic buyer.
   `derived_from`: the intro email, the kickoff transcript, the SOW. Links
   the contact + Tideform company + the kickoff meeting.
-- **`wiki/people/mara-lindqvist.md`** — `wiki-page` — Tideform design lead,
+- **`records/profiles/mara-lindqvist.md`** — `profile` (`meta-type: conclusion`) — Tideform design lead,
   Lumen's day-to-day contact on the rebrand. Links contact + company +
   meeting.
-- **`wiki/people/sofia-reyes.md`** — `wiki-page` — *judgment.* Founder of a
+- **`records/profiles/sofia-reyes.md`** — `profile` (`meta-type: conclusion`) — *judgment.* Founder of a
   prospect (Northgate); a thin bio is acceptable-extra. A curator may defer
-  a wiki page until the prospect converts. Not required.
+  a profile until the prospect converts. Not required.
 - *(Theo, Priya: optional bios — acceptable-extra.)*
 
-### Projects (`wiki/projects/`) — 1 expected
+### Projects (`records/projects/`) — 1 expected
 
-- **`wiki/projects/tideform-rebrand.md`** — `wiki-page`, `topic: Tideform
+- **`records/projects/tideform-rebrand.md`** — `project` (`meta-type: conclusion`), `topic: Tideform
   rebrand` — the flagship synthesis. Phase-one mobile rebrand + component
   library + marketing refresh + motion; **$45k fixed fee**, 8-week term,
   first review week of 5 May. `derived_from` the intro email, the kickoff
@@ -190,24 +189,24 @@ project-oriented; extra coherent pages are acceptable.
   contacts, and the kickoff meeting. This is the densest node in the graph
   — most backlinks point here.
 
-> A `wiki/projects/northgate-packaging.md` (prospect engagement) is
+> A `records/projects/northgate-packaging.md` (prospect engagement) is
 > ACCEPTABLE-EXTRA, not required.
 
-### What must NOT appear in `wiki/`
+### What must NOT appear in the conclusion records
 
 - **No page derived from the `newsletter`** (`2026-05-06-designweekly-digest`).
   It is an Ignored type AND tagged `transient` — two independent reasons it
-  is synthesis-excluded. A wiki page citing it in `derived_from` is an eval
+  is synthesis-excluded. A conclusion record citing it in `derived_from` is an eval
   FAILURE (and would itself raise `POLICY_IGNORED_TYPE_DERIVED`).
 
 ---
 
 ## Expected catalog (`index.md` / `index.jsonl`) — write-through, not rebuilt
 
-The `records/` and `wiki/` indexes must be **maintained write-through** by
+The `records/` indexes must be **maintained write-through** by
 the write commands as the agent works — **the agent must NOT call `dbmd index
-rebuild` in the operating loop** (a rebuild call interleaved with the record/
-wiki writes is a lifecycle failure; the catalog is write-through there).
+rebuild` in the operating loop** (a rebuild call interleaved with the record
+writes is a lifecycle failure; the catalog is write-through there).
 
 The one exception is the **shipped `sources/`**: it is the store's initial
 state — a *bulk external drop* in SPEC terms (`dbmd index rebuild` is "after a
@@ -221,9 +220,8 @@ occurs *before* the first content write; zero rebuilds appear once the
 operating loop has started. At end of session the hierarchy must exist and
 match a from-scratch rebuild:
 
-- **Root** `index.md` — lists the three layers with type-folder counts.
-- **Layer** indexes — `sources/index.md`, `records/index.md`,
-  `wiki/index.md`.
+- **Root** `index.md` — lists the two layers with type-folder counts.
+- **Layer** indexes — `sources/index.md` and `records/index.md`.
 - **Type-folder** indexes (`index.md` + complete `index.jsonl` twin) for
   every non-empty folder. Given the expected set:
   - `sources/emails/index.md` (5 files inc. the newsletter — sources are
@@ -231,8 +229,8 @@ match a from-scratch rebuild:
     (1), `sources/docs/index.md` (2)
   - `records/companies/index.md` (3), `records/contacts/index.md` (3–4),
     `records/meetings/index.md` (1), `records/invoices/index.md` (1),
-    `records/expenses/index.md` (1)
-  - `wiki/people/index.md` (2+), `wiki/projects/index.md` (1+)
+    `records/expenses/index.md` (1), `records/profiles/index.md` (2+),
+    `records/projects/index.md` (1+)
 - Every index entry **quotes the target file's `summary` verbatim**
   (`INDEX_SUMMARY_MISMATCH` if it drifts). Type-folder `index.md` entries
   are recency-ordered (newest `updated` first; ties by path ascending).
@@ -248,7 +246,7 @@ one entry per meaningful write the agent made, using recognised kinds
 (`ingest`, `create`, `update`, `link`, `validate`). Expected shape:
 
 - An `ingest` (or read) acknowledgement of the new sources near the top.
-- A `create` entry for each record + wiki page produced (object = the
+- A `create` entry for each record produced (object = the
   full-path wiki-link to the created file).
 - At least one `validate` entry in the back half of the session.
 - A final closing entry.
@@ -299,19 +297,19 @@ REQUIRED (run fails if missing or wrong):
   contacts (+ Theo)
 - Invoice: **helio-type HT-2026-0417**, status `paid`, `paid_at` 2026-05-06 (1)
 - Expense: **helio-type $1,188 on 2026-05-06**, linked to the invoice (1)
-- Wiki: **wiki/projects/tideform-rebrand** + bios for **daniel-osei** and
-  **mara-lindqvist**
-- Full index hierarchy (root + 3 layers + every non-empty type-folder, each
+- Conclusions (`meta-type: conclusion`): **records/projects/tideform-rebrand** + bios for
+  **records/profiles/daniel-osei** and **records/profiles/mara-lindqvist**
+- Full index hierarchy (root + 2 layers + every non-empty type-folder, each
   with `index.jsonl` twin) + a well-formed `log.md`
 - `dbmd validate` clean
 
 ACCEPTABLE-EXTRA (never penalised):
 - `records/companies/lumen-labs.md`; Priya/Theo bios;
-  `wiki/people/sofia-reyes`; `wiki/projects/northgate-packaging`; a Tideform
+  `records/profiles/sofia-reyes`; `records/projects/northgate-packaging`; a Tideform
   receivable `invoice`; richer cross-links.
 
 FAILURE (run is wrong if present):
-- Any record or wiki page derived from the **newsletter**.
+- Any record (fact or conclusion) derived from the **newsletter**.
 - A `contact` for any bare role/no-reply/own-inbox address
   (`billing@`, `newsletter@`, `hello@`, `accounts@`).
 - The Tideform **$45k fee modelled as an `expense`**.

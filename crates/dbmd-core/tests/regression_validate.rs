@@ -30,7 +30,7 @@ fn write(root: &Path, rel: &str, contents: &str) {
     std::fs::write(abs, contents).unwrap();
 }
 
-/// A fresh tempdir store with a valid `DB.md` identity file and the three layer
+/// A fresh tempdir store with a valid `DB.md` identity file and the two layer
 /// dirs — the same "truly clean" baseline the in-crate `Fixture::new` builds.
 fn fresh_store(dir: &Path) {
     std::fs::write(

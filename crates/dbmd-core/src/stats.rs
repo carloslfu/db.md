@@ -167,8 +167,8 @@ fn layer_dir_name(layer: Layer) -> &'static str {
 /// Recursively collect the `.md` **content** files under one layer root,
 /// skipping hidden entries (`.git`, dotfiles), the layer's immediate `log/`
 /// archive directory, and the `index.md` catalog meta files. Returns absolute
-/// paths. A missing layer root yields an empty list (a store need not have all
-/// three layers).
+/// paths. A missing layer root yields an empty list (a store need not have
+/// both layers).
 ///
 /// Only an immediate child of the layer named `log` (`sources/log/`) is the
 /// rotation-archive directory and skipped — matching `render::tree`, which

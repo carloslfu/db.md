@@ -181,7 +181,7 @@ fn writethrough_sequence_equals_rebuild_byte_for_byte() {
     // generators under its own root. They are test scaffolding, not store
     // content (no live index level lives there, and `rename`'s store-wide link
     // rewrite would otherwise wander into the golden copies). Remove them so the
-    // store under test is exactly its three layers + meta files.
+    // store under test is exactly its two layers + meta files.
     std::fs::remove_dir_all(store.join("EXPECTED")).ok();
     for entry in std::fs::read_dir(&store).unwrap() {
         let entry = entry.unwrap();
