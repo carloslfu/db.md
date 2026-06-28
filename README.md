@@ -38,6 +38,23 @@ every tool that ever touches it.
 It is not tiny. **db.md is built for stores that grow into millions of plain
 files**, with no vector database anywhere.
 
+## The short version
+
+- **A record is a file.** Fields live in YAML frontmatter, relationships are
+  `[[wiki-links]]`, and the body holds what a database row usually throws away.
+- **Two folders hold the data.** `sources/` keeps evidence as it arrived;
+  `records/` holds what the agent writes. One `DB.md` carries the identity,
+  schemas, and rules.
+- **Bring your own agent.** Claude Code, Codex, or your own reads and curates
+  the files. `dbmd`, one small Rust binary, does the search, query, validation,
+  and indexing.
+- **The agent reads indexes, not the whole store.** Every type folder keeps a
+  small derived index, so a query jumps straight to the right record instead of
+  scanning the store.
+
+New here? The [Quick start](#quick-start) is a prompt you paste into an agent.
+Everything else on this page is why the shape is this way.
+
 ## The stack collapse
 
 For decades, the default app shape was:
