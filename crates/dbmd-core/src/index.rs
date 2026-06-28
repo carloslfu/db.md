@@ -58,6 +58,7 @@ use chrono::{DateTime, FixedOffset, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::parser::FolderMeta;
 use crate::store::{Layer, Store};
 
 /// The browse-view cap for a type-folder `index.md`.
@@ -643,19 +644,25 @@ fn write_type_folder_artifacts(
 /// are rolled up, so the per-folder stat (`count` / `newest`) equals what a
 /// from-scratch walk would compute.
 fn update_parents(store: &Store, folder: &Path) -> crate::Result<()> {
-    // Read every relevant type-folder's sidecar EXACTLY ONCE into a stat cache
-    // (`count` + `newest` record), then render both rollups from the cache. The
-    // old path read each sidecar 2–3× per write — `child_counts_from_jsonl`
-    // (full parse just for a count) plus `render_layer_md_with_store` and
-    // `render_root_md_with_store` (each a full `read_jsonl_records` parse + sort
-    // just to take `.first()`). Because `index.jsonl` sidecars are uncapped and
-    // append-mostly, a single high-volume folder (months of ingested emails) made
-    // an UNRELATED tiny write reparse a multi-MB sidecar several times, turning
-    // the loop op into O(total store records) and violating the crate's O(changed)
-    // invariant (lib.rs). One streaming pass per sidecar, shared across both
-    // rollups, restores O(changed)-per-sidecar cost (and keeps the output
-    // byte-identical: `count` == `read_jsonl_records().len()` and `newest` is the
-    // same record `.first()` would yield).
+    // Read every type-folder's sidecar EXACTLY ONCE into a stat cache (`count` +
+    // `newest` record), then render both rollups from the cache. This removed the
+    // old 2–3×-per-write reparse (`child_counts_from_jsonl` for a count, plus
+    // `render_layer_md_with_store` / `render_root_md_with_store` each doing a full
+    // `read_jsonl_records` parse + sort just to take `.first()`); the output stays
+    // byte-identical (`count` == `read_jsonl_records().len()`, `newest` == its
+    // `.first()`).
+    //
+    // COST, stated honestly: this is `O(total catalogued records)` per write, NOT
+    // `O(changed)`. `collect_child_stats` reads and line-parses EVERY type-folder
+    // sidecar in the store to recompute the rollups, so a single high-volume
+    // folder (months of ingested emails) makes an unrelated tiny write scan that
+    // whole sidecar (a ~50× slowdown at ~200k records was measured). The crate's
+    // literal `Store::walk` guard holds — this reads `index.jsonl` sidecars, not
+    // the content tree — but the broader `O(changed)` complexity the loop path
+    // advertises is NOT met here. Restoring true `O(changed)` needs a persisted
+    // per-folder stat cache (or an in-place rollup patch for `on_write`); that is
+    // a deliberate change to the catalog hot path, tracked as a follow-up, not
+    // done inline. Until then, do not describe this op as `O(changed)`.
     let stats = collect_child_stats(store, &Layer::all())?;
 
     let layer = folder
@@ -666,14 +673,20 @@ fn update_parents(store: &Store, folder: &Path) -> crate::Result<()> {
     if let Some(layer) = layer {
         let p = store.root.join(layer_dir_name(layer)).join("index.md");
         if layer_has_children(&stats, layer) {
-            write_atomic(&p, render_layer_md_from_stats(layer, &stats))?;
+            write_atomic(
+                &p,
+                render_layer_md_from_stats(layer, &stats, &store.config.folders),
+            )?;
         } else {
             remove_if_exists(&p)?;
         }
     }
     let rp = store.root.join("index.md");
     if stats.values().any(|s| s.count > 0) {
-        write_atomic(&rp, render_root_md_from_stats(&stats))?;
+        write_atomic(
+            &rp,
+            render_root_md_from_stats(&stats, &store.config.folders),
+        )?;
     } else {
         remove_if_exists(&rp)?;
     }
@@ -692,7 +705,11 @@ fn layer_has_children(stats: &BTreeMap<PathBuf, FolderStat>, layer: Layer) -> bo
 /// child's count + newest summary/updated come from its single cached sidecar
 /// read, so the rollup matches the folder artifacts exactly (write-through and
 /// rebuild alike) without re-reading any sidecar.
-fn render_layer_md_from_stats(layer: Layer, stats: &BTreeMap<PathBuf, FolderStat>) -> String {
+fn render_layer_md_from_stats(
+    layer: Layer,
+    stats: &BTreeMap<PathBuf, FolderStat>,
+    folders: &BTreeMap<String, FolderMeta>,
+) -> String {
     let layer_dir = layer_dir_name(layer);
     let prefix = format!("{layer_dir}/");
     let mut max_upd: Option<DateTime<FixedOffset>> = None;
@@ -701,28 +718,15 @@ fn render_layer_md_from_stats(layer: Layer, stats: &BTreeMap<PathBuf, FolderStat
         if stat.count == 0 || !path_to_unix(tf).starts_with(&prefix) {
             continue;
         }
-        let newest = stat.newest.as_ref();
-        if let Some(u) = newest.and_then(|r| r.updated) {
+        if let Some(u) = stat.newest.as_ref().and_then(|r| r.updated) {
             max_upd = Some(match max_upd {
                 Some(cur) if cur >= u => cur,
                 _ => u,
             });
         }
         let tf_unix = path_to_unix(tf);
-        let display = capitalize(folder_basename(tf));
-        let preview = newest
-            .map(|r| truncate(&r.summary, 80))
-            .filter(|p| !p.is_empty() && p != MISSING_SUMMARY);
-        match preview {
-            Some(p) => entries.push_str(&format!(
-                "- [[{tf_unix}/index|{display}]] ({}) — {p}\n",
-                stat.count
-            )),
-            None => entries.push_str(&format!(
-                "- [[{tf_unix}/index|{display}]] ({})\n",
-                stat.count
-            )),
-        }
+        let (display, description) = folder_label(&tf_unix, folder_basename(tf), folders);
+        entries.push_str(&folder_entry(&tf_unix, &display, stat.count, description));
     }
     let mut s = String::new();
     s.push_str("---\n");
@@ -739,7 +743,10 @@ fn render_layer_md_from_stats(layer: Layer, stats: &BTreeMap<PathBuf, FolderStat
 }
 
 /// Render the root `index.md` from the prebuilt per-folder stat cache.
-fn render_root_md_from_stats(stats: &BTreeMap<PathBuf, FolderStat>) -> String {
+fn render_root_md_from_stats(
+    stats: &BTreeMap<PathBuf, FolderStat>,
+    folders: &BTreeMap<String, FolderMeta>,
+) -> String {
     let mut max_upd: Option<DateTime<FixedOffset>> = None;
     for stat in stats.values() {
         if stat.count == 0 {
@@ -777,8 +784,8 @@ fn render_root_md_from_stats(stats: &BTreeMap<PathBuf, FolderStat>) -> String {
         s.push_str(&format!("## {} ({total})\n", capitalize(layer_dir)));
         for (tf, n) in children {
             let tf_unix = path_to_unix(tf);
-            let display = capitalize(folder_basename(tf));
-            s.push_str(&format!("- [[{tf_unix}/index|{display}]] ({n})\n"));
+            let (display, description) = folder_label(&tf_unix, folder_basename(tf), folders);
+            s.push_str(&folder_entry(&tf_unix, &display, n, description));
         }
     }
     s
@@ -808,14 +815,9 @@ fn render_layer_md_with_store(store: &Store, idx: &Index) -> String {
             });
         }
         let tf_unix = path_to_unix(tf);
-        let display = capitalize(folder_basename(tf));
-        let preview = newest
-            .map(|r| truncate(&r.summary, 80))
-            .filter(|p| !p.is_empty() && p != MISSING_SUMMARY);
-        match preview {
-            Some(p) => entries.push_str(&format!("- [[{tf_unix}/index|{display}]] ({n}) — {p}\n")),
-            None => entries.push_str(&format!("- [[{tf_unix}/index|{display}]] ({n})\n")),
-        }
+        let (display, description) =
+            folder_label(&tf_unix, folder_basename(tf), &store.config.folders);
+        entries.push_str(&folder_entry(&tf_unix, &display, *n, description));
     }
     let mut s = String::new();
     s.push_str("---\n");
@@ -870,8 +872,9 @@ fn render_root_md_with_store(store: &Store, idx: &Index) -> String {
         s.push_str(&format!("## {} ({total})\n", capitalize(layer_dir)));
         for (tf, n) in children {
             let tf_unix = path_to_unix(tf);
-            let display = capitalize(folder_basename(tf));
-            s.push_str(&format!("- [[{tf_unix}/index|{display}]] ({n})\n"));
+            let (display, description) =
+                folder_label(&tf_unix, folder_basename(tf), &store.config.folders);
+            s.push_str(&folder_entry(&tf_unix, &display, *n, description));
         }
     }
     s
@@ -891,8 +894,7 @@ fn format_md_entry(rec: &IndexRecord) -> String {
     // forge a standalone catalog entry (`\n- [[…|Click me]] — injected`). The
     // CLI writers already collapse whitespace; do the same here so the spec's
     // primary write path (agents writing files directly) can't corrupt the
-    // catalog. Single-line normalization matches `truncate`'s rule (the
-    // layer/root rollups already single-line the same summary via `truncate`).
+    // catalog.
     let summary = collapse_whitespace(&rec.summary);
     let mut line = format!("- [[{path}]] — {summary}");
     if !rec.tags.is_empty() {
@@ -1275,10 +1277,15 @@ fn record_recency_cmp(a: &IndexRecord, b: &IndexRecord) -> std::cmp::Ordering {
 /// Per-child rollup stats for `layers`, read from each type-folder's on-disk
 /// `index.jsonl` (one [`read_folder_stat`] pass each) rather than walked from the
 /// content tree. The **loop-path** counterpart to the from-scratch counting in
-/// [`Index::build_layer`] / [`Index::build_root`]: it keeps [`update_parents`]
-/// `O(type-folders)` sidecar reads so a single write never re-enumerates the
-/// whole store, and reuses one read per sidecar across BOTH the layer and root
-/// rollups. Empty folders (`count == 0`) are kept out of the map.
+/// [`Index::build_layer`] / [`Index::build_root`], reusing one read per sidecar
+/// across BOTH the layer and root rollups. Empty folders (`count == 0`) are kept
+/// out of the map.
+///
+/// NOTE on cost: this performs one read per type-folder, but each read line-parses
+/// that folder's entire `index.jsonl`, so the total is `O(total catalogued
+/// records)`, not `O(type-folders)` — it reads the whole catalog every call. It
+/// avoids the content-tree walk ([`Store::walk`]), but it is NOT `O(changed)`. See
+/// [`update_parents`] for the honest bound and the follow-up to fix it.
 fn collect_child_stats(
     store: &Store,
     layers: &[Layer],
@@ -1487,20 +1494,51 @@ fn capitalize(s: &str) -> String {
 }
 
 /// Collapse all runs of whitespace (including newlines) into single spaces and
-/// trim the ends — the single-line normalization both the `index.md` browse
-/// entry ([`format_md_entry`]) and the rollup preview ([`truncate`]) share, so a
-/// multi-line block-scalar summary can never inject a newline into either.
+/// trim the ends — the single-line normalization the `index.md` browse entry
+/// ([`format_md_entry`]) applies so a multi-line block-scalar summary can never
+/// inject a newline into a catalog line.
 fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Truncate to at most `max` chars (char-boundary safe), single-line.
-fn truncate(s: &str, max: usize) -> String {
-    let one_line = collapse_whitespace(s);
-    if one_line.chars().count() <= max {
-        one_line
-    } else {
-        one_line.chars().take(max).collect()
+/// Derive a folder's display name from its basename: separators (`-`, `_`)
+/// become spaces and the first character is upper-cased (`hubspot-exports` →
+/// `Hubspot exports`). A deterministic floor — the curator overrides it via
+/// `DB.md ## Folders` (`records/x|HubSpot exports`) for casing the tool cannot
+/// guess. The tool tidies a folder's *name*; it never infers its *meaning*.
+fn default_display(basename: &str) -> String {
+    let spaced: String = basename
+        .chars()
+        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
+        .collect();
+    capitalize(&spaced)
+}
+
+/// The display name + optional description a root/layer rollup shows for a child
+/// type-folder: the curator's `## Folders` metadata when present, else the
+/// derived display name and **no description**. This is the whole anti-"tool
+/// invents the curator's judgment" contract for the rollups — a description is
+/// surfaced only when the agent authored one; it is never composed from the
+/// folder's newest member or any other content.
+fn folder_label<'a>(
+    tf_unix: &str,
+    basename: &str,
+    folders: &'a BTreeMap<String, FolderMeta>,
+) -> (String, Option<&'a str>) {
+    let meta = folders.get(tf_unix);
+    let display = meta
+        .and_then(|m| m.display.as_deref())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_display(basename));
+    (display, meta.and_then(|m| m.description.as_deref()))
+}
+
+/// One root/layer rollup entry: `- [[<tf>/index|<Display>]] (<count>)` with an
+/// ` — <description>` suffix only when the curator authored one.
+fn folder_entry(tf_unix: &str, display: &str, count: usize, description: Option<&str>) -> String {
+    match description {
+        Some(d) => format!("- [[{tf_unix}/index|{display}]] ({count}) — {d}\n"),
+        None => format!("- [[{tf_unix}/index|{display}]] ({count})\n"),
     }
 }
 
@@ -2061,7 +2099,7 @@ mod tests {
     // ── build_layer / build_root ─────────────────────────────────────────
 
     #[test]
-    fn layer_index_lists_type_folders_with_counts_and_preview() {
+    fn layer_index_lists_type_folders_with_counts() {
         let (_d, store) = mk_store();
         write_doc(
             &store,
@@ -2105,20 +2143,113 @@ mod tests {
             companies_at < contacts_at,
             "type folders must be alphabetical"
         );
-        // Count + display + newest-summary preview.
+        // Count + display only — with no `## Folders`, the rollup never invents
+        // a per-folder description from a member summary.
         assert!(
-            md.contains("- [[records/contacts/index|Contacts]] (2) — Contact B newest\n"),
+            md.contains("- [[records/contacts/index|Contacts]] (2)\n"),
             "contacts entry:\n{md}"
         );
         assert!(
-            md.contains("- [[records/companies/index|Companies]] (1) — Acme Inc\n"),
+            md.contains("- [[records/companies/index|Companies]] (1)\n"),
             "companies entry:\n{md}"
+        );
+        // Crucially: no member summary leaked into the rollup as a description.
+        assert!(
+            !md.contains("Contact B newest") && !md.contains("Acme Inc"),
+            "layer rollup must not quote a member summary:\n{md}"
         );
         // Layer `updated` is the max across children (contacts b = 05-09).
         assert!(
             md.contains("updated: 2026-05-09T00:00:00Z\n"),
             "layer updated must be max child:\n{md}"
         );
+    }
+
+    #[test]
+    fn folders_section_supplies_authored_display_and_description() {
+        // The aligned contract: rollups surface the curator's `## Folders`
+        // display + description; the tool never invents one. A folder with no
+        // entry shows counts only — no member summary leaks in as a description.
+        let (_d, mut store) = mk_store();
+        store.config.folders.insert(
+            "records/contacts".into(),
+            crate::parser::FolderMeta {
+                display: None,
+                description: Some("people across customer + prospect accounts".into()),
+            },
+        );
+        store.config.folders.insert(
+            "sources/hubspot-exports".into(),
+            crate::parser::FolderMeta {
+                display: Some("HubSpot exports".into()),
+                description: Some("deal + pipeline exports".into()),
+            },
+        );
+        write_doc(
+            &store,
+            "records/contacts/a.md",
+            "contact",
+            Some("Contact A"),
+            Some("2026-05-01T00:00:00Z"),
+            "",
+        );
+        // companies has NO `## Folders` entry → counts only.
+        write_doc(
+            &store,
+            "records/companies/x.md",
+            "company",
+            Some("Acme Inc"),
+            Some("2026-05-05T00:00:00Z"),
+            "",
+        );
+        write_doc(
+            &store,
+            "sources/hubspot-exports/d.md",
+            "hubspot-export",
+            Some("a single deal export"),
+            Some("2026-05-03T00:00:00Z"),
+            "",
+        );
+
+        Index::rebuild_all(&store).unwrap();
+
+        // Authored description surfaced (contacts), with the derived display.
+        let records_layer = read(&store, "records/index.md");
+        assert!(
+            records_layer.contains("- [[records/contacts/index|Contacts]] (1) — people across customer + prospect accounts\n"),
+            "authored description must surface:\n{records_layer}"
+        );
+        // No `## Folders` entry ⇒ counts only; the member summary never leaks in.
+        assert!(
+            records_layer.contains("- [[records/companies/index|Companies]] (1)\n")
+                && !records_layer.contains("Acme Inc"),
+            "un-described folder is counts-only:\n{records_layer}"
+        );
+
+        // Display override beats the derived "Hubspot exports".
+        let sources_layer = read(&store, "sources/index.md");
+        assert!(
+            sources_layer.contains("- [[sources/hubspot-exports/index|HubSpot exports]] (1) — deal + pipeline exports\n"),
+            "display override + description must surface:\n{sources_layer}"
+        );
+
+        // Root rollup carries the same authored metadata (display + description).
+        let root = read(&store, "index.md");
+        assert!(
+            root.contains("- [[records/contacts/index|Contacts]] (1) — people across customer + prospect accounts\n"),
+            "root surfaces authored description:\n{root}"
+        );
+        assert!(
+            root.contains("- [[sources/hubspot-exports/index|HubSpot exports]] (1) — deal + pipeline exports\n"),
+            "root surfaces display override:\n{root}"
+        );
+    }
+
+    #[test]
+    fn default_display_turns_separators_to_spaces_and_caps() {
+        assert_eq!(default_display("contacts"), "Contacts");
+        assert_eq!(default_display("hubspot-exports"), "Hubspot exports");
+        assert_eq!(default_display("usage_exports"), "Usage exports");
     }
 
     #[test]
@@ -2311,10 +2442,11 @@ mod tests {
         // The written folder is reflected in both rollups...
         let layer_md = read(&store, "records/index.md");
         let root_md = read(&store, "index.md");
-        // (layer rollup appends a summary preview, root does not)
+        // (both rollups show counts only — no `## Folders` here, so no preview)
         assert!(
-            layer_md.contains("- [[records/contacts/index|Contacts]] (1) — Sarah\n"),
-            "layer must reflect the written folder:\n{layer_md}"
+            layer_md.contains("- [[records/contacts/index|Contacts]] (1)\n")
+                && !layer_md.contains("Sarah"),
+            "layer must reflect the written folder, counts only:\n{layer_md}"
         );
         assert!(
             root_md.contains("- [[records/contacts/index|Contacts]] (1)\n"),

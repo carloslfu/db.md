@@ -7,11 +7,11 @@ updated: 2026-05-31T09:37:00-07:00
 
 # records
 
-- [[records/companies/index|Companies]] (5) — Customer; logistics SaaS on a 175-seat Acme PM contract, renewal in flight
-- [[records/contacts/index|Contacts]] (4) — Director of Ops at Northstar; renewal champion who drove the 175-seat expansion
-- [[records/expenses/index|Expenses]] (490) — 2026-05-31 — 115.19 USD — aws
-- [[records/invoices/index|Invoices]] (3) — AWS May infrastructure invoice; 1912.40 USD, unpaid (due end of month)
-- [[records/meetings/index|Meetings]] (3) — Renewal call with Northstar; agreed 175 seats, volume discount confirmed at 150
-- [[records/profiles/index|Profiles]] (2) — Elena Rodriguez bio; day-to-day Northstar operations contact on the Acme account
-- [[records/projects/index|Projects]] (1) — Northstar renewal; 120 → 175 seats, volume discount confirmed at 150, closed May
-- [[records/synthesis/index|Synthesis]] (1) — Signed-off 2026 Northstar renewal plan; frozen page — the toolkit refuses writes
+- [[records/companies/index|Companies]] (5)
+- [[records/contacts/index|Contacts]] (4)
+- [[records/expenses/index|Expenses]] (490)
+- [[records/invoices/index|Invoices]] (3)
+- [[records/meetings/index|Meetings]] (3)
+- [[records/profiles/index|Profiles]] (2)
+- [[records/projects/index|Projects]] (1)
+- [[records/synthesis/index|Synthesis]] (1)

@@ -78,7 +78,7 @@ fn regression_rebuild_layer_refreshes_root_index_counts() {
     );
     let records_layer = std::fs::read_to_string(store.join("records/index.md")).unwrap();
     assert!(
-        records_layer.contains("- [[records/contacts/index|Contacts]] (5) —"),
+        records_layer.contains("- [[records/contacts/index|Contacts]] (5)\n"),
         "layer rollup must show 5 contacts:\n{records_layer}"
     );
 

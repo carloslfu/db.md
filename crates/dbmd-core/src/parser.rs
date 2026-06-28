@@ -502,6 +502,26 @@ pub struct Config {
     pub ignored_types: Vec<String>,
     /// `## Schemas` → one entry per `### <type>` sub-section.
     pub schemas: BTreeMap<String, Schema>,
+    /// `## Folders` → optional per-folder display + description, surfaced in the
+    /// root + layer `index.md` rollups. Agent-authored; the tool never invents a
+    /// folder's description (absent ⇒ the rollup shows counts only). Keyed by the
+    /// store-relative, unix-slash folder path (e.g. `records/contacts`).
+    pub folders: BTreeMap<String, FolderMeta>,
+}
+
+/// Agent-authored display + description for one type-folder, declared in
+/// `DB.md ## Folders` and surfaced in the root/layer `index.md` rollups. Both
+/// fields are optional: `display` overrides the rollup's derived folder name
+/// (for casing the tool can't guess, e.g. acronyms like HubSpot); `description`
+/// is the one-line "what's in here" the rollup shows. The tool only ever
+/// *surfaces* these — it never composes a folder description from the folder's
+/// contents (that would be the tool inventing the curator's judgment).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FolderMeta {
+    /// Display-name override (absent ⇒ derived from the folder basename).
+    pub display: Option<String>,
+    /// One-line folder description shown in the rollup (absent ⇒ counts only).
+    pub description: Option<String>,
 }
 
 impl Config {
@@ -850,8 +870,15 @@ pub fn extract_wiki_links(body: &str, file: &Path) -> Vec<WikiLink> {
 
     let mut out = Vec::new();
     for (line_idx, line) in body.lines().enumerate() {
+        // Running (byte, char) cursor: derive each match's column in ONE linear
+        // pass over the line instead of recomputing it from the line start per
+        // match. `captures_iter` yields non-overlapping matches in increasing
+        // byte order, so advancing the char count by the gap since the previous
+        // match keeps the whole line O(line_len) rather than O(matches × len).
+        let mut cursor = ColCursor::new();
         for caps in re.captures_iter(line) {
             let whole = caps.get(0).expect("group 0 always present");
+            let col = cursor.column_at(line, whole.start());
             let target = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
             let display = caps.get(2).map(|m| m.as_str().to_string());
             out.push(WikiLink {
@@ -859,11 +886,7 @@ pub fn extract_wiki_links(body: &str, file: &Path) -> Vec<WikiLink> {
                 has_md_extension: target_has_md_extension(&target),
                 target,
                 display,
-                location: (
-                    file.to_path_buf(),
-                    (line_idx as u32) + 1,
-                    char_column(line, whole.start()),
-                ),
+                location: (file.to_path_buf(), (line_idx as u32) + 1, col),
             });
         }
     }
@@ -882,16 +905,16 @@ pub fn extract_markdown_links(body: &str, file: &Path) -> Vec<MarkdownLink> {
 
     let mut out = Vec::new();
     for (line_idx, line) in body.lines().enumerate() {
+        // One linear column cursor per line (see `extract_wiki_links`): avoids the
+        // O(matches × line_len) recompute on a link-dense line.
+        let mut cursor = ColCursor::new();
         for caps in re.captures_iter(line) {
             let whole = caps.get(0).expect("group 0 always present");
+            let col = cursor.column_at(line, whole.start());
             out.push(MarkdownLink {
                 text: caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string(),
                 url: caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string(),
-                location: (
-                    file.to_path_buf(),
-                    (line_idx as u32) + 1,
-                    char_column(line, whole.start()),
-                ),
+                location: (file.to_path_buf(), (line_idx as u32) + 1, col),
             });
         }
     }
@@ -1084,6 +1107,14 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
                     if !prose.is_empty() {
                         config.agent_instructions = Some(prose);
                     }
+                } else if name == "folders" {
+                    // `## Folders` carries its bullets directly under the H2 (no
+                    // `### <type>` sub-sections), like `## Agent instructions`.
+                    for b in bullet_lines(&section.body) {
+                        if let Some((path, meta)) = parse_folder_bullet(&b) {
+                            config.folders.insert(path, meta);
+                        }
+                    }
                 }
             }
             3 => {
@@ -1195,6 +1226,60 @@ fn parse_schema_bullet(bullet_line: &str) -> SchemaBullet {
     }
 
     SchemaBullet::Field(parse_field_spec(bullet_line))
+}
+
+/// Parse one `## Folders` bullet — `- <path>[|<display>] — <description>` — into
+/// the folder path (store-relative, unix-slash, no trailing slash) and its
+/// [`FolderMeta`]. The optional `|<display>` overrides the rollup's derived
+/// folder name (mirroring the wiki-link `|display` convention); the text after
+/// the first em-dash (`—`), or ` - `, is the description. Backticks around the
+/// path are tolerated (matching the `### Frozen pages` spelling). Returns `None`
+/// for a bullet with no usable path.
+fn parse_folder_bullet(bullet_line: &str) -> Option<(String, FolderMeta)> {
+    let line = bullet_line.trim();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+        .or_else(|| line.strip_prefix('-'))
+        .unwrap_or(line)
+        .trim();
+
+    // Split off the description at the first em-dash (preferred, matching the
+    // rollup's own ` — ` separator) or a ` - ` fallback.
+    let (pathspec, description) = match line.find('—') {
+        Some(i) => (line[..i].trim(), Some(line[i + '—'.len_utf8()..].trim())),
+        None => match line.find(" - ") {
+            Some(i) => (line[..i].trim(), Some(line[i + 3..].trim())),
+            None => (line, None),
+        },
+    };
+
+    // Optional `|display` override lives on the path side.
+    let (path_raw, display) = match pathspec.split_once('|') {
+        Some((p, d)) => (p.trim(), Some(d.trim())),
+        None => (pathspec, None),
+    };
+
+    // Normalize the path: drop surrounding backticks, a leading `./`, a trailing `/`.
+    let path = path_raw.trim().trim_matches('`').trim();
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path).trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    Some((
+        path.to_string(),
+        FolderMeta {
+            display: display.and_then(non_empty),
+            description: description.and_then(non_empty),
+        },
+    ))
 }
 
 /// Parse a single `## Schemas` field-bullet line — `- <name> (<modifiers>)` —
@@ -1743,9 +1828,35 @@ fn target_has_md_extension(target: &str) -> bool {
     target.trim().ends_with(".md")
 }
 
-/// 1-based character (Unicode scalar) column of `byte_offset` within `line`.
-fn char_column(line: &str, byte_offset: usize) -> u32 {
-    (line[..byte_offset].chars().count() as u32) + 1
+/// A forward-only cursor that yields the 1-based character (Unicode scalar)
+/// column of successive byte offsets within a single line in ONE linear pass.
+///
+/// The previous helper recomputed `line[..offset].chars().count()` from the line
+/// start for every match, so a line with N matches cost O(N × line_len) — a
+/// quadratic blowup on a link-dense line. Because regex matches arrive in
+/// non-decreasing byte order, this cursor advances the char count only across the
+/// gap since the last queried offset, giving O(line_len) total per line.
+///
+/// Offsets MUST be queried in non-decreasing order and must fall on UTF-8
+/// character boundaries (regex match starts always do).
+struct ColCursor {
+    byte: usize,
+    chars: u32,
+}
+
+impl ColCursor {
+    fn new() -> Self {
+        ColCursor { byte: 0, chars: 0 }
+    }
+
+    /// 1-based character column of `byte_offset` in `line`. `byte_offset` must be
+    /// `>=` every previously queried offset (debug-asserted).
+    fn column_at(&mut self, line: &str, byte_offset: usize) -> u32 {
+        debug_assert!(byte_offset >= self.byte, "ColCursor queried out of order");
+        self.chars += line[self.byte..byte_offset].chars().count() as u32;
+        self.byte = byte_offset;
+        self.chars + 1
+    }
 }
 
 /// Index of the first comma-token in `raw[from..]` that *starts a greedy
@@ -2641,6 +2752,21 @@ mod tests {
         assert_eq!(links.len(), 1);
         // "café " is 5 chars, so the `[[` starts at char column 6 (1-based).
         assert_eq!(links[0].location.2, 6);
+    }
+
+    #[test]
+    fn extract_wiki_links_columns_are_correct_for_multiple_links_on_one_line() {
+        // Locks the single-pass column cursor (the O(n²)→O(n) fix): each `[[`
+        // reports the right 1-based CHAR column even with multi-byte prefixes and
+        // several links per line.
+        let body = "café [[a]] · [[records/x/y]] end";
+        let links = extract_wiki_links(body, Path::new("d.md"));
+        assert_eq!(links.len(), 2);
+        // "café " = 5 chars → first `[[` at col 6.
+        assert_eq!(links[0].location.2, 6);
+        // "café [[a]] · " = 5 + 5 (`[[a]]`) + 3 (` · `, `·` is 1 char) = 13 chars
+        // → second `[[` at col 14.
+        assert_eq!(links[1].location.2, 14);
     }
 
     #[test]

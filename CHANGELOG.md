@@ -12,6 +12,27 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Toolkit
+
+#### Changed
+
+- **Root and layer `index.md` rollups no longer invent a per-folder
+  description.** Each rollup entry previously appended the *newest member
+  file's* `summary` truncated to 80 chars — a mid-word cut (`… renewal in
+  fli`) that read as one member masquerading as the whole folder, and that
+  churned the catalog on every write. Rollups now show
+  `- [[<folder>/index|Name]] (N)` (counts only). Folder display names also
+  tidy separators (`hubspot-exports` → `Hubspot exports`). Removes the dead
+  `truncate` helper.
+
+#### Added
+
+- **Optional `DB.md ## Folders` section** — agent-authored per-folder
+  display and description, surfaced in the root/layer rollups
+  (`- [[…|HubSpot exports]] (N) — deal + pipeline exports`); absent ⇒ counts
+  only. The tool only *surfaces* curator-authored text; it never composes a
+  folder description from the folder's contents.
+
 ## [0.4.0] — 2026-06-23
 
 ### Format — v0.3 (breaking: three layers collapse to two, plus a `meta-type` field)
