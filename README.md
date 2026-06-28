@@ -22,8 +22,9 @@ programs could not read and maintain meaning-rich state directly, so messy
 reality had to be squeezed into tables before software could use it.
 
 **That workaround is expiring.** A capable agent reads the files, writes them,
-links them, and finds the connections between them by meaning. The agent is the
-engine.
+links them, and finds the connections between them by meaning.
+
+The agent is the engine.
 
 And the engine is the bet. **A db.md store gets sharper every time the model
 behind it improves.** A better model can read the same files with more context,
@@ -40,14 +41,16 @@ files**, with no vector database anywhere.
 
 ## The short version
 
+- **An agent operates the store directly.** It reads, writes, links, repairs,
+  and migrates the files. No query language, no service, nothing in between.
 - **A record is a file.** Fields live in YAML frontmatter, relationships are
   `[[wiki-links]]`, and the body holds what a database row usually throws away.
 - **Two folders hold the data.** `sources/` keeps evidence as it arrived;
   `records/` holds what the agent writes. One `DB.md` carries the identity,
   schemas, and rules.
-- **Bring your own agent.** Claude Code, Codex, or your own reads and curates
-  the files. `dbmd`, one small Rust binary, does the search, query, validation,
-  and indexing.
+- **Bring your own agent.** Claude Code, Codex, or your own; db.md ships no
+  model. `dbmd`, one small Rust binary, does the search, query, validation, and
+  indexing.
 - **The agent reads indexes, not the whole store.** Every type folder keeps a
   small derived index, so a query jumps straight to the right record instead of
   scanning the store.
@@ -262,30 +265,34 @@ v0.3, and from here changes are additive. See the [CHANGELOG](CHANGELOG.md).
 
 A wave of products sells "memory" for agents, and a longer history of databases
 sells structure. Each ships a system you adopt and maintain; db.md ships a
-convention you own. To see the difference, ask three questions of every option:
-what sits in the middle, what does it ride on as the world improves, and what
-has to stay true for it to work. **db.md puts nothing in the middle, rides the
-model curve directly, and bets that models improve faster than schema matters.**
-The alternatives either ride on machinery you maintain (which only improves when
-someone does the work), bet that format standardization solves the problem, or
-bake the data into model weights you cannot read.
+convention you own. To see the difference, ask four questions of every option:
+who operates the live store, what sits between the agent and the data, what it
+rides on as the world improves, and what has to stay true for it to work. **db.md
+is the only one an agent operates directly: it puts nothing between the agent and
+the data, rides the model curve, and bets that models improve faster than schema
+matters.** The alternatives either ride on machinery you maintain (which only
+improves when someone does the work), bet that format standardization solves the
+problem, or bake the data into model weights you cannot read.
 
 Each row is an approach, tagged by **kind**; rows are grouped by kind, so you
-can read down by paradigm or jump to a product you already know by name.
+can read down by paradigm or jump to a product you already know by name. But one
+column settles it: who operates the live store. Read it down the page and db.md
+stands alone as the agent. That is not a property db.md has more of; it is the
+premise it is built on.
 
-| Approach | Kind | What sits between you and your data | What it rides on | The bet / what has to stay true |
-|---|---|---|---|---|
-| **db.md** | Files, direct | nothing. The data is the files. You read and edit them directly, and so does the agent | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index | agents improve faster than infrastructure. Two layers (sources + records) plus a meta-type field and schema repair work because models are smart enough. Files outlast all tools |
-| Karpathy's LLM Wiki | Files, direct | nothing. Plain markdown the model reads directly | the model curve. Better models read files better, with no index to rebuild | models improve fast enough to read context directly. The foundational idea db.md builds on |
-| Open Knowledge Format (OKF) | Files, direct | nothing. The data is files; linking is standard markdown | format standardization, not model improvement. Works at any capability level | format simplicity is the bottleneck, not model capability. A shared spec enables exchange across orgs and systems. Google's spec; portability-first, not operational database work |
-| GBrain | Retrieval stack | a Postgres + pgvector engine and reranker in front of the files | the model curve **and** a maintained graph+embedding stack | files alone aren't enough; the graph and index are load-bearing. Its own benchmark says the graph carries the result and the embeddings add almost nothing |
-| Mem0 | Retrieval stack | a vector-and-graph service you call; your memories mediated by a retrieval stack | an extract → embed → retrieve pipeline you maintain | similarity retrieval over extracted facts beats reading files. Its 2026 migration adds ADD-only extraction, hybrid search, and entity linking, moving toward dated, linked facts |
-| Zep / Graphiti | Retrieval stack | a hosted temporal knowledge graph and its API, a second structure kept in step with your data | a derived graph you keep synced | a temporal graph layer beats raw files, and the sync cost is worth it |
-| Microsoft GraphRAG | Retrieval stack | a knowledge graph an LLM extracts from your corpus, plus community summaries and an index, queried instead of the files | an offline extraction pipeline you re-run as the corpus changes, plus the model | an LLM-built graph answers better than reading the files, and the derived graph is worth extracting, storing, and rebuilding as data drifts |
-| Letta / MemGPT | Memory runtime | a runtime and retrieval layer around the context window (editable memory blocks plus archival retrieval) | a memory-management runtime you adopt | managing what's in context beats durable files. db.md keeps durable state as files instead |
-| Cartridges / Engram | Parametric | the model's own weights. The data is dissolved into parameters and a trained KV-cache; nobody reads or edits it, not you and not the agent | its own training research (cartridges, sparse memory fine-tuning, continual learning) plus two bets: that reading the whole context at query time stays costly enough to amortize into weights once, and that doing so beats long-context recall. The amortization bet is real; the recall bet runs *against* the model curve, and as long-context gets cheaper and sharper that half of the wedge shrinks | context is too lossy and too costly to read at query time, so knowledge must be baked into weights offline. Updating a fact means re-distillation; erasing one is training-side, not a file edit; provenance has no address |
-| SQL / graph (Neo4j) | Structured DB | a schema you design up front, a query language (SQL or Cypher), and an app to drive it | your schema and the app layer. Better models write better queries, but the store's meaning lives outside the model | a relational or graph schema, designed up front, is stable enough. Apps mediate between the model and the data. Migrations are acceptable costs |
-| Airtable, Notion | SaaS | a vendor's service you rent, your data on their servers, exports that commonly lose live behavior, views, formulas, relations | the vendor's roadmap and release cycle. You get the AI they bolt on, when they ship it, inside their walls | outsourcing is cheaper than operating. Vendor roadmap aligns with your needs. Platform lock-in is acceptable |
+| Approach | Who operates the live store | Kind | What sits between the agent and the data | What it rides on | The bet / what has to stay true |
+|---|---|---|---|---|---|
+| **db.md** | the agent, on the files directly | Files, direct | nothing. The data is the files. The agent reads and edits them directly, and so can you | the model curve, directly. Every new model works the same files better, with no vendor migration and no proprietary index | agents improve faster than infrastructure. Two layers (sources + records) plus a meta-type field and schema repair work because models are smart enough. Files outlast all tools |
+| Karpathy's LLM Wiki | the agent, on the files | Files, direct | nothing. Plain markdown the model reads directly | the model curve. Better models read files better, with no index to rebuild | models improve fast enough to read context directly. The foundational idea db.md builds on |
+| Open Knowledge Format (OKF) | no one; it is an interchange format | Files, direct | nothing. The data is files; linking is standard markdown | format standardization, not model improvement. Works at any capability level | format simplicity is the bottleneck, not model capability. A shared spec enables exchange across orgs and systems. Google's spec; portability-first, not operational database work |
+| GBrain | a retrieval pipeline you maintain | Retrieval stack | a Postgres + pgvector engine and reranker in front of the files | the model curve **and** a maintained graph+embedding stack | files alone aren't enough; the graph and index are load-bearing. Its own benchmark says the graph carries the result and the embeddings add almost nothing |
+| Mem0 | a retrieval service you call | Retrieval stack | a vector-and-graph service you call; your memories mediated by a retrieval stack | an extract → embed → retrieve pipeline you maintain | similarity retrieval over extracted facts beats reading files. Its 2026 migration adds ADD-only extraction, hybrid search, and entity linking, moving toward dated, linked facts |
+| Zep / Graphiti | a synced graph and its API | Retrieval stack | a hosted temporal knowledge graph and its API, a second structure kept in step with your data | a derived graph you keep synced | a temporal graph layer beats raw files, and the sync cost is worth it |
+| Microsoft GraphRAG | an offline extraction pipeline | Retrieval stack | a knowledge graph an LLM extracts from your corpus, plus community summaries and an index, queried instead of the files | an offline extraction pipeline you re-run as the corpus changes, plus the model | an LLM-built graph answers better than reading the files, and the derived graph is worth extracting, storing, and rebuilding as data drifts |
+| Letta / MemGPT | a memory-management runtime | Memory runtime | a runtime and retrieval layer around the context window (editable memory blocks plus archival retrieval) | a memory-management runtime you adopt | managing what's in context beats durable files. db.md keeps durable state as files instead |
+| Cartridges / Engram | no one; it lives in the weights | Parametric | the model's own weights. The data is dissolved into parameters and a trained KV-cache; nobody reads or edits it, not you and not the agent | its own training research (cartridges, sparse memory fine-tuning, continual learning) plus two bets: that reading the whole context at query time stays costly enough to amortize into weights once, and that doing so beats long-context recall. The amortization bet is real; the recall bet runs *against* the model curve, and as long-context gets cheaper and sharper that half of the wedge shrinks | context is too lossy and too costly to read at query time, so knowledge must be baked into weights offline. Updating a fact means re-distillation; erasing one is training-side, not a file edit; provenance has no address |
+| SQL / graph (Neo4j) | an app, via a query language | Structured DB | a schema you design up front, a query language (SQL or Cypher), and an app to drive it | your schema and the app layer. Better models write better queries, but the store's meaning lives outside the model | a relational or graph schema, designed up front, is stable enough. Apps mediate between the model and the data. Migrations are acceptable costs |
+| Airtable, Notion | the vendor's app | SaaS | a vendor's service you rent, your data on their servers, exports that commonly lose live behavior, views, formulas, relations | the vendor's roadmap and release cycle. You get the AI they bolt on, when they ship it, inside their walls | outsourcing is cheaper than operating. Vendor roadmap aligns with your needs. Platform lock-in is acceptable |
 
 The fight db.md picks most directly is with the retrieval stack. **db.md
 computes, stores, and searches no vector, ever.** RAG engineers a retrieval
