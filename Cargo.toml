@@ -10,9 +10,12 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
-rust-version = "1.85"
+# MSRV 1.88: forced by the `pdf-extract 0.12` security update (RUSTSEC-2026-0187),
+# whose `lopdf 0.42` uses stable let-chains (Rust 1.88+). Verified as the exact
+# floor — 1.87 fails to compile `lopdf`, 1.88 builds the whole workspace clean.
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/carloslfu/db.md"
 authors = ["Carlos Galarza"]
@@ -51,7 +54,10 @@ quick-xml = "0.40"        # docx/epub OOXML + XHTML parse (MIT)
 # DEFLATE backend it keeps pulls in `flate2` → `zlib-rs` (Zlib) + `zopfli`
 # (Apache-2.0); both are permissive and recorded in THIRD_PARTY_NOTICES (the
 # Zlib obligation is why `Zlib` is on the allowlist).
-# Keep this on 7.x while the workspace MSRV is Rust 1.85; zip 8.x requires 1.88.
+# Kept on 7.x deliberately: the deflate-only feature set is all docx/xlsx/epub
+# need and it keeps the dependency surface small. (The workspace MSRV is now 1.88,
+# so zip 8.x's 1.88 requirement is no longer the blocker; bumping it is a
+# separate, unneeded change.)
 zip = { version = "7.2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 insta = "1"

@@ -8,9 +8,23 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.4.2**.
+  `Cargo.toml`, currently **v0.4.3**.
 
 ## [Unreleased]
+
+## [0.4.3] — 2026-06-28
+
+### Toolkit
+
+#### Changed
+
+- **MSRV raised to Rust 1.88.** The `pdf-extract 0.12` security update
+  (RUSTSEC-2026-0187, shipped in 0.4.1) pulls in `lopdf 0.42`, which uses stable
+  let-chains and no longer compiles on Rust 1.85 — so the declared
+  `rust-version = "1.85"` had become inaccurate (a source build on 1.85 failed).
+  The declaration now matches reality (verified: 1.87 fails to compile `lopdf`,
+  1.88 builds the workspace clean), and the MSRV CI job checks 1.88. Prebuilt
+  binaries, `brew`, and `cargo install` on stable are unaffected.
 
 ## [0.4.2] — 2026-06-28
 
