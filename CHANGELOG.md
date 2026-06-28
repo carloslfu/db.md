@@ -8,9 +8,11 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.4.0**.
+  `Cargo.toml`, currently **v0.4.1**.
 
 ## [Unreleased]
+
+## [0.4.1] — 2026-06-28
 
 ### Toolkit
 
@@ -77,6 +79,12 @@ Two things version independently:
   rewrite a file **outside the store root** (plus catalog a stale entry pointing
   at it). They now resolve the path through `ensure_path_within_store` and refuse
   with `PATH_OUTSIDE_STORE`.
+- **Bumped `pdf-extract` 0.10 → 0.12 (pulls `lopdf` ≥ 0.42) to clear
+  [RUSTSEC-2026-0187](https://rustsec.org/advisories/RUSTSEC-2026-0187)** — an
+  unbounded-recursion stack overflow in `lopdf`'s PDF parser that a ~21 KB
+  deeply-nested PDF could trigger to abort the process (a `SIGABRT` that
+  `catch_unwind` cannot contain). `dbmd extract` on an untrusted PDF was exposed;
+  the patched parser bounds nesting depth. No API or extraction-output change.
 
 ## [0.4.0] — 2026-06-23
 
