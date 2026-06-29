@@ -634,3 +634,117 @@ fn regression_rename_non_creatable_destination_leaves_linkers_untouched() {
         "the source must survive a failed rename"
     );
 }
+
+/// Path-safety / data-loss — `rename` must rewrite incoming wiki-links ONLY in
+/// db.md content files (under `sources/` or `records/`), never in files outside
+/// the two content layers (SPEC § content files). The pre-fix handler fed
+/// `find_links_to` — which rides `walk_all_md`, a walk from the store ROOT — into
+/// the rewrite loop unfiltered, so a `[[old]]` line in a store-root file, a
+/// `scratch/` draft, an `EXPECTED/` test golden, or an `archive/` frozen copy was
+/// silently mutated `old → new`, corrupting files the tool does not own. The
+/// sibling `graph backlinks` already filters the same scan through the content
+/// predicate and correctly returns `[]` for those files; this test pins that the
+/// MUTATING surface now agrees:
+///   - the real content-layer linker IS rewritten,
+///   - the four non-layer files are byte-for-byte UNCHANGED,
+///   - `links_rewritten` counts ONLY the content rewrite (no over-count),
+///   - `graph backlinks` for the old target stays empty (the contrast surface).
+///
+/// Pre-fix every one of the four non-layer files is rewritten and
+/// `links_rewritten` is inflated to 5; post-fix only the content linker changes.
+#[test]
+fn regression_rename_rewrites_only_content_layer_files() {
+    let store = Store::new();
+    store.seed(
+        "records/contacts/alice.md",
+        "---\ntype: contact\nsummary: Alice\n---\n# Alice\n",
+    );
+    // A REAL content-layer linker that MUST be rewritten.
+    let content_before =
+        "---\ntype: note\nsummary: s\n---\nMet [[records/contacts/alice]] today.\n";
+    store.seed("records/meetings/2026/06/m.md", content_before);
+
+    // Four files OUTSIDE the two content layers, each carrying a `[[old]]` line.
+    // None of these is db.md content; `rename` must never touch their bytes.
+    let root_before = "Top-level note linking [[records/contacts/alice]].\n";
+    store.seed("NOTES.md", root_before); // store-root file
+    let scratch_before =
+        "---\ntype: note\nsummary: draft\n---\nMentions [[records/contacts/alice]].\n";
+    store.seed("scratch/draft.md", scratch_before); // non-layer dir
+    let expected_before = "GOLDEN references [[records/contacts/alice]] verbatim.\n";
+    store.seed("EXPECTED/snapshot.md", expected_before); // test golden
+    let archive_before = "ARCHIVE frozen: [[records/contacts/alice]]\n";
+    store.seed("archive/old.md", archive_before); // frozen copy
+
+    let out = store.run(&[
+        "--json",
+        "rename",
+        "records/contacts/alice.md",
+        "records/contacts/bob.md",
+    ]);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "the rename must succeed; stderr: {}",
+        out.stderr
+    );
+
+    // The real content-layer linker WAS retargeted.
+    let content_after =
+        std::fs::read_to_string(store.abs("records/meetings/2026/06/m.md")).unwrap();
+    assert!(
+        content_after.contains("[[records/contacts/bob]]")
+            && !content_after.contains("[[records/contacts/alice]]"),
+        "the content linker must be retargeted; got: {content_after}"
+    );
+
+    // The four NON-LAYER files are byte-for-byte UNCHANGED — the data-loss fix.
+    assert_eq!(
+        std::fs::read_to_string(store.abs("NOTES.md")).unwrap(),
+        root_before,
+        "a store-root file must NOT be rewritten by rename"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.abs("scratch/draft.md")).unwrap(),
+        scratch_before,
+        "a scratch/ file (non-layer dir) must NOT be rewritten by rename"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.abs("EXPECTED/snapshot.md")).unwrap(),
+        expected_before,
+        "an EXPECTED/ test golden must NOT be rewritten by rename"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.abs("archive/old.md")).unwrap(),
+        archive_before,
+        "an archive/ frozen copy must NOT be rewritten by rename"
+    );
+
+    // The reported rewrite count reflects ONLY the content rewrite — not the four
+    // non-layer files (pre-fix this was 5, the over-count called out in the bug).
+    let v = out.stdout_json();
+    assert_eq!(
+        v["links_rewritten"], 1,
+        "only the content-layer linker counts as rewritten; got {v}"
+    );
+
+    // Contrast surface: `graph backlinks` for the OLD target already ignored the
+    // non-layer files. After the rename the old path has no backlinks at all.
+    let bl = store.run(&["--json", "graph", "backlinks", "records/contacts/alice"]);
+    assert_eq!(
+        bl.code,
+        Some(0),
+        "graph backlinks must succeed; stderr: {}",
+        bl.stderr
+    );
+    // `graph backlinks --json` emits a bare JSON array of store-relative paths.
+    let bl_json = bl.stdout_json();
+    let count = bl_json
+        .as_array()
+        .map(|a| a.len())
+        .expect("graph backlinks --json must be an array");
+    assert_eq!(
+        count, 0,
+        "the renamed-away target must have no backlinks; got {bl_json}"
+    );
+}

@@ -132,6 +132,12 @@ pub fn run_query(ctx: &Context, args: &FmQueryArgs) -> CliResult {
     }
 
     let mut records = into_cli(query.execute(&store))?;
+    // `query.execute` concatenates per-sidecar reads in sidecar-PATH order, which
+    // is NOT globally record-path-sorted once a layer mixes loose files (a
+    // layer-root sidecar) with type-folders (whose sidecar path sorts after the
+    // loose file's record path). Sort by record path so the enumeration — and the
+    // `--limit` cap below — match `dbmd query` / `dbmd index query` exactly.
+    records.sort_by(|a, b| a.path.cmp(&b.path));
     if let Some(limit) = args.limit {
         records.truncate(limit);
     }

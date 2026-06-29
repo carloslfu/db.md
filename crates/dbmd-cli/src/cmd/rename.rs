@@ -171,6 +171,28 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     let mut rewritten_linkers: Vec<PathBuf> = Vec::new();
     let mut skip_warnings: Vec<String> = Vec::new();
     for linker_rel in &linkers {
+        // ── Layer guard: rename only rewrites CONTENT files ──────────────────
+        // `find_links_to` rides `Store::find_links_to_any`, whose scan
+        // (`walk_all_md`) walks from the store ROOT and so reports `[[old]]` text
+        // wherever it lives — store-root files (`NOTES.md`), non-layer dirs
+        // (`scratch/`, `EXPECTED/` test goldens, `archive/` frozen copies), and
+        // `index.md` catalogs alike. Those are NOT db.md content (SPEC § content
+        // files = everything under `sources/` and `records/` ONLY); `rename` does
+        // not own their bytes and must never rewrite them in place — that is the
+        // silent-mutation / data-loss bug this guard closes. The sibling
+        // `graph backlinks` already filters the same scan through the content
+        // predicate and correctly ignores these files; here we make the *mutating*
+        // surface agree, via the same canonical predicate
+        // (`dbmd_core::store::is_content_path`, the first-component layer check
+        // the graph engine's `is_content_rel` uses). The read-only working-set
+        // validate scan (`find_links_to_any`) is untouched — the filter lives at
+        // rename's point of mutation. The moved file's own self-link
+        // (`linker_rel == old_rel`) is exempt: it is rewritten in place and then
+        // carried to `<new>` by the deferred move, so a rename of a (rare)
+        // non-content `<old>` still self-retargets correctly.
+        if linker_rel != &old_rel && !dbmd_core::store::is_content_path(linker_rel) {
+            continue;
+        }
         // The linker is rewritten at its CURRENT path (`<old>` for a self-link),
         // because the move has not happened yet.
         let linker_abs = store.abs_path(linker_rel);

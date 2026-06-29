@@ -226,25 +226,41 @@ fn wiki_link_regex() -> Regex {
     Regex::new(r"\[\[([^\[\]|]+)(?:\|[^\]]*)?\]\]").expect("static wiki-link regex is valid")
 }
 
-/// Every wiki-link target in a file's full text (frontmatter + body), trimmed,
-/// with any trailing `.md` removed. Order-preserving; not deduped.
+/// Every wiki-link target in a file (frontmatter + body), trimmed, with any
+/// trailing `.md` removed. Order-preserving (frontmatter targets first, then
+/// body); not deduped. stats deliberately counts links in BOTH regions as edges.
 ///
-/// Fenced code blocks (```/~~~) are skipped, mirroring
-/// `validate::extract_wiki_links`: a `[[...]]` that lives only inside a code
-/// fence is illustrative syntax in a doc, not a graph edge, so stats must not
-/// count it as broken or use it to un-orphan a file. (Frontmatter never carries
-/// code fences, so this scan stays line-based over the whole file without
-/// dropping the frontmatter links stats deliberately counts as edges.)
+/// The frontmatter block and the body are scanned **separately** so fenced-code
+/// state can never leak between them. YAML frontmatter has no markdown code
+/// fences, so every `[[...]]` there is a real edge and is extracted with no
+/// fence tracking. The body is scanned with fresh fence tracking (started from
+/// no open fence), so a `[[...]]` that lives only inside a body code fence is
+/// still ignored — it is illustrative syntax, not a graph edge, mirroring
+/// `validate::extract_wiki_links` / `store::extract_edge_targets`.
+///
+/// The old single-pass-over-whole-file scan wrongly assumed "frontmatter never
+/// carries code fences": a stray ``` (or `~~~`) line inside a frontmatter value
+/// (e.g. a block-scalar field) opened a fence that swallowed every subsequent
+/// body `[[...]]`, dropping real edges and mis-marking files as orphans.
 fn extract_link_targets(text: &str, re: &Regex) -> Vec<PathBuf> {
+    let (frontmatter, body) = split_frontmatter_and_body(text);
     let mut out = Vec::new();
-    // Track the open fence as `(fence byte, run length)`, not a single boolean:
-    // an inner fence of the *other* character (a `~~~` line inside an open ```
-    // block, or vice versa) — or a shorter run — is content, and must NOT close
-    // the block. A naive toggle inverts the fence state on such a line and then
-    // mis-classifies every link for the rest of the file. Mirrors `render`'s
-    // `opening_fence` / `is_closing_fence`.
+    // (a) Frontmatter: every `[[...]]` is a real edge — no fence tracking. YAML
+    // has no markdown code fences, so a ``` line here is just text, never a fence.
+    if let Some(fm) = frontmatter {
+        for line in fm.lines() {
+            collect_links_on_line(line, re, &mut out);
+        }
+    }
+    // (b) Body: fence-aware, started fresh so no state is inherited from the
+    // frontmatter block above. Track the open fence as `(fence byte, run length)`,
+    // not a single boolean: an inner fence of the *other* character (a `~~~` line
+    // inside an open ``` block, or vice versa) — or a shorter run — is content,
+    // and must NOT close the block. A naive toggle inverts the fence state on
+    // such a line and then mis-classifies every link for the rest of the body.
+    // Mirrors `render`'s `opening_fence` / `is_closing_fence`.
     let mut fence: Option<(u8, usize)> = None;
-    for line in text.lines() {
+    for line in body.lines() {
         let content = line.trim_end_matches(['\n', '\r']);
         if let Some(f) = fence {
             if is_closing_fence(content, f) {
@@ -256,14 +272,76 @@ fn extract_link_targets(text: &str, re: &Regex) -> Vec<PathBuf> {
             fence = Some(opened);
             continue;
         }
-        for cap in re.captures_iter(line) {
-            if let Some(m) = cap.get(1) {
-                let raw = m.as_str().trim();
-                out.push(strip_md(Path::new(raw)));
-            }
-        }
+        collect_links_on_line(line, re, &mut out);
     }
     out
+}
+
+/// Push every wiki-link target found on one line into `out` (trimmed,
+/// `.md`-stripped). Shared by the frontmatter and body scans in
+/// [`extract_link_targets`].
+fn collect_links_on_line(line: &str, re: &Regex, out: &mut Vec<PathBuf>) {
+    for cap in re.captures_iter(line) {
+        if let Some(m) = cap.get(1) {
+            let raw = m.as_str().trim();
+            out.push(strip_md(Path::new(raw)));
+        }
+    }
+}
+
+/// Split a file into `(frontmatter YAML, body)`. The frontmatter is the text
+/// between a leading `---` line (the very first line, the universal frontmatter
+/// contract) and its closing `---`; the body is everything after that closing
+/// fence. A file with no valid leading frontmatter block yields `(None, text)` —
+/// the whole text is body — so files with no frontmatter (and a literal `---`
+/// that is content, not a fence) keep their prior whole-file body scan.
+///
+/// Operates on byte offsets into the original `text` so both returned slices
+/// borrow it; the frontmatter slice is offset-equivalent to
+/// [`frontmatter_block`]'s string, and the body picks up immediately after the
+/// closing `---` line's newline.
+fn split_frontmatter_and_body(text: &str) -> (Option<&str>, &str) {
+    // Normalize away a leading BOM, but require `---` as the first line.
+    let stripped = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // The opening fence must be the very first line: a line whose trimmed form is
+    // `---` (trailing whitespace tolerated, matching the prior `frontmatter_block`
+    // and the universal contract), followed by a line break (or EOF). A bare
+    // `---` body line that isn't the first line is not frontmatter.
+    let (first_line, after_first) = match stripped.find('\n') {
+        Some(nl) => (&stripped[..nl], &stripped[nl + 1..]),
+        None => (stripped, ""),
+    };
+    if first_line.trim_end_matches('\r').trim_end() != "---" {
+        return (None, text);
+    }
+    let after_open = after_first;
+    // Scan lines from just after the opening fence for the closing `---`.
+    let mut cursor = after_open;
+    let fm_start = after_open;
+    loop {
+        let (line, tail, had_newline) = match cursor.find('\n') {
+            Some(nl) => (&cursor[..nl], &cursor[nl + 1..], true),
+            None => (cursor, "", false),
+        };
+        if line.trim_end_matches('\r').trim_end() == "---" {
+            // Frontmatter is everything from `fm_start` up to (not including)
+            // this closing `---` line; the body is everything after it.
+            let fm_len = line_offset(fm_start, line);
+            return (Some(&fm_start[..fm_len]), tail);
+        }
+        if !had_newline {
+            // Reached EOF with no closing fence: not a valid frontmatter block.
+            return (None, text);
+        }
+        cursor = tail;
+    }
+}
+
+/// Byte offset of `line` within `base` (both borrow the same buffer). Used to
+/// recover the length of the frontmatter span from its first line and the
+/// closing-fence line.
+fn line_offset(base: &str, line: &str) -> usize {
+    line.as_ptr() as usize - base.as_ptr() as usize
 }
 
 /// If `line` opens a fenced code block, return its `(fence byte, run length)`.
@@ -443,25 +521,12 @@ fn parse_type(text: &str) -> Option<String> {
 
 /// Extract the raw YAML between a leading `---` fence and its closing `---`.
 /// The opening fence must be the very first line of the file (the universal
-/// frontmatter contract: frontmatter is the first thing in the file).
+/// frontmatter contract: frontmatter is the first thing in the file). Delegates
+/// to [`split_frontmatter_and_body`] so the frontmatter boundary is computed in
+/// exactly one place (the type-parse and the link-scan never disagree on where
+/// frontmatter ends).
 fn frontmatter_block(text: &str) -> Option<String> {
-    // Normalize away a leading BOM, but require `---` as the first line.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut lines = text.lines();
-    let first = lines.next()?;
-    if first.trim_end() != "---" {
-        return None;
-    }
-    let mut body = String::new();
-    for line in lines {
-        if line.trim_end() == "---" {
-            return Some(body);
-        }
-        body.push_str(line);
-        body.push('\n');
-    }
-    // No closing fence: not a valid frontmatter block.
-    None
+    split_frontmatter_and_body(text).0.map(str::to_string)
 }
 
 /// Sort a type distribution into the top `limit` types by count descending,
@@ -970,6 +1035,51 @@ mod tests {
         assert_eq!(
             s.orphan_count, 0,
             "the real post-fence link wires both files: {s:?}"
+        );
+    }
+
+    #[test]
+    fn regression_frontmatter_code_fence_does_not_swallow_body_links() {
+        // A stray code-fence line INSIDE the frontmatter (here an unbalanced ```
+        // in a YAML block-scalar value) must not leak fenced-code state into the
+        // body scan. Pre-fix `extract_link_targets` scanned the whole file with a
+        // single fence tracker, so the frontmatter ``` opened a fence that
+        // swallowed every later body `[[...]]`, dropping the real edge and
+        // mis-marking both endpoints as orphans. The fix splits frontmatter from
+        // body and starts the body fence tracking fresh.
+        let (_d, store) = temp_store();
+        write_rel(
+            &store,
+            "records/contacts/alice.md",
+            &doc("contact", "alice"),
+        );
+        // A profile whose frontmatter carries a wiki-link field AND an unbalanced
+        // ``` line, then a REAL body link plus a genuinely-fenced body link.
+        write_rel(
+            &store,
+            "records/profiles/note.md",
+            "---\ntype: profile\nsummary: note\n\
+             refs: \"[[records/contacts/alice]]\"\n\
+             field: |\n  start of a fence\n  ```\n  never closed in frontmatter\n---\n\
+             \nReal: [[records/contacts/alice]]\n\
+             \n```\n[[records/contacts/ghost]]\n```\n",
+        );
+
+        let s = compute(&store).expect("compute");
+        // The frontmatter ``` no longer hides the body link to alice, and the
+        // body-fenced ghost link is still ignored (not broken). If the leak
+        // returned, the body link would be dropped and the ghost would surface.
+        assert_eq!(
+            s.broken_link_count, 0,
+            "the genuinely body-fenced ghost link is not a broken edge, \
+             and the frontmatter fence did not surface it: {s:?}"
+        );
+        // alice is linked from note (via both the frontmatter `refs:` edge and
+        // the real body link), and note links out — neither is an orphan. Pre-fix
+        // the frontmatter fence dropped the body link and the orphan count was 2.
+        assert_eq!(
+            s.orphan_count, 0,
+            "the body link survives the frontmatter code fence and wires both files: {s:?}"
         );
     }
 

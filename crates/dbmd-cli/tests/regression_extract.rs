@@ -8,8 +8,14 @@
 //! - **#26** — `dbmd extract big.pdf | head` (a closed downstream pipe) used to
 //!   exit 1 with an `IO_ERROR` envelope; a broken pipe is a benign truncation
 //!   and must exit 0 with nothing on stderr.
+//! - **wide-table HTML bomb** — a tiny crafted flat `<td>`×200k HTML table made
+//!   html2text lay the row out at the 10_000 wrap width and emit gigantic U+2500
+//!   box rules, amplifying a ~2 MB input into multi-GB output / 9 GB+ peak RSS
+//!   (a resource-exhaustion DoS) while exiting 0. `dbmd extract` must now refuse
+//!   it cleanly with `EXTRACT_PARSE_ERROR` and a non-zero exit, never streaming
+//!   the giant output.
 //!
-//! Both drive the real `dbmd` binary so they assert the agent-visible CLI
+//! All drive the real `dbmd` binary so they assert the agent-visible CLI
 //! contract (exit code, machine code, stderr), not library internals.
 
 mod common;
@@ -191,6 +197,84 @@ fn dense_grid_bomb_xlsx_refuses_cleanly_not_oom() {
     let parsed: serde_json::Value =
         serde_json::from_str(stderr.trim()).expect("JSON error object on stderr");
     assert_eq!(parsed["error"]["code"], "EXTRACT_PARSE_ERROR");
+}
+
+// ── wide-table HTML bomb refused, not multi-GB streamed ───────────────────────
+
+/// Build the wide-table amplification bomb: a tiny flat HTML file whose single
+/// table row holds `cells` `<td>` cells. html2text would lay this out at the
+/// 10_000 wrap width and draw full-width U+2500 box rules, exploding a ~MB input
+/// into multi-GB output. The file on disk stays small; the danger is the layout.
+fn write_wide_table_html_bomb(dest: &Path, cells: usize) {
+    let mut body = String::with_capacity(cells * 10 + 64);
+    body.push_str("<html><body><table><tr>");
+    for _ in 0..cells {
+        body.push_str("<td>x</td>");
+    }
+    body.push_str("</tr></table></body></html>");
+    std::fs::write(dest, body).unwrap();
+}
+
+#[test]
+fn wide_table_html_bomb_refuses_cleanly_not_multi_gb() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bomb = tmp.path().join("bomb.html");
+    // 200k cells reproduces the original exploit (~2 MB on disk → multi-GB out
+    // pre-fix). The structural cell cap (1M) refuses anything this wide before
+    // html2text runs, so the layout — and the spike — never happens.
+    write_wide_table_html_bomb(&bomb, 2_000_000);
+
+    let on_disk = std::fs::metadata(&bomb).unwrap().len();
+    assert!(
+        on_disk < 25 * 1024 * 1024,
+        "the bomb must be small on disk (got {on_disk} bytes); the danger is the layout, not the file"
+    );
+
+    // Plain mode: non-zero exit, nothing on stdout (no giant output streamed).
+    let out = dbmd().arg("extract").arg(&bomb).assert().failure().code(1);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(
+        stdout.is_empty(),
+        "a wide-table bomb must emit nothing to stdout, got {} bytes",
+        stdout.len()
+    );
+
+    // JSON mode: the typed refusal carries the stable parse-error code.
+    let out = dbmd()
+        .arg("--json")
+        .arg("extract")
+        .arg(&bomb)
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("JSON error object on stderr");
+    assert_eq!(parsed["error"]["code"], "EXTRACT_PARSE_ERROR");
+}
+
+/// A normal HTML file with a small table still extracts cleanly (no regression
+/// from the wide-table cap).
+#[test]
+fn normal_html_table_extracts_unchanged() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("ok.html");
+    std::fs::write(
+        &f,
+        "<html><body><table>\
+<tr><td>Vendor</td><td>Amount</td></tr>\
+<tr><td>Acme</td><td>1200</td></tr></table></body></html>",
+    )
+    .unwrap();
+
+    let out = dbmd().arg("extract").arg(&f).assert().success().code(0);
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    for token in ["Vendor", "Amount", "Acme", "1200"] {
+        assert!(
+            stdout.contains(token),
+            "a normal table must keep {token:?}, got {stdout:?}"
+        );
+    }
 }
 
 // ── #26: broken pipe is a clean exit 0, not IO_ERROR ──────────────────────────

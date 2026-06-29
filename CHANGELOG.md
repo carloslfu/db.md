@@ -8,9 +8,71 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.4.5**.
+  `Cargo.toml`, currently **v0.4.6**.
 
 ## [Unreleased]
+
+## [0.4.6] — 2026-06-29
+
+### Toolkit
+
+Third adversarial-review pass (continued). 0.4.5 shipped the loose-only
+`validate` parity fix from this pass; 0.4.6 adds the remaining confirmed defects
+— 30 across two parallel review rounds (find → reproduce → triple-skeptic
+double-check), each fixed with a regression test. No format change (SPEC stays
+v0.3).
+
+Correctness & data-integrity:
+
+- **Concurrent write-through.** Two concurrent writes to different type-folders
+  under the same layer no longer lose a rollup row: `update_parents` now
+  serializes the shared layer/root `index.md` rewrite under a store-root lock,
+  and `FolderLock` waits-and-stale-breaks instead of silently degrading to
+  no-lock under contention (which had reintroduced the lost update).
+- **Wiki-link scanning is frontmatter-aware everywhere.** A code fence inside a
+  frontmatter value no longer leaks into the body scan and swallows real
+  wiki-links — fixed in `stats`, `search_by_link`/backlinks/forwardlinks/`links`
+  (`extract_edge_targets`), and `rename`'s `rewrite_links_to`.
+- **`rename` stays inside the content layers.** It no longer rewrites
+  wiki-links in files outside `sources/`+`records/` (e.g. archived/verbatim
+  copies, goldens).
+- **Unicode-normalized link comparison.** NFC/NFD spellings of the same target
+  now resolve as one edge in the graph (backlinks/forwardlinks/orphans), via
+  `unicode-normalization` (permissive, no AI/LLM deps).
+- **Query ordering.** `fm query` / `index query --limit` now path-sort before
+  truncating, matching `dbmd query`, so loose files coexisting with type-folders
+  return the correct subset.
+- **Sharding & validation.** Single-digit-month dates (`2026-1-15`) shard to the
+  correct month; wrong-case wiki-links are flagged consistently across
+  case-insensitive (APFS) and case-sensitive (Linux) filesystems; `write --fm
+  summary=` is honored; `parser` round-trips oversized integers inside YAML flow
+  collections.
+- **Log rotation.** Distinct same-minute entries are preserved across the
+  active/archive boundary on both the read path (`tail`/`since`) and a fresh
+  rotation that finds a lingering `.rotating` marker.
+
+Security & robustness on untrusted input:
+
+- **`extract` is bounded.** Wide-table HTML/EPUB/docx no longer amplify into
+  multi-GB output / OOM, and a truncated `.ods` no longer hangs forever — both
+  now fail fast with a typed error.
+- **Frozen-page globs can't ReDoS.** A `DB.md` frozen-page pattern with many
+  `**` segments no longer triggers catastrophic backtracking that hung every
+  write/rename.
+- **Containment.** `graph neighborhood` no longer discloses files outside the
+  store through a symlinked path component; `assets paths` no longer emits
+  store-escaping (`..`/absolute) recorded paths.
+
+Other:
+
+- `assets scan` recompacts a duplicate-line manifest (the documented
+  `merge=union` recovery), and `format` no longer retypes a genuine nested
+  array into a scalar wiki-link string.
+
+### Docs
+
+- SPEC § Validation now lists `## Folders` among the recognized `DB.md`
+  sections (it was documented elsewhere and already accepted by the validator).
 
 ## [0.4.5] — 2026-06-28
 

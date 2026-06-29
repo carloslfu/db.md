@@ -637,6 +637,79 @@ fn query_limit_caps_results() {
 }
 
 #[test]
+fn query_limit_is_path_sorted_with_loose_and_type_folders() {
+    // Regression: when a layer mixes a LOOSE file (a layer-root sidecar, e.g.
+    // `records/index.jsonl`) with a type-folder (`records/contacts/index.jsonl`),
+    // `query.execute` concatenates per-sidecar reads in sidecar-PATH order, which
+    // is NOT globally record-path-sorted: the loose file's record (`records/aaa.md`)
+    // sorts BEFORE the type-folder's records, but its sidecar sorts AFTER. Without
+    // a path sort before `--limit`, `index query --limit 2` dropped the true #1
+    // (`records/aaa.md`). `index query` must apply the same path sort `dbmd query`
+    // does, so the top-2 is the path-ascending top-2.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let store = tmp.path();
+    write_db_md(store);
+    write_file(
+        store,
+        "records/aaa.md",
+        "---\ntype: note\ncreated: 2026-01-01T00:00:00+00:00\nupdated: 2026-01-01T00:00:00+00:00\nsummary: loose a\n---\n# A\n",
+    );
+    for n in ["mmm", "nnn"] {
+        write_file(
+            store,
+            &format!("records/contacts/{n}.md"),
+            &format!("---\ntype: contact\ncreated: 2026-01-01T00:00:00+00:00\nupdated: 2026-01-01T00:00:00+00:00\nsummary: {n}\n---\n# {n}\n"),
+        );
+    }
+
+    dbmd()
+        .current_dir(store)
+        .args(["index", "rebuild"])
+        .assert()
+        .success();
+
+    // Global path order: records/aaa.md < records/contacts/mmm.md < .../nnn.md.
+    let got: Vec<String> = {
+        let out = dbmd()
+            .current_dir(store)
+            .args(["index", "query", "--in", "records", "--limit", "2"])
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        got,
+        vec![
+            "records/aaa.md".to_string(),
+            "records/contacts/mmm.md".to_string(),
+        ],
+        "index query --limit 2 must return the path-ascending top-2 (loose file first)"
+    );
+
+    // And it must agree with the canonical `dbmd query` on the identical store.
+    let canonical: Vec<String> = {
+        let out = dbmd()
+            .current_dir(store)
+            .args(["query", "--in", "records", "--limit", "2"])
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        got, canonical,
+        "index query and the canonical query must return the same top-2"
+    );
+}
+
+#[test]
 fn query_json_returns_full_records() {
     let out = dbmd()
         .args([

@@ -384,6 +384,14 @@ fn extract_docx(path: &Path) -> Result<Extracted> {
 ///
 /// Shared by [`extract_docx`]. Walks the event stream collecting `<w:t>` text;
 /// `<w:p>` ends a line, `<w:tab/>` is a tab, `<w:br>`/`<w:cr>` a newline.
+///
+/// Output-bounded for parity with the HTML/EPUB adapters. A docx is a zip, and
+/// `word/document.xml` is attacker-controlled `sources/` input that can compress
+/// enormously: a few-hundred-KB `.docx` whose `document.xml` inflates to hundreds
+/// of MB of `<w:t>` runs would otherwise accumulate without bound. We cap the
+/// running output at [`MAX_EXTRACT_OUTPUT_BYTES`] *during* accumulation — the
+/// same ceiling EPUB enforces — so peak memory stays bounded rather than only
+/// being checked after the full string is materialized.
 fn wordprocessing_text(xml: &str, format: &'static str) -> Result<String> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
@@ -392,6 +400,22 @@ fn wordprocessing_text(xml: &str, format: &'static str) -> Result<String> {
     let mut buf = Vec::new();
     let mut out = String::new();
     let mut in_text_run = false;
+
+    // Refuse once accumulated text crosses the cap. Checked after each append so a
+    // single huge run can't blow past the ceiling before the next loop turn.
+    macro_rules! bound_output {
+        () => {
+            if out.len() > MAX_EXTRACT_OUTPUT_BYTES {
+                return Err(ExtractError::Parse {
+                    format,
+                    message: format!(
+                        "extracted text exceeds the {MAX_EXTRACT_OUTPUT_BYTES} byte cap \
+                         (malformed or hostile input)"
+                    ),
+                });
+            }
+        };
+    }
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -404,7 +428,10 @@ fn wordprocessing_text(xml: &str, format: &'static str) -> Result<String> {
                 let name = e.name();
                 match local_name(name.as_ref()) {
                     b"t" => in_text_run = false,
-                    b"p" => out.push('\n'),
+                    b"p" => {
+                        out.push('\n');
+                        bound_output!();
+                    }
                     _ => {}
                 }
             }
@@ -422,6 +449,7 @@ fn wordprocessing_text(xml: &str, format: &'static str) -> Result<String> {
             Ok(Event::Text(t)) => {
                 if in_text_run {
                     out.push_str(&String::from_utf8_lossy(&t.into_inner()));
+                    bound_output!();
                 }
             }
             // `Smith &amp; Co` arrives as Text("Smith ") + GeneralRef("amp") +
@@ -429,6 +457,7 @@ fn wordprocessing_text(xml: &str, format: &'static str) -> Result<String> {
             Ok(Event::GeneralRef(r)) => {
                 if in_text_run {
                     out.push_str(&resolve_entity_ref(&r));
+                    bound_output!();
                 }
             }
             // CDATA inside a `<w:t>` run is valid WordprocessingML; its payload
@@ -436,6 +465,7 @@ fn wordprocessing_text(xml: &str, format: &'static str) -> Result<String> {
             Ok(Event::CData(c)) => {
                 if in_text_run {
                     out.push_str(&String::from_utf8_lossy(&c.into_inner()));
+                    bound_output!();
                 }
             }
             Ok(Event::Eof) => break,
@@ -524,6 +554,26 @@ const MAX_SPREADSHEET_CELLS: u64 = 50_000_000;
 fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
     use calamine::{open_workbook_auto, Reader};
 
+    // ODS has no sparse-iterator pre-scan (see `spreadsheet_dense_cells`), so the
+    // xlsx-family fail-fast on a truncated/unclosed `content.xml` does not protect
+    // it: a `.ods` whose `content.xml` opens `<table:table>` then hits EOF makes
+    // calamine's ODS reader spin forever (an UNBOUNDED loop, not a panic —
+    // `catch_unwind` cannot recover it). The hang is reachable from the very first
+    // calamine call (`open_workbook_auto` parses the ODS document on open), so the
+    // structural validity gate has to run BEFORE we hand the file to calamine at
+    // all — not merely before `worksheet_range`. Gate by extension (the `.ods`
+    // backend is the only one with this unbounded shape; `.xls`/BIFF is
+    // format-bounded and the xlsx-family is pre-scanned). A truncated/unclosed
+    // document fails fast here with a typed Parse refusal — the same shape the
+    // xlsx pre-scan produces on a truncated sheet.
+    let is_ods = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ods"));
+    if is_ods {
+        ods_content_xml_well_formed(path)?;
+    }
+
     let mut workbook = open_workbook_auto(path).map_err(|e| ExtractError::Parse {
         format: "spreadsheet",
         message: e.to_string(),
@@ -572,6 +622,69 @@ fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
         out.put_str("sheet_names", sheet_names.join(", "));
     }
     Ok(out)
+}
+
+/// Structurally validate an `.ods` `content.xml` before the unbounded calamine
+/// ODS reader touches it.
+///
+/// calamine's ODS backend exposes no sparse-cell iterator, so it gets none of the
+/// streaming pre-scan that bounds (and fails fast on truncated input) the
+/// xlsx/xlsb path in [`spreadsheet_dense_cells`]. On a `.ods` whose `content.xml`
+/// opens `<table:table>` and then hits EOF before the matching `</table:table>`,
+/// `worksheet_range` spins forever at full CPU — a resource-exhaustion DoS on
+/// untrusted `sources/` input, and an *infinite loop* that [`catch_unwind`]
+/// cannot recover (it catches panics, not hangs).
+///
+/// This gate reuses the shared zip helpers ([`open_zip`] / [`read_zip_entry`],
+/// bounded by [`MAX_ZIP_ENTRY_BYTES`]) to read `content.xml`, then streams it
+/// through `quick-xml` exactly like [`wordprocessing_text`] does for docx. A
+/// truncated/unclosed document surfaces as a `quick-xml` error (e.g. "Unexpected
+/// end of xml") or as an at-EOF tag-balance mismatch; either way we return a
+/// typed [`ExtractError::Parse`] (format `"spreadsheet"`) in well under a second,
+/// matching how a truncated `.xlsx` already fails — instead of letting calamine
+/// hang. A well-formed `content.xml` passes through untouched, so valid `.ods`
+/// extraction is unchanged. Peak memory stays bounded by the zip-entry cap; the
+/// scan never densely materializes anything.
+fn ods_content_xml_well_formed(path: &Path) -> Result<()> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let file = std::fs::File::open(path)?;
+    let mut archive = open_zip(file, "spreadsheet")?;
+    let xml = read_zip_entry(&mut archive, "content.xml", "spreadsheet")?;
+
+    let mut reader = Reader::from_str(&xml);
+    let mut depth: i64 = 0;
+    loop {
+        match reader.read_event() {
+            // Any structural malformation (including the unclosed `<table:table>`
+            // at EOF, which quick-xml reports as "Unexpected end of xml") is a
+            // typed refusal — never a hang.
+            Err(e) => {
+                return Err(ExtractError::Parse {
+                    format: "spreadsheet",
+                    message: format!("malformed ODS content.xml: {e}"),
+                });
+            }
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Eof) => break,
+            _ => {}
+        }
+    }
+
+    // Belt-and-suspenders: even if a quirk let the stream reach EOF with elements
+    // still open, an unbalanced tree is not a document the ODS reader can finish.
+    // Refuse rather than risk the unbounded path.
+    if depth != 0 {
+        return Err(ExtractError::Parse {
+            format: "spreadsheet",
+            message: "malformed ODS content.xml: unbalanced elements (truncated document)"
+                .to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Compute the would-be dense cell count (`rows × cols`) of one sheet WITHOUT
@@ -740,9 +853,15 @@ fn render_excel_datetime(dt: &calamine::ExcelDateTime) -> String {
 /// real book (which has well under a few hundred reading-order items).
 const MAX_EPUB_SPINE_ITEMS: usize = 10_000;
 
-/// Hard cap on the accumulated extracted-text bytes (EPUB chapter concatenation).
-/// The backstop for spine amplification: a long spine of distinct chapters, or a
-/// near-cap chapter referenced many times, can't balloon output without bound.
+/// Hard cap on accumulated extracted-text bytes, shared by every adapter that
+/// concatenates or materializes a large string from untrusted `sources/` input:
+/// EPUB chapter concatenation, the HTML/XHTML flattener ([`html_to_text`]), and
+/// the WordprocessingML run accumulator ([`wordprocessing_text`]). The common
+/// backstop against output amplification — a long EPUB spine, a renderer
+/// pathology, or a docx whose `document.xml` inflates to hundreds of MB — so
+/// extracted text (and stdout) can't balloon without bound. Each adapter checks
+/// it *during* accumulation, not only at the end, to keep peak memory bounded.
+/// Far above any real document's flattened text; only hostile/corrupt input hits.
 const MAX_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Extract an EPUB's reading-order text:
@@ -1101,12 +1220,58 @@ fn html_to_text(html: &[u8]) -> Result<String> {
             ),
         });
     }
-    html2text::config::with_decorator(PlainContentDecorator)
+    // Bound table size BEFORE html2text lays the table out. Depth alone misses
+    // the *width* amplification: a flat `<table><tr><td>x</td>×200_000</tr>` is
+    // only ~3 deep, so the nesting guard never fires — but html2text lays the row
+    // out at the 10_000 wrap width and draws full-width U+2500 box rules per row
+    // boundary, turning a ~2 MB input into multi-GB output and 9 GB+ peak RSS
+    // (resource-exhaustion DoS on untrusted `sources/` input). The MAX_EXTRACT_
+    // OUTPUT_BYTES backstop below cannot prevent that spike — html2text has
+    // already materialized the giant string by the time it's measured. So we
+    // refuse the layout BEFORE it happens, on the structural cause (table cell
+    // counts — both single-row width and the overall total), mirroring the
+    // refuse-before-allocate precedent of MAX_SPREADSHEET_CELLS / MAX_ZIP_ENTRY_
+    // BYTES. EPUB/xhtml chapters route through here too, so this covers them.
+    if let Some(bomb) =
+        html_table_amplification(html, MAX_HTML_TABLE_ROW_CELLS, MAX_HTML_TABLE_CELLS)
+    {
+        let message = match bomb {
+            TableBomb::RowTooWide(width) => format!(
+                "a table row declares {width} cells, exceeding the \
+                 {MAX_HTML_TABLE_ROW_CELLS}-cell-per-row cap (malformed or hostile input)"
+            ),
+            TableBomb::TooManyCells(total) => format!(
+                "HTML declares over {total} table cells, exceeding the \
+                 {MAX_HTML_TABLE_CELLS}-cell cap (malformed or hostile input)"
+            ),
+        };
+        return Err(ExtractError::Parse {
+            format: "html",
+            message,
+        });
+    }
+    let text = html2text::config::with_decorator(PlainContentDecorator)
         .string_from_read(html, 10_000)
         .map_err(|e| ExtractError::Parse {
             format: "html",
             message: e.to_string(),
-        })
+        })?;
+    // Hard output backstop. The structural pre-checks above stop the known
+    // amplifier (wide tables) before the layout pass, but they cannot anticipate
+    // every renderer pathology; this final byte cap guarantees the HTML path can
+    // never return (or stream to stdout) more than the same ceiling EPUB enforces,
+    // independent of *why* the output grew. A real document's flattened text is
+    // far under 64 MB; only hostile or corrupt input reaches it.
+    if text.len() > MAX_EXTRACT_OUTPUT_BYTES {
+        return Err(ExtractError::Parse {
+            format: "html",
+            message: format!(
+                "extracted text exceeds the {MAX_EXTRACT_OUTPUT_BYTES} byte cap \
+                 (malformed or hostile input)"
+            ),
+        });
+    }
+    Ok(text)
 }
 
 /// The deepest block-element nesting `html_to_text` tolerates. No legitimate
@@ -1114,6 +1279,33 @@ fn html_to_text(html: &[u8]) -> Result<String> {
 /// refuse the deeply-nested bomb that makes html2text's layout pass run for
 /// minutes. Set with large headroom so it can only fire on pathological input.
 const MAX_HTML_NESTING_DEPTH: usize = 4_096;
+
+/// Ceiling on the number of cells (`<td>`/`<th>`) in any SINGLE table row before
+/// extraction refuses the document. This is the primary structural guard against
+/// the wide-table amplification DoS: html2text lays a table out at the 10_000
+/// wrap width and draws full-width U+2500 box rules sized to the row, so a flat
+/// `<td>`×N single row is the worst case — N=200_000 in a ~2 MB file balloons to
+/// multi-GB output and 9 GB+ peak RSS. *Row width* is what drives the spike (a
+/// tall narrow table of the same total cell count costs an order of magnitude
+/// less), so we bound it directly and BEFORE html2text runs — the same
+/// refuse-before-allocate precedent as MAX_SPREADSHEET_CELLS / MAX_ZIP_ENTRY_BYTES.
+///
+/// 4_096 columns is far beyond any real document's table width — a spreadsheet
+/// export with thousands of columns is already unreadable as flattened text —
+/// yet keeps the worst-case (all in one row) layout under ~16 MB peak, measured.
+const MAX_HTML_TABLE_ROW_CELLS: usize = 4_096;
+
+/// Ceiling on the TOTAL number of table cells (`<td>`/`<th>`) across the whole
+/// document. The backstop to [`MAX_HTML_TABLE_ROW_CELLS`] for the *tall* shape:
+/// even narrow rows, if there are enough of them, grow html2text's layout memory
+/// roughly linearly in total cells (independent of output size). The row-width
+/// cap alone wouldn't bound a million-row × few-column table, so this caps the
+/// aggregate too. Checked in the same single scan, before html2text runs.
+///
+/// 200_000 cells is far above any real tabular document (a 20_000-row × 10-column
+/// table) yet keeps the worst measured tall-table peak under ~450 MB. Set
+/// generously so it can only fire on pathological input.
+const MAX_HTML_TABLE_CELLS: usize = 200_000;
 
 /// HTML5 void elements — they have no closing tag, so they must NOT increment
 /// the nesting depth (a document of many sibling `<br>`/`<img>` is flat, not
@@ -1177,6 +1369,87 @@ fn html_block_nesting_exceeds(html: &[u8], limit: usize) -> Option<usize> {
             depth += 1;
             if depth > limit {
                 return Some(depth);
+            }
+        }
+        i = end;
+    }
+    None
+}
+
+/// Why a table-cell pre-check refused an HTML document, with the offending count.
+/// Returned by [`html_table_amplification`] so the caller can name the exact
+/// structural cause (row width vs. total cells) in the typed error.
+enum TableBomb {
+    /// A single row holds more than [`MAX_HTML_TABLE_ROW_CELLS`] cells — the wide
+    /// shape that html2text amplifies into multi-GB output. Carries the row width.
+    RowTooWide(usize),
+    /// The document holds more than [`MAX_HTML_TABLE_CELLS`] cells in total — the
+    /// tall shape whose aggregate grows html2text's layout memory. Carries the
+    /// total count (at the moment the cap was crossed).
+    TooManyCells(usize),
+}
+
+/// Scan an HTML byte stream once and return `Some(TableBomb)` if its table cells
+/// would amplify html2text's layout past a safe bound, else `None`. Two bounds
+/// are checked in the single pass: the max cells in any one `<tr>` (the *width*
+/// amplifier, the dominant cost) against `row_limit`, and the total cell count
+/// (the *tall* aggregate) against `total_limit`. Whichever trips first wins.
+///
+/// Like [`html_block_nesting_exceeds`] this is a crude, allocation-free tag
+/// scanner — NOT a parser. It counts cell *opens* (`<td>`/`<th>`); closing tags
+/// and self-closing forms add no cell. A `<tr>` open resets the per-row counter.
+/// Comments/doctype/PI are skipped (so a `<td>` inside a comment isn't counted)
+/// and a stray `<` in prose is ignored. The exact tally past a limit doesn't
+/// matter, only whether the limit is crossed — so we can early-return.
+fn html_table_amplification(
+    html: &[u8],
+    row_limit: usize,
+    total_limit: usize,
+) -> Option<TableBomb> {
+    let mut total: usize = 0;
+    let mut row_cells: usize = 0;
+    let mut i = 0usize;
+    let n = html.len();
+    while i < n {
+        if html[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let Some(&c) = html.get(i + 1) else { break };
+        if c == b'!' || c == b'?' {
+            // Comment, doctype, CDATA, or processing instruction — skip to `>`.
+            i = memchr_gt(html, i + 1);
+            continue;
+        }
+        if c == b'/' {
+            // Closing tag — not a new cell.
+            i = memchr_gt(html, i + 1);
+            continue;
+        }
+        if !c.is_ascii_alphabetic() {
+            // A stray `<` in text (`a < b`) — not a tag open.
+            i += 1;
+            continue;
+        }
+        let end = memchr_gt(html, i + 1);
+        // Tag name = the run of letters/digits right after `<`.
+        let name_end = (i + 1..end.min(n))
+            .find(|&j| !html[j].is_ascii_alphanumeric())
+            .unwrap_or(end.min(n));
+        let name = html[i + 1..name_end].to_ascii_lowercase();
+        if name == b"tr" {
+            // A new row resets the per-row width tally. (A `<td>` outside any row
+            // still counts toward both totals; resetting only on `<tr>` is the
+            // conservative choice — it can never under-count a real row's width.)
+            row_cells = 0;
+        } else if name == b"td" || name == b"th" {
+            total += 1;
+            row_cells += 1;
+            if row_cells > row_limit {
+                return Some(TableBomb::RowTooWide(row_cells));
+            }
+            if total > total_limit {
+                return Some(TableBomb::TooManyCells(total));
             }
         }
         i = end;
@@ -1554,6 +1827,212 @@ mod tests {
         );
     }
 
+    /// The table scanner counts `<td>`/`<th>` opens, ignores closing and
+    /// commented-out cells, resets the per-row tally on `<tr>`, and reports the
+    /// right bomb variant (row-too-wide vs. too-many-cells). Small-limit probes
+    /// keep the test fast.
+    #[test]
+    fn html_table_scanner_counts_cells_and_classifies_shape() {
+        // 5 real cells (td + th, case-insensitive) in ONE row; the commented cell
+        // and the closing tags must NOT be counted.
+        let one_row = b"<table><tr><td>a</td><TH>b</TH><td>c</td>\
+<!-- <td>x</td> --><td>d</td><td>e</td></tr></table>";
+        // Row-width cap of 4 trips on the 5-wide row.
+        assert!(
+            matches!(
+                html_table_amplification(one_row, 4, 1000),
+                Some(TableBomb::RowTooWide(w)) if w == 5
+            ),
+            "a 5-wide row must trip the row-width cap as RowTooWide(5)"
+        );
+        // Generous row cap, generous total → no bomb (commented cell not counted).
+        assert!(
+            html_table_amplification(one_row, 100, 100).is_none(),
+            "5 cells under both caps must not fire"
+        );
+
+        // Many narrow rows: width stays at 1, total accumulates → TooManyCells.
+        let tall: String = "<table>".to_string() + &"<tr><td>x</td></tr>".repeat(20) + "</table>";
+        assert!(
+            matches!(
+                html_table_amplification(tall.as_bytes(), 100, 10),
+                Some(TableBomb::TooManyCells(t)) if t == 11
+            ),
+            "20 single-cell rows must trip the total cap at 11 (width stays under)"
+        );
+
+        // A document with no tables never trips it.
+        assert!(
+            html_table_amplification(b"<p>plain prose, a < b</p>", 0, 0).is_none(),
+            "no table cells means the scanner never fires"
+        );
+    }
+
+    /// The wide-table amplification bomb (HIGH DoS): a tiny flat `<td>`×N row
+    /// makes html2text emit gigantic U+2500 box rules (multi-GB output, 9 GB+
+    /// RSS) from a ~MB input. The row-width pre-check refuses it BEFORE the
+    /// layout pass — fast, typed, never materializing the giant string — while a
+    /// normal small table still extracts intact (no regression).
+    #[test]
+    fn regression_html_wide_table_bomb_is_refused_small_table_ok() {
+        // Just over the per-row width cap in a single row — the exact shape of the
+        // real exploit (a flat `<td>`×N row), kept small enough that the test is
+        // fast precisely BECAUSE the pre-check refuses before html2text runs.
+        let cells = MAX_HTML_TABLE_ROW_CELLS + 10;
+        let bomb = format!(
+            "<html><body><table><tr>{}</tr></table></body></html>",
+            "<td>x</td>".repeat(cells)
+        );
+        // The pre-check fires; html2text is never reached, so no giant string is
+        // materialized (the test would OOM/hang otherwise).
+        assert!(
+            matches!(
+                html_table_amplification(
+                    bomb.as_bytes(),
+                    MAX_HTML_TABLE_ROW_CELLS,
+                    MAX_HTML_TABLE_CELLS
+                ),
+                Some(TableBomb::RowTooWide(_))
+            ),
+            "an over-cap wide row must trip the scanner as RowTooWide"
+        );
+        let err = html_to_text(bomb.as_bytes()).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Parse { format, message }
+                if *format == "html" && message.contains("cell-per-row")),
+            "the wide-table bomb must be refused with a typed row-width error; got {err:?}"
+        );
+        assert_eq!(err.code(), "EXTRACT_PARSE_ERROR");
+
+        // A tall table whose TOTAL cells exceed the aggregate cap is also refused
+        // (narrow rows, but too many of them) — bounding the other shape.
+        let rows = MAX_HTML_TABLE_CELLS / 2 + 5; // 2 cells/row, just over the total cap
+        let tall = format!(
+            "<html><body><table>{}</table></body></html>",
+            "<tr><td>a</td><td>b</td></tr>".repeat(rows)
+        );
+        let err = html_to_text(tall.as_bytes()).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Parse { message, .. } if message.contains("table cells")),
+            "an over-cap tall table must be refused with the total-cell error; got {err:?}"
+        );
+
+        // A normal small table still extracts its cell content cleanly.
+        let ok = "<html><body><table>\
+<tr><td>Name</td><td>Amount</td></tr>\
+<tr><td>Acme</td><td>1200</td></tr></table></body></html>";
+        let out = html_to_text(ok.as_bytes()).unwrap();
+        for token in ["Name", "Amount", "Acme", "1200"] {
+            assert!(
+                out.contains(token),
+                "small table must keep {token:?}, got {out:?}"
+            );
+        }
+        // And the output is far under the byte cap.
+        assert!(
+            out.len() < MAX_EXTRACT_OUTPUT_BYTES,
+            "a 2x2 table must not approach the output cap (got {} bytes)",
+            out.len()
+        );
+    }
+
+    /// Build an `.epub` whose single chapter body is `chapter_body` (spliced
+    /// inside `<body>…</body>`). Lets a test exercise a hostile chapter shape
+    /// (e.g. a wide table) through the real EPUB → html_to_text path.
+    fn write_epub_with_chapter_body(dest: &Path, chapter_body: &str) {
+        use std::io::Write;
+        let container = "<?xml version=\"1.0\"?>\
+<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\
+<rootfiles><rootfile full-path=\"OEBPS/content.opf\" \
+media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
+        let opf = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"id\">\
+<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Wide</dc:title></metadata>\
+<manifest><item id=\"c1\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>\
+<spine><itemref idref=\"c1\"/></spine></package>";
+        let chapter = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>{chapter_body}</body></html>"
+        );
+        let file = std::fs::File::create(dest).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("mimetype", stored).unwrap();
+        writer.write_all(b"application/epub+zip").unwrap();
+        writer.start_file("META-INF/container.xml", stored).unwrap();
+        writer.write_all(container.as_bytes()).unwrap();
+        writer.start_file("OEBPS/content.opf", stored).unwrap();
+        writer.write_all(opf.as_bytes()).unwrap();
+        writer.start_file("OEBPS/chapter.xhtml", stored).unwrap();
+        writer.write_all(chapter.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// An EPUB chapter that is itself a wide-table bomb routes through
+    /// `html_to_text` and must be refused with the same typed table-cell error,
+    /// before any giant chapter string is materialized — so EPUB peak memory
+    /// stays bounded per chapter, not just at the final concatenation check.
+    #[test]
+    fn regression_epub_wide_table_chapter_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bomb = tmp.path().join("wide.epub");
+        let body = format!(
+            "<table><tr>{}</tr></table>",
+            "<td>x</td>".repeat(MAX_HTML_TABLE_ROW_CELLS + 10)
+        );
+        write_epub_with_chapter_body(&bomb, &body);
+        let err = extract(&bomb).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Parse { message, .. } if message.contains("cell-per-row")),
+            "a wide-table EPUB chapter must be refused with the row-width error; got {err:?}"
+        );
+
+        // A normal EPUB chapter with a small table still extracts.
+        let ok = tmp.path().join("ok.epub");
+        write_epub_with_chapter_body(
+            &ok,
+            "<p>Chapter one.</p><table><tr><td>Cell A</td><td>Cell B</td></tr></table>",
+        );
+        let got = extract(&ok).unwrap();
+        assert_eq!(got.metadata["chapters"], MetaValue::Num(1));
+        assert!(
+            got.text.contains("Cell A") && got.text.contains("Cell B"),
+            "small EPUB table must extract, got {:?}",
+            got.text
+        );
+    }
+
+    /// A `.docx` whose `word/document.xml` expands to an enormous run of `<w:t>`
+    /// text must be refused by the output-byte cap during accumulation (docx
+    /// parity with HTML/EPUB), while a normal docx extracts unchanged.
+    #[test]
+    fn regression_docx_oversized_text_is_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bomb = tmp.path().join("huge.docx");
+        // One paragraph whose single run holds > MAX_EXTRACT_OUTPUT_BYTES of text.
+        // (Built as one big string so the body XML itself is the amplified input;
+        // a real exploit relies on zip deflate to ship this compactly.)
+        let big = "A".repeat(MAX_EXTRACT_OUTPUT_BYTES + 1024);
+        let body = format!("<w:p><w:r><w:t>{big}</w:t></w:r></w:p>");
+        write_docx(&bomb, &body);
+        let err = extract(&bomb).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Parse { format, message }
+                if *format == "docx" && message.contains("byte cap")),
+            "an oversized docx must be refused with the output-cap error; got {err:?}"
+        );
+
+        // A normal docx still extracts intact (no regression).
+        let ok = tmp.path().join("ok.docx");
+        write_docx(
+            &ok,
+            "<w:p><w:r><w:t>Quarterly report total 1200.</w:t></w:r></w:p>",
+        );
+        let got = extract(&ok).unwrap();
+        assert_eq!(got.text, "Quarterly report total 1200.\n");
+    }
+
     // ── format detection ────────────────────────────────────────────────────
 
     #[test]
@@ -1845,6 +2324,91 @@ mod tests {
         let got = extract(&fixture("sample.xlsx")).unwrap();
         assert_eq!(got.metadata["sheets"], MetaValue::Num(1));
         assert!(!got.text.is_empty());
+    }
+
+    /// Build a minimal `.ods` (OpenDocument Spreadsheet) whose `content.xml`
+    /// body is exactly `content_xml`, written to `dest`. Lets a test inject a
+    /// truncated/unclosed document XML and drive it through the real
+    /// `extract_spreadsheet` ODS path. The mimetype + manifest members make
+    /// calamine's auto-detector recognize the package as ODS.
+    fn write_ods_with_content(dest: &Path, content_xml: &str) {
+        use std::io::Write;
+        let manifest = "<?xml version=\"1.0\"?>\
+<manifest:manifest xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\">\
+<manifest:file-entry manifest:full-path=\"/\" \
+manifest:media-type=\"application/vnd.oasis.opendocument.spreadsheet\"/></manifest:manifest>";
+        let file = std::fs::File::create(dest).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        // The mimetype member must be the first, STORED entry for OpenDocument.
+        writer.start_file("mimetype", stored).unwrap();
+        writer
+            .write_all(b"application/vnd.oasis.opendocument.spreadsheet")
+            .unwrap();
+        writer.start_file("META-INF/manifest.xml", stored).unwrap();
+        writer.write_all(manifest.as_bytes()).unwrap();
+        writer.start_file("content.xml", stored).unwrap();
+        writer.write_all(content_xml.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// A truncated `.ods` — `content.xml` opens `<table:table>` then hits EOF
+    /// before the matching `</table:table>` — must be REFUSED fast with a typed
+    /// Parse error, not spin forever inside calamine's unbounded ODS reader
+    /// (resource-exhaustion DoS on untrusted `sources/` input). Pre-fix this test
+    /// hangs (calamine's `worksheet_range` never returns); post-fix the structural
+    /// pre-scan refuses it in microseconds. A well-formed `.ods` still extracts.
+    #[test]
+    fn regression_truncated_ods_is_refused_not_hung() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Truncated: the spreadsheet opens `<table:table>` and the document ends
+        // there — exactly the EOF-mid-table shape that hangs the ODS reader.
+        let trunc = tmp.path().join("trunc.ods");
+        let truncated_content = "<?xml version=\"1.0\"?>\
+<office:document-content \
+xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\">\
+<office:body><office:spreadsheet><table:table table:name=\"S\">";
+        write_ods_with_content(&trunc, truncated_content);
+
+        let start = std::time::Instant::now();
+        let err = extract(&trunc).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(&err, ExtractError::Parse { format, .. } if *format == "spreadsheet"),
+            "a truncated .ods must be a typed spreadsheet Parse refusal, got {err:?}"
+        );
+        assert_eq!(err.code(), "EXTRACT_PARSE_ERROR");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the truncated .ods must fail fast (<1s); took {elapsed:?} (would-be hang)"
+        );
+
+        // A well-formed `.ods` with a single 1-row, 2-cell table still extracts
+        // its cell text — the pre-scan must not regress valid spreadsheets.
+        let ok = tmp.path().join("ok.ods");
+        let valid_content = "<?xml version=\"1.0\"?>\
+<office:document-content \
+xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
+xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">\
+<office:body><office:spreadsheet>\
+<table:table table:name=\"S\">\
+<table:table-row>\
+<table:table-cell office:value-type=\"string\"><text:p>Alpha</text:p></table:table-cell>\
+<table:table-cell office:value-type=\"string\"><text:p>Beta</text:p></table:table-cell>\
+</table:table-row>\
+</table:table>\
+</office:spreadsheet></office:body></office:document-content>";
+        write_ods_with_content(&ok, valid_content);
+        let got = extract(&ok).unwrap();
+        assert!(
+            got.text.contains("Alpha") && got.text.contains("Beta"),
+            "a valid .ods must still extract its cell text, got {:?}",
+            got.text
+        );
     }
 
     // ── regression: entity-ref / CDATA fidelity (findings #34, #1011) ──────────

@@ -945,15 +945,39 @@ pub fn canonical_link_target(raw: &str) -> String {
     s.trim().to_string()
 }
 
-/// The comparison key for a canonical link target: identity on a case-sensitive
-/// filesystem, ASCII-lowercased on a case-insensitive one (macOS/Windows), so
-/// the string-keyed edge comparison agrees with the filesystem's case-folding
-/// `is_file()` resolution. Callers compare `link_edge_key(a) == link_edge_key(b)`.
+/// The comparison key for a canonical link target. Two normalizations, applied
+/// in order, so the string-keyed edge comparison agrees with how the filesystem
+/// resolves the same link:
+///
+///   1. **Unicode NFC, always.** macOS/APFS folds NFC and NFD forms of a name to
+///      the same file, so a file `records/contacts/josé.md` written NFC
+///      (`é` = U+00E9) and a link `[[records/contacts/josé]]` written NFD
+///      (`e` + U+0301) name the *same* file on disk — yet their raw UTF-8 bytes
+///      differ. Without normalization the graph keys them as two different
+///      targets, so `backlinks`/`forwardlinks` miss the edge and `orphans` flags
+///      a linked-to file as an orphan, while `validate` (which resolves through
+///      the filesystem) sees the link as live: the surfaces silently disagree.
+///      Normalizing BOTH sides to NFC here makes the comparison
+///      normalization-insensitive, matching the filesystem. This lives in the
+///      comparison key — not in [`canonical_link_target`] — so the canonical
+///      form stays byte/normalization-preserving (rename REWRITE output is never
+///      silently re-normalized); both the link target and the file path pass
+///      through this function, so NFC here is sufficient to unify them.
+///   2. **ASCII case-fold on a case-insensitive filesystem.** Identity on a
+///      case-sensitive FS, ASCII-lowercased on macOS/Windows, so the comparison
+///      also agrees with the filesystem's case-folding `is_file()` resolution.
+///
+/// Callers compare `link_edge_key(a) == link_edge_key(b)`.
 pub fn link_edge_key(canonical_target: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    // NFC first — always, on every platform: the graph must agree across hosts,
+    // and the comparison must be normalization-insensitive regardless of which
+    // host's filesystem folded the on-disk name.
+    let nfc: String = canonical_target.nfc().collect();
     if fs_is_case_insensitive() {
-        canonical_target.to_ascii_lowercase()
+        nfc.to_ascii_lowercase()
     } else {
-        canonical_target.to_string()
+        nfc
     }
 }
 
@@ -975,8 +999,31 @@ pub fn link_edge_key(canonical_target: &str) -> String {
 /// before the first `|` is the target; a target whose trimmed form starts with
 /// `[` is the rejected triple-bracket flow-form list mis-encoding
 /// (`[[[a]], [[b]]]`), not a real link — skipped, matching validate.
-pub fn extract_edge_targets(body: &str) -> Vec<String> {
+///
+/// Accepts a whole file's text *or* a body-only fragment. A leading `---`
+/// frontmatter block is YAML, not markdown: it has no code fences, and a
+/// `[[…]]` in any frontmatter field is a real edge. The frontmatter is therefore
+/// scanned WITHOUT fence tracking, and the body is scanned with a FRESH fence
+/// state — so a stray ``` / `~~~` inside a frontmatter value can never open a
+/// fence that swallows the body's real wiki-links. (Callers `search_by_link`,
+/// `forwardlinks`, and `dbmd links` all pass full file text; without this
+/// boundary reset a fenced frontmatter value silently dropped every subsequent
+/// body edge — under-reporting backlinks/forwardlinks/`links`.) A fragment with
+/// no leading frontmatter takes the body path unchanged.
+pub fn extract_edge_targets(text: &str) -> Vec<String> {
     let mut out = Vec::new();
+    // Split off a leading `---`…`---` frontmatter block (raw — no YAML parse, so
+    // a malformed file is still fully scanned). Frontmatter links are edges but
+    // must not participate in code-fence state.
+    let body = match split_frontmatter_raw(text) {
+        Some((frontmatter, body)) => {
+            for line in frontmatter.lines() {
+                push_edges_in_line(line, &mut out);
+            }
+            body
+        }
+        None => text,
+    };
     let mut fence: Option<(u8, usize)> = None;
     for line in body.lines() {
         let content = line.trim_end_matches('\r');
@@ -990,27 +1037,35 @@ pub fn extract_edge_targets(body: &str) -> Vec<String> {
             fence = Some(opened);
             continue;
         }
-        let bytes = line.as_bytes();
-        let mut i = 0usize;
-        while i + 1 < bytes.len() {
-            if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-                if let Some(close) = line[i + 2..].find("]]") {
-                    let inner = &line[i + 2..i + 2 + close];
-                    let raw_target = inner.split('|').next().unwrap_or(inner).trim();
-                    if !raw_target.is_empty() && !raw_target.starts_with('[') {
-                        let canonical = canonical_link_target(raw_target);
-                        if !canonical.is_empty() {
-                            out.push(canonical);
-                        }
-                    }
-                    i = i + 2 + close + 2;
-                    continue;
-                }
-            }
-            i += 1;
-        }
+        push_edges_in_line(line, &mut out);
     }
     out
+}
+
+/// Push every `[[target]]` on one line into `out`, alias-stripped (`[[a|b]]` →
+/// `a`), trimmed, and canonicalized. The triple-bracket flow-form mis-encoding
+/// (`[[[a]], …]`) is skipped, matching validate. Shared by both the frontmatter
+/// and body scans in [`extract_edge_targets`] so they honor one link grammar.
+fn push_edges_in_line(line: &str, out: &mut Vec<String>) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(close) = line[i + 2..].find("]]") {
+                let inner = &line[i + 2..i + 2 + close];
+                let raw_target = inner.split('|').next().unwrap_or(inner).trim();
+                if !raw_target.is_empty() && !raw_target.starts_with('[') {
+                    let canonical = canonical_link_target(raw_target);
+                    if !canonical.is_empty() {
+                        out.push(canonical);
+                    }
+                }
+                i = i + 2 + close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// If `line` opens a fenced code block, return `(fence byte, run length)`. The
@@ -1181,6 +1236,32 @@ fn layer_of_folder(folder: &Path) -> Option<Layer> {
     Layer::from_dir_name(first)
 }
 
+/// True if a store-relative path is a db.md **content** file: rooted in a real
+/// layer (`sources/` or `records/` as its FIRST component), with a `.md`
+/// extension, and not an `index.md` sidecar. This is the SPEC's "content files =
+/// everything under `sources/` and `records/` only" predicate (SPEC § content
+/// files), keyed on the *first* component so a non-layer top-level dir is never
+/// content even if a deeper component happens to be named `records`/`sources`
+/// (e.g. `EXPECTED/records/x.md`, `archive/sources/y.md`).
+///
+/// It mirrors the graph engine's content filter so the surfaces that READ the
+/// store (`graph backlinks`) and the surface that MUTATES it (`rename`) agree on
+/// exactly which files are content. `rename` uses it to restrict its
+/// link-rewrite set: a store-root file, a non-layer dir (`scratch/`,
+/// `EXPECTED/`, `archive/`), or an `index.md` is NEVER rewritten — `rename` does
+/// not own those bytes. The broad store scan ([`Store::find_links_to_any`],
+/// shared with the read-only working-set validate) is left untouched; the filter
+/// is applied at the point of mutation.
+pub fn is_content_path(rel: &Path) -> bool {
+    if layer_of_folder(rel).is_none() {
+        return false;
+    }
+    if rel.extension().and_then(|e| e.to_str()) != Some("md") {
+        return false;
+    }
+    rel.file_name().and_then(|n| n.to_str()) != Some("index.md")
+}
+
 /// Infer a content file's canonical `type` from its store-relative path — the
 /// inverse of [`default_type_folder`] and the single source of truth for
 /// path→type inference (the CLI's `fm init` calls this, never re-derives it).
@@ -1257,30 +1338,42 @@ fn value_to_year_month(value: &serde_norway::Value) -> Option<(String, String)> 
     year_month_from_str(s.trim())
 }
 
-/// `(YYYY, MM)` from the leading `YYYY-MM` of a date string.
+/// `(YYYY, MM)` from the leading `YYYY-M` or `YYYY-MM` of a date string, with
+/// the month returned zero-padded to two digits.
+///
+/// The month may be single- OR double-digit so that `2026-1-15` and its
+/// zero-padded twin `2026-01-15` shard to the *same* `2026/01` folder. This
+/// matches the lenient `date`-shape validator (`is_iso8601_date_or_datetime`,
+/// chrono `%Y-%m-%d`), which accepts an unpadded month — without this, a value
+/// the validator treats as a valid date is silently mis-filed under the
+/// `created`-fallback month. Genuinely non-date input still returns `None`.
 fn year_month_from_str(s: &str) -> Option<(String, String)> {
-    // Hand-roll the leading-`YYYY-MM` parse to avoid a regex compile on the
-    // write path. Require: 4 digits, '-', 2 digits.
-    let bytes = s.as_bytes();
-    if bytes.len() < 7 {
+    // Hand-roll the leading-`YYYY-M[M]` parse to avoid a regex compile on the
+    // write path. Split on '-': require a 4-digit year, then a 1-or-2-digit
+    // numeric month in 1..=12. Anything after the month (a `-DD` day, a `T...`
+    // time) is ignored — the day field never separates the leading date.
+    let mut parts = s.splitn(3, '-');
+    let year = parts.next()?;
+    let month_part = parts.next()?;
+
+    // Year: exactly 4 ASCII digits.
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let is_digit = |b: u8| b.is_ascii_digit();
-    if !(is_digit(bytes[0])
-        && is_digit(bytes[1])
-        && is_digit(bytes[2])
-        && is_digit(bytes[3])
-        && bytes[4] == b'-'
-        && is_digit(bytes[5])
-        && is_digit(bytes[6]))
+
+    // Month: 1 or 2 ASCII digits, value 1..=12. Padded to two digits on output.
+    if month_part.is_empty()
+        || month_part.len() > 2
+        || !month_part.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
     }
-    let month: u8 = (bytes[5] - b'0') * 10 + (bytes[6] - b'0');
+    let month: u8 = month_part.parse().ok()?;
     if !(1..=12).contains(&month) {
         return None;
     }
-    Some((s[0..4].to_string(), s[5..7].to_string()))
+
+    Some((year.to_string(), format!("{month:02}")))
 }
 
 /// Render a YAML scalar as a string: a real `String` verbatim, otherwise the
@@ -1330,6 +1423,39 @@ fn frontmatter_block(text: &str) -> Option<&str> {
         scanned += line.len() + 1; // +1 for the consumed '\n'
         if after.is_empty() {
             return None;
+        }
+        rest = after;
+    }
+}
+
+/// Split a file's text into `(frontmatter, body)` at the leading `---`…`---`
+/// fence — raw (no YAML parse), so a file with malformed frontmatter is still
+/// split and fully scanned. `frontmatter` is the text between the fences
+/// (exclusive); `body` is everything after the closing fence's line. Returns
+/// `None` when the text does not open with a `---` fence or has no closing
+/// fence — the caller then treats the whole text as body. Mirrors
+/// [`frontmatter_block`]'s boundary detection (BOM- and CRLF-tolerant).
+fn split_frontmatter_raw(text: &str) -> Option<(&str, &str)> {
+    let stripped = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let (first, after_first) = split_first_line(stripped);
+    if first.trim_end() != "---" {
+        return None;
+    }
+    let block_start = after_first;
+    let mut scanned = 0usize;
+    let mut rest = after_first;
+    loop {
+        let (line, after) = split_first_line(rest);
+        if line.trim_end() == "---" {
+            // `after` is the body: everything past the closing fence line.
+            return Some((&block_start[..scanned], after));
+        }
+        if after.is_empty() && line.is_empty() {
+            return None; // reached EOF with no closing fence
+        }
+        scanned += line.len() + 1; // +1 for the consumed '\n'
+        if after.is_empty() {
+            return None; // closing fence never found
         }
         rest = after;
     }
@@ -1493,6 +1619,30 @@ mod tests {
         let mut v = [Layer::Records, Layer::Sources];
         v.sort();
         assert_eq!(v, [Layer::Sources, Layer::Records]);
+    }
+
+    #[test]
+    fn is_content_path_is_layer_rooted_and_excludes_non_layer_files() {
+        // Real content: a `.md` file rooted in a layer's FIRST component.
+        assert!(is_content_path(Path::new("records/contacts/alice.md")));
+        assert!(is_content_path(Path::new("sources/emails/2026/05/x.md")));
+        // Store-root meta files and a bare top-level note are NOT content.
+        assert!(!is_content_path(Path::new("DB.md")));
+        assert!(!is_content_path(Path::new("log.md")));
+        assert!(!is_content_path(Path::new("NOTES.md")));
+        // Non-layer top-level dirs are NEVER content — even if a DEEPER
+        // component is named `records`/`sources` (the rename data-loss case).
+        assert!(!is_content_path(Path::new("scratch/draft.md")));
+        assert!(!is_content_path(Path::new("EXPECTED/snapshot.md")));
+        assert!(!is_content_path(Path::new("archive/old.md")));
+        assert!(!is_content_path(Path::new(
+            "EXPECTED/records/contacts/x.md"
+        )));
+        assert!(!is_content_path(Path::new("archive/sources/emails/y.md")));
+        // An `index.md` sidecar inside a layer is a catalog, not content.
+        assert!(!is_content_path(Path::new("records/contacts/index.md")));
+        // A non-`.md` file inside a layer (e.g. the jsonl sidecar) is not content.
+        assert!(!is_content_path(Path::new("records/contacts/index.jsonl")));
     }
 
     // ── is_db_md_store / open ────────────────────────────────────────────────
@@ -1886,6 +2036,65 @@ mod tests {
             !store.type_shards("contact"),
             "unconfigured entity type stays flat"
         );
+    }
+
+    // ── year_month_from_str ──────────────────────────────────────────────────
+
+    #[test]
+    fn year_month_from_str_accepts_unpadded_month() {
+        // A single-digit month shards to the same zero-padded folder as its twin,
+        // matching the lenient `date`-shape validator (chrono `%Y-%m-%d`).
+        let ym = year_month_from_str;
+        assert_eq!(
+            ym("2026-1-15"),
+            Some(("2026".to_string(), "01".to_string())),
+        );
+        assert_eq!(
+            ym("2026-01-15"),
+            Some(("2026".to_string(), "01".to_string())),
+        );
+        assert_eq!(
+            ym("2026-12-5"),
+            Some(("2026".to_string(), "12".to_string())),
+        );
+        assert_eq!(ym("2026-1"), Some(("2026".to_string(), "01".to_string())));
+        // Full timestamps still parse off the leading date.
+        assert_eq!(
+            ym("2026-3-22T10:00:00-07:00"),
+            Some(("2026".to_string(), "03".to_string())),
+        );
+    }
+
+    #[test]
+    fn year_month_from_str_rejects_non_dates() {
+        // Genuinely non-date input still returns None (behavior unchanged).
+        assert_eq!(year_month_from_str(""), None);
+        assert_eq!(year_month_from_str("not-a-date"), None);
+        assert_eq!(year_month_from_str("2026"), None); // no month part
+        assert_eq!(year_month_from_str("26-1-15"), None); // year not 4 digits
+        assert_eq!(year_month_from_str("2026-13-01"), None); // month out of range
+        assert_eq!(year_month_from_str("2026-0-01"), None); // month zero
+        assert_eq!(year_month_from_str("2026-001-01"), None); // month over 2 digits
+        assert_eq!(year_month_from_str("2026-x-01"), None); // non-numeric month
+        assert_eq!(year_month_from_str("20a6-1-15"), None); // non-numeric year
+    }
+
+    #[test]
+    fn shard_path_accepts_unpadded_month_same_as_padded() {
+        // End-to-end: an unpadded `date` shards to its real month, identically to
+        // its zero-padded twin — not to the `created`-fallback month.
+        let dir = empty_store();
+        let store = open(&dir);
+
+        let padded = store
+            .shard_path_for("expense", &fm_with_extra("date", "2026-01-15"), "padded")
+            .unwrap();
+        assert_eq!(padded, PathBuf::from("records/expenses/2026/01/padded.md"));
+
+        let single = store
+            .shard_path_for("expense", &fm_with_extra("date", "2026-1-15"), "single")
+            .unwrap();
+        assert_eq!(single, PathBuf::from("records/expenses/2026/01/single.md"));
     }
 
     // ── shard_path_for ───────────────────────────────────────────────────────
@@ -3065,6 +3274,42 @@ After fence [[records/companies/acme]].
     }
 
     #[test]
+    fn extract_edge_targets_frontmatter_fence_does_not_swallow_body_links() {
+        // Regression: `search_by_link` / `forwardlinks` / `dbmd links` feed the
+        // WHOLE file (frontmatter + body) here. A stray code-fence run inside a
+        // frontmatter value must NOT open a markdown fence that swallows the
+        // body's real wiki-links. Frontmatter links are still edges; a link
+        // genuinely inside a BODY fence is still ignored.
+        let file = "\
+---
+type: note
+summary: \"a note\"
+ref: \"[[records/contacts/sarah]]\"
+snippet: \"```\"
+---
+
+Body mentions [[records/companies/acme]].
+
+```
+[[records/contacts/ghost-example]] inside a body fence.
+```
+
+After fence [[records/contacts/dave]].
+";
+        let got = extract_edge_targets(file);
+        assert_eq!(
+            got,
+            vec![
+                "records/contacts/sarah".to_string(), // frontmatter edge
+                "records/companies/acme".to_string(), // body edge AFTER the frontmatter ```
+                "records/contacts/dave".to_string(),  // body edge after a real body fence
+            ],
+            "a code fence inside frontmatter must not suppress body wiki-links, \
+             and a real body-fenced link must still be ignored"
+        );
+    }
+
+    #[test]
     fn extract_edge_targets_handles_nested_indented_and_long_run_fences() {
         // Regression for the naive `starts_with("```")/("~~~")` toggle: a fence
         // nested inside another, an over-indented (>3 space) marker, and a
@@ -3137,6 +3382,26 @@ After [[records/companies/acme]].
         } else {
             assert_ne!(a, b, "case-sensitive FS must keep the key case-exact");
         }
+    }
+
+    #[test]
+    fn link_edge_key_unifies_nfc_and_nfd_normalization_forms() {
+        // REGRESSION (Unicode encoding / silent graph break): on macOS/APFS a
+        // file written in one Unicode normalization form and a link written in
+        // the other name the SAME file (the FS folds NFC/NFD), but their raw
+        // bytes differ. The edge comparison key must fold them to one key on
+        // every platform, or the graph (backlinks/forwardlinks/orphans) keys the
+        // two as different targets and silently misses the edge.
+        let nfc = "records/contacts/jos\u{00e9}"; // é = U+00E9 (NFC)
+        let nfd = "records/contacts/jose\u{0301}"; // e + U+0301 (NFD)
+                                                   // The two inputs are genuinely byte-different (the test would be vacuous
+                                                   // otherwise).
+        assert_ne!(nfc, nfd, "test inputs must be byte-distinct NFC vs NFD");
+        assert_eq!(
+            link_edge_key(nfc),
+            link_edge_key(nfd),
+            "NFC and NFD spellings of the same name must produce one edge key"
+        );
     }
 
     // ── walk follows symlinked content ───────────────────────────────────────

@@ -243,9 +243,34 @@ impl Log {
                 if !recovering {
                     fs::write(&marker, b"")?;
                 }
+
+                // Scope the crash-recovery dedup correctly. The marker only tells
+                // us a rotation may have been interrupted; on its own it does NOT
+                // prove these specific entries are a re-roll. A genuine interrupted
+                // rotation commits its archive appends FIRST and crashes before the
+                // active trim, so on retry every prior-month entry still in the
+                // active file already has a matching copy in its archive — the
+                // whole roll-out batch is a multiset-subset of the archives. Only
+                // then is the dedup the right thing: suppress the copies the prior
+                // attempt already wrote.
+                //
+                // If instead some prior-month entry has NO matching archive copy,
+                // no completed archive write exists to re-roll: the marker is stale
+                // (e.g. committed/synced into a `merge=union` clone after a crash
+                // stranded it) and these entries are a FRESH roll. Treating them as
+                // a re-roll would dedup a genuinely-distinct same-(minute,kind,
+                // object,note) entry against an unrelated pre-existing archive entry
+                // and, because the active file is trimmed unconditionally below,
+                // drop it from disk entirely. So we only enter recovery mode when
+                // the entire batch is already reflected in the archives. The
+                // tradeoff favors preservation: a rare genuine partial multi-month
+                // crash may re-append an already-archived entry (a visible,
+                // recoverable duplicate) rather than ever silently losing one.
+                let recovering_reroll = recovering && batch_is_archived(store, &by_month)?;
+
                 for ((y, m), month_entries) in &by_month {
                     let path = archive_path(store, *y, *m);
-                    append_to_archive(&path, month_entries, recovering)?;
+                    append_to_archive(&path, month_entries, recovering_reroll)?;
                 }
 
                 // Rewrite the active file to the kept (current-month) entries
@@ -320,25 +345,35 @@ impl Log {
         // within-file early stop: out-of-order entries mean a newer entry can
         // sit physically before an older one, so each file is read fully.
         let mut window = NewestWindow::new(n);
-        // Active↔archive overlap dedup, narrowly scoped (see `since`): an
-        // interrupted rotation can leave the SAME entry in both the untrimmed
-        // active file and its month archive; without suppression it would occupy
-        // two window slots and surface twice. We record every ACTIVE entry's
-        // identity and suppress only an ARCHIVE entry that matches one — NEVER an
-        // active entry against another active entry, nor an archive entry against
-        // another archive entry. A global content key over-reaches: on-disk
-        // headers are minute-precision, so two genuinely-distinct same-minute
-        // appends share an identity and a global dedup silently dropped the
-        // second on read.
+        // Active↔archive overlap dedup, narrowly scoped AND gated on the
+        // crash-recovery marker (mirrors `since` and the write side). The only
+        // legitimate source of an active↔archive overlap is a rotation
+        // interrupted between its two non-atomic durable writes (archive append
+        // committed, active trim not), which leaves the SAME entry in both the
+        // untrimmed active file and its month archive — exactly the state the
+        // `.rotating` marker records (see `rotation_marker_path`). When the
+        // marker is ABSENT (normal operation) there is no such overlap: a
+        // backdated append that rotated as a FRESH roll and merely collides on
+        // (minute,kind,object,note) with an active entry is a genuinely-DISTINCT
+        // event the write side deliberately preserved on disk, and the reader
+        // must report it. The old code deduped unconditionally and silently
+        // dropped that distinct entry (the bug). We therefore build `active_seen`
+        // — and suppress matching archive entries below — ONLY while the marker
+        // is present. Even then it suppresses only an ARCHIVE entry that matches
+        // an ACTIVE one, never active-vs-active or archive-vs-archive.
+        let recovering = rotation_marker_path(store).exists();
         let mut active_seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
         // Active file: scan fully (current-month-bounded by rotation). Record
-        // every identity for overlap detection, but consider every entry — a
-        // same-minute duplicate WITHIN the active file is two distinct appends.
+        // every identity for overlap detection *only while recovering* (the
+        // marker is present); consider every entry regardless — a same-minute
+        // duplicate WITHIN the active file is two distinct appends.
         let active = active_log_path(store);
         if active.exists() {
             reverse_collect(&active, |e| {
-                active_seen.insert(entry_key(&e));
+                if recovering {
+                    active_seen.insert(entry_key(&e));
+                }
                 window.consider(e);
                 false
             })?;
@@ -359,9 +394,12 @@ impl Log {
                 }
             }
             reverse_collect(&archive, |e| {
-                // Suppress only the active↔archive crash-retry overlap; keep
-                // every distinct same-minute archive entry (archives are never
-                // deduped against each other).
+                // Suppress only a crash-retry active↔archive overlap, and only
+                // when recovering (marker present). `active_seen` is empty
+                // otherwise, so this never suppresses in normal operation — a
+                // distinct same-(minute,kind,object,note) archive entry survives
+                // even when an active entry collides on those fields. Archives
+                // are never deduped against each other.
                 if !active_seen.contains(&entry_key(&e)) {
                     window.consider(e);
                 }
@@ -396,25 +434,34 @@ impl Log {
     /// month is entirely at or before `time`'s.
     pub fn since(store: &Store, time: DateTime<FixedOffset>) -> crate::Result<Vec<LogEntry>> {
         let mut collected: Vec<LogEntry> = Vec::new();
-        // Active↔archive overlap dedup, narrowly scoped. An interrupted rotation
-        // (archive write committed, active rewrite not) leaves the same entries
-        // in BOTH the untrimmed active file and the archive; without suppression
-        // each comes back twice. We record ACTIVE identities and suppress only an
-        // ARCHIVE entry that matches one — never active-vs-active or
-        // archive-vs-archive. A global content key would over-reach: on-disk
-        // headers are minute-precision, so two genuinely-distinct same-minute
-        // appends share an identity, and a global dedup silently under-reported
-        // the second.
+        // Active↔archive overlap dedup, narrowly scoped AND gated on the
+        // crash-recovery marker (mirrors `tail` and the write side). An overlap
+        // (the SAME entry in both the untrimmed active file and the archive)
+        // arises ONLY from a rotation interrupted between its two non-atomic
+        // durable writes — exactly the state the `.rotating` marker records (see
+        // `rotation_marker_path`). When the marker is ABSENT (normal operation)
+        // there is no overlap to mask: a backdated append that rotated as a FRESH
+        // roll and merely collides on (minute,kind,object,note) with an active
+        // entry is a genuinely-DISTINCT event the write side preserved on disk,
+        // and the reader must report it. Deduping unconditionally silently
+        // dropped that distinct entry (the bug). We therefore record ACTIVE
+        // identities — and suppress matching archive entries below — ONLY while
+        // recovering; even then it suppresses an ARCHIVE entry against an ACTIVE
+        // one, never active-vs-active or archive-vs-archive.
+        let recovering = rotation_marker_path(store).exists();
         let mut active_seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
         // Active file: scan fully, no early stop (out-of-order safe). Collect
         // every in-window entry (a same-minute duplicate within the active file
-        // is two distinct appends), recording identities for overlap detection.
+        // is two distinct appends), recording identities for overlap detection
+        // only while recovering (the marker is present).
         let active = active_log_path(store);
         if active.exists() {
             reverse_collect(&active, |e| {
                 if e.timestamp > time {
-                    active_seen.insert(entry_key(&e));
+                    if recovering {
+                        active_seen.insert(entry_key(&e));
+                    }
                     collected.push(e);
                 }
                 false
@@ -444,8 +491,11 @@ impl Log {
             // Scan this archive fully — within a month, entries may still be
             // out of order, so no within-file early stop.
             reverse_collect(&archive, |e| {
-                // Suppress only the active↔archive crash-retry overlap; keep
-                // every distinct same-minute archive entry.
+                // Suppress only a crash-retry active↔archive overlap, and only
+                // when recovering (marker present). `active_seen` is empty
+                // otherwise, so a distinct same-(minute,kind,object,note) archive
+                // entry survives in normal operation even when an active entry
+                // collides on those fields.
                 if e.timestamp > time && !active_seen.contains(&entry_key(&e)) {
                     collected.push(e);
                 }
@@ -1033,6 +1083,52 @@ fn append_to_archive(path: &Path, entries: &[LogEntry], recovering: bool) -> cra
         crate::fsx::write_atomic(path, full.as_bytes())?;
     }
     Ok(())
+}
+
+/// True iff every prior-month entry about to be rolled out (`by_month`) already
+/// has a matching, unconsumed copy in its month archive — i.e. the whole
+/// roll-out batch is a multiset-subset of the archives.
+///
+/// This is the load-bearing test for "is the `.rotating` marker a genuine
+/// interrupted-rotation re-roll, or a stale marker over a fresh roll?" A genuine
+/// interrupted rotation commits its per-month archive appends BEFORE the active
+/// trim, so on retry the still-untrimmed active file's prior-month entries are
+/// all present in the archives — exactly the duplicates the dedup must suppress.
+/// If any entry is missing from its archive, no completed archive write exists to
+/// re-roll: the marker is stale and these are a fresh roll that must be appended,
+/// never deduped (deduping a genuinely-distinct same-(minute,kind,object,note)
+/// entry against an unrelated pre-existing archive copy would, with the
+/// unconditional active trim, drop it from disk — the bug).
+///
+/// Multiset semantics: each archived copy is consumed at most once, so two
+/// distinct same-minute entries in the batch require two archived copies to count
+/// as a re-roll. Cheap: only the months actually being rolled are read, and only
+/// when the marker is present (the cold recovery path).
+fn batch_is_archived(
+    store: &Store,
+    by_month: &BTreeMap<(i32, u32), Vec<LogEntry>>,
+) -> crate::Result<bool> {
+    for ((y, m), month_entries) in by_month {
+        let path = archive_path(store, *y, *m);
+        if !path.exists() {
+            // No archive for this month: nothing was rolled here yet, so the
+            // batch cannot be a completed re-roll.
+            return Ok(false);
+        }
+        let (_header, archived) = parse_active(&fs::read_to_string(&path)?);
+        let mut available: std::collections::HashMap<EntryKey, usize> =
+            std::collections::HashMap::new();
+        for e in &archived {
+            *available.entry(entry_key(e)).or_insert(0) += 1;
+        }
+        for e in month_entries {
+            match available.get_mut(&entry_key(e)) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => return Ok(false),
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// A hashable identity for a log entry, used to dedup an idempotent archive
@@ -2490,6 +2586,127 @@ Second.
         );
     }
 
+    /// THE BUG (write side, data-loss). A STALE `.rotating` marker (e.g.
+    /// committed/synced into a `merge=union` clone after a crash stranded it
+    /// between the archive write and the active trim) must NOT make a fresh
+    /// rotation treat a genuinely-distinct same-(minute,kind,object,note) entry
+    /// as a crash re-roll and silently drop it.
+    ///
+    /// On-disk shape (the exact CLI repro): the January archive already holds one
+    /// `dup` entry (authored independently); the active log holds a February entry
+    /// AND a SECOND, distinct, byte-identical-at-minute-precision January `dup`
+    /// (a backdated append that merged in). The stale marker is present. Rotating
+    /// (a March append) rolls both prior months out. The marker is NOT proof of a
+    /// re-roll here: February is absent from the archives, so no completed prior
+    /// rotation of this batch exists. Pre-fix, the global marker flag drove the
+    /// archive dedup against the ENTIRE existing archive, suppressed the active
+    /// `dup` against the unrelated pre-existing archive `dup`, wrote nothing to the
+    /// archive, and still trimmed the active file — so the entry vanished from
+    /// disk. The archive must end with BOTH `dup` entries.
+    #[test]
+    fn regression_stale_marker_does_not_drop_distinct_same_minute_on_fresh_roll() {
+        let (_d, store) = temp_store();
+        let dir = archive_dir(&store);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Pre-existing, independently-authored January archive entry.
+        let jan = entry(2026, 1, 15, 9, 0, LogKind::Create, Some("dup"), "body");
+        let mut arch = String::from(LOG_FRONTMATTER);
+        arch.push('\n');
+        arch.push_str(&jan.render());
+        fs::write(archive_path(&store, 2026, 1), arch).unwrap();
+
+        // Active file: a February entry plus a SECOND, distinct, byte-identical
+        // January `dup` (backdated, physically alongside February).
+        let feb = entry(2026, 2, 5, 9, 0, LogKind::Create, Some("feb"), "feb");
+        write_raw_log(&store, &[feb, jan.clone()]);
+
+        // A stale rotation marker lingers (crash stranded it; not gitignored, so
+        // it can ride into a clone).
+        fs::write(rotation_marker_path(&store), b"").unwrap();
+
+        // A March append rotates January AND February out as a FRESH roll.
+        let mar = entry(2026, 3, 1, 0, 0, LogKind::Create, Some("mar"), "mar");
+        Log::append(&store, &mar).unwrap();
+
+        // The genuinely-distinct January `dup` must survive: BOTH copies in the
+        // archive, the entry never lost.
+        let jan_arch = fs::read_to_string(archive_path(&store, 2026, 1)).unwrap();
+        assert_eq!(
+            count_occurrences(&jan_arch, "## [2026-01-15 09:00] create | dup"),
+            2,
+            "stale marker dropped a distinct same-minute January entry; got:\n{jan_arch}"
+        );
+        // February rolled to its own (newly created) archive exactly once.
+        let feb_arch = fs::read_to_string(archive_path(&store, 2026, 2)).unwrap();
+        assert_eq!(
+            count_occurrences(&feb_arch, "## [2026-02-05 09:00] create | feb"),
+            1,
+            "February did not roll cleanly; got:\n{feb_arch}"
+        );
+        // The marker is cleared after the committed rotation.
+        assert!(
+            !rotation_marker_path(&store).exists(),
+            "rotation marker must be cleared after a committed rotation"
+        );
+        // The reader agrees: both January `dup`s are visible (no marker now).
+        let dups = Log::since(&store, ts(2026, 1, 1, 0, 0))
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.object.as_deref() == Some("dup"))
+            .count();
+        assert_eq!(dups, 2, "since must report both distinct January dups");
+    }
+
+    /// PRESERVED INVARIANT (write side). A GENUINE interrupted rotation — the
+    /// whole prior-month roll-out batch is already present in the archives (the
+    /// archive write committed before the crash), the same entries still sit in
+    /// the untrimmed active file, and the marker is present — must STILL dedup the
+    /// re-roll exactly once. This is the case the scoped recovery dedup must keep
+    /// suppressing; the fix narrows recovery mode to "batch already archived",
+    /// which this scenario satisfies.
+    #[test]
+    fn regression_true_crash_retry_still_dedups_when_whole_batch_already_archived() {
+        let (_d, store) = temp_store();
+        let dir = archive_dir(&store);
+        fs::create_dir_all(&dir).unwrap();
+
+        let apr1 = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("apr-a"), "apr one");
+        let apr2 = entry(2026, 4, 20, 9, 0, LogKind::Create, Some("apr-b"), "apr two");
+
+        // The interrupted rotation already committed both April entries to the
+        // archive.
+        let mut arch = String::from(LOG_FRONTMATTER);
+        arch.push('\n');
+        arch.push_str(&apr1.render());
+        arch.push_str(&apr2.render());
+        fs::write(archive_path(&store, 2026, 4), arch).unwrap();
+
+        // The active file still holds the SAME April entries (trim never landed).
+        write_raw_log(&store, &[apr1.clone(), apr2.clone()]);
+
+        // The crash left the in-progress-rotation marker behind.
+        fs::write(rotation_marker_path(&store), b"").unwrap();
+
+        // The agent retries with a May append: April is re-rolled. Because the
+        // whole April batch is already in the archive, this is a true re-roll and
+        // must NOT duplicate.
+        let may = entry(2026, 5, 2, 8, 0, LogKind::Update, Some("may"), "may one");
+        Log::append(&store, &may).unwrap();
+
+        let archived = fs::read_to_string(archive_path(&store, 2026, 4)).unwrap();
+        assert_eq!(
+            count_occurrences(&archived, "## [2026-04-10 09:00] ingest | apr-a"),
+            1,
+            "true crash-retry duplicated the first April entry; got:\n{archived}"
+        );
+        assert_eq!(
+            count_occurrences(&archived, "## [2026-04-20 09:00] create | apr-b"),
+            1,
+            "true crash-retry duplicated the second April entry; got:\n{archived}"
+        );
+    }
+
     /// Adversarial review (#7) — two GENUINELY-DISTINCT appends that render
     /// byte-identically at minute precision (same minute/kind/object/note) must
     /// BOTH survive rotation. The backdated-duplicate case: apr1 rotates in May;
@@ -2568,6 +2785,151 @@ Second.
             since.len(),
             2,
             "since must return both same-minute active entries; got {since:#?}"
+        );
+    }
+
+    // ── regression: read-side active↔archive dedup must be marker-gated ────────
+
+    /// THE BUG (HIGH, data-loss). Two GENUINELY-DISTINCT same-(minute,kind,
+    /// object,note) entries, one in the active `log.md` and one in its month
+    /// archive, with NO rotation marker present (normal operation). The write
+    /// side deliberately preserved both on disk (a backdated append after a
+    /// completed rotation that merely collides on those minute-precision fields
+    /// is a distinct real event). Pre-fix the read side deduped the
+    /// active↔archive overlap UNCONDITIONALLY, so `tail`/`since` silently
+    /// dropped the archive copy — reporting 1 where disk holds 2. The fix gates
+    /// that dedup on the `.rotating` marker (mirroring the write side); with no
+    /// marker, both must come back.
+    #[test]
+    fn regression_tail_since_keep_distinct_split_entries_without_rotation_marker() {
+        let (_d, store) = temp_store();
+
+        // Author the SAME (minute,kind,object,note) entry once in the May
+        // archive and once in the active file. This is exactly the on-disk shape
+        // the repro produces: an entry rotates into log/2026-05.md, then a second
+        // backdated append of identical fields lands in the active log.md after a
+        // later-month rotation completed (so NO marker lingers).
+        let dir = archive_dir(&store);
+        fs::create_dir_all(&dir).unwrap();
+        let dup = entry(
+            2026,
+            5,
+            10,
+            8,
+            0,
+            LogKind::Ingest,
+            Some("records/x.md"),
+            "same note text",
+        );
+        let mut arch = String::from(LOG_FRONTMATTER);
+        arch.push('\n');
+        arch.push_str(&dup.render());
+        fs::write(archive_path(&store, 2026, 5), arch).unwrap();
+
+        // Active file: a current-month (June) entry plus the SECOND distinct copy
+        // of the May-dated event (backdated, so physically alongside June).
+        let jun = entry(
+            2026,
+            6,
+            1,
+            9,
+            0,
+            LogKind::Create,
+            Some("records/june.md"),
+            "june",
+        );
+        write_raw_log(&store, &[jun, dup.clone()]);
+
+        // No rotation marker => normal operation => trust the disk: BOTH distinct
+        // copies of the May event must be reported by since and tail.
+        assert!(
+            !rotation_marker_path(&store).exists(),
+            "precondition: no rotation marker (normal operation)"
+        );
+
+        let since = Log::since(&store, ts(2026, 5, 1, 0, 0)).unwrap();
+        let since_dups = since.iter().filter(|e| **e == dup).count();
+        assert_eq!(
+            since_dups, 2,
+            "since must return BOTH distinct same-minute entries split across \
+             active+archive when no rotation marker is present; got {since:#?}"
+        );
+
+        let tail = Log::tail(&store, 10).unwrap();
+        let tail_dups = tail.iter().filter(|e| **e == dup).count();
+        assert_eq!(
+            tail_dups, 2,
+            "tail must return BOTH distinct same-minute entries split across \
+             active+archive when no rotation marker is present; got {tail:#?}"
+        );
+    }
+
+    /// PRESERVED INVARIANT. When a rotation IS in flight (the `.rotating` marker
+    /// is present), an interrupted rotation can leave the SAME physical entry in
+    /// both the untrimmed active file and its archive. That crash-induced
+    /// duplicate must still be deduped on read so it is not double-reported —
+    /// the gating must not throw away the legitimate crash-recovery masking.
+    #[test]
+    fn regression_tail_since_dedup_crash_overlap_when_rotation_marker_present() {
+        let (_d, store) = temp_store();
+
+        // Simulate the mid-rotation crash state: the SAME physical May entry is
+        // in BOTH the archive (write committed) and the active file (trim never
+        // landed), and the in-flight marker is still on disk.
+        let dir = archive_dir(&store);
+        fs::create_dir_all(&dir).unwrap();
+        let rolled = entry(
+            2026,
+            5,
+            10,
+            8,
+            0,
+            LogKind::Ingest,
+            Some("records/x.md"),
+            "same note text",
+        );
+        let mut arch = String::from(LOG_FRONTMATTER);
+        arch.push('\n');
+        arch.push_str(&rolled.render());
+        fs::write(archive_path(&store, 2026, 5), arch).unwrap();
+
+        // Active file still holds the un-trimmed May entry plus a current-month
+        // (June) entry — the pre-trim shape a crash leaves behind.
+        let jun = entry(
+            2026,
+            6,
+            1,
+            9,
+            0,
+            LogKind::Create,
+            Some("records/june.md"),
+            "june",
+        );
+        write_raw_log(&store, &[jun, rolled.clone()]);
+
+        // The crash leaves the in-progress-rotation marker behind.
+        fs::write(rotation_marker_path(&store), b"").unwrap();
+        assert!(
+            rotation_marker_path(&store).exists(),
+            "precondition: rotation marker present (crash mid-rotation)"
+        );
+
+        // Recovering => the active↔archive overlap is the crash duplicate, masked
+        // on read: the May entry must be reported ONCE, not twice.
+        let since = Log::since(&store, ts(2026, 5, 1, 0, 0)).unwrap();
+        let since_dups = since.iter().filter(|e| **e == rolled).count();
+        assert_eq!(
+            since_dups, 1,
+            "since must dedup the crash-induced active↔archive overlap when the \
+             rotation marker is present; got {since:#?}"
+        );
+
+        let tail = Log::tail(&store, 10).unwrap();
+        let tail_dups = tail.iter().filter(|e| **e == rolled).count();
+        assert_eq!(
+            tail_dups, 1,
+            "tail must dedup the crash-induced active↔archive overlap when the \
+             rotation marker is present; got {tail:#?}"
         );
     }
 
@@ -3012,6 +3374,15 @@ Second.
         // but the active rewrite never trimmed, so the same April entries live in
         // BOTH the untrimmed active file and `log/2026-04.md`. Readers must
         // return each entry ONCE, not twice.
+        //
+        // A real crash in that window necessarily leaves the `.rotating` marker
+        // behind — it is written BEFORE the archive append (Log::append step 1)
+        // and removed only AFTER the active trim commits, so any state where the
+        // archive holds the entries but the active was never trimmed has the
+        // marker present. The read-side overlap dedup is gated on that marker
+        // (mirroring the write side); without it, an active↔archive collision is
+        // treated as two genuinely-distinct entries, not a crash duplicate. So
+        // the test must set the marker to model the crash it claims to.
         let (_d, store) = temp_store();
         let apr_a = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("apr-a"), "apr one");
         let apr_b = entry(2026, 4, 20, 9, 0, LogKind::Create, Some("apr-b"), "apr two");
@@ -3026,6 +3397,9 @@ Second.
         arch.push_str(&apr_a.render());
         arch.push_str(&apr_b.render());
         fs::write(archive_path(&store, 2026, 4), arch).unwrap();
+        // The crash leaves the in-progress-rotation marker on disk; this is what
+        // authorizes the read-side overlap dedup.
+        fs::write(rotation_marker_path(&store), b"").unwrap();
 
         // `since` must return each April entry exactly once.
         let since = Log::since(&store, ts(2026, 4, 1, 0, 0)).unwrap();

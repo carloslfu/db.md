@@ -10,7 +10,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 # MSRV 1.88: forced by the `pdf-extract 0.12` security update (RUSTSEC-2026-0187),
 # whose `lopdf 0.42` uses stable let-chains (Rust 1.88+). Verified as the exact
@@ -36,6 +36,12 @@ regex = "1"
 grep = "0.3"
 ignore = "0.4"
 walkdir = "2"
+# Unicode NFC normalization for the wiki-link comparison key (graph edge
+# matching). Deterministic, table-driven Unicode algorithm — zero AI/LLM, zero
+# embeddings. MIT OR Apache-2.0 (permissive); its transitive `tinyvec`
+# (Zlib OR Apache-2.0 OR MIT) + `tinyvec_macros` (MIT OR Apache-2.0 OR Zlib)
+# discharge via MIT/Apache, all on the allowlist. Recorded in THIRD_PARTY_NOTICES.
+unicode-normalization = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 thiserror = "2"
 # SHA-256 for the asset manifest (content hashing in dbmd-core's `assets`

@@ -202,10 +202,33 @@ fn introduces_block_scalar(content: &str) -> bool {
 
 /// Quote an oversized bare-integer value on a single block line, returning the
 /// rewritten line, or `None` if the line carries no such value.
+///
+/// Handles two value shapes:
+/// - a bare scalar value (`key: <int>`, `- <int>`, `- key: <int>`), and
+/// - a single-line flow collection value (`key: [ … ]` / `key: { … }`) holding
+///   one or more oversized integer literals (possibly mixed with in-range ints,
+///   strings, and nested flow collections) — see [`quote_oversized_ints_in_flow`].
+///
+/// In both cases only the offending integer scalar(s) are single-quoted; every
+/// other byte is preserved exactly.
 fn quote_int_value_in_line(content: &str) -> Option<String> {
     let value_start = scalar_value_start(content)?;
     let region = &content[value_start..];
     let value = region.trim_end();
+
+    // Single-line flow collection: scan inside it for oversized int literals.
+    // (A bare scalar never starts with `[`/`{`, so these arms are disjoint.)
+    if value.starts_with('[') || value.starts_with('{') {
+        let trailing = &region[value.len()..];
+        let rewritten = quote_oversized_ints_in_flow(value)?;
+        return Some(format!(
+            "{}{}{}",
+            &content[..value_start],
+            rewritten,
+            trailing
+        ));
+    }
+
     if !is_oversized_int_literal(value) {
         return None;
     }
@@ -219,6 +242,113 @@ fn quote_int_value_in_line(content: &str) -> Option<String> {
     ))
 }
 
+/// Scan a single-line YAML flow collection (`[ … ]` / `{ … }`) and single-quote
+/// each oversized bare-integer literal it contains, returning the rewritten flow
+/// text, or `None` when it holds no such literal (so the caller can leave the
+/// line untouched and `changed` stays false for an unaffected file).
+///
+/// The flow grammar is tokenized by its structural characters — `[ ] { } , :` —
+/// at the top level: text between two structural characters (and outside any
+/// single/double quoted scalar) is one plain scalar. A plain scalar whose trimmed
+/// form is an oversized canonical decimal integer (per [`is_oversized_int_literal`])
+/// is wrapped in single quotes; everything else — in-range ints, quoted strings,
+/// floats, booleans, nested collections, the structural punctuation and all
+/// surrounding whitespace — is emitted verbatim. Nested collections and multiple
+/// literals on one line are handled by the same single left-to-right pass.
+fn quote_oversized_ints_in_flow(flow: &str) -> Option<String> {
+    let mut out = String::with_capacity(flow.len() + 2);
+    let mut changed = false;
+    // Byte offset where the current plain-scalar token began (None ⇒ not inside
+    // a plain scalar, e.g. just after a structural char or inside a quote).
+    let mut scalar_start: Option<usize> = None;
+    let bytes = flow.as_bytes();
+    let mut i = 0usize;
+
+    // Flush the plain scalar spanning `[start, end)`: quote it iff it is an
+    // oversized integer literal, otherwise copy it through verbatim.
+    fn flush(out: &mut String, flow: &str, start: usize, end: usize, changed: &mut bool) {
+        let raw = &flow[start..end];
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && is_oversized_int_literal(trimmed) {
+            // Preserve the token's incidental leading/trailing whitespace; only
+            // the literal itself is quoted. A pure-digit literal contains no `'`,
+            // so single-quoting needs no escaping.
+            let lead = &raw[..raw.len() - raw.trim_start().len()];
+            let tail = &raw[raw.trim_end().len()..];
+            out.push_str(lead);
+            out.push('\'');
+            out.push_str(trimmed);
+            out.push('\'');
+            out.push_str(tail);
+            *changed = true;
+        } else {
+            out.push_str(raw);
+        }
+    }
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            // Quoted scalars: copy through verbatim, skipping their contents so a
+            // structural char or digit run inside a string is never reinterpreted.
+            b'\'' | b'"' => {
+                if let Some(start) = scalar_start.take() {
+                    flush(&mut out, flow, start, i, &mut changed);
+                }
+                let quote = b;
+                let str_start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        // A doubled single-quote (`''`) is an escaped quote inside
+                        // a single-quoted YAML scalar, not the closing delimiter.
+                        if quote == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        // A backslash-escaped quote inside a double-quoted scalar
+                        // does not close it.
+                        if quote == b'"' && bytes[i - 1] == b'\\' {
+                            i += 1;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str(&flow[str_start..i]);
+            }
+            // Structural characters end the current plain scalar and are copied
+            // through. `:` separates a flow-mapping key from its value; `,`
+            // separates entries; brackets/braces open or close a (possibly
+            // nested) collection.
+            b'[' | b']' | b'{' | b'}' | b',' | b':' => {
+                if let Some(start) = scalar_start.take() {
+                    flush(&mut out, flow, start, i, &mut changed);
+                }
+                out.push(b as char);
+                i += 1;
+            }
+            _ => {
+                if scalar_start.is_none() {
+                    scalar_start = Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    if let Some(start) = scalar_start.take() {
+        flush(&mut out, flow, start, bytes.len(), &mut changed);
+    }
+
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Pre-quote bare integer literals beyond the `i64`/`u64` range so they parse as
 /// STRING scalars and round-trip verbatim.
 ///
@@ -229,8 +359,10 @@ fn quote_int_value_in_line(content: &str) -> Option<String> {
 /// round-trip byte-for-byte. Quoting them up front makes them string-valued (the
 /// type narrows from number to string, but no data is destroyed).
 ///
-/// Conservative: only a single-line `key: <int>` / `- <int>` / `- key: <int>`
-/// value that is a canonical decimal integer beyond `i64`/`u64` is quoted; block
+/// Conservative: only a canonical decimal integer beyond `i64`/`u64` is quoted —
+/// whether it appears as a bare value (`key: <int>` / `- <int>` / `- key: <int>`)
+/// or as a scalar inside a single-line flow collection (`key: [ … ]` /
+/// `key: { … }`, including nested collections and mixed/multiple literals); block
 /// scalars are tracked and never touched; anything already in range, quoted, or
 /// not a bare integer is left exactly as written.
 fn quote_oversized_integers(yaml: &str) -> std::borrow::Cow<'_, str> {
@@ -408,6 +540,34 @@ impl Frontmatter {
                 }
             }
         }
+
+        // Disambiguate the one YAML shape `serde_norway` cannot tell apart on its
+        // own: an *inline scalar* wiki-link `field: [[x]]` and a *genuine 2D
+        // array* `field:`\n`- - x` BOTH parse to the identical
+        // `Seq[ Seq[String("x")] ]`. The parsed `Value` has lost which one the
+        // source wrote, but the source text has not — so we resolve it here, the
+        // only place the original spelling is still visible. For every `extra`
+        // key the source wrote in the inline `[[…]]` form, store the canonical
+        // quoted scalar `String("[[x]]")` instead of the ambiguous nested
+        // sequence. `to_yaml`/`canonicalize_extra_value` then emit it inline and
+        // round-trip it (SPEC § Linking, `company: [[…]]`), while a real nested
+        // array — which never appears in inline-link source form — stays a
+        // sequence and is preserved verbatim rather than silently retyped.
+        for key in inline_scalar_link_keys(yaml) {
+            if let Some(value) = fm.extra.get_mut(&key) {
+                // The parsed value of an inline `key: [[x]]` is the one-element
+                // outer `Seq[ Seq[String(x)] ]`; `unquoted_inline_link` reads the
+                // inner `Seq[String(x)]`, so unwrap the lone outer item first.
+                if let Value::Sequence(items) = value {
+                    if items.len() == 1 {
+                        if let Some(link) = unquoted_inline_link(&items[0]) {
+                            *value = Value::String(wiki_link_literal(&link));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(fm)
     }
 
@@ -781,32 +941,86 @@ fn normalize_frozen_path(p: &Path) -> String {
 /// free (no glob crate) while making `records/decisions/*` actually freeze the
 /// files beneath it instead of failing open.
 fn frozen_glob_matches(pat: &str, path: &str) -> bool {
-    let pat_segs: Vec<&str> = pat.split('/').collect();
+    // Collapse runs of consecutive `**` segments into a single `**` before
+    // matching: `**/**` matches exactly the same set of paths as `**`, so the
+    // duplicates carry no semantics — they only multiply the number of
+    // (star-index, path-index) splits the matcher must consider. Dropping them
+    // up front is the first half of keeping the match polynomial (the
+    // two-pointer matcher below is the second); without it, a DB.md bullet like
+    // `**/**/…/zzz` against a deep non-matching target made the old recursive
+    // matcher explore exponentially many splits and hang the entire write path.
+    let pat_segs: Vec<&str> = collapse_double_stars(pat.split('/'));
     let path_segs: Vec<&str> = path.split('/').collect();
     glob_segments(&pat_segs, &path_segs)
 }
 
-/// Recursive segment matcher for [`frozen_glob_matches`]. `**` consumes any
-/// number of path segments; every other pattern segment must match exactly one
-/// path segment (with `*` wildcards inside it).
-fn glob_segments(pat: &[&str], path: &[&str]) -> bool {
-    match pat.split_first() {
-        None => path.is_empty(),
-        Some((&"**", rest_pat)) => {
-            // `**` matches zero segments here, or one-or-more by consuming a path
-            // segment and recursing on the same `**`.
-            if glob_segments(rest_pat, path) {
-                return true;
-            }
-            !path.is_empty() && glob_segments(pat, &path[1..])
+/// Drop every `**` segment that immediately follows another `**`, leaving at most
+/// one `**` per run. Consecutive `**` are semantically identical to a single `**`
+/// (each matches "zero or more whole segments"), so this never changes the set of
+/// matched paths — it only removes the redundant pattern positions that otherwise
+/// fuel catastrophic backtracking.
+fn collapse_double_stars<'a>(segs: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in segs {
+        if seg == "**" && out.last() == Some(&"**") {
+            continue;
         }
-        Some((&first_pat, rest_pat)) => match path.split_first() {
-            Some((&first_path, rest_path)) => {
-                glob_segment_text(first_pat, first_path) && glob_segments(rest_pat, rest_path)
-            }
-            None => false,
-        },
+        out.push(seg);
     }
+    out
+}
+
+/// Segment matcher for [`frozen_glob_matches`]. `**` consumes any number of path
+/// segments; every other pattern segment must match exactly one path segment
+/// (with `*` wildcards inside it).
+///
+/// Implemented as the classic linear wildcard match: a single forward scan with a
+/// remembered "last `**`" backtrack point, never the two-way recursion the old
+/// version used. The old `glob_segments(rest, path)` OR `glob_segments(pat,
+/// &path[1..])` recursion had no memoization, so N consecutive `**` against a
+/// deep target that ultimately fails to match explored an exponential number of
+/// (star-index, path-index) splits — one DB.md frozen-page bullet could hang the
+/// store's whole write path. This greedy scan with backtrack is O(pat × path) in
+/// the worst case while matching exactly the same set of paths.
+fn glob_segments(pat: &[&str], path: &[&str]) -> bool {
+    let mut pi = 0usize; // cursor into pattern segments
+    let mut si = 0usize; // cursor into path segments
+                         // Backtrack point: where in the pattern the last `**` sat, and the path
+                         // position to resume from if a later literal mismatch forces the `**` to
+                         // swallow one more segment. `None` until we have seen a `**`.
+    let mut star_pi: Option<usize> = None;
+    let mut star_si = 0usize;
+
+    while si < path.len() {
+        if pi < pat.len() && pat[pi] == "**" {
+            // Record this `**` as the resume point and tentatively let it match
+            // zero segments (advance past it). If a later segment fails, we come
+            // back here and let the `**` swallow one more path segment.
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if pi < pat.len() && glob_segment_text(pat[pi], path[si]) {
+            // Ordinary segment match: advance both cursors.
+            pi += 1;
+            si += 1;
+        } else if let Some(sp) = star_pi {
+            // Mismatch (or pattern exhausted) but an earlier `**` can absorb more:
+            // resume just after that `**`, having it consume one extra segment.
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            // Mismatch with no `**` to fall back on.
+            return false;
+        }
+    }
+
+    // Path consumed; any trailing pattern must be all `**` (each matching zero
+    // segments) for a full match.
+    while pi < pat.len() && pat[pi] == "**" {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 /// Match a single glob segment against a single path segment. `*` matches any
@@ -1827,14 +2041,19 @@ fn canonicalize_extra_value(value: &Value) -> Value {
             None => value.clone(),
         },
         Value::Sequence(items) => {
-            // Scalar wiki-link, unquoted inline form: `field: [[x]]` parses to a
-            // one-element `Seq[ Seq[String(x)] ]`. Collapse back to the quoted
-            // scalar string so the link is preserved rather than block-emitted.
-            if items.len() == 1 {
-                if let Some(link) = unquoted_inline_link(&items[0]) {
-                    return Value::String(wiki_link_literal(&link));
-                }
-            }
+            // NOTE: we deliberately do NOT collapse a one-element
+            // `Seq[ Seq[String(x)] ]` to the scalar `String("[[x]]")` here. That
+            // shape is ambiguous — `serde_norway` parses BOTH an inline scalar
+            // wiki-link `field: [[x]]` AND a genuine 2D array `field:`\n`- - x`
+            // to exactly that value, so collapsing it silently retyped a real
+            // nested array (`matrix: [["cell"]]`) into the string `'[[cell]]'`
+            // and the file stopped round-tripping. The two cases ARE
+            // distinguishable, but only from the source text, so the genuine
+            // inline-link case is resolved at parse time
+            // ([`Frontmatter::parse`] → [`inline_scalar_link_keys`]), where it is
+            // stored as a `String("[[x]]")` and handled by the arm above. By the
+            // time a `Seq[Seq[String]]` reaches here it is a real nested array and
+            // must pass through verbatim (SPEC § "Unknown fields pass through").
             // List of wiki-links: re-emit as a block sequence of quoted-link
             // strings, the canonical list form `to_yaml` renders block-style and
             // `links_in_field_value` accepts. Only canonicalize when *every* item
@@ -1891,6 +2110,76 @@ fn unquoted_inline_link(v: &Value) -> Option<WikiLink> {
         return None;
     }
     parse_wiki_link_str(&format!("[[{s}]]"))
+}
+
+/// Scan raw frontmatter YAML for top-level keys whose value is written in the
+/// **inline scalar wiki-link** form `key: [[target]]` (optionally
+/// `[[target|display]]`).
+///
+/// This is the one disambiguation the parsed [`Value`] cannot supply on its own:
+/// `serde_norway` parses BOTH
+///
+/// ```yaml
+/// field: [[x]]
+/// ```
+///
+/// and
+///
+/// ```yaml
+/// field:
+/// - - x
+/// ```
+///
+/// to the identical `Seq[ Seq[String("x")] ]`. Only the source text says which one
+/// the operator wrote. [`Frontmatter::parse`] calls this and rewrites the inline
+/// cases to the canonical scalar `String("[[x]]")`, leaving every genuine nested
+/// array a sequence (preserved verbatim per SPEC § "Unknown fields pass through").
+///
+/// Conservative by construction: a key is reported only when, on a single
+/// top-level (zero-indent) line, the value after the first `:` is *exactly* one
+/// `[[…]]` token (whitespace and an optional trailing `# comment` aside) with no
+/// nested brackets inside. A quoted value (`field: "[[x]]"`), a flow list
+/// (`field: [[a], [b]]`), a block sequence, or any indented/multi-token value is
+/// left for the normal parse path. Duplicate keys (last-wins in YAML) are handled
+/// by the caller looking up the final stored value.
+fn inline_scalar_link_keys(yaml: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in yaml.lines() {
+        // Only top-level keys: an indented line is a nested mapping/sequence
+        // entry, never a top-level `key: [[x]]` scalar.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let Some((raw_key, raw_val)) = line.split_once(':') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        // Drop a trailing `# comment` (YAML allows one after a plain scalar on the
+        // same line). A `#` inside the bracketed link target is not a comment, but
+        // such a target is rejected below anyway (it would not be a clean link).
+        let val = match raw_val.split_once(" #") {
+            Some((before, _)) => before.trim(),
+            None => raw_val.trim(),
+        };
+        // The value must be exactly one bracket-delimited `[[…]]` token: starts
+        // with `[[`, ends with `]]`, and the inner text carries no further
+        // brackets (which would make it a flow list / nested collection, not a
+        // single inline wiki-link).
+        let Some(inner) = val.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) else {
+            continue;
+        };
+        if inner.contains('[') || inner.contains(']') {
+            continue;
+        }
+        // Confirm it is actually a parseable wiki-link, not e.g. an empty `[[]]`.
+        if parse_wiki_link_str(val).is_some() {
+            keys.push(key.to_string());
+        }
+    }
+    keys
 }
 
 /// Decide whether a `dbmd fm set` / `--fm` value string is a **list of
@@ -2641,6 +2930,158 @@ mod tests {
         }
     }
 
+    #[test]
+    fn regression_oversized_int_in_flow_sequence_round_trips() {
+        // The single-line flow SEQUENCE form regressed: an oversized int inside
+        // `ids: [123…]` reached serde_norway un-quoted and hard-failed the whole
+        // block as MalformedYaml (`as u128`), making every read surface
+        // (format / fm get/set / link / validate) unable to read the file at all.
+        // It must now parse, preserve the literal verbatim, and be idempotent.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.md");
+        let big = "123456789012345678901234567890"; // 30 digits, > u128::MAX
+        let original = format!("---\ntype: note\nsummary: x\nids: [{big}]\n---\nbody\n");
+        std::fs::write(&path, &original).unwrap();
+
+        for _ in 0..2 {
+            let (fm, body) = read_file(&path).expect("flow-sequence oversized int must parse");
+            // The list value survives in `extra`, holding the literal as a string.
+            let ids = fm.extra.get("ids").expect("ids field preserved");
+            assert!(
+                matches!(ids, Value::Sequence(_)),
+                "ids should stay a sequence, got: {ids:?}"
+            );
+            write_file(&path, &fm, &body).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                after.contains(big),
+                "30-digit integer in flow sequence corrupted by format:\n{after}"
+            );
+            assert!(
+                !after.to_lowercase().contains("1.234"),
+                "integer was truncated to a float:\n{after}"
+            );
+            assert_eq!(body, "body\n", "body must be preserved verbatim");
+        }
+    }
+
+    #[test]
+    fn regression_oversized_int_in_flow_mapping_round_trips() {
+        // The single-line flow MAPPING form regressed identically:
+        // `meta: {ext: 123…}` hard-failed the block. It must now parse and the
+        // oversized value must survive verbatim.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("m.md");
+        let big = "123456789012345678901234567890";
+        let original = format!("---\ntype: note\nsummary: x\nmeta: {{ext: {big}}}\n---\nbody\n");
+        std::fs::write(&path, &original).unwrap();
+
+        for _ in 0..2 {
+            let (fm, body) = read_file(&path).expect("flow-mapping oversized int must parse");
+            let meta = fm.extra.get("meta").expect("meta field preserved");
+            assert!(
+                matches!(meta, Value::Mapping(_)),
+                "meta should stay a mapping, got: {meta:?}"
+            );
+            write_file(&path, &fm, &body).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                after.contains(big),
+                "oversized integer in flow mapping corrupted by format:\n{after}"
+            );
+            assert_eq!(body, "body\n", "body must be preserved verbatim");
+        }
+    }
+
+    #[test]
+    fn regression_oversized_int_in_mixed_flow_collection_round_trips() {
+        // A flow collection mixing an oversized int with an in-range int and a
+        // string: only the oversized int is quoted; the in-range int stays a
+        // number, the string stays a string, and the whole thing parses.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mix.md");
+        let big = "123456789012345678901234567890";
+        let original = format!(
+            "---\ntype: note\nsummary: x\nvals: [{big}, 42, hello, \"world\"]\n---\nbody\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let (fm, body) = read_file(&path).expect("mixed flow collection must parse");
+        let Value::Sequence(seq) = fm.extra.get("vals").expect("vals preserved") else {
+            panic!("vals should be a sequence");
+        };
+        assert_eq!(seq.len(), 4, "all four entries preserved");
+        // The oversized literal narrows to a string; the in-range int stays a
+        // number; the bare and quoted strings stay strings.
+        assert_eq!(seq[0].as_str(), Some(big), "oversized int -> string");
+        assert_eq!(seq[1].as_i64(), Some(42), "in-range int stays a number");
+        assert_eq!(seq[2].as_str(), Some("hello"));
+        assert_eq!(seq[3].as_str(), Some("world"));
+
+        write_file(&path, &fm, &body).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains(big), "oversized int lost:\n{after}");
+        assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn regression_multiple_oversized_ints_in_one_flow_line_round_trip() {
+        // Two oversized literals on the same flow line — and a nested collection —
+        // must each be quoted in the single left-to-right pass.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("multi.md");
+        let a = "99999999999999999999"; // 20 digits
+        let b = "123456789012345678901234567890"; // 30 digits
+        let original =
+            format!("---\ntype: note\nsummary: x\nm: {{a: {a}, nested: [{b}, 7]}}\n---\nbody\n");
+        std::fs::write(&path, &original).unwrap();
+
+        let (fm, body) = read_file(&path).expect("multi oversized flow must parse");
+        write_file(&path, &fm, &body).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains(a), "first oversized int lost:\n{after}");
+        assert!(after.contains(b), "second oversized int lost:\n{after}");
+        assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn regression_flow_with_only_in_range_and_strings_is_byte_exact() {
+        // A flow collection with NO oversized int must round-trip byte-for-byte:
+        // the pre-quoter must not touch in-range ints, strings, or floats. We
+        // assert on the prepared-YAML stage so an unaffected line is left as the
+        // borrowed input (no rewrite, no quoting drift).
+        let yaml = "type: note\nids: [1, 2, 3]\nmeta: {ext: 42, name: bob}\nf: [1.5, 2.5]\n";
+        let prepared = quote_oversized_integers(yaml);
+        assert_eq!(
+            prepared.as_ref(),
+            yaml,
+            "in-range flow collections must be left byte-exact"
+        );
+        // And it still parses cleanly with the expected numeric types intact.
+        let fm = Frontmatter::parse(yaml, Path::new("n.md")).unwrap();
+        let Value::Sequence(ids) = fm.extra.get("ids").unwrap() else {
+            panic!("ids should be a sequence");
+        };
+        assert_eq!(ids[0].as_i64(), Some(1));
+    }
+
+    #[test]
+    fn quote_oversized_ints_in_flow_skips_quoted_and_digit_strings() {
+        // A quoted scalar whose contents happen to be a long digit run must NOT
+        // be re-quoted or otherwise altered — it is already a string. A flow with
+        // only such strings yields no change (None).
+        let flow = "[\"123456789012345678901234567890\", '99999999999999999999']";
+        assert_eq!(
+            quote_oversized_ints_in_flow(flow),
+            None,
+            "already-quoted digit strings must be left untouched"
+        );
+        // A bare oversized int alongside a quoted one: only the bare one is quoted.
+        let flow2 = "[123456789012345678901234567890, \"already\"]";
+        let out = quote_oversized_ints_in_flow(flow2).expect("bare int should be quoted");
+        assert_eq!(out, "['123456789012345678901234567890', \"already\"]");
+    }
+
     // ── Regression: BOM-prefixed files parse like store/index (finding #19) ────
 
     #[test]
@@ -2678,16 +3119,22 @@ mod tests {
         // Regression (PRIMARY): the SPEC-canonical scalar wiki-link is the
         // *unquoted* inline `company: [[records/companies/northstar]]`
         // (SPEC § Linking, the worked `contact` example). YAML parses it to the
-        // nested `Seq[Seq[String]]` shape and `parse` stores that verbatim in
-        // `extra`. Before the fix, `to_yaml` re-emitted it block-style as
+        // nested `Seq[Seq[String]]` shape. Before the fix, `to_yaml` re-emitted
+        // it block-style as
         //     company:
         //     - - records/companies/northstar
         // — the `[[ ]]` brackets GONE — so a no-op re-emit (`dbmd format`, and
         // any `fm set` / `link` write) silently destroyed the link.
         let yaml = "type: contact\ncompany: [[records/companies/northstar]]";
         let fm = Frontmatter::parse(yaml, Path::new("c.md")).unwrap();
-        // Sanity: it really parsed as the nested sequence, not a string.
-        assert!(fm.extra.get("company").and_then(|v| v.as_str()).is_none());
+        // Sanity: `parse` now disambiguates the inline-link source form at read
+        // time (the genuine `Seq[Seq[String]]` of a 2D array no longer gets
+        // collapsed at emit), so the inline link is stored as the canonical
+        // scalar `String("[[x]]")`.
+        assert_eq!(
+            fm.extra.get("company").and_then(|v| v.as_str()),
+            Some("[[records/companies/northstar]]")
+        );
 
         let out = fm.to_yaml();
         // The link must survive as a quoted inline scalar — brackets intact, and
@@ -3095,8 +3542,14 @@ mod tests {
         // surface exactly one link with the correct target.
         let yaml = "type: meeting\ncompany: [[records/companies/northstar]]";
         let fm = Frontmatter::parse(yaml, Path::new("m.md")).unwrap();
-        // Sanity: it really did parse as the nested sequence form, NOT a string.
-        assert!(fm.extra.get("company").and_then(|v| v.as_str()).is_none());
+        // Sanity: `parse` disambiguates the inline-link source form at read time,
+        // storing it as the canonical scalar `String("[[x]]")` (so a genuine
+        // `Seq[Seq[String]]` 2D array is never collapsed/retyped). link_fields()
+        // reads either spelling back as the same link.
+        assert_eq!(
+            fm.extra.get("company").and_then(|v| v.as_str()),
+            Some("[[records/companies/northstar]]")
+        );
 
         let fields = fm.link_fields();
         let links: Vec<(&str, &str, Option<&str>)> = fields
@@ -3660,6 +4113,97 @@ mod tests {
         assert!(reparsed.link_fields().is_empty());
     }
 
+    #[test]
+    fn regression_genuine_nested_array_is_not_retyped_to_scalar_string() {
+        // BUG: `dbmd format` silently retyped a genuine 2D array
+        //     matrix:
+        //     - - cell
+        // (data `[["cell"]]`) into the scalar string `matrix: '[[cell]]'`. The
+        // root cause is the irreducible YAML ambiguity: serde parses BOTH the
+        // inline scalar wiki-link `field: [[x]]` AND the block nested-seq
+        // `field:`\n`- - x` to the identical `Seq[Seq[String]]`. The old
+        // `canonicalize_extra_value` collapsed every one-element `Seq[Seq[String]]`
+        // to a string, destroying the array. The fix resolves the inline-link
+        // case from the SOURCE text at parse time and leaves a genuine block
+        // array verbatim.
+        let yaml = "type: note\nsummary: nested\nmatrix:\n- - cell\n";
+        let fm = Frontmatter::parse(yaml, Path::new("nested.md")).unwrap();
+
+        // The block source form stays a nested sequence, NOT a string — the
+        // inline-link disambiguation only fires for source written `key: [[x]]`.
+        let stored = fm.extra.get("matrix").expect("matrix preserved");
+        assert!(
+            matches!(stored, Value::Sequence(items)
+                if items.len() == 1 && matches!(&items[0], Value::Sequence(_))),
+            "genuine 2D array was retyped at parse time; got {stored:?}"
+        );
+
+        let out = fm.to_yaml();
+        // Emit must keep the array (a block nested sequence), never the bogus
+        // scalar string `'[[cell]]'`.
+        assert!(
+            !out.contains("'[[cell]]'") && !out.contains("[[cell]]"),
+            "genuine nested array retyped to a scalar wiki-link string; got:\n{out}"
+        );
+        assert!(
+            out.contains("- - cell"),
+            "nested array lost its 2D shape on emit; got:\n{out}"
+        );
+
+        // Full round-trip: re-parsing the emitted YAML yields the identical value
+        // — the file's bytes are preserved, which is what BUG 2 was about. (The
+        // read-side `link_fields` still treats a one-element `Seq[Seq[String]]` as
+        // the inline-link shape it is indistinguishable from on disk; that is the
+        // same irreducible ambiguity and is out of scope here — the fix's job is
+        // that `format` no longer silently RETYPES the array to a string.)
+        let reparsed = Frontmatter::parse(&out, Path::new("nested.md")).unwrap();
+        assert_eq!(
+            reparsed.extra.get("matrix"),
+            fm.extra.get("matrix"),
+            "nested array did not round-trip through format"
+        );
+        // The stored value is still a sequence after round-trip (never a string).
+        assert!(
+            matches!(reparsed.extra.get("matrix"), Some(Value::Sequence(_))),
+            "nested array became a non-sequence after round-trip"
+        );
+    }
+
+    #[test]
+    fn inline_scalar_wiki_link_still_round_trips_after_nested_array_fix() {
+        // The companion guarantee to the test above: the SPEC-canonical inline
+        // scalar wiki-link `field: [[x]]` (SPEC.md:383) must still format to a
+        // canonical inline `[[x]]` that round-trips and surfaces as one link —
+        // the nested-array fix must not regress it.
+        let yaml = "type: contact\ncompany: [[records/companies/northstar]]\n";
+        let fm = Frontmatter::parse(yaml, Path::new("c.md")).unwrap();
+        // Disambiguated at parse time to the canonical scalar string.
+        assert_eq!(
+            fm.extra.get("company").and_then(|v| v.as_str()),
+            Some("[[records/companies/northstar]]")
+        );
+
+        let out = fm.to_yaml();
+        assert!(
+            out.contains("[[records/companies/northstar]]") && !out.contains("- - "),
+            "inline wiki-link not canonical after the nested-array fix; got:\n{out}"
+        );
+
+        let reparsed = Frontmatter::parse(&out, Path::new("c.md")).unwrap();
+        let fields = reparsed.link_fields();
+        let links: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, l)| (k.as_str(), l.target.as_str()))
+            .collect();
+        assert_eq!(links, vec![("company", "records/companies/northstar")]);
+        // Idempotent across repeated curator-loop writes.
+        assert_eq!(
+            reparsed.to_yaml(),
+            out,
+            "inline link is not a format fixed point"
+        );
+    }
+
     // ── Regression: fence-line trailing whitespace is tolerated (#4) ───────────
 
     #[test]
@@ -3855,6 +4399,80 @@ mod tests {
         };
         assert!(suffix.is_frozen(Path::new("records/decisions/q1.md")));
         assert!(!suffix.is_frozen(Path::new("records/decisions/draft.md")));
+    }
+
+    #[test]
+    fn regression_frozen_glob_many_double_stars_does_not_backtrack_exponentially() {
+        use std::time::Instant;
+
+        // A DB.md frozen-page bullet with many consecutive `**` segments and a
+        // literal tail (`zzz`), matched against a deep target that ends in a
+        // DIFFERENT segment (`file.md`), is the catastrophic-backtracking case:
+        // the old two-way `glob_segments` recursion explored an exponential
+        // number of (star, path) splits before concluding "no match" — ~119s for
+        // 15 stars — hanging the store's entire write path (every write/rename/
+        // fm-set funnels through `frozen_match`). The two-pointer matcher + `**`
+        // collapse make this polynomial.
+        let pat = format!("{}/zzz", vec!["**"; 30].join("/"));
+        let target_path = format!("records/{}/file.md", vec!["a"; 40].join("/"));
+        let cfg = Config {
+            frozen_pages: vec![PathBuf::from(&pat)],
+            ..Config::default()
+        };
+
+        let start = Instant::now();
+        let frozen = cfg.is_frozen(Path::new(&target_path));
+        let elapsed = start.elapsed();
+
+        // The tail `zzz` never matches the target's `file.md`, so it is NOT frozen…
+        assert!(
+            !frozen,
+            "non-matching deep target wrongly reported frozen (semantics changed)"
+        );
+        // …and the decision must be near-instant, not exponential. The pre-fix
+        // code took tens of seconds here; a generous ceiling still fails loudly
+        // if the blow-up ever returns.
+        assert!(
+            elapsed.as_secs() < 1,
+            "frozen glob took {elapsed:?} — catastrophic backtracking is back"
+        );
+
+        // Semantics preserved: the same many-`**` pattern with a tail that DOES
+        // match still freezes the file (a real match still refuses the write).
+        let pat_hit = format!("{}/file.md", vec!["**"; 30].join("/"));
+        let cfg_hit = Config {
+            frozen_pages: vec![PathBuf::from(&pat_hit)],
+            ..Config::default()
+        };
+        assert!(
+            cfg_hit.is_frozen(Path::new(&target_path)),
+            "many-`**` pattern failed to freeze a genuinely-matching deep target"
+        );
+    }
+
+    #[test]
+    fn frozen_glob_double_star_collapse_preserves_match_set() {
+        // Collapsing consecutive `**` must not change which paths match: `**/**`
+        // matches exactly what `**` does. Interleaved `**` and literals still
+        // match across segments, and a non-matching literal tail still fails.
+        let collapsed = Config {
+            frozen_pages: vec![PathBuf::from("records/**/**/**/q1.md")],
+            ..Config::default()
+        };
+        assert!(collapsed.is_frozen(Path::new("records/decisions/q1.md")));
+        assert!(collapsed.is_frozen(Path::new("records/a/b/c/q1.md")));
+        assert!(collapsed.is_frozen(Path::new("records/q1.md")));
+        assert!(!collapsed.is_frozen(Path::new("records/a/b/c/q2.md")));
+        assert!(!collapsed.is_frozen(Path::new("sources/a/q1.md")));
+
+        // `**` between two literals spans zero or more intermediate segments.
+        let between = Config {
+            frozen_pages: vec![PathBuf::from("records/**/draft.md")],
+            ..Config::default()
+        };
+        assert!(between.is_frozen(Path::new("records/draft.md")));
+        assert!(between.is_frozen(Path::new("records/a/b/draft.md")));
+        assert!(!between.is_frozen(Path::new("records/a/b/final.md")));
     }
 
     #[test]

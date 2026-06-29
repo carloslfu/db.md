@@ -1103,7 +1103,7 @@ see; grouped by category):
 | `NOT_A_STORE` | error | path has no `DB.md`; not a db.md store |
 | `DB_MD_BAD_TYPE` | error | the store's `DB.md` is not `type: db-md` |
 | `DB_MD_MISSING_FIELD` | error | the store's `DB.md` frontmatter lacks `scope` or `owner` |
-| `DB_MD_UNKNOWN_SECTION` | warning | `DB.md` has an `##` section other than `Agent instructions` / `Policies` / `Schemas` |
+| `DB_MD_UNKNOWN_SECTION` | warning | `DB.md` has an `##` section other than `Agent instructions` / `Policies` / `Schemas` / `Folders` |
 | `DB_MD_SCHEMA_FIELD` | warning / info | a `DB.md ## Schemas` field declaration is malformed (empty or duplicate field name → warning) or carries an unrecognized modifier (→ info) |
 | `FM_MISSING_TYPE` | error | content file has no `type:` |
 | `FM_MISSING_CREATED` | error | content file has no `created:` timestamp — run `dbmd fm init` or set RFC3339 manually |
@@ -1171,8 +1171,9 @@ shape is checked directly (not as a content file — it carries no
 (`DB_MD_BAD_TYPE` otherwise, including when `type:` is absent or
 malformed) and MUST carry both `scope` and `owner`
 (`DB_MD_MISSING_FIELD`, one issue per absent field). Its body MAY
-contain only the three recognized `##` sections — `Agent instructions`,
-`Policies`, `Schemas`; any other `##` heading is a likely typo or
+contain only the four recognized `##` sections — `Agent instructions`,
+`Policies`, `Schemas`, `Folders` (optional display overrides for the
+generated rollup `index.md` files); any other `##` heading is a likely typo or
 misplacement and surfaces as `DB_MD_UNKNOWN_SECTION` (warning — the
 parser ignores it, so it does not corrupt the config, but it signals
 the operator wrote a section the toolkit will never read). Recognized

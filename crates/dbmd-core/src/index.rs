@@ -707,6 +707,20 @@ fn update_parents(store: &Store, folder: &Path) -> crate::Result<()> {
     // per-folder stat cache (or an in-place rollup patch for `on_write`); that is
     // a deliberate change to the catalog hot path, tracked as a follow-up, not
     // done inline. Until then, do not describe this op as `O(changed)`.
+    //
+    // CONCURRENCY: the layer `index.md` and the root `index.md` are SHARED across
+    // every type-folder, but the calling write only holds a lock on its OWN
+    // type-folder (`on_write`/`on_remove`/`on_rename`). Two concurrent writes to
+    // *different* type-folders would otherwise both read the sidecar set and both
+    // rewrite the same two rollups, losing one update (a stale rollup that no
+    // longer matches `rebuild_all` — a write-through/rebuild parity violation).
+    // Serialize the whole read-stats + render + write under a store-root lock so
+    // the last writer to commit its sidecar (each write commits its own
+    // `index.jsonl` BEFORE calling here) observes every committed sidecar. Lock
+    // order is always type-folder(s) → root, and nothing acquires the root lock
+    // before a type-folder lock, so this cannot deadlock with the per-folder
+    // locks held by the caller.
+    let _root_lock = FolderLock::acquire(&store.root);
     let stats = collect_child_stats(store, &Layer::all())?;
 
     let layer = folder
@@ -1728,53 +1742,69 @@ struct FolderLock {
 }
 
 impl FolderLock {
-    /// Acquire the lock for `folder_abs`. Spins (with a short sleep) up to a
-    /// bounded number of attempts, breaking a lock older than the staleness
-    /// window so a crash can't deadlock the folder. Best-effort: if the lock
-    /// genuinely can't be taken (extremely rare contention), it proceeds
-    /// unlocked rather than failing the write — degrading to the prior behavior
-    /// instead of erroring a sanctioned operation.
+    /// Acquire the lock for `folder_abs`. Waits until it either takes the lock or
+    /// breaks a genuinely-stale one (a crashed writer's leftover, older than the
+    /// staleness window). It does **not** give up after a fixed budget and
+    /// proceed unlocked under contention.
+    ///
+    /// Why no contention budget: a single legitimate write can hold this lock for
+    /// several seconds — `on_write`/`on_remove`/`on_rename` hold it across the
+    /// whole body, and `update_parents` recomputes the rollups in
+    /// `O(total catalogued records)`. A short give-up budget (the old ~6s) would
+    /// expire while a LIVE writer still held the lock, and the loser would then
+    /// run the sidecar read-modify-write with no mutual exclusion — both writers
+    /// read the same `index.jsonl` snapshot, each adds only its own row, and one
+    /// overwrites the other, silently dropping a catalogued record (the lost
+    /// update this lock exists to prevent; surfaced only by a full
+    /// `validate --all` as `INDEX_JSONL_DESYNC`). So a live holder is always
+    /// waited out, never raced. Forward progress is still bounded against a
+    /// *dead* holder: a lockfile older than `STALE_AFTER` is broken.
+    ///
+    /// Residual limitation (documented, follow-up): a single legitimate hold
+    /// longer than `STALE_AFTER` could be mistaken for a crash and broken. That
+    /// needs a pathological store (an `update_parents` rollup exceeding the
+    /// window — itself the flagged `O(total)` hot-path cost). The complete fix is
+    /// a holder heartbeat that refreshes the lockfile mtime during long ops; not
+    /// done inline to keep this change surgical. Only a genuine non-contention
+    /// error (e.g. a permission failure creating the lockfile) degrades to
+    /// proceeding unlocked — never contention.
     fn acquire(folder_abs: &Path) -> Self {
         use std::time::{Duration, SystemTime};
-        const MAX_ATTEMPTS: u32 = 600; // ~6s at 10ms/attempt
         const SPIN: Duration = Duration::from_millis(10);
         const STALE_AFTER: Duration = Duration::from_secs(30);
 
         let path = folder_abs.join(".index.lock");
         // Ensure the folder exists so the lockfile create can succeed.
         let _ = fs::create_dir_all(folder_abs);
-        for _ in 0..MAX_ATTEMPTS {
+        loop {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => {
-                    return FolderLock { path, held: true };
-                }
+                Ok(_) => return FolderLock { path, held: true },
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Break a stale lock left by a crashed writer.
-                    if let Ok(meta) = fs::metadata(&path) {
-                        if let Ok(modified) = meta.modified() {
-                            if SystemTime::now()
-                                .duration_since(modified)
-                                .map(|age| age > STALE_AFTER)
-                                .unwrap_or(false)
-                            {
-                                let _ = fs::remove_file(&path);
-                                continue;
-                            }
-                        }
+                    // Break a stale lock left by a crashed writer; otherwise wait
+                    // for the live holder to release. NEVER proceed unlocked here.
+                    let stale = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .map(|age| age > STALE_AFTER)
+                        .unwrap_or(false);
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                        continue;
                     }
                     std::thread::sleep(SPIN);
                 }
-                // Any other error (e.g. permissions): give up on locking and
-                // proceed unlocked rather than failing the write.
+                // A non-contention error (permissions, read-only fs): we cannot
+                // lock here at all, so proceed unlocked rather than fail a
+                // sanctioned write — the prior best-effort behavior, but ONLY for
+                // hard errors, never for contention.
                 Err(_) => return FolderLock { path, held: false },
             }
         }
-        // Contention budget exhausted: proceed unlocked (best-effort).
-        FolderLock { path, held: false }
     }
 }
 
@@ -3684,5 +3714,77 @@ mod tests {
             !exists(&store, "records/index.jsonl"),
             "layer jsonl must be removed once the last loose file is gone"
         );
+    }
+
+    // ── concurrency: shared layer/root rollup under parallel write-through ────
+
+    #[test]
+    fn concurrent_writes_to_different_type_folders_match_rebuild() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Two threads, each owning a DISTINCT type-folder, drive `on_write`
+        // concurrently. The layer `index.md` and root `index.md` are shared
+        // across both folders, but each `on_write` only locks its own
+        // type-folder — so before the `update_parents` store-root lock, the two
+        // threads raced to rewrite those shared rollups and one update was lost
+        // (the rollup no longer matched `rebuild_all`). With the lock the final
+        // rollups must be byte-identical to a from-scratch rebuild, regardless
+        // of interleaving.
+        let (_d, store) = mk_store();
+        let folders = ["records/contacts", "records/companies"];
+        let n = 12usize;
+
+        // Pre-create all content files (disjoint paths) so the threads race only
+        // on the index write-through, not on content creation.
+        for (fi, folder) in folders.iter().enumerate() {
+            for i in 0..n {
+                write_doc(
+                    &store,
+                    &format!("{folder}/f{fi}_{i}.md"),
+                    "contact",
+                    Some(&format!("Summary {fi}-{i}")),
+                    Some(&format!("2026-06-{:02}T08:00:00Z", i + 1)),
+                    &format!("id: f{fi}_{i}\n"),
+                );
+            }
+        }
+
+        let store = Arc::new(store);
+        let handles: Vec<_> = folders
+            .iter()
+            .enumerate()
+            .map(|(fi, folder)| {
+                let store = Arc::clone(&store);
+                let folder = folder.to_string();
+                thread::spawn(move || {
+                    for i in 0..n {
+                        let rel = format!("{folder}/f{fi}_{i}.md");
+                        Index::on_write(&store, Path::new(&rel)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Snapshot the write-through artifacts, then rebuild from scratch over
+        // the identical content and snapshot again — they must agree exactly.
+        let got = snapshot_artifacts(&store);
+        Index::rebuild_all(&store).unwrap();
+        let want = snapshot_artifacts(&store);
+
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>(),
+            "artifact set after concurrent write-through must match rebuild"
+        );
+        for (k, v) in &want {
+            assert_eq!(
+                &got[k], v,
+                "rollup artifact {k} diverged from rebuild after concurrent writes"
+            );
+        }
     }
 }

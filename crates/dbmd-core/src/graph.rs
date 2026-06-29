@@ -65,7 +65,7 @@ use ignore::WalkBuilder;
 use crate::index::IndexRecord;
 use crate::store::{
     canonical_link_target, ensure_path_within_store, extract_edge_targets, fence_closes,
-    fence_opens, layer_for_type, link_edge_key, Layer, Store, StoreError,
+    fence_opens, link_edge_key, Layer, Store, StoreError,
 };
 
 /// Which edge directions a traversal follows.
@@ -134,14 +134,15 @@ pub fn backlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreError>
 ///   it keeps the unscoped call inside the loop budget (the old per-candidate
 ///   confirm-read re-opened every file in the store → O(store)).
 /// - **Scoped** (`types` and/or `layer` set): the candidate set — the files that
-///   *might* link to `path` — is read from the relevant layer's `index.jsonl`
-///   sidecars, so the call touches only the named layer(s): O(entities-in-layer),
-///   the sanctioned loop cost. Each candidate is then confirmed by a single-file
-///   parse. When `types` lists several types, the sidecars of each type's layer
-///   are read and the candidate sets unioned (filtered to the type), so a type
-///   whose records span multiple folders within its layer (e.g. a `profile` filed
-///   under any `records/<folder>/`) is fully covered; a `layer` further restricts
-///   the candidate paths to that layer.
+///   *might* link to `path` — is read from `index.jsonl` sidecars (never a
+///   content-tree walk). With a `--in <layer>` the read touches only that layer:
+///   O(entities-in-layer), the sanctioned loop cost. A type-only scope (no `--in`)
+///   reads store-wide sidecars and filters by `type`, exactly as
+///   [`crate::query::Query::execute`] does — so a record of the type filed under a
+///   non-canonical folder of its layer (a `profile` under any `records/<folder>/`)
+///   *and* a **loose file** of the type filed at the *other* layer's root (a `note`
+///   filed directly under `records/`, catalogued in `records/index.jsonl`) are both
+///   candidates. Each candidate is then confirmed by a single-file parse.
 ///
 /// **Correctness (one edge set, both paths).** An incoming edge to X is exactly:
 /// some file whose [`forwardlinks`] contains X — a wiki-link in the body or in
@@ -255,29 +256,39 @@ pub fn forwardlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreErr
 }
 
 /// The candidate set for an incoming-edge scan: the sidecar records that could
-/// link to the target, read from the type-folder `index.jsonl` sidecars (never
-/// a content-tree walk). `types`/`layer` narrow *which* sidecars are read — the
-/// I/O scope that keeps a typed/layer backlinks O(entities-in-layer).
+/// link to the target, read from the `index.jsonl` sidecars (never a content-tree
+/// walk). `types`/`layer` narrow *which* sidecars are read — the I/O scope that
+/// keeps a typed/layer backlinks O(entities-in-layer) when a layer is named.
 ///
-/// - `types` non-empty: for each type, read **the whole layer** the type belongs
-///   to ([`layer_for_type`] → [`Store::sidecar_records`]) and keep the records of
-///   that `type`, unioned by path across the requested types. A `layer` filter,
-///   when given, intersects with the type's own layer (a type lives in exactly
-///   one layer, so a mismatched `--in` simply yields no candidates).
+/// - `types` non-empty, `layer` given: read **only that layer's** sidecars
+///   (O(entities-in-layer)) and keep the records whose `type` is in `types`. The
+///   read is *not* short-circuited on a layer that disagrees with a type's
+///   canonical layer, because a record of that type may legitimately be filed
+///   there as a **loose file** (a `note` filed directly at `records/`, catalogued
+///   in `records/index.jsonl`); the `type` filter on the layer read is what keeps
+///   the result correct in either case.
+/// - `types` non-empty, `layer` `None`: read **store-wide** sidecars and keep the
+///   records whose `type` is in `types` — exactly what [`crate::query::Query::execute`]
+///   does for a type-only query. This is complete across every folder *and* every
+///   layer the type is filed under: its canonical-layer records (the common case)
+///   plus any loose file of that type filed at the *other* layer's root.
 /// - `types` empty: every sidecar record under `layer` (or store-wide when
 ///   `None`) via [`Store::sidecar_records`].
 ///
-/// **Why the whole layer, not just the type's canonical folder.** A `type` can
-/// legitimately span several folders within one layer — a conclusion `profile`
-/// is the canonical case (it lives under `records/profiles/` by default, but an
-/// agent may file one under any other `records/<folder>/`: `records/people/`,
-/// `records/projects/`, …). Reading only the single canonical-guess folder
-/// (`records/profiles/`) would silently drop every profile filed elsewhere in the
-/// layer, so a scoped `backlinks --type profile` would under-report dependents the
-/// moment that canonical folder exists — breaking the docstring's promise that the
-/// scoped edge set equals the unscoped one. Reading the type's full layer subtree
-/// and filtering by `type` is complete and still O(entities-in-layer), the
-/// sanctioned loop scope.
+/// **Why store-wide (not the type's one canonical layer) for the type-only case.**
+/// [`layer_for_type`](crate::store::layer_for_type) maps a type to exactly ONE
+/// layer (`note` → Sources, `contact`
+/// → Records), but a loose file (SPEC § Loose files) may legitimately be filed at
+/// the *other* layer's root and catalogued in that layer's `index.jsonl`. Reading
+/// only `layer_for_type(T)` would silently drop a records-loose `note` from
+/// `backlinks --type note`, and early-`continue`-ing on `--in records` (because
+/// `records` ≠ `layer_for_type(note)`) would return empty — diverging from the
+/// unscoped scan, from `--type T --in <layer>`, and from `dbmd query --type T`.
+/// Reading store-wide (or the named layer) and filtering by `type` is sidecar-backed
+/// (no content-tree walk) and keeps the scoped edge set equal to the unscoped one.
+/// A `type` can also span several folders within one layer — a conclusion `profile`
+/// filed under any `records/<folder>/`, not only `records/profiles/` — and the
+/// store-wide/layer read covers that too.
 fn candidate_records(
     store: &Store,
     types: &[String],
@@ -286,24 +297,18 @@ fn candidate_records(
     if types.is_empty() {
         return store.sidecar_records(layer);
     }
+    let want: HashSet<&str> = types.iter().map(|s| s.as_str()).collect();
+    // A layer scope reads only that layer's sidecars (O(entities-in-layer)); with
+    // no layer, read store-wide so a loose file of the type filed at *either*
+    // layer's root is covered — matching `Query::execute`'s type-only candidate
+    // set. The `type` filter (not a per-type canonical-layer guess) is what makes
+    // both correct, so a loose `note` under `records/` is found and a `note` under
+    // `sources/` is excluded when `--in records`.
     let mut by_path: std::collections::BTreeMap<PathBuf, IndexRecord> =
         std::collections::BTreeMap::new();
-    for type_ in types {
-        // A type lives in exactly one layer; read that whole layer's sidecars so
-        // a record filed under a non-canonical folder of the same type (e.g. a
-        // `profile` under `records/people/` rather than `records/profiles/`) is
-        // still a candidate. An explicit `--in` layer that disagrees with the type's
-        // layer can never match the type, so skip the read entirely.
-        let type_layer = layer_for_type(type_);
-        if let Some(scope) = layer {
-            if scope != type_layer {
-                continue;
-            }
-        }
-        for rec in store.sidecar_records(Some(type_layer))? {
-            if rec.type_ == *type_ {
-                by_path.insert(rec.path.clone(), rec);
-            }
+    for rec in store.sidecar_records(layer)? {
+        if want.contains(rec.type_.as_str()) {
+            by_path.insert(rec.path.clone(), rec);
         }
     }
     Ok(by_path.into_values().collect())
@@ -430,6 +435,14 @@ pub fn neighborhood_capped(
             for (neighbor, dir) in edges {
                 if cap_reached(admitted) {
                     break;
+                }
+                // Drop a neighbor that exists on disk but resolves OUTSIDE the
+                // store via a symlinked path component — it is not a real in-store
+                // edge, exactly as a `..` escape is dropped at edge extraction. This
+                // yields no node (and no traversal through it), closing the
+                // `graph neighborhood` disclosure vector at the graph boundary.
+                if target_escapes_store(store, &neighbor) {
+                    continue;
                 }
                 if !discovered.insert(neighbor.clone()) {
                     continue;
@@ -575,15 +588,45 @@ pub fn rewrite_links_to(text: &str, old: &Path, new: &Path) -> String {
     let old_key = edge_key(&old_target);
 
     let mut out = String::with_capacity(text.len());
-    // Track the fence as a `(char, run length)` exactly like validate and
-    // `extract_edge_targets` (NOT a bool toggled on any ``` / ~~~ line). The
-    // naive toggle flips mid-block on a nested/indented/long-run fence, so a
-    // fenced example link would be rewritten — corrupting documentation and
-    // making rename disagree with validate's edge notion.
+
+    // Split off the leading `---`…`---` frontmatter block exactly like the read
+    // side ([`Store::extract_edge_targets`] via `split_frontmatter_raw`): the
+    // frontmatter is YAML, NOT markdown — it has no code fences, and a `[[…]]`
+    // in any frontmatter field is a real edge. So the frontmatter region is
+    // rewrite-scanned WITHOUT fence tracking, and the body is rewrite-scanned
+    // with a FRESH fence state. Without this boundary reset, a stray ``` / `~~~`
+    // inside a frontmatter block scalar opens a fence that persists into the
+    // body, so every body `[[…]]` is treated as fenced and silently skipped —
+    // leaving a dangling link after rename even though `backlinks`/`forwardlinks`
+    // (which DO reset at this boundary) still report the body edge. Returns
+    // byte offsets so the `---` fence lines and everything else are copied
+    // byte-exact; the only mutation is a matched `[[…]]` retarget.
+    let body_start = match frontmatter_body_split(text) {
+        Some(body_offset) => {
+            // Frontmatter prefix = `0..body_offset` (the opening `---` line, the
+            // YAML, and the closing `---` line). Scan it line-by-line with
+            // rewriting on and NO fence state: the literal `---` fence lines
+            // never match link syntax (rewrite is a no-op on them), and any
+            // real `[[…]]` in a YAML field is retargeted.
+            for line in text[..body_offset].split_inclusive('\n') {
+                rewrite_links_in_line(line, &old_key, &new_target, &mut out);
+            }
+            body_offset
+        }
+        // No leading frontmatter block → the whole text is body.
+        None => 0,
+    };
+
+    // Body scan with a FRESH fence state. Track the fence as a `(byte, run
+    // length)` exactly like validate and `extract_edge_targets` (NOT a bool
+    // toggled on any ``` / ~~~ line). The naive toggle flips mid-block on a
+    // nested/indented/long-run fence, so a fenced example link would be
+    // rewritten — corrupting documentation and making rename disagree with
+    // validate's edge notion.
     let mut fence: Option<(u8, usize)> = None;
     // `split_inclusive` keeps each line's trailing `\n`, so copying a chunk
     // verbatim preserves the original line endings exactly.
-    for line in text.split_inclusive('\n') {
+    for line in text[body_start..].split_inclusive('\n') {
         // The fence rules key on line content without trailing `\r`/`\n`; the
         // full chunk (line endings intact) is what we copy verbatim.
         let content = line.trim_end_matches('\n').trim_end_matches('\r');
@@ -604,6 +647,42 @@ pub fn rewrite_links_to(text: &str, old: &Path, new: &Path) -> String {
         rewrite_links_in_line(line, &old_key, &new_target, &mut out);
     }
     out
+}
+
+/// Byte offset where the body begins after a leading `---`…`---` frontmatter
+/// block — i.e. the first byte past the closing `---` line's `\n`. `None` when
+/// the text does not open with a `---` fence or has no closing fence (the caller
+/// then treats the whole text as body). Local mirror of store's
+/// `split_frontmatter_raw` boundary detection (BOM- and CRLF-tolerant) — kept
+/// in graph.rs so the module stays self-contained, paired with the existing
+/// `frontmatter_block` mirror. Returns an offset (not slices) so
+/// [`rewrite_links_to`] can copy the frontmatter and body regions byte-exact and
+/// scan them with different fence policies.
+fn frontmatter_body_split(text: &str) -> Option<usize> {
+    // Tolerate a single leading UTF-8 BOM, matching parser/store/index/validate.
+    let bom = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let after_open = if text[bom..].starts_with("---\n") {
+        bom + 4
+    } else if text[bom..].starts_with("---\r\n") {
+        bom + 5
+    } else {
+        return None;
+    };
+    // Walk lines from just after the opening fence; the body starts right after
+    // the line that is exactly `---`.
+    let mut idx = after_open;
+    for line in text[after_open..].split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        idx += line.len();
+        if trimmed == "---" {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 /// Rewrite every `[[...]]` on a single (non-fenced) line whose target matches
@@ -715,32 +794,69 @@ fn is_within_store_target(target: &str) -> bool {
 /// [`ensure_path_within_store`] gate, matching validate's safe-path guard.
 fn resolve_existing(store: &Store, store_relative: &Path) -> Option<PathBuf> {
     let direct = store.root.join(store_relative);
-    if direct.is_file() && resolves_within_store(store, store_relative, &direct) {
+    if direct.is_file() && resolves_within_store(store, &direct) {
         return Some(direct);
     }
     let normalized = normalize_target(store_relative);
     let with_md = store.root.join(format!("{normalized}.md"));
-    if with_md.is_file() && resolves_within_store(store, Path::new(&normalized), &with_md) {
+    if with_md.is_file() && resolves_within_store(store, &with_md) {
         return Some(with_md);
     }
     None
 }
 
-/// Containment check for a candidate on-disk path, with a cheap fast path. A
-/// store-relative path made of only `Normal` components (no `..`, no absolute /
-/// platform prefix) is trivially inside the root, so the common case avoids the
-/// `canonicalize` syscalls entirely. Anything with a `..`/absolute/prefix
-/// component falls through to the authoritative [`ensure_path_within_store`]
-/// gate (symlink-resolving), which is the only thing that can prove an escaping
-/// or symlink-redirected path actually stays inside the store.
-fn resolves_within_store(store: &Store, store_relative: &Path, abs: &Path) -> bool {
-    let plain_relative = !store_relative.is_absolute()
-        && store_relative
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)));
-    if plain_relative {
+/// True if a store-relative wiki-link target exists on disk but **resolves
+/// outside the store** — i.e. some `Normal` component is a symlink redirecting to
+/// an external dir/file (`records/linkdir/secret` through `records/linkdir ->
+/// /external`, or a directly-symlinked `records/aliased.md -> /external/x.md`).
+///
+/// This is the symlink twin of the `..` escape that [`is_within_store_target`]
+/// drops at edge *extraction*: a `..` target is rejected by its spelling, but a
+/// symlink escape is spelled with only `Normal` components and can only be caught
+/// by resolving the path. [`neighborhood_capped`] uses this to drop such a
+/// neighbor from the traversal entirely, so an escaping symlink yields **no node**
+/// (matching the `..` control) rather than a phantom node whose summary/type are
+/// blanked — closing the `graph neighborhood` disclosure vector at the graph
+/// boundary, not only at the file read.
+///
+/// A genuinely *dangling* in-store link (a target that exists nowhere) is **not**
+/// an escape: it does not resolve on disk at all, so this returns `false` and the
+/// dangling target is still surfaced as a node (existing behavior; broken-link
+/// reporting is [`crate::validate`]'s job).
+fn target_escapes_store(store: &Store, store_relative: &Path) -> bool {
+    // Already in-store-resolvable → not an escape.
+    if resolve_existing(store, store_relative).is_some() {
+        return false;
+    }
+    // Not resolvable in-store: is it because it points OUTSIDE (a symlink escape),
+    // or because it does not exist at all (a dangling link)? It escapes iff the
+    // path (as written or with `.md`) exists on disk yet fails containment.
+    let direct = store.root.join(store_relative);
+    if direct.exists() && !resolves_within_store(store, &direct) {
         return true;
     }
+    let normalized = normalize_target(store_relative);
+    let with_md = store.root.join(format!("{normalized}.md"));
+    with_md.exists() && !resolves_within_store(store, &with_md)
+}
+
+/// Containment check for a candidate on-disk path. Always routes through the
+/// authoritative, symlink-resolving [`ensure_path_within_store`] gate — the only
+/// thing that can prove an escaping or symlink-redirected path actually stays
+/// inside the store.
+///
+/// There is deliberately **no** "all-`Normal`-components" fast path that returns
+/// `true` without canonicalizing. A `Normal` component is not safe by spelling:
+/// it can itself be a symlink to a directory or file outside the store
+/// (`records/linkdir -> /etc`, or a directly-symlinked `records/aliased.md ->
+/// ../../outside/secret.md`). `store.root.join(rel)` follows that in-store symlink,
+/// `is_file()` succeeds (it follows symlinks), and without canonicalizing the
+/// resolved target the out-of-store file's `summary`/`type` leak into a
+/// `graph neighborhood` slice. `ensure_path_within_store` canonicalizes `abs`
+/// (resolving every symlink in its chain) and confirms the result is under the
+/// canonicalized root, closing that disclosure vector — the same gate the `..`
+/// path already passes through.
+fn resolves_within_store(store: &Store, abs: &Path) -> bool {
     ensure_path_within_store(&store.root, abs).is_ok()
 }
 
@@ -1187,6 +1303,131 @@ Real link: [[records/contacts/robert]].
         assert_eq!(
             got, expected,
             "fenced example links must survive a rename verbatim; only live edges retarget"
+        );
+    }
+
+    #[test]
+    fn rewrite_frontmatter_fence_does_not_swallow_body_link() {
+        // Regression for the frontmatter/body fence-boundary data-loss bug: a
+        // stray ``` inside a YAML block scalar in frontmatter used to open a code
+        // fence that persisted into the body, so the rewriter treated every body
+        // `[[…]]` as fenced and skipped it — leaving a dangling link after rename
+        // even though `backlinks`/`forwardlinks` (which reset fence state at the
+        // frontmatter boundary) still report the body edge. The write side must
+        // split the frontmatter off and scan the body with a FRESH fence state,
+        // exactly like the read side, so rename and the graph reads agree.
+        let fx = Fixture::new();
+        let text = "\
+---
+type: meeting
+created: 2026-05-27T08:00:00-07:00
+updated: 2026-05-27T08:00:00-07:00
+summary: Notes
+note: |
+  fence with no close:
+  ```
+---
+Met with [[records/contacts/sarah-chen]] yesterday.
+";
+        fx.write_raw("records/meeting.md", text);
+
+        // Read side: despite the stray fence in frontmatter, the body edge is a
+        // live forward edge (fence state resets at the frontmatter boundary).
+        let edges = forwardlinks(&fx.store, &fx.p("records/meeting.md")).unwrap();
+        assert_eq!(
+            paths(&edges),
+            vec!["records/contacts/sarah-chen"],
+            "read side must report the body edge despite the frontmatter fence"
+        );
+
+        // Write side: rename must retarget that exact body edge — not skip it as
+        // fenced. Output is byte-exact everywhere else (frontmatter verbatim,
+        // including the stray ```).
+        let got = rewrite_links_to(
+            text,
+            Path::new("records/contacts/sarah-chen"),
+            Path::new("records/contacts/sc2"),
+        );
+        let expected = "\
+---
+type: meeting
+created: 2026-05-27T08:00:00-07:00
+updated: 2026-05-27T08:00:00-07:00
+summary: Notes
+note: |
+  fence with no close:
+  ```
+---
+Met with [[records/contacts/sc2]] yesterday.
+";
+        assert_eq!(
+            got, expected,
+            "the body link the read side reports must be rewritten; frontmatter copied verbatim"
+        );
+
+        // Cross-check through the parser: after rewrite the read side sees the new
+        // target and no trace of the old — rename and the graph reads agree.
+        fx.write_raw("records/meeting.md", &got);
+        let after = forwardlinks(&fx.store, &fx.p("records/meeting.md")).unwrap();
+        assert_eq!(
+            paths(&after),
+            vec!["records/contacts/sc2"],
+            "after rename the read side must report only the retargeted edge"
+        );
+    }
+
+    #[test]
+    fn rewrite_link_genuinely_inside_a_body_fence_is_left_untouched() {
+        // The boundary reset must not over-correct: a `[[…]]` truly inside a BODY
+        // code fence is a documentation example, NOT an edge (matching the read
+        // side), and must survive rename verbatim. This pairs with the
+        // frontmatter-fence test: the body still gets a fresh, real fence state.
+        let fx = Fixture::new();
+        let text = "\
+---
+type: meeting
+created: 2026-05-27T08:00:00-07:00
+updated: 2026-05-27T08:00:00-07:00
+summary: Notes
+---
+Real link: [[records/contacts/sarah-chen]].
+
+```
+Example: [[records/contacts/sarah-chen]]
+```
+";
+        fx.write_raw("records/meeting.md", text);
+
+        // Read side: only the unfenced body link is an edge; the fenced one is not.
+        let edges = forwardlinks(&fx.store, &fx.p("records/meeting.md")).unwrap();
+        assert_eq!(
+            paths(&edges),
+            vec!["records/contacts/sarah-chen"],
+            "only the unfenced body link is a live edge"
+        );
+
+        // Write side: the real link retargets; the fenced example is byte-exact.
+        let got = rewrite_links_to(
+            text,
+            Path::new("records/contacts/sarah-chen"),
+            Path::new("records/contacts/sc2"),
+        );
+        let expected = "\
+---
+type: meeting
+created: 2026-05-27T08:00:00-07:00
+updated: 2026-05-27T08:00:00-07:00
+summary: Notes
+---
+Real link: [[records/contacts/sc2]].
+
+```
+Example: [[records/contacts/sarah-chen]]
+```
+";
+        assert_eq!(
+            got, expected,
+            "a link inside a body fence must survive rename; only the live edge retargets"
         );
     }
 
@@ -1694,6 +1935,81 @@ Real link: [[records/contacts/robert]].
             paths(&unscoped),
             vec!["records/people/sarah"],
             "scoped and unscoped backlinks must agree on the edge set"
+        );
+    }
+
+    #[test]
+    fn backlinks_scoped_type_finds_loose_file_at_non_canonical_layer() {
+        // REGRESSION (spec-conformance, SPEC § Loose files): a loose file (content
+        // directly at a layer root, no type-folder) may be filed at a layer that is
+        // NOT the type's canonical layer — e.g. a `note` (canonical layer
+        // `sources/`) filed as `records/loose-note.md` and catalogued in
+        // `records/index.jsonl`. A scoped `backlinks --type note` must still find
+        // it, matching the unscoped scan and `dbmd query --type note`.
+        //
+        // Pre-fix, `candidate_records(--type note)` read only `layer_for_type(note)`
+        // = Sources, so the records-loose note was invisible (`--type note` empty),
+        // and `--type note --in records` hit the early `continue` (records ≠ the
+        // note's canonical Sources layer) → also empty. Both diverged from the
+        // store-wide unscoped scan. The fix reads store-wide (or the named layer)
+        // sidecars and filters by `type`, never short-circuiting on the canonical
+        // layer.
+        let fx = Fixture::new();
+        fx.write("records/contacts/sarah.md", "contact", "Sarah", "");
+        // A loose `note` directly at the records/ layer root (no type-folder),
+        // linking the target. Its canonical layer is sources/, so this exercises
+        // exactly the off-canonical-layer loose-file path.
+        fx.write_raw(
+            "records/loose-note.md",
+            "---\ntype: note\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: Loose\n---\nMentions [[records/contacts/sarah]].\n",
+        );
+        fx.reindex(); // catalogs the loose note in records/index.jsonl
+
+        let target = fx.p("records/contacts/sarah.md");
+        let note_type = vec!["note".to_string()];
+
+        // Unscoped: the loose note is a backlink (ground truth).
+        let unscoped = backlinks(&fx.store, &target).unwrap();
+        assert_eq!(
+            paths(&unscoped),
+            vec!["records/loose-note"],
+            "unscoped backlinks finds the records-loose note"
+        );
+
+        // `--type note` (no layer): must agree with unscoped, NOT empty.
+        let by_type = backlinks_filtered(&fx.store, &target, &note_type, None).unwrap();
+        assert_eq!(
+            paths(&by_type),
+            vec!["records/loose-note"],
+            "`--type note` must find the loose note filed at the non-canonical (records) layer"
+        );
+
+        // `--type note --in records`: the note lives in records/, so this must
+        // find it too — the early `continue` on canonical-layer mismatch is gone.
+        let by_type_in_records =
+            backlinks_filtered(&fx.store, &target, &note_type, Some(Layer::Records)).unwrap();
+        assert_eq!(
+            paths(&by_type_in_records),
+            vec!["records/loose-note"],
+            "`--type note --in records` must find the records-loose note"
+        );
+
+        // Cross-check the same completeness via the structured query path the SPEC
+        // ties graph reads to: `query --type note` (store-wide) sees the loose note,
+        // proving the data was real and the scoped graph result now agrees with it.
+        let q_records: Vec<String> = paths(
+            &crate::query::Query::new()
+                .with_type("note")
+                .execute(&fx.store)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.path)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            q_records,
+            vec!["records/loose-note.md"],
+            "query --type note sees the loose note store-wide; scoped backlinks must agree"
         );
     }
 
@@ -2393,6 +2709,63 @@ Trailing [[records/contacts/sarah]].
         );
     }
 
+    /// REGRESSION (Unicode encoding / silent graph break): a file whose name is
+    /// written in one Unicode normalization form and an incoming link written in
+    /// the OTHER form must be ONE edge — on macOS/APFS both name the same file
+    /// (the FS folds NFC/NFD), so the string-keyed graph must agree. Before the
+    /// fix, `link_edge_key` only case-folded (no NFC), so `backlinks` returned
+    /// empty and `orphans` flagged the linked-to file as an orphan while
+    /// `validate` saw the link as live. NFC-keying both sides unifies them.
+    ///
+    /// Runs on every platform: the file is written NFC and linked NFD (both
+    /// representable in any filename), and `link_edge_key` normalizes
+    /// unconditionally, so the assertion holds regardless of host FS folding.
+    #[test]
+    fn nfc_nfd_cross_normalization_link_is_one_edge() {
+        let fx = Fixture::new();
+        // File on disk: NFC `josé` (é = U+00E9).
+        fx.write(
+            "records/contacts/jos\u{00e9}.md",
+            "contact",
+            "Jose",
+            "the contact",
+        );
+        // Incoming link: NFD `josé` (e + U+0301) — byte-different, same name.
+        fx.write(
+            "records/profiles/bio.md",
+            "profile",
+            "Bio",
+            "Knows [[records/contacts/jose\u{0301}]].",
+        );
+        fx.reindex();
+
+        // backlinks: the NFD link must resolve to the NFC file.
+        assert_eq!(
+            paths(&backlinks(&fx.store, Path::new("records/contacts/jos\u{00e9}.md")).unwrap()),
+            vec!["records/profiles/bio"],
+            "an NFD incoming link must be a backward edge of the NFC-named file"
+        );
+
+        // orphans: the linked-to file must NOT be flagged as an orphan.
+        let orphan_set = paths(&orphans(&fx.store, None).unwrap());
+        assert!(
+            !orphan_set.contains(&"records/contacts/jos\u{00e9}.md".to_string()),
+            "a target with a live cross-normalization incoming link must NOT be orphaned: \
+             {orphan_set:?}"
+        );
+
+        // forwardlinks: the body link is a real forward edge. Its emitted target
+        // is the canonical (normalization-PRESERVING) form — i.e. the NFD bytes
+        // as written, NOT re-normalized to NFC — because `forwardlinks` output
+        // feeds byte-faithful rewrites; only the comparison KEY is NFC-folded.
+        let fwd = paths(&forwardlinks(&fx.store, &fx.p("records/profiles/bio.md")).unwrap());
+        assert_eq!(
+            fwd,
+            vec!["records/contacts/jose\u{0301}"],
+            "forwardlinks must emit the body link's canonical (NFD-preserving) target"
+        );
+    }
+
     /// A `[[../outside/x]]` escaping wiki-link is never a forward edge, and a
     /// `neighborhood` from the escaping page never reads or traverses through the
     /// external file — closing the disclosure vector.
@@ -2447,6 +2820,109 @@ Trailing [[records/contacts/sarah]].
                 .all(|n| !n.path.to_string_lossy().contains("outside")),
             "neighborhood must not read/traverse the external file: {:?}",
             slice.nodes
+        );
+    }
+
+    /// REGRESSION (path-safety / info-disclosure): a wiki-link target whose path
+    /// is made entirely of `Normal` components but routes through a **symlink**
+    /// pointing outside the store must NOT leak the out-of-store file's
+    /// `summary`/`type` into a `neighborhood` slice. Two shapes:
+    ///   (a) a symlinked DIRECTORY component (`records/linkdir -> /external/dir`,
+    ///       link `[[records/linkdir/secret]]`), and
+    ///   (b) a directly-symlinked `.md` (`records/aliased.md -> /external/secret.md`,
+    ///       link `[[records/aliased]]`).
+    /// Both used to slip past the all-`Normal`-components fast path in
+    /// `resolves_within_store` (which returned `true` without canonicalizing), so
+    /// `store.root.join(rel)` followed the in-store symlink, `is_file()` succeeded,
+    /// and the external file was read. The fix routes every candidate through the
+    /// symlink-resolving `ensure_path_within_store`, so these resolve to NO
+    /// out-of-store node — exactly like the `..` escape control above. A legitimate
+    /// in-store link still resolves, proving the gate did not over-block.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_normal_component_does_not_disclose_out_of_store_file() {
+        use std::os::unix::fs::symlink;
+
+        let fx = Fixture::new();
+        // The secret lives OUTSIDE the store root, as a sibling of it.
+        let outside_dir = fx.store.root.parent().unwrap().join("secret");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(
+            outside_dir.join("secret.md"),
+            "---\ntype: contact\nsummary: TOP SECRET\n---\n# x\n",
+        )
+        .unwrap();
+
+        // A legitimate in-store target, to prove the gate does not over-block.
+        fx.write("records/contacts/real.md", "contact", "Real Contact", "");
+
+        // (a) symlinked DIRECTORY component: records/linkdir -> <outside>/secret
+        symlink(&outside_dir, fx.store.root.join("records/linkdir")).unwrap();
+        fx.write(
+            "records/contacts/seed.md",
+            "contact",
+            "Seed",
+            "[[records/linkdir/secret]] and the in-store [[records/contacts/real]].",
+        );
+
+        // (b) directly-symlinked .md: records/aliased.md -> <outside>/secret.md
+        symlink(
+            outside_dir.join("secret.md"),
+            fx.store.root.join("records/aliased.md"),
+        )
+        .unwrap();
+        fx.write(
+            "records/contacts/seed2.md",
+            "contact",
+            "Seed2",
+            "[[records/aliased]]",
+        );
+        fx.reindex();
+
+        // (a): the symlinked-dir target must NOT appear; the in-store link must.
+        let slice = neighborhood(
+            &fx.store,
+            &fx.p("records/contacts/seed.md"),
+            1,
+            &[],
+            Direction::Outgoing,
+        )
+        .unwrap();
+        assert!(
+            !slice.nodes.iter().any(|n| n.summary == "TOP SECRET"),
+            "a symlinked-dir component must not disclose the out-of-store summary: {:?}",
+            slice.nodes
+        );
+        assert!(
+            !slice
+                .nodes
+                .iter()
+                .any(|n| n.path.to_string_lossy().contains("linkdir")),
+            "the symlinked-out-of-store target must not be a node: {:?}",
+            slice.nodes
+        );
+        assert!(
+            slice
+                .nodes
+                .iter()
+                .any(|n| n.path == fx.p("records/contacts/real")),
+            "the legitimate in-store link must still resolve (gate did not over-block): {:?}",
+            slice.nodes
+        );
+
+        // (b): the directly-symlinked .md target must NOT disclose anything.
+        let slice2 = neighborhood(
+            &fx.store,
+            &fx.p("records/contacts/seed2.md"),
+            1,
+            &[],
+            Direction::Outgoing,
+        )
+        .unwrap();
+        assert!(
+            slice2.nodes.is_empty(),
+            "a directly-symlinked .md pointing outside the store must yield no node: {:?}",
+            slice2.nodes
         );
     }
 

@@ -160,15 +160,15 @@ pub fn read_manifest(store: &Store) -> crate::Result<Vec<AssetRecord>> {
     Ok(by_path.into_values().collect())
 }
 
-/// Write the manifest atomically (temp + fsync + rename, via [`write_atomic`]),
-/// records sorted by path ascending. An empty record set removes the file.
-pub fn write_manifest(store: &Store, records: &[AssetRecord]) -> crate::Result<()> {
-    let abs = store.root.join(MANIFEST_FILE);
+/// The canonical serialized form of a record set: one JSON line per record,
+/// records sorted by path ascending, trailing newline. An empty record set is
+/// the empty string (the manifest file is removed, not written empty). This is
+/// the SINGLE source of the manifest's byte layout — both [`write_manifest`] and
+/// the [`scan`] no-change gate go through it, so "what scan would write" and
+/// "what's on disk" are compared as the same bytes.
+fn serialize_manifest(records: &[AssetRecord]) -> String {
     if records.is_empty() {
-        if abs.exists() {
-            std::fs::remove_file(&abs)?;
-        }
-        return Ok(());
+        return String::new();
     }
     let mut sorted = records.to_vec();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
@@ -177,6 +177,20 @@ pub fn write_manifest(store: &Store, records: &[AssetRecord]) -> crate::Result<(
         let line = serde_json::to_string(rec).expect("AssetRecord serializes");
         out.push_str(&line);
         out.push('\n');
+    }
+    out
+}
+
+/// Write the manifest atomically (temp + fsync + rename, via [`write_atomic`]),
+/// records sorted by path ascending. An empty record set removes the file.
+pub fn write_manifest(store: &Store, records: &[AssetRecord]) -> crate::Result<()> {
+    let abs = store.root.join(MANIFEST_FILE);
+    let out = serialize_manifest(records);
+    if out.is_empty() {
+        if abs.exists() {
+            std::fs::remove_file(&abs)?;
+        }
+        return Ok(());
     }
     write_atomic(&abs, out.as_bytes())?;
     Ok(())
@@ -304,11 +318,21 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
         Vec::new()
     };
 
-    // Only write when the canonical content actually changed.
+    // Only write when the canonical BYTES differ from what's on disk. Comparing
+    // parsed records would miss non-canonical on-disk state — duplicate lines
+    // from a git `merge=union`, a wrong sort, a missing trailing newline — since
+    // `read_manifest` dedupes-by-path and sorts, so a poisoned file parses back
+    // equal to the freshly computed records and the no-op gate never repairs it.
+    // We instead compare the canonical serialization against the raw on-disk
+    // bytes, so `scan` recompacts a non-canonical manifest (mirroring how
+    // `index::rebuild_all` always normalizes its artifacts). This is also the
+    // documented `merge=union` recovery (SPEC § Assets).
     let mut wrote = false;
     if !dry_run {
-        let current = read_manifest(store).unwrap_or_default();
-        if current != records {
+        let canonical = serialize_manifest(&records);
+        let abs = store.root.join(MANIFEST_FILE);
+        let on_disk = std::fs::read(&abs).unwrap_or_default();
+        if on_disk != canonical.as_bytes() {
             write_manifest(store, &records)?;
             wrote = true;
         }
@@ -458,8 +482,22 @@ pub fn status(store: &Store) -> crate::Result<StatusReport> {
 /// The cataloged asset paths, sorted ascending. The VCS-neutral list a harness
 /// feeds into a `.gitignore` managed block or a sync-service exclude. db.md
 /// itself never writes any ignore file.
+///
+/// Every emitted path is routed through the same containment guard `scan`,
+/// `verify`, and `status` use — the module contract is that the guard applies
+/// "wherever a path is read or resolved" (SPEC § Assets > Path safety). A
+/// poisoned / hand-edited manifest path that escapes the store (absolute, or a
+/// `..` traversal — the `merge=union`-corruption state SPEC anticipates) is
+/// OMITTED, so this list — which a harness pipes straight into a `.gitignore`
+/// managed block or a sync-exclude — can never carry an out-of-store path. The
+/// list analog of how `verify` counts an escaping record corrupt and `status`
+/// counts it missing: a path that can't be a real store member is left out.
 pub fn paths(store: &Store) -> crate::Result<Vec<String>> {
-    Ok(read_manifest(store)?.into_iter().map(|r| r.path).collect())
+    Ok(read_manifest(store)?
+        .into_iter()
+        .filter(|r| store::ensure_path_within_store(&store.root, &store.root.join(&r.path)).is_ok())
+        .map(|r| r.path)
+        .collect())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -776,5 +814,155 @@ mod tests {
 
         // scan's `.sum()` over the same records must likewise not overflow.
         scan(&store, true, false).expect("scan must not overflow on a poisoned manifest");
+    }
+
+    /// Build a minimal store with one wrapper declaring one present asset, and
+    /// return `(store, canonical_manifest_string)` after an initial scan.
+    fn store_with_one_asset() -> (tempfile::TempDir, Store, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sources")).unwrap();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n# store\n").unwrap();
+        std::fs::write(
+            root.join("sources/a.pdf.md"),
+            "---\ntype: pdf-source\nsummary: x\nasset: sources/a.pdf\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("sources/a.pdf"), b"PDFBYTES").unwrap();
+        let store = Store {
+            root: root.to_path_buf(),
+            config: crate::parser::Config::default(),
+        };
+        let report = scan(&store, false, false).unwrap();
+        assert!(report.wrote, "first scan writes the manifest");
+        let canonical = std::fs::read_to_string(root.join(MANIFEST_FILE)).unwrap();
+        (tmp, store, canonical)
+    }
+
+    /// Regression (adversarial review): `assets scan`'s no-change gate must
+    /// compare the canonical serialization against the on-disk BYTES, not parsed
+    /// records. A duplicate-line manifest (the git `merge=union` recovery case,
+    /// SPEC § Assets) parses — via `read_manifest`'s dedupe-by-path — back to the
+    /// same records, so a records-vs-records gate would call it "no change" and
+    /// leave the non-canonical bytes forever. `scan` must recompact it to the one
+    /// canonical line and report `wrote: true` (mirroring `index::rebuild_all`,
+    /// which always normalizes non-canonical artifacts).
+    #[test]
+    fn scan_recompacts_duplicate_line_manifest() {
+        let (_tmp, store, canonical) = store_with_one_asset();
+        let abs = store.root.join(MANIFEST_FILE);
+
+        // Simulate a git `merge=union`: the same canonical line, twice.
+        std::fs::write(&abs, format!("{canonical}{canonical}")).unwrap();
+        assert_eq!(std::fs::read_to_string(&abs).unwrap().lines().count(), 2);
+
+        let report = scan(&store, false, false).unwrap();
+        assert!(
+            report.wrote,
+            "a non-canonical (duplicate-line) manifest must be recompacted and reported as updated"
+        );
+        let after = std::fs::read_to_string(&abs).unwrap();
+        assert_eq!(
+            after.lines().count(),
+            1,
+            "duplicate lines must collapse to the single canonical line"
+        );
+        assert_eq!(
+            after, canonical,
+            "scan must restore the exact canonical bytes"
+        );
+    }
+
+    /// Regression (adversarial review): a wrongly-sorted / no-trailing-newline
+    /// manifest is also non-canonical on-disk and must be repaired by `scan`,
+    /// even though it parses (after the read-side sort) to the same records.
+    #[test]
+    fn scan_recompacts_noncanonical_byte_layout() {
+        let (_tmp, store, canonical) = store_with_one_asset();
+        let abs = store.root.join(MANIFEST_FILE);
+
+        // Strip the trailing newline: same record, non-canonical bytes.
+        std::fs::write(&abs, canonical.trim_end_matches('\n')).unwrap();
+        let report = scan(&store, false, false).unwrap();
+        assert!(
+            report.wrote,
+            "a manifest missing its trailing newline must be recompacted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&abs).unwrap(),
+            canonical,
+            "scan must restore the canonical trailing newline"
+        );
+    }
+
+    /// Regression (adversarial review): `paths` must enforce the containment
+    /// guard "wherever it reads the manifest" (SPEC § Assets > Path safety),
+    /// matching its sibling reads `verify`/`status`. A poisoned / hand-edited
+    /// `assets.jsonl` (the `merge=union`-corruption state the SPEC anticipates)
+    /// with an absolute (`/etc/hosts`) and a `..`-traversal recorded path must
+    /// NOT leak those verbatim — they would flow straight into a harness's
+    /// `.gitignore` managed block or sync-exclude. `paths` is a list, so the
+    /// analog of verify-counts-corrupt / status-counts-missing is to OMIT them;
+    /// the legitimate in-store path is still emitted unchanged.
+    #[test]
+    fn paths_omits_store_escaping_records() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n# store\n").unwrap();
+        // One legitimate in-store record plus two store-escaping ones.
+        std::fs::write(
+            root.join("assets.jsonl"),
+            "{\"path\":\"sources/legit.pdf\",\"sha256\":\"a\",\"bytes\":9,\
+\"media_type\":\"application/pdf\",\"wrappers\":[\"sources/legit.pdf.md\"],\"required\":true}\n\
+{\"path\":\"../../../../../../etc/passwd\",\"sha256\":\"b\",\"bytes\":4096,\
+\"media_type\":\"text/plain\",\"wrappers\":[\"sources/legit.pdf.md\"],\"required\":false}\n\
+{\"path\":\"/etc/hosts\",\"sha256\":\"c\",\"bytes\":4096,\
+\"media_type\":\"text/plain\",\"wrappers\":[\"sources/legit.pdf.md\"],\"required\":false}\n",
+        )
+        .unwrap();
+        let store = Store {
+            root: root.to_path_buf(),
+            config: crate::parser::Config::default(),
+        };
+
+        let out = paths(&store).expect("paths is non-failing on a poisoned manifest");
+        assert_eq!(
+            out,
+            vec!["sources/legit.pdf".to_string()],
+            "only the safe in-store path is emitted; escaping paths are omitted"
+        );
+        assert!(
+            !out.iter().any(|p| p.starts_with('/') || p.contains("..")),
+            "no absolute or `..` path may ever leak from `paths`: {out:?}"
+        );
+    }
+
+    /// A clean (all-in-store) manifest must be unchanged by the containment
+    /// filter: every legitimate path is emitted, none dropped.
+    #[test]
+    fn paths_passes_a_clean_manifest_through_unchanged() {
+        let (_tmp, store, _canonical) = store_with_one_asset();
+        let out = paths(&store).expect("paths over a clean manifest");
+        assert_eq!(out, vec!["sources/a.pdf".to_string()]);
+    }
+
+    /// Idempotency must survive the fix: a genuinely-canonical manifest is left
+    /// byte-identical and `scan` reports `wrote: false`. (The old gate already
+    /// did this for parsed-equal records; the byte gate must not regress it.)
+    #[test]
+    fn scan_canonical_manifest_is_left_untouched() {
+        let (_tmp, store, canonical) = store_with_one_asset();
+        let abs = store.root.join(MANIFEST_FILE);
+
+        let report = scan(&store, false, false).unwrap();
+        assert!(
+            !report.wrote,
+            "a canonical, unchanged manifest must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&abs).unwrap(),
+            canonical,
+            "a no-op rescan must leave the manifest byte-identical"
+        );
     }
 }

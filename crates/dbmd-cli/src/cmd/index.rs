@@ -149,6 +149,13 @@ pub fn run_query(ctx: &Context, args: &IndexQueryArgs) -> CliResult {
     let win = TimeWindow::from_args(args)?;
     records.retain(|r| win.accepts(r));
 
+    // `query.execute` concatenates per-sidecar reads in sidecar-PATH order, which
+    // is NOT globally record-path-sorted once a layer mixes loose files (a
+    // layer-root sidecar) with type-folders (whose sidecar path sorts after the
+    // loose file's record path). Sort by record path so the enumeration — and the
+    // `--limit` cap below — match `dbmd query` / `dbmd fm query` exactly.
+    records.sort_by(|a, b| a.path.cmp(&b.path));
+
     if let Some(limit) = args.limit {
         records.truncate(limit);
     }

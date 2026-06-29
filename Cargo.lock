@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "dbmd-cli"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "dbmd-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "calamine",
  "chrono",
@@ -431,6 +431,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "unicode-normalization",
  "walkdir",
  "zip",
 ]

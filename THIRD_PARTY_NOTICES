@@ -80,6 +80,24 @@ after any dependency change.
 - grep             0.3.x    MIT OR Unlicense    — embedded ripgrep search engine
 - ignore           0.4.x    MIT OR Unlicense    — embedded ripgrep dir walk / gitignore
 - walkdir          2.x      MIT OR Unlicense    — recursive store walk (sweep ops)
+- unicode-normalization
+                   0.1.x    MIT OR Apache-2.0   — Unicode NFC normalization of the
+                                                  wiki-link edge comparison key
+                                                  (`link_edge_key`), so an NFC/NFD
+                                                  spelling of the same name keys to
+                                                  one graph edge — matching how
+                                                  macOS/APFS folds the two forms to
+                                                  one file. Deterministic Unicode
+                                                  algorithm; zero AI/LLM, zero
+                                                  embeddings. Pulls in `tinyvec`
+                                                  (Zlib OR Apache-2.0 OR MIT) +
+                                                  `tinyvec_macros`
+                                                  (MIT OR Apache-2.0 OR Zlib); both
+                                                  are OR-disjunctions discharged via
+                                                  the MIT/Apache branch (their Zlib
+                                                  term is an alternative, NOT a
+                                                  conjunctive obligation like
+                                                  zlib-rs's bare `Zlib`)
 - chrono           0.4.x    MIT OR Apache-2.0   — RFC3339 / ISO-8601 timestamps
 - thiserror        2.x      MIT OR Apache-2.0   — error enum derive
 

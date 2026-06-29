@@ -342,6 +342,126 @@ fn write_event_record_honours_explicit_subfolder_and_still_shards() {
     assert!(store.abs("records/meetings/2026/04/m1.md").exists());
 }
 
+// ── write: `--fm summary=` is honored (regression: silent clobber) ────────────
+//
+// The bug: `dbmd write --fm summary=…` set `fm.summary` via `apply_fm_assignments`,
+// then unconditionally recomposed the summary from `compose_default` (which never
+// reads `fm.summary`), silently discarding the agent's value. With no body it was
+// worse — the value was dropped AND the write was refused with `SUMMARY_REQUIRED`.
+// The fix: precedence is `--summary` flag → already-populated `fm.summary` →
+// `compose_default`. These pin all four arms.
+
+#[test]
+fn write_fm_summary_with_body_is_honored_not_clobbered_by_body_paragraph() {
+    // (1) `--fm summary=X` WITH a body must keep X, not the body's first paragraph.
+    let store = Store::new();
+    let body_path = store.abs("body.md");
+    std::fs::write(&body_path, "First paragraph from body.\n").unwrap();
+
+    let out = store.run(&[
+        "write",
+        "records/contacts/fmsum.md",
+        "--type",
+        "contact",
+        "--fm",
+        "summary=EXPLICIT FM SUMMARY",
+        "--body-file",
+        body_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+
+    let written = std::fs::read_to_string(store.abs("records/contacts/fmsum.md")).unwrap();
+    // The `summary` FIELD must be the agent's value, not the composed body
+    // paragraph. (The paragraph still appears in the body — that's expected — so
+    // assert on the parsed field, not the raw file text.)
+    assert_eq!(
+        fm_value(&written, "summary"),
+        "EXPLICIT FM SUMMARY",
+        "`--fm summary=` must win over the composed body paragraph:\n{written}"
+    );
+    assert_ne!(
+        fm_value(&written, "summary"),
+        "First paragraph from body.",
+        "the body paragraph must NOT have clobbered the explicit fm summary:\n{written}"
+    );
+}
+
+#[test]
+fn write_fm_summary_with_no_body_succeeds_and_writes_value() {
+    // (2) `--fm summary=X` with NO body must SUCCEED (no spurious SUMMARY_REQUIRED)
+    // and write X. This is the worst-case form of the bug: value dropped AND write
+    // refused even though the agent supplied a summary.
+    let store = Store::new();
+    let out = store.run(&[
+        "write",
+        "records/contacts/nobody.md",
+        "--type",
+        "contact",
+        "--fm",
+        "summary=EXPLICIT FM SUMMARY",
+    ]);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "a `--fm summary=` with no body must not be refused: {}",
+        out.stderr
+    );
+    let written = std::fs::read_to_string(store.abs("records/contacts/nobody.md")).unwrap();
+    assert_eq!(
+        fm_value(&written, "summary"),
+        "EXPLICIT FM SUMMARY",
+        "the no-body `--fm summary=` value must be written:\n{written}"
+    );
+}
+
+#[test]
+fn write_summary_flag_wins_over_fm_summary_when_both_given() {
+    // (3) The dedicated `--summary` flag keeps precedence over `--fm summary=`.
+    let store = Store::new();
+    let out = store.run(&[
+        "write",
+        "records/contacts/both.md",
+        "--type",
+        "contact",
+        "--summary",
+        "FLAG SUMMARY",
+        "--fm",
+        "summary=FM SUMMARY",
+    ]);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let written = std::fs::read_to_string(store.abs("records/contacts/both.md")).unwrap();
+    assert_eq!(
+        fm_value(&written, "summary"),
+        "FLAG SUMMARY",
+        "the explicit --summary flag must win over --fm summary=:\n{written}"
+    );
+}
+
+#[test]
+fn write_with_neither_summary_still_composes_default_from_body() {
+    // (4) No regression: with neither `--summary` nor `--fm summary=`, the
+    // deterministic default still composes from the body's first paragraph.
+    let store = Store::new();
+    let body_path = store.abs("body.md");
+    std::fs::write(&body_path, "First paragraph from body.\n").unwrap();
+
+    let out = store.run(&[
+        "write",
+        "records/contacts/composed.md",
+        "--type",
+        "contact",
+        "--body-file",
+        body_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let written = std::fs::read_to_string(store.abs("records/contacts/composed.md")).unwrap();
+    assert_eq!(
+        fm_value(&written, "summary"),
+        "First paragraph from body.",
+        "with neither summary input, compose_default must still apply:\n{written}"
+    );
+}
+
 #[test]
 fn write_json_emits_written_path_and_type() {
     let store = Store::new();

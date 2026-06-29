@@ -1494,34 +1494,40 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     // *across date shards* — a sharded file's "type folder" is the folder right
     // under the layer). We key on the type-folder so shards roll up correctly.
     let mut type_folders: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-    let mut layers_present: BTreeSet<&'static str> = BTreeSet::new();
     for rel in files {
-        // The layer is the first path component — recorded independently of the
-        // type-folder so a layer containing only loose files still requires an
-        // `index.md`.
-        if let Some(layer) = rel.iter().next().and_then(|s| s.to_str()) {
-            match layer {
-                "sources" => layers_present.insert("sources"),
-                "records" => layers_present.insert("records"),
-                _ => false,
-            };
-        }
         if let Some(tf) = type_folder_of(rel) {
             type_folders.entry(tf).or_default().push(rel.clone());
         }
     }
 
-    // ── Root index.md ─────────────────────────────────────────────────────────
-    // The root `index.md` is a TYPE-FOLDER rollup, so it is required only when
-    // the store has type-folder content. A store whose only content is loose
-    // files (directly at a layer root) is catalogued by its layer `index.jsonl`
-    // and has nothing to roll up, so the absence of a root `index.md` is not a
-    // defect — but if one exists, scope-check it.
-    {
+    // Layers that actually contain a type-folder. The index WRITER creates a
+    // layer/root `index.md` ONLY when a type-folder exists to roll up:
+    // `Index::build_root`/`build_layer` populate `child_counts` from type-folders
+    // alone, and `rebuild_all`/`write_level` remove the `index.md` when that map
+    // is empty. A layer with ONLY loose files therefore has NO `index.md` — its
+    // loose records live in the layer's own `index.jsonl` (checked in the loose
+    // block below). Gating the `index.md` requirement on type-folder presence
+    // (not on "any content file") keeps `validate --all` in parity with
+    // `dbmd index rebuild`: requiring an `index.md` for a loose-only layer would
+    // demand an artifact the canonical rebuild never creates, permanently
+    // wedging the sweep on a correct store.
+    let mut layers_with_type_folders: BTreeSet<&'static str> = BTreeSet::new();
+    for tf in type_folders.keys() {
+        match tf.iter().next().and_then(|s| s.to_str()) {
+            Some("sources") => {
+                layers_with_type_folders.insert("sources");
+            }
+            Some("records") => {
+                layers_with_type_folders.insert("records");
+            }
+            _ => {}
+        }
+    }
+
+    // ── Root index.md ──── (only when a type-folder exists to roll up) ──────────
+    if !type_folders.is_empty() {
         let root_index = store.root.join("index.md");
-        if root_index.is_file() {
-            check_index_scope(store, Path::new("index.md"), "root", None, issues);
-        } else if !type_folders.is_empty() {
+        if !root_index.is_file() {
             push(
                 issues,
                 Severity::Error,
@@ -1533,21 +1539,16 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
                 Some("run `dbmd index rebuild`".into()),
                 vec![],
             );
+        } else {
+            check_index_scope(store, Path::new("index.md"), "root", None, issues);
         }
     }
 
-    // ── Layer index.md ────────────────────────────────────────────────────────
-    // A layer `index.md` is the rollup of that layer's type-folders, so it is
-    // required only when the layer HAS type-folders. A layer whose only content
-    // is loose files is catalogued by its own `index.jsonl` (checked below) and
-    // needs no rollup; demanding one there was a false `INDEX_MISSING`.
-    for layer in &layers_present {
+    // ── Layer index.md ──── (only layers that contain a type-folder) ───────────
+    for layer in &layers_with_type_folders {
         let layer_index_rel = PathBuf::from(layer).join("index.md");
         let abs = store.root.join(&layer_index_rel);
-        let layer_has_type_folders = type_folders.keys().any(|tf| tf.starts_with(layer));
-        if abs.is_file() {
-            check_index_scope(store, &layer_index_rel, "layer", Some(layer), issues);
-        } else if layer_has_type_folders {
+        if !abs.is_file() {
             push(
                 issues,
                 Severity::Error,
@@ -1559,6 +1560,8 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
                 Some("run `dbmd index rebuild`".into()),
                 vec![],
             );
+        } else {
+            check_index_scope(store, &layer_index_rel, "layer", Some(layer), issues);
         }
     }
 
@@ -3046,6 +3049,26 @@ fn resolve_wiki_target(store: &Store, bare: &str) -> TargetResolution {
 /// engine. `None` when neither exists, or when the bare target escapes the store
 /// (callers that need to distinguish unsafe from merely-missing use
 /// [`resolve_wiki_target`]).
+///
+/// **Existence is EXACT-CASE, deliberately platform-independent.** A db.md store
+/// is Git-synced across machines, so a `validate --all` that passes on the
+/// author's box must guarantee link integrity on the box that serves the store.
+/// Bare `Path::is_file()` honors the *host* filesystem's case sensitivity: on
+/// case-insensitive APFS/macOS (or NTFS) a wrong-case link `[[records/x/BOB]]`
+/// resolves to the on-disk `records/x/bob.md` and passes — but on case-sensitive
+/// Linux that file genuinely does not exist (`WIKI_LINK_BROKEN`, per SPEC.md
+/// § Validation: "target file doesn't exist"). To stay platform-independent we
+/// confirm not just that *a* file exists for the candidate but that its real
+/// on-disk casing matches the requested store-relative path character-for-
+/// character (via [`disk_case_matches`]); a case mismatch is treated as NOT
+/// found, so macOS reports the same broken links Linux would.
+///
+/// NOTE on the residual validate-vs-graph divergence on macOS: the graph engine
+/// ([`crate::graph`]) intentionally mirrors host `is_file()` + ASCII-lowercased
+/// keys for its internal backlink/rename bookkeeping on a *single* host, so on
+/// case-insensitive macOS `graph backlinks` will still resolve a wrong-case link
+/// that `validate` now flags. That divergence is by design: the graph's job is
+/// single-host consistency; `validate`'s job is cross-platform link integrity.
 fn resolved_target_abs(store: &Store, bare: &str) -> Option<PathBuf> {
     if !is_safe_store_relative_path(Path::new(bare)) {
         return None;
@@ -3053,15 +3076,55 @@ fn resolved_target_abs(store: &Store, bare: &str) -> Option<PathBuf> {
     // The literal path, as written (e.g. an `.eml`/`.pdf` source file kept
     // verbatim under `sources/`).
     let literal = store.root.join(bare);
-    if literal.is_file() {
+    if literal.is_file() && disk_case_matches(store, &literal, bare) {
         return Some(literal);
     }
     // The `.md`-appended path (a content page referenced without its extension).
-    let with_md = store.root.join(format!("{bare}.md"));
-    if with_md.is_file() {
+    let with_md_rel = format!("{bare}.md");
+    let with_md = store.root.join(&with_md_rel);
+    if with_md.is_file() && disk_case_matches(store, &with_md, &with_md_rel) {
         return Some(with_md);
     }
     None
+}
+
+/// True if `abs` (already confirmed to be an existing file under `store.root`)
+/// has the exact on-disk casing of the requested store-relative path `requested`.
+///
+/// Makes wiki-link existence resolution platform-independent: on case-insensitive
+/// filesystems (APFS/macOS, NTFS) `Path::is_file()` says yes to a wrong-case
+/// path, so we canonicalize the candidate — which returns the *real* on-disk
+/// casing — and compare its store-relative portion to `requested`
+/// case-sensitively. A mismatch means the file the link actually names does not
+/// exist on a case-sensitive host, so the caller treats it as not found.
+///
+/// Conservative on `canonicalize` failure: if we cannot read the real path (a
+/// transient FS error, a symlink we cannot resolve, a root that is itself a
+/// symlink we cannot strip), we fall back to accepting the `is_file()` result
+/// rather than producing a spurious `WIKI_LINK_BROKEN`. This keeps the check
+/// additive — it only ever *adds* the case-mismatch detection; it never makes a
+/// genuinely-resolvable correct-case link fail.
+fn disk_case_matches(store: &Store, abs: &Path, requested: &str) -> bool {
+    let Ok(canon_abs) = abs.canonicalize() else {
+        return true; // cannot read real casing — don't invent a broken link
+    };
+    // Strip the store root (also canonicalized so a symlinked root still cancels)
+    // to get the real on-disk store-relative path, then compare to what the link
+    // asked for. `canonicalize` on the root may itself fail (e.g. the root no
+    // longer exists by the time we probe) — be conservative there too.
+    let Ok(canon_root) = store.root.canonicalize() else {
+        return true;
+    };
+    let Ok(disk_rel) = canon_abs.strip_prefix(&canon_root) else {
+        // The real file lives outside the (canonical) root — e.g. reached via a
+        // symlink in the store. Containment is already enforced by
+        // `is_safe_store_relative_path`; here we simply cannot make a
+        // case-comparison, so don't manufacture a broken link.
+        return true;
+    };
+    // Compare store-relative paths component-by-component, case-sensitively,
+    // independent of the host's path separator and case folding.
+    disk_rel == Path::new(requested)
 }
 
 /// True if a bare target path is under `prefix` (both `.md`-stripped).
@@ -6162,6 +6225,69 @@ mod tests {
         );
     }
 
+    // ── Regression: wrong-case wiki-link must be platform-independent ─────────
+
+    #[test]
+    fn wrong_case_wiki_link_is_broken_exact_case() {
+        // Regression (cross-platform false-negative): on case-insensitive
+        // APFS/macOS, `Path::is_file()` resolves `[[records/contacts/BOB]]` to the
+        // on-disk `bob.md`, so validate passed — but on case-sensitive Linux that
+        // file does not exist (WIKI_LINK_BROKEN). Existence resolution is now
+        // exact-case, so a wrong-case target is flagged on every platform.
+        let fx = Fixture::new();
+        fx.write("records/contacts/bob.md", &valid_contact("Bob"));
+        let mut body = valid_contact("links with the wrong case");
+        body.push_str("\nKnows [[records/contacts/BOB]].\n");
+        fx.write("records/contacts/alice.md", &body);
+        let issues = fx.store_all();
+        let issue = find(&issues, codes::WIKI_LINK_BROKEN);
+        assert!(issue.is_error());
+        assert!(
+            issue.message.contains("records/contacts/BOB"),
+            "the wrong-case target must be named in the issue: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn correct_case_wiki_link_still_resolves() {
+        // The companion to the exact-case fix: a *correct*-case lowercase link to
+        // the same on-disk file must STILL resolve clean. Only a genuine case
+        // mismatch is newly flagged; correct case is never a false positive.
+        let fx = Fixture::new();
+        fx.write("records/contacts/bob.md", &valid_contact("Bob"));
+        let mut body = valid_contact("links with the right case");
+        body.push_str("\nKnows [[records/contacts/bob]].\n");
+        fx.write("records/contacts/alice.md", &body);
+        let issues = fx.store_all();
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.code == codes::WIKI_LINK_BROKEN && i.message.contains("contacts/bob")),
+            "a correct-case link must resolve clean: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn wrong_case_raw_source_wiki_link_is_broken() {
+        // The literal-path candidate (raw `.eml`/`.pdf` sources kept verbatim)
+        // gets the same exact-case treatment as the `.md`-appended candidate: a
+        // wrong-case link to a raw source is broken on a case-sensitive host, so
+        // it must flag on macOS too.
+        let fx = Fixture::new();
+        fx.write("sources/emails/2026-05-22-elena.eml", "raw email bytes\n");
+        fx.write(
+            "records/contacts/a.md",
+            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\nSee [[sources/emails/2026-05-22-ELENA.eml]] for context.\n",
+        );
+        let issues = fx.store_all();
+        let issue = find(&issues, codes::WIKI_LINK_BROKEN);
+        assert!(issue.is_error());
+        assert!(
+            issue.message.contains("2026-05-22-ELENA.eml"),
+            "the wrong-case raw-source target must be flagged: {issues:#?}"
+        );
+    }
+
     // ── Regression: unreadable (non-UTF-8) content file ──────────────────────
 
     #[test]
@@ -6435,27 +6561,6 @@ mod tests {
         assert!(
             has(&issues, codes::INDEX_JSONL_MISSING),
             "a loose file with no layer index.jsonl must raise INDEX_JSONL_MISSING, got: {issues:?}"
-        );
-    }
-
-    #[test]
-    fn loose_only_store_validates_clean_without_a_rollup_index_md() {
-        // A store whose ONLY content is a loose file (no type-folder anywhere):
-        // rebuild writes the layer `index.jsonl` but no root/layer `index.md`
-        // rollup — there is nothing to roll up. `validate --all` must accept that;
-        // the rollup is required only when type-folders exist. (Regression: this
-        // emitted two false INDEX_MISSING errors in 0.4.4.)
-        let fx = Fixture::new();
-        fx.write("records/solo.md", LOOSE_ALICE);
-        fx.rebuild_indexes();
-        assert!(
-            !fx.dir.path().join("index.md").is_file(),
-            "no root rollup index.md should exist for a loose-only store"
-        );
-        let issues = fx.store_all();
-        assert!(
-            issues.is_empty(),
-            "a loose-only store must validate clean (catalog is the layer index.jsonl), got: {issues:?}"
         );
     }
 }

@@ -443,3 +443,71 @@ fn regression_working_set_stale_index_entry_is_not_wiki_link_broken() {
         "`validate --all` must report the stale index entry as INDEX_STALE_ENTRY: {all:#?}"
     );
 }
+
+// ── Loose-only layer: `index rebuild` output must validate clean ──────────────
+//
+// Findings #0/#1/#3/#4/#8/#12/#14 (one root cause, hit by seven finders): a layer
+// holding ONLY loose content (files directly at the layer root, no type-folder)
+// is catalogued by the WRITER in the layer's own `index.jsonl` and deliberately
+// gets NO root or layer `index.md` (those roll up type-folders only). But
+// `validate --all` demanded both `index.md` artifacts whenever any content file
+// existed, so a freshly `index rebuild`-ed loose-only store FAILED its own
+// validator with two unfixable `INDEX_MISSING` errors (the suggested
+// `dbmd index rebuild` never converges) — a write-through/rebuild parity break.
+
+/// A store whose only content is a single loose record must, after the canonical
+/// `Index::rebuild_all`, validate clean: no `INDEX_MISSING` for the root or layer
+/// `index.md` the rebuild intentionally does not create.
+#[test]
+fn loose_only_layer_validates_clean_after_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fresh_store(root);
+    // One loose record directly under the layer root — no type-folder.
+    write(
+        root,
+        "records/loose-note.md",
+        "---\ntype: note\ncreated: 2026-06-01T08:00:00-07:00\nupdated: 2026-06-01T08:00:00-07:00\nsummary: \"A loose note\"\n---\n\n# A\n",
+    );
+
+    let store = open(root);
+    Index::rebuild_all(&store).unwrap();
+
+    // The canonical rebuild creates the layer `index.jsonl` (loose catalog) and
+    // NO `index.md` anywhere — and `validate --all` must accept exactly that.
+    let all = validate_all(&store).unwrap();
+    assert!(
+        !has(&all, codes::INDEX_MISSING),
+        "a freshly-rebuilt loose-only store must not report INDEX_MISSING: {all:#?}"
+    );
+    assert!(
+        !all.iter()
+            .any(|i| i.severity == dbmd_core::validate::Severity::Error),
+        "a freshly-rebuilt loose-only store must validate clean (no errors): {all:#?}"
+    );
+}
+
+/// Removing the layer `index.jsonl` from a loose-only store MUST still be caught
+/// — the loose catalog requirement moved to `INDEX_JSONL_MISSING`, it was not
+/// dropped along with the spurious `index.md` requirement.
+#[test]
+fn loose_only_layer_missing_jsonl_is_still_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fresh_store(root);
+    write(
+        root,
+        "records/loose-note.md",
+        "---\ntype: note\ncreated: 2026-06-01T08:00:00-07:00\nupdated: 2026-06-01T08:00:00-07:00\nsummary: \"A loose note\"\n---\n\n# A\n",
+    );
+    let store = open(root);
+    Index::rebuild_all(&store).unwrap();
+    // Delete the loose catalog the rebuild created.
+    std::fs::remove_file(root.join("records/index.jsonl")).unwrap();
+
+    let all = validate_all(&store).unwrap();
+    assert!(
+        has(&all, codes::INDEX_JSONL_MISSING),
+        "a loose file with no layer index.jsonl must report INDEX_JSONL_MISSING: {all:#?}"
+    );
+}

@@ -33,8 +33,9 @@ use crate::error::{CliError, CliResult, ExitCode};
 /// Order of operations (the contract the tests pin):
 /// 1. Open the store (`NOT_A_STORE` if no `DB.md`).
 /// 2. Seed `created`/`updated`, apply `--fm k=v`, set `type`.
-/// 3. Compose `summary` (`--summary` wins; else the deterministic default) —
-///    refuse a content file with no usable summary.
+/// 3. Resolve `summary` by precedence: the `--summary` flag, else an
+///    already-populated `fm.summary` (from `--fm summary=…`), else the
+///    deterministic default — refuse a content file with no usable summary.
 /// 4. Resolve the on-disk path (`Store::shard_path_for` auto-shards source +
 ///    event types by date; flat types pass through).
 /// 5. Refuse on collision with a structured error carrying the existing file's
@@ -69,16 +70,26 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
         None => String::new(),
     };
 
-    // ── summary: explicit wins; else compose a deterministic default ─────────
-    // An explicit `--summary` is the agent's ceiling: collapse it to a single
-    // line (the `SUMMARY_MULTILINE` contract) but DO NOT truncate it — that
-    // matches `dbmd fm set` (which preserves the value verbatim) and lets the
-    // validator surface an over-long value as a `SUMMARY_TOO_LONG` warning
-    // rather than silently dropping the agent's trailing content. Only the
-    // composed deterministic floor is capped at `MAX_SUMMARY_LEN`.
-    let summary_text = match &args.summary {
-        Some(s) => summary::collapse_whitespace(s),
-        None => summary::compose_default(&store, &args.r#type, &fm, &body)?,
+    // ── summary precedence: --summary flag, then --fm summary=, then default ──
+    // The agent supplies the ceiling two equivalent ways and BOTH must win over
+    // the composed floor: the dedicated `--summary` flag, OR `--fm summary=…`
+    // (which `apply_fm_assignments` already wrote into `fm.summary` above). An
+    // agent-supplied summary is the ceiling, so collapse it to a single line
+    // (the `SUMMARY_MULTILINE` contract) but DO NOT truncate it — that matches
+    // `dbmd fm set` (which preserves the value verbatim) and lets the validator
+    // surface an over-long value as a `SUMMARY_TOO_LONG` warning rather than
+    // silently dropping the agent's trailing content. Both agent paths go
+    // through the same `collapse_whitespace` so whitespace handling is
+    // identical. Only when neither is present do we compose the deterministic
+    // floor (capped at `MAX_SUMMARY_LEN`). `fm.summary` is consulted before
+    // `compose_default` so a `--fm summary=` value is never clobbered — and so
+    // the no-body case SUCCEEDS instead of refusing with `SUMMARY_REQUIRED`.
+    let summary_text = match (&args.summary, fm.summary.as_deref()) {
+        (Some(s), _) => summary::collapse_whitespace(s),
+        (None, Some(fm_summary)) if !fm_summary.trim().is_empty() => {
+            summary::collapse_whitespace(fm_summary)
+        }
+        _ => summary::compose_default(&store, &args.r#type, &fm, &body)?,
     };
     if is_content_type(&args.r#type) && summary_text.trim().is_empty() {
         return Err(no_summary_error(&args.r#type));

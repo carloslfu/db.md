@@ -98,6 +98,73 @@ fn scan_is_idempotent_no_change_on_second_run() {
 }
 
 #[test]
+fn scan_recompacts_duplicate_line_manifest() {
+    // The documented git `merge=union` recovery (SPEC § Assets): a manifest with
+    // duplicate identical lines must be recompacted to the single canonical line
+    // by `assets scan`, and reported as updated — not silently left as-is. The
+    // bug was a no-change gate comparing parsed (deduped-by-path) records instead
+    // of the on-disk bytes, so a duplicate-line manifest parsed back equal and
+    // was never repaired.
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    let manifest = tmp.path().join("assets.jsonl");
+    let canonical = std::fs::read_to_string(&manifest).unwrap();
+    assert_eq!(canonical.lines().count(), 1);
+
+    // Simulate `merge=union`: the same canonical content, twice.
+    std::fs::write(&manifest, format!("{canonical}{canonical}")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap().lines().count(),
+        2
+    );
+
+    let assert = dbmd()
+        .args(["--json", "assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let v = json_stdout(assert.get_output());
+    assert_eq!(
+        v["wrote"], true,
+        "a non-canonical (duplicate-line) manifest must be recompacted and reported as updated"
+    );
+
+    let after = std::fs::read_to_string(&manifest).unwrap();
+    assert_eq!(
+        after.lines().count(),
+        1,
+        "duplicate lines must collapse to the single canonical line"
+    );
+    assert_eq!(
+        after, canonical,
+        "scan must restore the exact canonical bytes"
+    );
+
+    // And re-running over the now-canonical manifest is a true no-op again.
+    let assert = dbmd()
+        .args(["--json", "assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let v = json_stdout(assert.get_output());
+    assert_eq!(
+        v["wrote"], false,
+        "a recompacted, canonical manifest must rescan as no-change"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap(),
+        canonical,
+        "the no-op rescan must leave the manifest byte-identical"
+    );
+}
+
+#[test]
 fn verify_fails_and_status_reports_missing_required() {
     let tmp = tempfile::TempDir::new().unwrap();
     setup(tmp.path());
@@ -180,6 +247,70 @@ fn traversal_asset_path_is_rejected_and_not_cataloged() {
     );
     // No manifest written when nothing valid was cataloged.
     assert!(!tmp.path().join("assets.jsonl").exists());
+}
+
+#[test]
+fn paths_omits_store_escaping_records() {
+    // SPEC § Assets > Path safety: `dbmd` enforces store-relative containment
+    // "wherever it reads the manifest". A poisoned / hand-edited `assets.jsonl`
+    // (the `merge=union`-corruption state the SPEC anticipates) with an absolute
+    // and a `..`-traversal recorded path must NOT leak those verbatim out of
+    // `assets paths` — a harness pipes that list straight into a `.gitignore`
+    // managed block or sync-exclude. The escaping entries are omitted (the list
+    // analog of how `verify` counts them corrupt and `status` counts them
+    // missing); the legitimate in-store path is emitted unchanged.
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    // Append two store-escaping records to the scanned manifest.
+    let manifest = tmp.path().join("assets.jsonl");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str(
+        "{\"path\":\"../../../../../../etc/passwd\",\"sha256\":\"deadbeef\",\"bytes\":4096,\
+\"media_type\":\"text/plain\",\"wrappers\":[\"sources/docs/2026/06/contract.pdf.md\"],\
+\"required\":false}\n",
+    );
+    text.push_str(
+        "{\"path\":\"/etc/hosts\",\"sha256\":\"deadbeef\",\"bytes\":4096,\
+\"media_type\":\"text/plain\",\"wrappers\":[\"sources/docs/2026/06/contract.pdf.md\"],\
+\"required\":false}\n",
+    );
+    std::fs::write(&manifest, text).unwrap();
+
+    // Text form: only the safe in-store path, never the escaping ones.
+    let assert = dbmd()
+        .args(["assets", "paths", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("sources/docs/2026/06/contract.pdf"),
+        "the legitimate in-store path is still emitted: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("etc/passwd") && !stdout.contains("etc/hosts"),
+        "no store-escaping path may leak from `assets paths`: {stdout:?}"
+    );
+
+    // JSON form: same containment — only the safe path in the array.
+    let assert = dbmd()
+        .args(["--json", "assets", "paths", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let v = json_stdout(assert.get_output());
+    let list = v.as_array().expect("paths --json is an array");
+    assert_eq!(
+        list,
+        &vec![Value::from("sources/docs/2026/06/contract.pdf")],
+        "JSON `paths` emits only the safe in-store path"
+    );
 }
 
 #[test]
