@@ -8,9 +8,24 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.4.4**.
+  `Cargo.toml`, currently **v0.4.5**.
 
 ## [Unreleased]
+
+## [0.4.5] — 2026-06-28
+
+### Toolkit
+
+Fix: a store whose only content is loose files — a layer with no type-folder at
+all — reported two false `INDEX_MISSING` errors from `dbmd validate --all`, even
+though `dbmd index rebuild` had just produced that store and the loose file was
+query-visible. The root and layer `index.md` are type-folder rollups, written
+only when type-folders exist; with none, rebuild writes no rollup, but `validate`
+still demanded one. `validate` now requires the root / layer `index.md` only
+when that scope has type-folders — a loose-only layer's catalogue is its
+`index.jsonl`, which has nothing to roll up. (Predates 0.4.4; the 0.4.4
+loose-file work surfaced it by making such a store reachable and queryable for
+the first time. SPEC § Loose files gains a sentence; format stays **v0.3**.)
 
 ## [0.4.4] — 2026-06-28
 

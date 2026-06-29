@@ -1512,9 +1512,16 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     }
 
     // ── Root index.md ─────────────────────────────────────────────────────────
-    if !files.is_empty() {
+    // The root `index.md` is a TYPE-FOLDER rollup, so it is required only when
+    // the store has type-folder content. A store whose only content is loose
+    // files (directly at a layer root) is catalogued by its layer `index.jsonl`
+    // and has nothing to roll up, so the absence of a root `index.md` is not a
+    // defect — but if one exists, scope-check it.
+    {
         let root_index = store.root.join("index.md");
-        if !root_index.is_file() {
+        if root_index.is_file() {
+            check_index_scope(store, Path::new("index.md"), "root", None, issues);
+        } else if !type_folders.is_empty() {
             push(
                 issues,
                 Severity::Error,
@@ -1526,16 +1533,21 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
                 Some("run `dbmd index rebuild`".into()),
                 vec![],
             );
-        } else {
-            check_index_scope(store, Path::new("index.md"), "root", None, issues);
         }
     }
 
     // ── Layer index.md ────────────────────────────────────────────────────────
+    // A layer `index.md` is the rollup of that layer's type-folders, so it is
+    // required only when the layer HAS type-folders. A layer whose only content
+    // is loose files is catalogued by its own `index.jsonl` (checked below) and
+    // needs no rollup; demanding one there was a false `INDEX_MISSING`.
     for layer in &layers_present {
         let layer_index_rel = PathBuf::from(layer).join("index.md");
         let abs = store.root.join(&layer_index_rel);
-        if !abs.is_file() {
+        let layer_has_type_folders = type_folders.keys().any(|tf| tf.starts_with(layer));
+        if abs.is_file() {
+            check_index_scope(store, &layer_index_rel, "layer", Some(layer), issues);
+        } else if layer_has_type_folders {
             push(
                 issues,
                 Severity::Error,
@@ -1547,8 +1559,6 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
                 Some("run `dbmd index rebuild`".into()),
                 vec![],
             );
-        } else {
-            check_index_scope(store, &layer_index_rel, "layer", Some(layer), issues);
         }
     }
 
@@ -6425,6 +6435,27 @@ mod tests {
         assert!(
             has(&issues, codes::INDEX_JSONL_MISSING),
             "a loose file with no layer index.jsonl must raise INDEX_JSONL_MISSING, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn loose_only_store_validates_clean_without_a_rollup_index_md() {
+        // A store whose ONLY content is a loose file (no type-folder anywhere):
+        // rebuild writes the layer `index.jsonl` but no root/layer `index.md`
+        // rollup — there is nothing to roll up. `validate --all` must accept that;
+        // the rollup is required only when type-folders exist. (Regression: this
+        // emitted two false INDEX_MISSING errors in 0.4.4.)
+        let fx = Fixture::new();
+        fx.write("records/solo.md", LOOSE_ALICE);
+        fx.rebuild_indexes();
+        assert!(
+            !fx.dir.path().join("index.md").is_file(),
+            "no root rollup index.md should exist for a loose-only store"
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues.is_empty(),
+            "a loose-only store must validate clean (catalog is the layer index.jsonl), got: {issues:?}"
         );
     }
 }
