@@ -492,6 +492,21 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
     // file — the SWEEP cost.
     let all = walk_content_files(store)?;
 
+    // Every walked content file's edge KEY (NFC-folded, `.md`-stripped). A
+    // wiki-link counts as a live incoming/outgoing edge when it resolves on disk
+    // OR its edge key matches a walked file's. The key match is what makes a
+    // cross-NORMALIZATION link a real edge on a byte-exact filesystem: an NFD
+    // link to an NFC-named file (or vice versa) does NOT satisfy
+    // `resolve_existing`'s `is_file` on Linux (the bytes differ), though it does
+    // on macOS/APFS (which folds NFC/NFD). `link_edge_key` NFC-folds both sides,
+    // so the keys agree on every platform — without this, `orphans` flagged a
+    // live cross-normalization target as an orphan on Linux while macOS hid it.
+    let content_keys: HashSet<String> = all
+        .iter()
+        .filter_map(|abs| rel_path(store, abs))
+        .map(|rel| edge_key(&normalize_target(&rel)))
+        .collect();
+
     // `linked_to` holds case-folded edge KEYS (not raw paths): the link text may
     // spell a target with different casing than the on-disk file (e.g.
     // `[[records/contacts/Sarah-Chen]]` → `sarah-chen.md`), and on a
@@ -524,7 +539,13 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
             if target.is_empty() || edge_key(&target) == self_key {
                 continue;
             }
-            if resolve_existing(store, Path::new(&target)).is_none() {
+            // A live edge: resolves on disk (handles raw `.eml`/`.pdf` sources and
+            // store containment) OR matches a walked content file by NFC-folded
+            // key (the cross-normalization case `resolve_existing` misses on a
+            // byte-exact filesystem).
+            if resolve_existing(store, Path::new(&target)).is_none()
+                && !content_keys.contains(&edge_key(&target))
+            {
                 continue;
             }
             outgoing = true;
