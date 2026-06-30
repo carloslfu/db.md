@@ -109,11 +109,19 @@ deny = [
 # .github/workflows/audit.yml (`cargo deny check advisories`), on dependency
 # changes and on a daily schedule. With `version = 2`, every matching advisory
 # is an error; to accept a specific one, add its RUSTSEC id to `ignore` below
-# WITH a justifying comment. Empty today: the tree is advisory-clean (the
-# serde_yml -> serde_norway migration cleared RUSTSEC-2025-0067/0068).
+# WITH a justifying comment.
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0192 — `ttf-parser` is UNMAINTAINED (not a vulnerability). It
+    # is a transitive dep of the optional document-text path (`dbmd extract`):
+    # pdf-extract -> lopdf -> ttf-parser. The advisory itself states there is no
+    # safe upgrade available (the lopdf/pdf-extract chain pins ttf-parser 0.25),
+    # so there is nothing to bump to. Accepted with intent until pdf-extract /
+    # lopdf move off ttf-parser, or we swap the PDF extractor; the daily advisory
+    # schedule keeps it visible so it is not forgotten.
+    "RUSTSEC-2026-0192",
+]
 
 # ---------------------------------------------------------------------------
 # Sources: deny crates from outside crates.io. Workspace path dependencies are
