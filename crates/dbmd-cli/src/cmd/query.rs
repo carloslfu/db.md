@@ -3,16 +3,19 @@
 //! Thin wrapper: parse [`QueryArgs`] into a `dbmd_core::query::Query`
 //! (`with_type` / `with_layer` / `with_where`), `execute` it against the store
 //! (sidecar-backed — never a whole-store parse), and print the matching paths
-//! (text) or the full [`IndexRecord`]s (`--json`). Args parsing + record
-//! formatting only; all resolution logic lives in `dbmd-core`.
+//! apply the `--updated/created-*` time windows in memory, and print the
+//! matching paths (text) or the full [`IndexRecord`]s (`--json`). Args parsing +
+//! record formatting only; all resolution logic lives in `dbmd-core`.
 
 use std::path::Path;
 
+use chrono::{DateTime, FixedOffset};
 use dbmd_core::query::Query;
 use dbmd_core::store::Layer;
 use dbmd_core::{IndexRecord, Store};
 
 use crate::cli::QueryArgs;
+use crate::cmd::log::parse_flexible_timestamp;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -22,6 +25,13 @@ pub fn run(ctx: &Context, args: &QueryArgs) -> CliResult {
     let query = build_query(args)?;
 
     let mut records = query.execute(&store).map_err(map_store_error)?;
+
+    // Time windows: drop records outside any supplied `--updated/created-*`
+    // bound. A record missing the relevant timestamp fails a bound on that
+    // field (it can't be shown to be inside the window).
+    let window = TimeWindow::from_args(args)?;
+    records.retain(|r| window.accepts(r));
+
     // The sidecar readers return a path-sorted set; keep that order stable and
     // apply the optional cap after sorting so `--limit` is deterministic.
     records.sort_by(|a, b| a.path.cmp(&b.path));
@@ -111,4 +121,66 @@ fn records_json(records: &[IndexRecord]) -> String {
     let mut s = serde_json::to_string_pretty(records).unwrap_or_else(|_| "[]".to_string());
     s.push('\n');
     s
+}
+
+/// The parsed `--created/updated-after/-before` window. Absent bounds impose no
+/// constraint on that side.
+struct TimeWindow {
+    updated_after: Option<DateTime<FixedOffset>>,
+    updated_before: Option<DateTime<FixedOffset>>,
+    created_after: Option<DateTime<FixedOffset>>,
+    created_before: Option<DateTime<FixedOffset>>,
+}
+
+impl TimeWindow {
+    /// Parse every supplied bound (date-only tolerated, same contract as
+    /// `log since`). Absent bounds are `None`.
+    fn from_args(args: &QueryArgs) -> Result<TimeWindow, CliError> {
+        Ok(TimeWindow {
+            updated_after: opt_ts(&args.updated_after)?,
+            updated_before: opt_ts(&args.updated_before)?,
+            created_after: opt_ts(&args.created_after)?,
+            created_before: opt_ts(&args.created_before)?,
+        })
+    }
+
+    /// True if `record` satisfies every set bound. An `*-after` / `*-before`
+    /// bound is inclusive; a record missing the relevant timestamp fails any
+    /// bound on that field (it can't be shown to be inside the window).
+    fn accepts(&self, record: &IndexRecord) -> bool {
+        if let Some(bound) = self.updated_after {
+            match record.updated {
+                Some(u) if u >= bound => {}
+                _ => return false,
+            }
+        }
+        if let Some(bound) = self.updated_before {
+            match record.updated {
+                Some(u) if u <= bound => {}
+                _ => return false,
+            }
+        }
+        if let Some(bound) = self.created_after {
+            match record.created {
+                Some(c) if c >= bound => {}
+                _ => return false,
+            }
+        }
+        if let Some(bound) = self.created_before {
+            match record.created {
+                Some(c) if c <= bound => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Parse an optional timestamp bound through the shared flexible parser
+/// (RFC3339 or bare `YYYY-MM-DD`).
+fn opt_ts(raw: &Option<String>) -> Result<Option<DateTime<FixedOffset>>, CliError> {
+    match raw {
+        Some(s) => Ok(Some(parse_flexible_timestamp(s)?)),
+        None => Ok(None),
+    }
 }

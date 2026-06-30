@@ -525,11 +525,12 @@ fn budgets_hold_on_the_10k_scale_corpus() {
 
     // ── Loop ops — O(changed), must stay flat in store size ──────────────────
 
-    // `fm query` — sidecar read, scoped to one type-folder's index.jsonl.
+    // `query --where` — sidecar read, scoped to one type-folder's index.jsonl
+    // (the former `fm query` dedup primitive).
     let median = median_time(LOOP_ITERS, &|| {
         vec![
-            "fm".into(),
             "query".into(),
+            "--where".into(),
             "status=active".into(),
             "--type".into(),
             "company".into(),
@@ -537,9 +538,11 @@ fn budgets_hold_on_the_10k_scale_corpus() {
             store_str.clone(),
         ]
     });
-    eprintln!("[perf] fm query --type company: median {median:?} (budget {BUDGET_FM_QUERY:?})");
+    eprintln!(
+        "[perf] query --where status=active --type company: median {median:?} (budget {BUDGET_FM_QUERY:?})"
+    );
     assert_within_budget(
-        "fm query status=active --type company",
+        "query --where status=active --type company",
         median,
         BUDGET_FM_QUERY,
     );

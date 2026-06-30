@@ -472,8 +472,8 @@ fn audit_index_artifacts(artifacts: &[Artifact], store_root: &Path) -> usize {
                 a.path
             );
             assert!(
-                a.content.contains("dbmd index query"),
-                "the `## More` footer must point at `dbmd index query` for the complete catalog in {}",
+                a.content.contains("dbmd query --type"),
+                "the `## More` footer must point at `dbmd query --type … --in …` for the complete catalog in {}",
                 a.path
             );
         }

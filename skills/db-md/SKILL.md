@@ -50,7 +50,7 @@ dbmd log tail 20                                    # what was done lately (avoi
 dbmd search "(renewal|contract|ARR)" --in records   # ripgrep; the regex IS your query expansion (no embeddings)
 dbmd query --type contact --where company=Acme       # structured frontmatter query via the sidecar
 dbmd graph neighborhood records/contacts/sarah-chen --hops 2   # context in one call
-dbmd links records/contacts/sarah-chen               # who points here (blast radius)
+dbmd graph backlinks records/contacts/sarah-chen               # who points here (blast radius)
 
 # Write — create and connect (frontmatter is composed for you)
 dbmd write records/meetings/standup.md --type meeting --summary "weekly sync"

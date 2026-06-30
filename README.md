@@ -452,7 +452,7 @@ Then, from inside the store:
 ```bash
 dbmd search "renewal" --in records                   # search content and frontmatter
 dbmd query --type contact --where status=active      # filter by frontmatter
-dbmd links records/contacts/elena-rodriguez          # who links to this record
+dbmd graph backlinks records/contacts/elena-rodriguez          # who links to this record
 dbmd graph neighborhood records/companies/northstar  # the local web around a record
 dbmd validate                                        # frontmatter, links, schemas, all checked
 ```

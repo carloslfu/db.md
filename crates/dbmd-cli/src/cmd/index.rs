@@ -14,23 +14,20 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset};
-
-use crate::cli::{IndexArgs, IndexCommand, IndexQueryArgs, IndexRebuildArgs, IndexShowArgs};
+use crate::cli::{IndexArgs, IndexCommand, IndexRebuildArgs, IndexShowArgs};
 use crate::cmd::fm::parse_layer;
-use crate::cmd::log::{into_cli, open_store, parse_flexible_timestamp};
+use crate::cmd::log::open_store;
 use crate::cmd::write::require_store_relative;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
-use dbmd_core::{Index, IndexLevel, IndexRecord, Layer, Query, Store};
+use dbmd_core::{Index, IndexLevel, Layer, Store};
 
 /// Dispatch `dbmd index <sub>` to the matching leaf body.
 pub fn run(ctx: &Context, args: &IndexArgs) -> CliResult {
     match &args.command {
         IndexCommand::Rebuild(a) => run_rebuild(ctx, a),
         IndexCommand::Show(a) => run_show(ctx, a),
-        IndexCommand::Query(a) => run_query(ctx, a),
     }
 }
 
@@ -122,46 +119,6 @@ pub fn run_show(ctx: &Context, args: &IndexShowArgs) -> CliResult {
         }
         Err(e) => Err(e.into()),
     }
-}
-
-/// `dbmd index query [...]` — complete structured read/filter over the
-/// `index.jsonl` sidecar(s). Resolves the type/where/layer query via the core
-/// sidecar reader, then applies the time-window filters and `--limit` in memory.
-pub fn run_query(ctx: &Context, args: &IndexQueryArgs) -> CliResult {
-    let store = open_store(&args.dir)?;
-
-    let mut query = Query::new();
-    if let Some(t) = &args.r#type {
-        query = query.with_type(t);
-    }
-    if let Some(layer) = &args.r#in {
-        query = query.with_layer(parse_layer(layer)?);
-    }
-    for clause in &args.r#where {
-        let (k, v) = split_where(clause)?;
-        query = query.with_where(k, v);
-    }
-
-    let mut records = into_cli(query.execute(&store))?;
-
-    // Time windows: parse each bound once, then retain matching records. A bound
-    // a record can't satisfy (missing/!parseable timestamp) drops the record.
-    let win = TimeWindow::from_args(args)?;
-    records.retain(|r| win.accepts(r));
-
-    // `query.execute` concatenates per-sidecar reads in sidecar-PATH order, which
-    // is NOT globally record-path-sorted once a layer mixes loose files (a
-    // layer-root sidecar) with type-folders (whose sidecar path sorts after the
-    // loose file's record path). Sort by record path so the enumeration — and the
-    // `--limit` cap below — match `dbmd query` / `dbmd fm query` exactly.
-    records.sort_by(|a, b| a.path.cmp(&b.path));
-
-    if let Some(limit) = args.limit {
-        records.truncate(limit);
-    }
-
-    emit_records(ctx, &records);
-    Ok(())
 }
 
 // ── Rebuild scope ─────────────────────────────────────────────────────────────
@@ -311,99 +268,6 @@ fn type_folders_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
     }
     out.sort();
     out
-}
-
-// ── Query output (shared with `fm query`) ─────────────────────────────────────
-
-/// Render a result set of [`IndexRecord`]s: under `--json`, the full records as
-/// a JSON array (path + summary + tags + links + fields); in text mode, one
-/// store-relative path per line. Shared by `index query` and `fm query`.
-pub(crate) fn emit_records(ctx: &Context, records: &[IndexRecord]) {
-    if ctx.json {
-        let arr: Vec<serde_json::Value> = records
-            .iter()
-            .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
-            .collect();
-        println!("{}", serde_json::Value::Array(arr));
-    } else {
-        for r in records {
-            println!("{}", path_str(&r.path));
-        }
-    }
-}
-
-/// The parsed `--created/updated-after/-before` window for `index query`.
-struct TimeWindow {
-    updated_after: Option<DateTime<FixedOffset>>,
-    updated_before: Option<DateTime<FixedOffset>>,
-    created_after: Option<DateTime<FixedOffset>>,
-    created_before: Option<DateTime<FixedOffset>>,
-}
-
-impl TimeWindow {
-    /// Parse every supplied bound (date-only tolerated, same contract as
-    /// `log since`). Absent bounds are `None` (no constraint on that side).
-    fn from_args(args: &IndexQueryArgs) -> Result<TimeWindow, CliError> {
-        Ok(TimeWindow {
-            updated_after: opt_ts(&args.updated_after)?,
-            updated_before: opt_ts(&args.updated_before)?,
-            created_after: opt_ts(&args.created_after)?,
-            created_before: opt_ts(&args.created_before)?,
-        })
-    }
-
-    /// True if `record` satisfies every set bound. An `*-after`/`*-before` bound
-    /// is inclusive; a record missing the relevant timestamp fails any bound on
-    /// that field (it can't be shown to be inside the window).
-    fn accepts(&self, record: &IndexRecord) -> bool {
-        if let Some(bound) = self.updated_after {
-            match record.updated {
-                Some(u) if u >= bound => {}
-                _ => return false,
-            }
-        }
-        if let Some(bound) = self.updated_before {
-            match record.updated {
-                Some(u) if u <= bound => {}
-                _ => return false,
-            }
-        }
-        if let Some(bound) = self.created_after {
-            match record.created {
-                Some(c) if c >= bound => {}
-                _ => return false,
-            }
-        }
-        if let Some(bound) = self.created_before {
-            match record.created {
-                Some(c) if c <= bound => {}
-                _ => return false,
-            }
-        }
-        true
-    }
-}
-
-/// Parse an optional timestamp bound, threading through the shared flexible
-/// parser (RFC3339 or bare `YYYY-MM-DD`).
-fn opt_ts(raw: &Option<String>) -> Result<Option<DateTime<FixedOffset>>, CliError> {
-    match raw {
-        Some(s) => Ok(Some(parse_flexible_timestamp(s)?)),
-        None => Ok(None),
-    }
-}
-
-/// Split a `--where key=value` clause at the first `=`. The value may contain
-/// further `=`. An empty key is a usage error.
-fn split_where(clause: &str) -> Result<(&str, &str), CliError> {
-    match clause.split_once('=') {
-        Some((k, v)) if !k.is_empty() => Ok((k, v)),
-        _ => Err(CliError::new(
-            ExitCode::Runtime,
-            "BAD_WHERE",
-            format!("--where expects `key=value`, got {clause:?}"),
-        )),
-    }
 }
 
 // ── Path glue ────────────────────────────────────────────────────────────────

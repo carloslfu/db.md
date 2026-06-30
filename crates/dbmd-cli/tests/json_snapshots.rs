@@ -116,26 +116,26 @@ fn validate_working_set_clean_envelope() {
     insta::assert_snapshot!("validate_working_set_clean", out);
 }
 
-// ── index query ─────────────────────────────────────────────────────────────
+// ── query --type (structured read; --json = full records) ────────────────────
 
-/// `dbmd index query --type contact --json` — the full IndexRecords read out of
-/// the `records/contacts/index.jsonl` sidecar, path-sorted. Locks the complete
+/// `dbmd query --type contact --json` — the full IndexRecords read out of the
+/// `records/contacts/index.jsonl` sidecar, path-sorted. Locks the complete
 /// record schema (path + summary + tags + links + every type-specific field).
 #[test]
-fn index_query_contacts_json() {
-    let out = json_stdout(&["index", "query", "--type", "contact"]);
-    insta::assert_snapshot!("index_query_contacts", out);
+fn query_type_contact_json() {
+    let out = json_stdout(&["query", "--type", "contact"]);
+    insta::assert_snapshot!("query_type_contact", out);
 }
 
-// ── fm query ──────────────────────────────────────────────────────────────
+// ── query --where (the dedup lens; former `fm query`) ────────────────────────
 
-/// `dbmd fm query status=active --type contact --json` — the same sidecar
-/// record shape reached through the frontmatter-query lens. All four corpus
+/// `dbmd query --where status=active --type contact --json` — the same sidecar
+/// record shape reached through the frontmatter-filter lens. All four corpus
 /// contacts are `status: active`, so this is the populated, path-sorted set.
 #[test]
-fn fm_query_active_contacts_json() {
-    let out = json_stdout(&["fm", "query", "status=active", "--type", "contact"]);
-    insta::assert_snapshot!("fm_query_active_contacts", out);
+fn query_where_status_active_json() {
+    let out = json_stdout(&["query", "--where", "status=active", "--type", "contact"]);
+    insta::assert_snapshot!("query_where_status_active", out);
 }
 
 // ── stats ─────────────────────────────────────────────────────────────────

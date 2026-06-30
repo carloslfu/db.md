@@ -304,12 +304,18 @@ fn set_rejects_a_non_assignment_argument() {
 
 // ── fm query ───────────────────────────────────────────────────────────────────
 
-/// Run `dbmd fm query <args> --dir corpus_a` and return stdout path lines.
+/// Run `dbmd query --where <filter> <flags> --dir corpus_a` and return stdout
+/// path lines. `args[0]` is the `key=value` filter (the former `fm query`
+/// positional, now folded into `query --where`); the rest are flags.
 fn query_paths(args: &[&str]) -> BTreeSet<String> {
+    let (filter, flags) = args
+        .split_first()
+        .expect("query_paths needs a key=value filter as its first arg");
     let out = dbmd()
-        .arg("fm")
         .arg("query")
-        .args(args)
+        .arg("--where")
+        .arg(filter)
+        .args(flags)
         .arg("--dir")
         .arg(corpus_a())
         .assert()
@@ -329,8 +335,8 @@ fn query_by_typed_field_with_type_scope() {
 fn query_returns_full_records_in_json() {
     let out = dbmd()
         .args([
-            "fm",
             "query",
+            "--where",
             "email=sarah.chen@northstar.io",
             "--type",
             "contact",
@@ -363,7 +369,7 @@ fn query_limit_caps_results() {
 #[test]
 fn query_rejects_a_non_assignment() {
     dbmd()
-        .args(["fm", "query", "no-equals"])
+        .args(["query", "--where", "no-equals"])
         .arg("--dir")
         .arg(corpus_a())
         .assert()
@@ -406,7 +412,7 @@ fn query_limit_is_path_sorted_with_loose_and_type_folders() {
     // Global path order: records/aaa.md < records/contacts/mmm.md < .../nnn.md.
     let out = dbmd()
         .current_dir(store)
-        .args(["fm", "query", "meta-type=fact", "--limit", "2"])
+        .args(["query", "--where", "meta-type=fact", "--limit", "2"])
         .assert()
         .success();
     let got: Vec<String> = String::from_utf8(out.get_output().stdout.clone())

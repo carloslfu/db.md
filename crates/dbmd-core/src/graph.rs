@@ -1727,7 +1727,7 @@ Example: [[records/contacts/sarah-chen]]
         // (`Store::find_links_to`), NOT by reading the sidecar candidate set and
         // then `read_to_string`-confirming each candidate (which re-opens every
         // content file → O(store); the documented >3x budget miss). A ripgrep
-        // pass is the same scan engine `validate`/`rename`/`dbmd links` ride, and
+        // pass is the same scan engine `validate`/`rename`/`dbmd graph backlinks` ride, and
         // the tree — not the sidecar — is its ground truth: a linker that is on
         // disk but absent from every sidecar (stale / never-built index) is still
         // found. We assert that behaviorally, which fails loudly if the unscoped

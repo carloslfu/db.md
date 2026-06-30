@@ -105,7 +105,6 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Validate(args) => cmd::validate::run(ctx, args),
         Command::Format(args) => cmd::format::run(ctx, args),
         Command::Query(args) => cmd::query::run(ctx, args),
-        Command::Links(args) => cmd::links::run(ctx, args),
         Command::Sections(args) => cmd::sections::run(ctx, args),
         Command::Extract(args) => cmd::extract::run(ctx, args),
         Command::Search(args) => cmd::search::run(ctx, args),

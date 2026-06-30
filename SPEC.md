@@ -89,7 +89,7 @@ db/                          # any path; one db.md store per scope
 
 **Required:** the `DB.md` file + at minimum one of `sources/` / `records/` (most stores have both). Sub-folders by type are convention; tools may use other groupings. The synthesis narrative that lived in `wiki/` in v0.2 now lives in `records/` as files carrying `meta-type: conclusion` (see [Meta-type](#meta-type-fact-operational-conclusion)) — same store, distinguished by a queryable field, not a folder.
 
-**Curator-maintained (optional, created on first curator action):** `index.md` (catalog of the store) and `log.md` (chronological action log). Absent at store creation; populated by the curator as it works. Each non-empty **type-folder** additionally carries an `index.jsonl` — the complete, machine-readable twin of its `index.md` (the `.md` is the capped human browse view; the `.jsonl` is the uncapped structured catalog that backs `dbmd fm query` / `dbmd index query` / dedup). See [The `index.md` and `log.md` files](#the-indexmd-and-logmd-files).
+**Curator-maintained (optional, created on first curator action):** `index.md` (catalog of the store) and `log.md` (chronological action log). Absent at store creation; populated by the curator as it works. Each non-empty **type-folder** additionally carries an `index.jsonl` — the complete, machine-readable twin of its `index.md` (the `.md` is the capped human browse view; the `.jsonl` is the uncapped structured catalog that backs `dbmd query` / dedup). See [The `index.md` and `log.md` files](#the-indexmd-and-logmd-files).
 
 **Filename convention:** the config file is `DB.md` (uppercase), matching README / LICENSE / NOTICE conventions for "main file in a project root" and differentiating from the standard name `db.md` (lowercase, referring to the project / spec). `index.md` and `log.md` are lowercase — they're curator-maintained content, not config.
 
@@ -478,7 +478,7 @@ differentiates the file from the standard name `db.md`.
 
 **If `DB.md` is absent**, the directory is not a db.md store. Every
 store-walking `dbmd` subcommand (`validate`, `search`, `graph`,
-`fm query`, `index rebuild`, `stats`, ...) exits non-zero with
+`query`, `index rebuild`, `stats`, ...) exits non-zero with
 structured error code `NOT_A_STORE` rather than guessing.
 **Creating a store is the agent's job, not a tool command.** `DB.md` is
 operator/agent-authored — you write it. There is deliberately **no `dbmd
@@ -700,12 +700,12 @@ my-store/
 
 - **Root `index.md`** — exists whenever the store has any files. Lightweight: lists each layer + each type folder under it with counts. One entry per type folder; does NOT enumerate every file. Wiki-links target the layer indexes.
 - **Layer `index.md`** (`sources/index.md`, `records/index.md`) — exists whenever that layer has any files. Lists each type folder under the layer with counts and brief summaries. Wiki-links target type-folder indexes.
-- **Type-folder `index.md`** — exists whenever the type folder has any files. The **human / recency browse view**: lists files in the type-folder, **across date-shards**, with a one-line summary, **capped at 500 entries** selected by recency (newest first by the frontmatter `updated` field — clone-stable, unlike filesystem mtime, which `git clone` resets — ties broken by store-relative path ascending). Above the cap it lists the 500 most-recent and ends with a `## More` section pointing to `dbmd fm query` / `dbmd index query --type <t> --in <layer>` (the complete twin below) for full enumeration. The cap keeps the browse view inside an LLM context budget and bounded in the write loop; completeness lives in the `index.jsonl` twin, not here.
-- **Type-folder `index.jsonl`** — the complete, **uncapped** machine twin of `index.md`: one JSON object per file in the folder (across date-shards), `{path, type, summary, tags, links, created, updated, <other frontmatter fields>}` — where **`tags` and `links` are the document's expansion** (`tags` = the LLM's flat semantic labels; `links` = wiki-links to concept pages + related records). Same kind of artifact as `index.md` — a derived, write-through, rebuildable **plain file** (JSONL, so it stays git-diffable line-by-line and ripgrep-able), not a database engine. The current toolkit keeps it compacted on write for byte-for-byte rebuild equivalence; readers also tolerate un-compacted append-style lines by applying last-write-wins by path. It is the **backing for structured reads**: `dbmd fm query`, `dbmd index query`, `dbmd search --type/--where`, the dedup pre-write checks, and `dbmd graph backlinks` read it (one sequential, complete read per type-folder — cold-cache-proof) instead of scanning frontmatter across the tree. This is what makes the catalog complete *and* fast with no engine; ad-hoc full-text body search stays ripgrep. **Tags ≠ concepts:** a tag is a flat label (the agent filters/aggregates it on demand from this sidecar; no page of its own); a concept is a `meta-type: conclusion` record the doc links to (`links`), navigated via `graph backlinks`. Both are LLM-authored, never inferred — they are the *doc-side* of query expansion, so the agent's expanded query and the document's tags/concepts meet lexically here, with no embeddings. (The root stays a markdown-only rollup. A layer is a markdown-only rollup too in the common case — its `.jsonl` twin appears only when content files live *directly* at the layer root with no type-folder between them; see **Loose files** below.)
+- **Type-folder `index.md`** — exists whenever the type folder has any files. The **human / recency browse view**: lists files in the type-folder, **across date-shards**, with a one-line summary, **capped at 500 entries** selected by recency (newest first by the frontmatter `updated` field — clone-stable, unlike filesystem mtime, which `git clone` resets — ties broken by store-relative path ascending). Above the cap it lists the 500 most-recent and ends with a `## More` section pointing to `dbmd query --type <t> --in <layer>` (the complete twin below) for full enumeration. The cap keeps the browse view inside an LLM context budget and bounded in the write loop; completeness lives in the `index.jsonl` twin, not here.
+- **Type-folder `index.jsonl`** — the complete, **uncapped** machine twin of `index.md`: one JSON object per file in the folder (across date-shards), `{path, type, summary, tags, links, created, updated, <other frontmatter fields>}` — where **`tags` and `links` are the document's expansion** (`tags` = the LLM's flat semantic labels; `links` = wiki-links to concept pages + related records). Same kind of artifact as `index.md` — a derived, write-through, rebuildable **plain file** (JSONL, so it stays git-diffable line-by-line and ripgrep-able), not a database engine. The current toolkit keeps it compacted on write for byte-for-byte rebuild equivalence; readers also tolerate un-compacted append-style lines by applying last-write-wins by path. It is the **backing for structured reads**: `dbmd query`, `dbmd search --type/--where`, the dedup pre-write checks, and `dbmd graph backlinks` read it (one sequential, complete read per type-folder — cold-cache-proof) instead of scanning frontmatter across the tree. This is what makes the catalog complete *and* fast with no engine; ad-hoc full-text body search stays ripgrep. **Tags ≠ concepts:** a tag is a flat label (the agent filters/aggregates it on demand from this sidecar; no page of its own); a concept is a `meta-type: conclusion` record the doc links to (`links`), navigated via `graph backlinks`. Both are LLM-authored, never inferred — they are the *doc-side* of query expansion, so the agent's expanded query and the document's tags/concepts meet lexically here, with no embeddings. (The root stays a markdown-only rollup. A layer is a markdown-only rollup too in the common case — its `.jsonl` twin appears only when content files live *directly* at the layer root with no type-folder between them; see **Loose files** below.)
 
 **Empty folders have no `index.md`.** Folders below the type-folder level (sub-sub-folders, if an operator creates them) are operator territory — not part of the canonical hierarchy, no auto-indexing.
 
-**Loose files (content directly at a layer root).** A content file MAY live directly at a layer root — `records/<file>.md` or `sources/<file>.md` — with no type-folder between it and the layer. Folder layout is convention, not enforcement (§ Layers), so this is a valid store: `dbmd write` never produces it (it routes every type to a canonical type-folder), but a bulk import or a hand-edit can. Such *loose* files are catalogued in the **layer's own `index.jsonl`** — the same complete, uncapped structured twin a type-folder carries, anchored at the layer dir — so structured reads (`dbmd query`, `dbmd index query`, `dbmd search --type`, the dedup pre-write checks, `dbmd graph`) see a loose file exactly as they see a canonical one, with no whole-store walk. The layer `index.md` stays a type-folder rollup and does NOT list loose files (the layer `index.jsonl` is their catalog); a layer with no loose files carries no `index.jsonl`, so canonical stores are byte-unchanged. The layer `index.jsonl` is maintained write-through and rebuilt by `dbmd index rebuild`, byte-identically. `dbmd validate --all` reports `INDEX_JSONL_MISSING` when a loose file is absent from its layer `index.jsonl` (and `INDEX_JSONL_DESYNC` / `INDEX_JSONL_STALE` for a sidecar out of sync with the files), so a loose file is never *silently* missing from the catalog. (The canonical home for a record is still its type-folder; loose placement is supported, not encouraged — `dbmd rename`-ing a loose file into its type-folder removes the layer sidecar once the layer has no loose files left.) A layer — or an entire store — whose only content is loose files has **no rollup `index.md`** at the layer or root level: there are no type-folders to summarise, so the layer `index.jsonl` is the whole catalogue, and `dbmd validate` does not require a rollup that would have nothing to roll up.
+**Loose files (content directly at a layer root).** A content file MAY live directly at a layer root — `records/<file>.md` or `sources/<file>.md` — with no type-folder between it and the layer. Folder layout is convention, not enforcement (§ Layers), so this is a valid store: `dbmd write` never produces it (it routes every type to a canonical type-folder), but a bulk import or a hand-edit can. Such *loose* files are catalogued in the **layer's own `index.jsonl`** — the same complete, uncapped structured twin a type-folder carries, anchored at the layer dir — so structured reads (`dbmd query`, `dbmd query`, `dbmd search --type`, the dedup pre-write checks, `dbmd graph`) see a loose file exactly as they see a canonical one, with no whole-store walk. The layer `index.md` stays a type-folder rollup and does NOT list loose files (the layer `index.jsonl` is their catalog); a layer with no loose files carries no `index.jsonl`, so canonical stores are byte-unchanged. The layer `index.jsonl` is maintained write-through and rebuilt by `dbmd index rebuild`, byte-identically. `dbmd validate --all` reports `INDEX_JSONL_MISSING` when a loose file is absent from its layer `index.jsonl` (and `INDEX_JSONL_DESYNC` / `INDEX_JSONL_STALE` for a sidecar out of sync with the files), so a loose file is never *silently* missing from the catalog. (The canonical home for a record is still its type-folder; loose placement is supported, not encouraged — `dbmd rename`-ing a loose file into its type-folder removes the layer sidecar once the layer has no loose files left.) A layer — or an entire store — whose only content is loose files has **no rollup `index.md`** at the layer or root level: there are no type-folders to summarise, so the layer `index.jsonl` is the whole catalogue, and `dbmd validate` does not require a rollup that would have nothing to roll up.
 
 **Example — root `index.md`:**
 
@@ -759,7 +759,7 @@ updated: 2026-05-27T10:00:00Z
   ## More
 
   This folder has 12,348 files. The 500 most recent are listed above.
-  Use `dbmd index query --type email --in sources` for the complete catalog.
+  Use `dbmd query --type email --in sources` for the complete catalog.
   ```
 - **Indexes are maintained write-through, not rebuilt in the loop.** The write commands (`dbmd write` / `dbmd fm init` / `dbmd fm set` / `dbmd rename`) update the affected entries as the agent works — bounded to the affected type-folder: splice the ≤500-entry `index.md`, read/update/rewrite that folder's compact `index.jsonl`, plus refresh the parent counts. The catalog is always current; there is no full-store rebuild step in the normal session. `dbmd index rebuild` is the from-scratch repair — after a bulk external drop into `sources/`, or to recover a damaged index — walking the store once, rewriting all three levels (both `index.md` and the complete `index.jsonl`, compacting the jsonl), deleting stale indexes. Never edited by hand.
 
@@ -979,8 +979,8 @@ Before `dbmd write`, `dbmd link`, or `dbmd fm set`, the agent
 should:
 
 1. **Search for existing entities** to avoid soft collisions —
-   `dbmd fm query email=<addr> --in records/contacts` before creating
-   a `contact`; `dbmd fm query domain=<host> --in records/companies`
+   `dbmd query --where email=<addr> --in records/contacts` before creating
+   a `contact`; `dbmd query --where domain=<host> --in records/companies`
    before creating a `company` (each path-scoped to the entity's flat
    type-folder ⇒ O(entities), not O(store)); the
    collision-detection vocabulary in
@@ -1030,7 +1030,7 @@ toolkit doesn't enforce it; the contract lives here.
    policies, and schemas.
 2. **Warm up** — `dbmd log tail 20` to learn what was done lately;
    `dbmd log since <last-session-time>` for a precise diff.
-3. **Operate** — read with `dbmd search` / `dbmd fm query` /
+3. **Operate** — read with `dbmd search` / `dbmd query` /
    `dbmd graph` / `dbmd extract`; write with `dbmd write` /
    `dbmd fm set` / `dbmd link` / `dbmd rename`. Apply
    [pre-write checks](#pre-write-checks) before every write.
@@ -1318,7 +1318,7 @@ Four properties deliver it:
   aggregates across shards; the shards themselves are storage, not
   catalog levels.
 - **Structured reads hit the `index.jsonl` sidecar; full-text reads
-  are ripgrep.** `dbmd fm query`, `dbmd index query`, `dbmd search
+  are ripgrep.** `dbmd query`, `dbmd search
   --type/--where`, the entity-dedup pre-write checks, and `dbmd graph
   backlinks` read the relevant type-folder `index.jsonl` — one
   sequential, complete read, cold-cache-proof (it replaces scanning
@@ -1348,7 +1348,7 @@ marginally over the tight 100ms target at 10k in `tests/PERF.md`.
 | Operation                              | Class           | 10k    | ~1M    |
 |----------------------------------------|-----------------|--------|--------|
 | `dbmd write` / `fm set` (+ catalog)    | loop            | target <100ms; measured near target | target <100ms |
-| `dbmd fm query <k>=<v>`                | loop (ripgrep)  | <300ms | <2s    |
+| `dbmd query --where <k>=<v>`           | loop (ripgrep)  | <300ms | <2s    |
 | `dbmd search <query>`                  | loop (ripgrep)  | <300ms | <2s    |
 | `dbmd graph backlinks <path>`          | loop (ripgrep)  | <200ms | <2s    |
 | `dbmd log tail 20`                     | loop (rev-read) | <50ms  | <50ms  |
@@ -1580,7 +1580,7 @@ files" contract or the format you read today:
   every tool that reads files still works, and this is how the
   **packed** flavor presents as a directory — while the backing engine
   serves queries from real index structures (B-tree / LSM / inverted
-  full-text index — all lexical, no vectors), not linear scans. `fm query`, `search`, and `backlinks` become
+  full-text index — all lexical, no vectors), not linear scans. `query`, `search`, and `backlinks` become
   sublinear; a store scales past the point where a literal directory
   of millions of files (or git over it) would fall down.
 - **Faster lexical search — never embeddings.** *Today, model-free:* the
@@ -1667,7 +1667,7 @@ prompt interactively.
 |-----------|-------------|
 | Open      | `dbmd spec`, `dbmd fm get DB.md <key>` |
 | Warm up   | `dbmd log tail [N]`, `dbmd log since <ts>` |
-| Read      | `dbmd search <q> [--type --in --where --linked-from --linked-to --updated-after --updated-before]`, `dbmd query [--type --in --where --limit]` (frontmatter filter over the sidecar), `dbmd fm query <k>=<v>`, `dbmd fm get <file> <key>`, `dbmd graph <backlinks\|forwardlinks\|neighborhood\|orphans>`, `dbmd tree`, `dbmd outline <file>`, `dbmd stats`, `dbmd extract <file>`, `dbmd index show [<path>]` |
+| Read      | `dbmd search <q> [--type --in --where --linked-from --linked-to --updated-after --updated-before]`, `dbmd query [--type --in --where --updated-after --updated-before --created-after --created-before --limit]` (frontmatter filter over the sidecar; paths by default, `--json` = full records — the dedup/`--where` lookup folds in the former `fm query`, `--json` the former `index query`), `dbmd fm get <file> <key>`, `dbmd graph <backlinks\|forwardlinks\|neighborhood\|orphans>`, `dbmd tree`, `dbmd outline <file>`, `dbmd stats`, `dbmd extract <file>`, `dbmd index show [<path>]` |
 | Write     | `dbmd write <path> --type <t> [--summary --fm --body-file]`, `dbmd fm set <file> <k>=<v>`, `dbmd fm init <file>`, `dbmd link <from> <to>`, `dbmd rename <old> <new>`, `dbmd format <file>` |
 | Validate  | `dbmd validate [--json]` (working set), `dbmd validate --all` (full sweep) |
 | Maintain  | indexes are write-through; `dbmd index rebuild [--layer --folder --dry-run]` repairs / folds in bulk drops |

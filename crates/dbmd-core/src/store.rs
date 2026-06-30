@@ -1006,7 +1006,7 @@ pub fn link_edge_key(canonical_target: &str) -> String {
 /// scanned WITHOUT fence tracking, and the body is scanned with a FRESH fence
 /// state — so a stray ``` / `~~~` inside a frontmatter value can never open a
 /// fence that swallows the body's real wiki-links. (Callers `search_by_link`,
-/// `forwardlinks`, and `dbmd links` all pass full file text; without this
+/// `forwardlinks`, and `dbmd graph backlinks` all pass full file text; without this
 /// boundary reset a fenced frontmatter value silently dropped every subsequent
 /// body edge — under-reporting backlinks/forwardlinks/`links`.) A fragment with
 /// no leading frontmatter takes the body path unchanged.
@@ -2928,7 +2928,7 @@ mod tests {
         // serde_json's canonical f64 render, which DISCARDS the file's source
         // spelling (`1234.00` -> `1234.0`, `1e3` -> `1000.0`). A textual compare
         // made the spelling a human reads in the file miss (and disagree with
-        // free-text `search`); numeric compare fixes it. `fm query`/`index query`
+        // free-text `search`); numeric compare fixes it. `query`
         // is the SPEC pre-write dedup primitive, so a miss here silently writes a
         // duplicate record.
         let dir = empty_store();
@@ -3275,7 +3275,7 @@ After fence [[records/companies/acme]].
 
     #[test]
     fn extract_edge_targets_frontmatter_fence_does_not_swallow_body_links() {
-        // Regression: `search_by_link` / `forwardlinks` / `dbmd links` feed the
+        // Regression: `search_by_link` / `forwardlinks` / `dbmd graph backlinks` feed the
         // WHOLE file (frontmatter + body) here. A stray code-fence run inside a
         // frontmatter value must NOT open a markdown fence that swallows the
         // body's real wiki-links. Frontmatter links are still edges; a link

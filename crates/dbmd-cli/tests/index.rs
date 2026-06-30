@@ -572,10 +572,9 @@ fn show_missing_index_exits_1_with_empty_stdout_and_a_hint() {
 
 // ── query ──────────────────────────────────────────────────────────────────────
 
-/// Run `dbmd index query <args> --dir corpus_a`; return stdout path lines.
+/// Run `dbmd query <args> --dir corpus_a`; return stdout path lines.
 fn query_paths(args: &[&str]) -> Vec<String> {
     let out = dbmd()
-        .arg("index")
         .arg("query")
         .args(args)
         .arg("--dir")
@@ -672,7 +671,7 @@ fn query_limit_is_path_sorted_with_loose_and_type_folders() {
     let got: Vec<String> = {
         let out = dbmd()
             .current_dir(store)
-            .args(["index", "query", "--in", "records", "--limit", "2"])
+            .args(["query", "--in", "records", "--limit", "2"])
             .assert()
             .success();
         String::from_utf8(out.get_output().stdout.clone())
@@ -712,14 +711,7 @@ fn query_limit_is_path_sorted_with_loose_and_type_folders() {
 #[test]
 fn query_json_returns_full_records() {
     let out = dbmd()
-        .args([
-            "index",
-            "query",
-            "--type",
-            "invoice",
-            "--where",
-            "status=paid",
-        ])
+        .args(["query", "--type", "invoice", "--where", "status=paid"])
         .arg("--json")
         .arg("--dir")
         .arg(corpus_a())

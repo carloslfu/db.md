@@ -8,9 +8,45 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.4.6**.
+  `Cargo.toml`, currently **v0.5.0**.
 
 ## [Unreleased]
+
+## [0.5.0] — 2026-06-29
+
+### Toolkit (breaking — CLI read surface)
+
+Collapsed the structured-read surface to **three primitives, one per data
+model** — `query` (frontmatter fields), `search` (body text / ripgrep), `graph`
+(wiki-link edges) — folding three redundant verbs into them. **Lossless:** every
+capability survives, just reached through one command.
+
+- **`dbmd index query` → `dbmd query`.** `query` already printed paths (default)
+  or full records (`--json`); it now also carries `index query`'s time-window
+  filters (`--updated/created-after/-before`). `index query` is removed; `index`
+  keeps `rebuild` / `show`.
+- **`dbmd fm query <k>=<v>` → `dbmd query --where <k>=<v>`.** The pre-write dedup
+  lookup is now a `query` filter; the dedup *pattern* is documented in the SPEC
+  rather than reified as its own command. `fm query` is removed; `fm` keeps
+  `get` / `set` / `init`.
+- **`dbmd links <target>` → `dbmd graph backlinks <target>`.** The top-level
+  `links` was a byte-identical alias of `graph backlinks` (incoming wiki-links);
+  removed in favor of the single `graph` axis.
+
+Rationale: an agent generates its tool calls fresh at read-time against the
+current interface — and `dbmd spec` reloads the standard into its system prompt
+each run — so a pre-1.0 surface change is cheap. Collapse to the minimal,
+principled shape now rather than carry compatibility cruft. `search`, the
+`fm`/`index` write & maintain verbs, and the navigate verbs (`tree`, `outline`,
+`sections`, `stats`, `index show`, `fm get`) are unchanged.
+
+The `## More` footer written into an overflowing type-folder `index.md` now
+points at `dbmd query --type <t> --in <layer>` (was `dbmd index query …`).
+
+### Format
+
+No on-disk format change: `SPEC.md` documents the three-read surface and the
+dedup-via-`--where` pattern; the store schema is untouched. Format stays **v0.3**.
 
 ## [0.4.6] — 2026-06-29
 

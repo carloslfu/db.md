@@ -7,7 +7,7 @@
 //! [`IndexRecord`]s straight from the sidecar (path + fields + summary +
 //! links); the caller opens the underlying file only if it needs the body.
 //!
-//! Backs `dbmd search --type/--where`, `dbmd fm query`, `dbmd index query`, and
+//! Backs `dbmd search --type/--where`, `dbmd query`, and
 //! `dbmd graph backlinks --type/--in`.
 
 use chrono::{DateTime, FixedOffset};

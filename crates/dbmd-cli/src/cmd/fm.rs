@@ -16,20 +16,19 @@ use std::path::{Path, PathBuf};
 
 use serde_norway::Value as YamlValue;
 
-use crate::cli::{FmArgs, FmCommand, FmGetArgs, FmInitArgs, FmQueryArgs, FmSetArgs};
-use crate::cmd::log::{into_cli, open_store};
+use crate::cli::{FmArgs, FmCommand, FmGetArgs, FmInitArgs, FmSetArgs};
+use crate::cmd::log::into_cli;
 use crate::cmd::write::{apply_schema_defaults, path_escapes_store_error, require_store_relative};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
-use dbmd_core::{infer_type_from_path, parser, summary, Index, Layer, Query, Store};
+use dbmd_core::{infer_type_from_path, parser, summary, Index, Layer, Store};
 
 /// Dispatch `dbmd fm <sub>` to the matching leaf body.
 pub fn run(ctx: &Context, args: &FmArgs) -> CliResult {
     match &args.command {
         FmCommand::Get(a) => run_get(ctx, a),
         FmCommand::Set(a) => run_set(ctx, a),
-        FmCommand::Query(a) => run_query(ctx, a),
         FmCommand::Init(a) => run_init(ctx, a),
     }
 }
@@ -114,35 +113,6 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
             );
         }
     }
-    Ok(())
-}
-
-/// `dbmd fm query <key>=<value> [--type --in --limit]` — the pre-write dedup
-/// primitive: a complete, sidecar-backed store query by one frontmatter field.
-pub fn run_query(ctx: &Context, args: &FmQueryArgs) -> CliResult {
-    let (key, value) = split_assignment(&args.assignment)?;
-    let store = open_store(&args.dir)?;
-
-    let mut query = Query::new().with_where(key, value);
-    if let Some(t) = &args.r#type {
-        query = query.with_type(t);
-    }
-    if let Some(layer) = &args.r#in {
-        query = query.with_layer(parse_layer(layer)?);
-    }
-
-    let mut records = into_cli(query.execute(&store))?;
-    // `query.execute` concatenates per-sidecar reads in sidecar-PATH order, which
-    // is NOT globally record-path-sorted once a layer mixes loose files (a
-    // layer-root sidecar) with type-folders (whose sidecar path sorts after the
-    // loose file's record path). Sort by record path so the enumeration — and the
-    // `--limit` cap below — match `dbmd query` / `dbmd index query` exactly.
-    records.sort_by(|a, b| a.path.cmp(&b.path));
-    if let Some(limit) = args.limit {
-        records.truncate(limit);
-    }
-
-    crate::cmd::index::emit_records(ctx, &records);
     Ok(())
 }
 

@@ -420,7 +420,7 @@ pub(crate) fn into_cli<T, E: Into<dbmd_core::Error>>(r: Result<T, E>) -> Result<
 /// Parse a user-supplied timestamp into a fixed-offset instant, accepting both
 /// a full RFC3339 string (`2026-05-27T10:00:00Z`, `…-07:00`) and a bare
 /// date (`2026-05-27`, treated as `T00:00:00Z`). Shared by `log since` and
-/// `index query`'s `--*-after/-before` windows so both honor the same contract.
+/// `query`'s `--*-after/-before` windows so both honor the same contract.
 pub(crate) fn parse_flexible_timestamp(raw: &str) -> Result<DateTime<FixedOffset>, CliError> {
     let s = raw.trim();
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {

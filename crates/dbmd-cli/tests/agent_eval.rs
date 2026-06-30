@@ -374,8 +374,8 @@ fn run_curator_session(s: &mut Session) {
         "2026-05-29T17:01:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "domain=tideform.com",
             "--type",
             "company",
@@ -408,8 +408,8 @@ fn run_curator_session(s: &mut Session) {
         "2026-05-29T17:02:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "domain=heliotype.com",
             "--type",
             "company",
@@ -442,8 +442,8 @@ fn run_curator_session(s: &mut Session) {
         "2026-05-29T17:03:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "domain=northgatecoffee.co",
             "--type",
             "company",
@@ -503,8 +503,8 @@ fn run_curator_session(s: &mut Session) {
         "2026-05-29T17:05:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "email=daniel.osei@tideform.com",
             "--type",
             "contact",
@@ -538,8 +538,8 @@ fn run_curator_session(s: &mut Session) {
         "2026-05-29T17:06:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "email=mara@tideform.com",
             "--type",
             "contact",
@@ -573,8 +573,8 @@ fn run_curator_session(s: &mut Session) {
         "2026-05-29T17:07:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "email=sofia@northgatecoffee.co",
             "--type",
             "contact",
@@ -608,8 +608,8 @@ fn run_curator_session(s: &mut Session) {
         "2026-05-29T17:08:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "email=theo.vance@gmail.com",
             "--type",
             "contact",
@@ -1151,16 +1151,16 @@ fn corpus_e_command_log_satisfies_the_session_lifecycle() {
         first.subverb()
     );
 
-    // Step 3 — for every `write` of a CONTACT, a preceding `fm query email=…`
+    // Step 3 — for every `write` of a CONTACT, a preceding `query --where email=…`
     // exists earlier in the log (pre-write dedup check #1).
     for (i, inv) in log.iter().enumerate() {
         if is_contact_write(inv) {
-            let has_preceding_email_query = log[..i].iter().any(|p| {
-                p.verb() == Some("fm") && p.subverb() == Some("query") && p.arg_contains("email=")
-            });
+            let has_preceding_email_query = log[..i]
+                .iter()
+                .any(|p| p.verb() == Some("query") && p.arg_contains("email="));
             assert!(
                 has_preceding_email_query,
-                "contact write at index {i} ({:?}) has no preceding `fm query email=…`",
+                "contact write at index {i} ({:?}) has no preceding `query --where email=…`",
                 inv.args
             );
         }
@@ -1326,8 +1326,8 @@ fn fm_set_and_rename_lifecycle_guards_fire_on_real_invocations() {
         "2026-05-29T17:02:00Z",
         &[
             "--json",
-            "fm",
             "query",
+            "--where",
             "email=daniel.osei@tideform.com",
             "--type",
             "contact",
@@ -1483,7 +1483,7 @@ fn fm_set_and_rename_lifecycle_guards_fire_on_real_invocations() {
             exit_code: 0,
         },
         Invocation {
-            args: vec!["fm".into(), "query".into(), "email=x@y.z".into()],
+            args: vec!["query".into(), "--where".into(), "email=x@y.z".into()],
             exit_code: 0,
         },
     ];
@@ -2032,10 +2032,10 @@ fn perf_1m_loop_ops_stay_flat_and_sweeps_stay_in_budget() {
         log_tail <= Duration::from_millis(50) * SLACK,
         "log tail 20 @1M {log_tail:?} exceeds the flat budget (50ms × {SLACK})"
     );
-    let fm_query = time_median(&["fm", "query", "status=active", "--type", "company"]);
+    let fm_query = time_median(&["query", "--where", "status=active", "--type", "company"]);
     assert!(
         fm_query <= Duration::from_secs(2) * SLACK,
-        "fm query @1M {fm_query:?} exceeds the flat budget (2s × {SLACK})"
+        "query --where @1M {fm_query:?} exceeds the flat budget (2s × {SLACK})"
     );
     let search = time_median(&["search", "Kickoff", "--type", "email"]);
     assert!(

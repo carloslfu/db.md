@@ -81,12 +81,13 @@ pub enum Command {
     Format(FormatArgs),
 
     // ── Read: structured query ───────────────────────────────────────────────
-    /// Query files by frontmatter `type` and `--where` filters (Dataview-style).
+    /// Query files by frontmatter — `--type`, `--where key=value` (repeatable),
+    /// `--in <layer>`, and `--updated/created-after/-before` time windows.
     /// Resolves against the `index.jsonl` sidecar — never a whole-store parse.
+    /// Prints matching store-relative paths; `--json` emits the complete records
+    /// (path + summary + tags + links + timestamps + type-specific fields).
+    /// (For incoming wiki-links use `graph backlinks`.)
     Query(QueryArgs),
-
-    /// List every incoming wiki-link to a target file (its dependents).
-    Links(LinksArgs),
 
     /// List the `##` sections of a single file.
     Sections(SectionsArgs),
@@ -109,7 +110,8 @@ pub enum Command {
     Graph(GraphArgs),
 
     // ── Read / Write: frontmatter ────────────────────────────────────────────
-    /// Read, write, query, or initialize file frontmatter.
+    /// Read, write, or initialize file frontmatter. (For frontmatter queries /
+    /// pre-write dedup lookups use `query --where key=value`.)
     Fm(FmArgs),
 
     // ── Read: structural views ───────────────────────────────────────────────
@@ -126,7 +128,8 @@ pub enum Command {
 
     // ── Read / Maintain: the index catalog ───────────────────────────────────
     /// Maintain or read the write-through index catalog (`index.md` +
-    /// `index.jsonl`): rebuild, show, or query.
+    /// `index.jsonl`): rebuild or show. (For structured reads over the sidecar
+    /// use `query`.)
     Index(IndexArgs),
 
     // ── Warm up / Close: the chronological log ───────────────────────────────
@@ -215,25 +218,25 @@ pub struct QueryArgs {
     #[arg(long = "where", value_name = "K=V")]
     pub r#where: Vec<String>,
 
+    /// Only files whose `updated` is at or after this RFC3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
+    pub updated_after: Option<String>,
+
+    /// Only files whose `updated` is at or before this RFC3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
+    pub updated_before: Option<String>,
+
+    /// Only files whose `created` is at or after this RFC3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
+    pub created_after: Option<String>,
+
+    /// Only files whose `created` is at or before this RFC3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
+    pub created_before: Option<String>,
+
     /// Cap the number of results.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
-
-    /// Store root. Defaults to the current directory.
-    #[arg(long, value_name = "DIR", default_value = ".")]
-    pub dir: String,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// links
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `dbmd links <target>` — incoming wiki-links to a file.
-#[derive(Debug, Args)]
-pub struct LinksArgs {
-    /// The store-relative target path whose incoming links to list.
-    #[arg(value_name = "TARGET")]
-    pub target: String,
 
     /// Store root. Defaults to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]
@@ -454,10 +457,6 @@ pub enum FmCommand {
     /// Atomic; re-sorts the type-folder index entry if recency changed.
     Set(FmSetArgs),
 
-    /// Query the store by frontmatter via the sidecar (the pre-write dedup
-    /// primitive): `dbmd fm query <key>=<value> [--type --in]`.
-    Query(FmQueryArgs),
-
     /// Initialize canonical frontmatter on a file: auto-detect type by path,
     /// seed timestamps, compose a default `summary`, and fold the file into its
     /// `index`. `dbmd fm init <file> [--summary <str>]`.
@@ -487,30 +486,6 @@ pub struct FmSetArgs {
     /// quoted string.
     #[arg(value_name = "K=V")]
     pub assignment: String,
-}
-
-/// `dbmd fm query <key>=<value>`.
-#[derive(Debug, Args)]
-pub struct FmQueryArgs {
-    /// The frontmatter filter, `key=value`.
-    #[arg(value_name = "K=V")]
-    pub assignment: String,
-
-    /// Restrict to files of this `type` (scopes to that type-folder's sidecar).
-    #[arg(long, value_name = "TYPE")]
-    pub r#type: Option<String>,
-
-    /// Restrict to a single layer: `sources` or `records`.
-    #[arg(long, value_name = "LAYER")]
-    pub r#in: Option<String>,
-
-    /// Cap the number of results.
-    #[arg(long, value_name = "N")]
-    pub limit: Option<usize>,
-
-    /// Store root. Defaults to the current directory.
-    #[arg(long, value_name = "DIR", default_value = ".")]
-    pub dir: String,
 }
 
 /// `dbmd fm init <file>`.
@@ -597,10 +572,6 @@ pub enum IndexCommand {
     /// Print an `index.md` to stdout. Default = root; pass a layer or
     /// type-folder path for a scoped index.
     Show(IndexShowArgs),
-
-    /// Complete structured read/filter over the `index.jsonl` sidecar(s).
-    /// Returns full records (path + summary + tags + links + fields).
-    Query(IndexQueryArgs),
 }
 
 /// `dbmd index rebuild`.
@@ -631,46 +602,6 @@ pub struct IndexShowArgs {
     /// `records/profiles`). Omit for the root `index.md`.
     #[arg(value_name = "PATH")]
     pub path: Option<String>,
-
-    /// Store root. Defaults to the current directory.
-    #[arg(long, value_name = "DIR", default_value = ".")]
-    pub dir: String,
-}
-
-/// `dbmd index query`.
-#[derive(Debug, Args)]
-pub struct IndexQueryArgs {
-    /// Filter to records of this frontmatter `type`.
-    #[arg(long, value_name = "TYPE")]
-    pub r#type: Option<String>,
-
-    /// Restrict to a single layer: `sources` or `records`.
-    #[arg(long, value_name = "LAYER")]
-    pub r#in: Option<String>,
-
-    /// Additional frontmatter filter as `key=value`. Repeatable.
-    #[arg(long = "where", value_name = "K=V")]
-    pub r#where: Vec<String>,
-
-    /// Only records whose `updated` is at or after this RFC3339 timestamp.
-    #[arg(long, value_name = "RFC3339")]
-    pub updated_after: Option<String>,
-
-    /// Only records whose `updated` is at or before this RFC3339 timestamp.
-    #[arg(long, value_name = "RFC3339")]
-    pub updated_before: Option<String>,
-
-    /// Only records whose `created` is at or after this RFC3339 timestamp.
-    #[arg(long, value_name = "RFC3339")]
-    pub created_after: Option<String>,
-
-    /// Only records whose `created` is at or before this RFC3339 timestamp.
-    #[arg(long, value_name = "RFC3339")]
-    pub created_before: Option<String>,
-
-    /// Cap the number of results.
-    #[arg(long, value_name = "N")]
-    pub limit: Option<usize>,
 
     /// Store root. Defaults to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]

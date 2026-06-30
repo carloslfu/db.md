@@ -970,7 +970,7 @@ fn format_md_entry(rec: &IndexRecord) -> String {
 /// The deterministic `## More` footer for an over-cap type-folder.
 fn more_footer(total: usize, type_: &str, layer: &str) -> String {
     format!(
-        "## More\n\nThis folder has {total} files. The {MD_CAP} most recent are listed above.\nUse `dbmd index query --type {type_} --in {layer}` for the complete catalog.\n"
+        "## More\n\nThis folder has {total} files. The {MD_CAP} most recent are listed above.\nUse `dbmd query --type {type_} --in {layer}` for the complete catalog.\n"
     )
 }
 
@@ -2216,9 +2216,7 @@ mod tests {
             "footer count wrong:\n{md}"
         );
         assert!(
-            md.contains(
-                "Use `dbmd index query --type email --in sources` for the complete catalog.\n"
-            ),
+            md.contains("Use `dbmd query --type email --in sources` for the complete catalog.\n"),
             "footer must infer type=email layer=sources:\n{md}"
         );
 
