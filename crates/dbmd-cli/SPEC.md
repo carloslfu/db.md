@@ -448,7 +448,13 @@ the canonical collision modes:
   A `unique:` directive names one or more fields (a compound key when
   more than one); records of that type whose combined values match
   collide. A list-valued key field collapses to a sorted set, so order
-  never matters (e.g. a meeting's attendee set).
+  never matters (e.g. a meeting's attendee set). A record missing any
+  key field (or leaving it empty) is **skipped** — an incomplete key
+  never collides (SQL's `NULLS DISTINCT` rule). A key built on an
+  optional field therefore silently stops checking the records that
+  omit it: **build `unique:` keys from `required` fields.**
+  `dbmd validate` warns (`DB_MD_SCHEMA_FIELD`) when a key names a field
+  the schema does not mark `required`.
 
 No type carries a built-in dedup key — the store opts in, per type. A
 `### contact` schema with `unique: email` warns on two contacts sharing
@@ -557,7 +563,7 @@ Don't synthesize conclusion records from sources tagged `transient`.
 - amount (required)
 - currency (default USD)
 - category (string)
-- vendor (link to records/companies/)
+- vendor (required, link to records/companies/)
 - receipt (link to sources/)
 - unique: date, amount, vendor
 ```
@@ -608,7 +614,10 @@ Don't synthesize conclusion records from sources tagged `transient`.
     listed field(s) (compound when more than one). Two records of this
     type whose values collide warn as `DUP_UNIQUE_KEY`. Repeat the
     directive for independent constraints. A wiki-link field compares by
-    target; a list field compares as a sorted set.
+    target; a list field compares as a sorted set. A record missing any
+    key field (or leaving it empty) is skipped — an incomplete key never
+    collides — so **every key field should be `required`**;
+    `dbmd validate` warns (`DB_MD_SCHEMA_FIELD`) otherwise.
   - `summary_template: <template>` — the `{field}`-interpolation pattern
     `dbmd fm init` / `dbmd write` use to compose this type's default
     `summary` (see [Example types](#example-types)).
@@ -1104,7 +1113,7 @@ see; grouped by category):
 | `DB_MD_BAD_TYPE` | error | the store's `DB.md` is not `type: db-md` |
 | `DB_MD_MISSING_FIELD` | error | the store's `DB.md` frontmatter lacks `scope` or `owner` |
 | `DB_MD_UNKNOWN_SECTION` | warning | `DB.md` has an `##` section other than `Agent instructions` / `Policies` / `Schemas` / `Folders` |
-| `DB_MD_SCHEMA_FIELD` | warning / info | a `DB.md ## Schemas` field declaration is malformed (empty or duplicate field name → warning) or carries an unrecognized modifier (→ info) |
+| `DB_MD_SCHEMA_FIELD` | warning / info | a `DB.md ## Schemas` declaration is malformed (empty or duplicate field name → warning), carries an unrecognized modifier (→ info), or a `unique:` key names a field not marked `required` (→ warning; incomplete keys are silently skipped) |
 | `FM_MISSING_TYPE` | error | content file has no `type:` |
 | `FM_MISSING_CREATED` | error | content file has no `created:` timestamp — run `dbmd fm init` or set RFC3339 manually |
 | `FM_MISSING_UPDATED` | error | content file has no `updated:` timestamp — run `dbmd fm init` or set RFC3339 manually |

@@ -543,13 +543,14 @@ fn not_a_store_sibling_is_one_issue_and_outside_the_sweep() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3b — DB.md structure: the bad-db-md/ sub-store trips the three DB_MD_* codes
-//      in a single SEPARATE invocation, and the corpus-b root sweep never
-//      descends into it.
+// 3b — DB.md structure: the bad-db-md/ sub-store trips the DB_MD_* codes (the
+//      three identity-contract issues plus the two DB_MD_SCHEMA_FIELD
+//      unique-key warnings) in a single SEPARATE invocation, and the corpus-b
+//      root sweep never descends into it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn bad_db_md_substore_emits_the_three_db_md_codes_and_is_outside_the_sweep() {
+fn bad_db_md_substore_emits_the_db_md_codes_and_is_outside_the_sweep() {
     let golden: serde_json::Value = read_json(&corpus_b_expected("bad-db-md.json"));
     assert!(
         golden["exit_code_nonzero"].as_bool().unwrap_or(false),
@@ -578,7 +579,7 @@ fn bad_db_md_substore_emits_the_three_db_md_codes_and_is_outside_the_sweep() {
     let report: serde_json::Value =
         serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
 
-    // ── the issue SET equals the golden, exactly (the three DB_MD_* codes) ────
+    // ── the issue SET equals the golden, exactly (the DB_MD_* issues) ─────────
     let got = issue_set(report["issues"].as_array().expect("issues is an array"));
     let want = issue_set(golden["issues"].as_array().expect("golden issues array"));
     let missing: Vec<&IssueKey> = want.difference(&got).collect();
@@ -590,7 +591,9 @@ fn bad_db_md_substore_emits_the_three_db_md_codes_and_is_outside_the_sweep() {
          EXTRA (emitted, not in EXPECTED): {extra:#?}"
     );
 
-    // The exact three codes, with the right severities (2 error + 1 warning).
+    // The exact four codes, with the right severities (2 errors + 3 warnings:
+    // one DB_MD_UNKNOWN_SECTION plus two DB_MD_SCHEMA_FIELD unique-key
+    // warnings — `amount` undeclared, `vendor` declared but optional).
     assert_eq!(
         code_histogram(report["issues"].as_array().unwrap()),
         code_histogram(golden["issues"].as_array().unwrap()),
@@ -607,12 +610,13 @@ fn bad_db_md_substore_emits_the_three_db_md_codes_and_is_outside_the_sweep() {
         BTreeSet::from([
             "DB_MD_BAD_TYPE",
             "DB_MD_MISSING_FIELD",
+            "DB_MD_SCHEMA_FIELD",
             "DB_MD_UNKNOWN_SECTION"
         ]),
-        "exactly the three DB.md-structure codes fire"
+        "exactly the four DB.md-structure codes fire"
     );
 
-    // Summary tallies match the golden (2 errors, 1 warning, 0 info, total 3).
+    // Summary tallies match the golden (2 errors, 3 warnings, 0 info, total 5).
     for k in ["errors", "warnings", "info", "total"] {
         assert_eq!(
             report["summary"][k], golden["summary"][k],

@@ -74,4 +74,7 @@ validated, never operated. Do not synthesise, do not repair.
 - unique: date, attendees
 
 ### email
+- from (required)
+- subject (required)
+- date (required)
 - unique: from, subject, date

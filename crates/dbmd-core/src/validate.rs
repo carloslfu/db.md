@@ -2507,6 +2507,54 @@ fn check_db_md_schemas(
                 );
             }
         }
+
+        // A `unique:` key silently skips any record missing (or leaving empty)
+        // one of its fields — an incomplete key never collides (`dedup_key`).
+        // So a key that names a field the schema doesn't mark `required` stops
+        // checking exactly the records most likely to be re-entered partially
+        // filled. Surface the gap at the declaration: every key field should
+        // be a `required` field. (A field declared more than once counts as
+        // required if any declaration marks it — the duplicate itself is
+        // already flagged above.)
+        let mut declared: BTreeMap<&str, bool> = BTreeMap::new();
+        for f in &schema.fields {
+            let e = declared.entry(f.name.trim()).or_insert(false);
+            *e = *e || f.required;
+        }
+        let mut flagged: BTreeSet<&str> = BTreeSet::new();
+        for key_fields in &schema.unique_keys {
+            for field in key_fields {
+                let name = field.trim();
+                if name.is_empty()
+                    || declared.get(name).copied() == Some(true)
+                    || !flagged.insert(name)
+                {
+                    continue;
+                }
+                let message = if declared.contains_key(name) {
+                    format!(
+                        "`### {type_name}` `unique:` key field `{name}` is not `required` — a record missing or leaving it empty is silently skipped by the unique check"
+                    )
+                } else {
+                    format!(
+                        "`### {type_name}` `unique:` key field `{name}` is not declared in the schema, so it can never be `required` — a record missing it is silently skipped by the unique check"
+                    )
+                };
+                push(
+                    issues,
+                    Severity::Warning,
+                    codes::DB_MD_SCHEMA_FIELD,
+                    rel,
+                    line,
+                    Some(name.to_string()),
+                    message,
+                    Some(format!(
+                        "mark `{name}` `required` in `### {type_name}`, or build the `unique:` key from required fields only"
+                    )),
+                    vec![],
+                );
+            }
+        }
     }
 }
 
@@ -6468,6 +6516,112 @@ mod tests {
                 && i.severity == Severity::Info
                 && i.key.as_deref() == Some("name")),
             "an unrecognized schema modifier must surface as Info: {issues:#?}"
+        );
+    }
+
+    /// A `unique:` key naming a declared-but-optional field silently skips
+    /// every record missing that field (an incomplete key never collides), so
+    /// the declaration itself must warn. The dogfood case: `unique: date,
+    /// amount, vendor` with `vendor` optional — a vendorless re-entered
+    /// expense sails past the check.
+    #[test]
+    fn schema_unique_key_optional_field_is_warning() {
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "expense".into(),
+            Schema {
+                fields: vec![
+                    FieldSpec {
+                        name: "date".into(),
+                        required: true,
+                        ..Default::default()
+                    },
+                    FieldSpec {
+                        name: "amount".into(),
+                        required: true,
+                        ..Default::default()
+                    },
+                    FieldSpec {
+                        name: "vendor".into(),
+                        ..Default::default()
+                    },
+                ],
+                unique_keys: vec![vec!["date".into(), "amount".into(), "vendor".into()]],
+                ..Default::default()
+            },
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues.iter().any(|i| i.code == codes::DB_MD_SCHEMA_FIELD
+                && i.severity == Severity::Warning
+                && i.key.as_deref() == Some("vendor")
+                && i.message.contains("unique")),
+            "a `unique:` key field not marked required must warn: {issues:#?}"
+        );
+        // The required key fields are fine — no warning for them.
+        assert!(
+            !issues.iter().any(|i| i.code == codes::DB_MD_SCHEMA_FIELD
+                && matches!(i.key.as_deref(), Some("date") | Some("amount"))),
+            "required key fields must not warn: {issues:#?}"
+        );
+    }
+
+    /// A `unique:` key naming a field the schema never declares can also never
+    /// be `required` — same silent skip, same warning.
+    #[test]
+    fn schema_unique_key_undeclared_field_is_warning() {
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "expense".into(),
+            Schema {
+                fields: vec![FieldSpec {
+                    name: "date".into(),
+                    required: true,
+                    ..Default::default()
+                }],
+                unique_keys: vec![vec!["date".into(), "vendor".into()]],
+                ..Default::default()
+            },
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues.iter().any(|i| i.code == codes::DB_MD_SCHEMA_FIELD
+                && i.severity == Severity::Warning
+                && i.key.as_deref() == Some("vendor")
+                && i.message.contains("not declared")),
+            "a `unique:` key field absent from the schema must warn: {issues:#?}"
+        );
+    }
+
+    /// The clean shape — every key field `required` — stays silent.
+    #[test]
+    fn schema_unique_key_all_required_is_clean() {
+        let mut fx = Fixture::new();
+        fx.config.schemas.insert(
+            "expense".into(),
+            Schema {
+                fields: vec![
+                    FieldSpec {
+                        name: "date".into(),
+                        required: true,
+                        ..Default::default()
+                    },
+                    FieldSpec {
+                        name: "amount".into(),
+                        required: true,
+                        ..Default::default()
+                    },
+                ],
+                unique_keys: vec![vec!["date".into(), "amount".into()]],
+                ..Default::default()
+            },
+        );
+        let issues = fx.store_all();
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.code == codes::DB_MD_SCHEMA_FIELD && i.message.contains("unique")),
+            "an all-required unique key must not warn: {issues:#?}"
         );
     }
 

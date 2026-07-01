@@ -8,9 +8,46 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.5.0**.
+  `Cargo.toml`, currently **v0.5.1**.
 
 ## [Unreleased]
+
+## [0.5.1] — 2026-06-30
+
+### Toolkit
+
+Dogfooding a real store surfaced a silent dedup gap: a `unique:` key that
+names a field the schema does not mark `required` stops checking any record
+missing that field — `dedup_key` skips incomplete keys by design (SQL's
+`NULLS DISTINCT` rule), so a vendorless re-entered expense sailed past
+`unique: date, amount, vendor` unflagged. The skip behavior is correct; the
+key declaration was the defect, and nothing surfaced it. No format change
+(SPEC stays v0.3; no new validation code — the lint reuses
+`DB_MD_SCHEMA_FIELD`).
+
+- **`validate` lints `unique:` keys at the declaration.** A key field that is
+  not marked `required` (or is never declared) in its `### <type>` schema now
+  warns as `DB_MD_SCHEMA_FIELD`, one issue per field, anchored to the
+  `### <type>` heading, with the remediation in the suggestion ("mark
+  `<field>` `required`, or build the `unique:` key from required fields
+  only"). Regression-tested: declared-but-optional, undeclared, and
+  all-required-stays-silent.
+- **SPEC documents the skip rule.** "A record missing any key field (or
+  leaving it empty) is skipped — an incomplete key never collides" was
+  implemented but stated nowhere an agent could read it. It is now in both
+  places that define `unique:` (§ Linking → Collision detection and § The
+  `DB.md` file → Schemas directives), with the discipline stated: build keys
+  from `required` fields.
+- **The SPEC's own example taught the foot-gun.** The canonical `### expense`
+  example keyed `unique: date, amount, vendor` while leaving `vendor`
+  optional — the exact shape the dogfood store copied. The example now marks
+  `vendor` `required`.
+- **corpus-b seeds the new warning.** `bad-db-md/` (the DB.md-structure
+  fixture) gains a `### expense` schema tripping both message variants
+  (`amount` undeclared, `vendor` declared but optional; 5 issues total in
+  `bad-db-md.json`), and the main store's `### email` schema now declares its
+  key fields `required` so the root sweep stays `DB_MD_*`-clean. Coverage:
+  39 of the 48 SPEC codes seeded.
 
 ## [0.5.0] — 2026-06-29
 

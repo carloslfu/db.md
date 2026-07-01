@@ -726,10 +726,14 @@ fn corpus_a_and_b_meeting_schemas_differ_on_attendees_link() {
 }
 
 /// `corpus-b`'s `bad-db-md/` sub-store has a `DB.md` whose body carries an
-/// unrecognized `## Glossary` H2. `parse_db_md` must **ignore** the unknown
-/// section (so it never corrupts config) while still capturing the recognized
-/// `## Agent instructions` — the parser is lenient, and flagging the unknown
-/// section is `validate`'s job (`DB_MD_UNKNOWN_SECTION`), not the parser's.
+/// unrecognized `## Glossary` H2 alongside two recognized sections
+/// (`## Agent instructions`, `## Schemas`). `parse_db_md` must **ignore** the
+/// unknown section (so it never corrupts config) while still capturing both
+/// recognized ones — the parser is lenient, and flagging the unknown section
+/// is `validate`'s job (`DB_MD_UNKNOWN_SECTION`), not the parser's. (The
+/// `### expense` schema is itself a deliberate `DB_MD_SCHEMA_FIELD` seed —
+/// its `unique:` key names non-`required` fields — but that too is
+/// `validate`'s call, not a parse error.)
 ///
 /// Asserting against the real `bad-db-md/DB.md` file binds the
 /// "unknown-section-is-not-a-parse-error" contract to the committed fixture.
@@ -747,9 +751,25 @@ fn corpus_b_bad_db_md_parses_known_sections_and_ignores_unknown() {
             .unwrap_or(false),
         "the recognized ## Agent instructions must still be captured"
     );
+    // The recognized ## Schemas is captured: exactly the `### expense` block,
+    // with its `unique: date, amount, vendor` directive intact.
+    assert_eq!(
+        cfg.schemas.keys().collect::<Vec<_>>(),
+        ["expense"],
+        "the recognized ## Schemas must be captured, and only it"
+    );
+    assert_eq!(
+        cfg.schemas["expense"].unique_keys,
+        vec![vec![
+            "date".to_string(),
+            "amount".to_string(),
+            "vendor".to_string()
+        ]],
+        "the expense unique: directive parses intact"
+    );
     // The unknown ## Glossary section contributes nothing to the parsed config.
     assert!(
-        cfg.schemas.is_empty() && cfg.frozen_pages.is_empty() && cfg.ignored_types.is_empty(),
-        "an unknown H2 must not leak into schemas/policies"
+        cfg.frozen_pages.is_empty() && cfg.ignored_types.is_empty(),
+        "an unknown H2 must not leak into policies"
     );
 }

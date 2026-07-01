@@ -1,12 +1,12 @@
 {
-  "_comment": "Hand-derived from SPEC.md § Validation (the DB.md-structure rules) and from exactly what bad-db-md/DB.md breaks — never copied from tool output. Running `dbmd validate --all --json tests/corpora/corpus-b-edges/bad-db-md` (a sub-store whose DB.md violates the identity contract) MUST emit exactly these three issues and exit non-zero. This is a SEPARATE invocation from the corpus-b --all sweep: the sweep checks only `<root>/DB.md` and walks sources/records under the root, so it never descends into this sibling. Line numbers are intent-derived: DB_MD_BAD_TYPE anchors to the `type:` key line (file line 2); DB_MD_MISSING_FIELD for an ABSENT field anchors to the frontmatter block top (line 1); DB_MD_UNKNOWN_SECTION anchors to the offending `##` heading's file line (the `## Glossary` heading at line 18). Issues sorted by (file, line, code).",
+  "_comment": "Hand-derived from SPEC.md § Validation (the DB.md-structure rules) and from exactly what bad-db-md/DB.md breaks — never copied from tool output. Running `dbmd validate --all --json tests/corpora/corpus-b-edges/bad-db-md` (a sub-store whose DB.md violates the identity contract) MUST emit exactly these five issues and exit non-zero. This is a SEPARATE invocation from the corpus-b --all sweep: the sweep checks only `<root>/DB.md` and walks sources/records under the root, so it never descends into this sibling. Line numbers are intent-derived: DB_MD_BAD_TYPE anchors to the `type:` key line (file line 2); DB_MD_MISSING_FIELD for an ABSENT field anchors to the frontmatter block top (line 1); DB_MD_UNKNOWN_SECTION anchors to the offending `##` heading's file line (the `## Glossary` heading at line 18); the two DB_MD_SCHEMA_FIELD unique-key warnings anchor to the `### expense` schema heading (line 31), one per non-required key field (`amount` undeclared, `vendor` declared but optional — an incomplete key is silently skipped by the unique check). Issues sorted by (file, line, code).",
   "invocation": "dbmd validate --all --json tests/corpora/corpus-b-edges/bad-db-md",
   "exit_code_nonzero": true,
   "summary": {
     "errors": 2,
-    "warnings": 1,
+    "warnings": 3,
     "info": 0,
-    "total": 3
+    "total": 5
   },
   "issues": [
     {
@@ -37,6 +37,26 @@
       "key": null,
       "message": "DB.md has an unrecognized `## Glossary` section",
       "suggestion": "DB.md sections are `## Agent instructions`, `## Policies`, `## Schemas` — remove or rename this heading",
+      "related": []
+    },
+    {
+      "severity": "warning",
+      "code": "DB_MD_SCHEMA_FIELD",
+      "file": "DB.md",
+      "line": 31,
+      "key": "amount",
+      "message": "`### expense` `unique:` key field `amount` is not declared in the schema, so it can never be `required` — a record missing it is silently skipped by the unique check",
+      "suggestion": "mark `amount` `required` in `### expense`, or build the `unique:` key from required fields only",
+      "related": []
+    },
+    {
+      "severity": "warning",
+      "code": "DB_MD_SCHEMA_FIELD",
+      "file": "DB.md",
+      "line": 31,
+      "key": "vendor",
+      "message": "`### expense` `unique:` key field `vendor` is not `required` — a record missing or leaving it empty is silently skipped by the unique check",
+      "suggestion": "mark `vendor` `required` in `### expense`, or build the `unique:` key from required fields only",
       "related": []
     }
   ]
