@@ -64,6 +64,15 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     set_fm(&mut fm, "type", &args.r#type)?;
     apply_schema_defaults(&store, &args.r#type, &mut fm)?;
 
+    // ── stable id: mint a lowercase ULID when the caller supplied none ───────
+    // SPEC § The `id` field (v0.4): `dbmd write` mints on every content-file
+    // create; an explicit `--fm id=…` wins; meta types carry no record
+    // identity. Only `write` mints — `fm init` never retrofits an id onto an
+    // existing file (adding ids to hand-written files is the agent's call).
+    if is_content_type(&args.r#type) && fm.id.as_deref().is_none_or(|s| s.trim().is_empty()) {
+        fm.id = Some(dbmd_core::ulid::mint());
+    }
+
     // ── body (optional) ──────────────────────────────────────────────────────
     let body = match &args.body_file {
         Some(p) => read_body_file(p)?,

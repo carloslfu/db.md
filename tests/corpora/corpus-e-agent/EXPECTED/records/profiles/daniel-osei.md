@@ -1,6 +1,7 @@
 ---
 type: profile
 meta-type: conclusion
+id: 01j8e6prs00000000000000013
 created: 2026-05-29T17:13:00+00:00
 updated: 2026-05-29T17:13:00+00:00
 summary: Tideform Head of Product; economic buyer on the Lumen rebrand

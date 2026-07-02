@@ -1,5 +1,6 @@
 ---
 type: contact
+id: 01j8e6prs00000000000000006
 created: 2026-05-29T17:06:00+00:00
 updated: 2026-05-29T17:06:00+00:00
 summary: Design Lead at Tideform; Lumen's day-to-day contact on the rebrand

@@ -80,7 +80,9 @@ is text and the model does the rest.
 Read with `dbmd search` / `dbmd query` / `dbmd graph`; write with `dbmd write` /
 `dbmd fm set` / `dbmd link`; validate with `dbmd validate`; record with
 `dbmd log`. Every command takes `--json`. Read the store's `DB.md` (identity,
-policies, schemas) before writing.
+policies, schemas) before writing. `dbmd write` mints a stable lowercase-ULID
+`id` for each new record (recommended, not required — files without one stay
+fully valid).
 
 ## Where a new store lives
 

@@ -119,6 +119,10 @@ pub mod codes {
     pub const FM_BAD_TIMESTAMP: &str = "FM_BAD_TIMESTAMP";
     /// `meta-type` is present but not one of fact / operational / conclusion.
     pub const FM_BAD_META_TYPE: &str = "FM_BAD_META_TYPE";
+    /// `id` is present but unusable as an identifier (non-scalar, empty, or
+    /// contains whitespace). Warning: the recommended lowercase-ULID form is
+    /// never enforced — hand-authored opaque ids stay legal (SPEC v0.4).
+    pub const FM_BAD_ID: &str = "FM_BAD_ID";
     /// content file has no `summary`.
     pub const SUMMARY_MISSING: &str = "SUMMARY_MISSING";
     /// `summary` present but empty.
@@ -595,6 +599,51 @@ fn check_frontmatter(
                     ),
                     vec![],
                 ),
+            }
+        }
+    }
+
+    // ── id (recommended stable identity; opaque token — v0.4) ────────────────
+    // Absent is fully valid (identity falls back to the path; SPEC § The `id`
+    // field). Present, it must be USABLE as an identifier: a non-empty scalar
+    // with no whitespace. The recommended FORM (lowercase ULID, what
+    // `dbmd write` mints) is deliberately not enforced — a hand-authored
+    // opaque id stays legal, which is what keeps v0.4 additive over v0.3
+    // stores — so this warns only on values that break identifier semantics.
+    // A non-scalar `id` matters doubly: `DUP_ID` reads ids via the scalar
+    // coercion, so a list/mapping value silently opts the file out of
+    // duplicate detection.
+    if is_content {
+        if let Some(v) = fm.get("id").filter(|v| !v.is_null()) {
+            let problem = match scalar_string(v) {
+                Some(id) if id.trim().is_empty() => Some("`id` is empty".to_string()),
+                Some(id) if id.chars().any(char::is_whitespace) => {
+                    Some(format!("`id` {id:?} contains whitespace"))
+                }
+                Some(_) => None,
+                None => Some(
+                    "`id` is not a scalar (found a list or mapping), so duplicate detection \
+                     (DUP_ID) cannot see it"
+                        .to_string(),
+                ),
+            };
+            if let Some(message) = problem {
+                push(
+                    issues,
+                    Severity::Warning,
+                    codes::FM_BAD_ID,
+                    rel,
+                    fm_key_line_or_top(fm_yaml, "id"),
+                    Some("id".into()),
+                    message,
+                    Some(
+                        "use one opaque token with no whitespace — the recommended form is a \
+                         lowercase ULID (`dbmd write` mints one) — or drop `id` to fall back to \
+                         filename identity"
+                            .into(),
+                    ),
+                    vec![],
+                );
             }
         }
     }
@@ -4174,6 +4223,95 @@ mod tests {
                 "`meta-type: {bad}` must be rejected with FM_BAD_META_TYPE; got {issues:#?}"
             );
         }
+    }
+
+    // ── id: recommended + opaque; FM_BAD_ID is structural only (v0.4) ────────
+
+    /// The additive-v0.4 guarantee, pinned: an ABSENT id, a hand-authored
+    /// opaque slug id (legal since v0.3 and present in the shipped examples),
+    /// a minted lowercase ULID, and a numeric scalar are ALL silent. The
+    /// recommended ULID form is never a validation gate — a check that flags
+    /// `id: sarah-chen` would retroactively dirty every v0.3 store and break
+    /// the "v0.3 validates unchanged under v0.4" contract.
+    #[test]
+    fn id_absent_slug_ulid_and_numeric_are_all_silent() {
+        let body = |id_line: &str| {
+            format!(
+                "---\ntype: contact\n{id_line}created: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n"
+            )
+        };
+        for (case, id_line) in [
+            ("absent", ""),
+            ("slug", "id: sarah-chen\n"),
+            ("ulid", "id: 01j5qc3v9k4ym8rwbn2tqe6f7d\n"),
+            ("numeric-scalar", "id: 100\n"),
+        ] {
+            let fx = Fixture::new();
+            fx.write("records/contacts/a.md", &body(id_line));
+            let issues = validate_working_set(&fx.store(), None).unwrap();
+            assert!(
+                !has(&issues, codes::FM_BAD_ID),
+                "id case `{case}` must be silent; got {issues:#?}"
+            );
+        }
+    }
+
+    /// FM_BAD_ID (warning) fires exactly on ids that cannot work as an
+    /// identifier: empty / whitespace-only, internal whitespace, and
+    /// non-scalar (list / mapping) — the last also being the shape that
+    /// silently escapes `DUP_ID`'s scalar read.
+    #[test]
+    fn id_unusable_as_identifier_warns_fm_bad_id() {
+        let body = |id_line: &str| {
+            format!(
+                "---\ntype: contact\n{id_line}\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nbody\n"
+            )
+        };
+        for bad in [
+            "id: \"\"",
+            "id: \"   \"",
+            "id: two words",
+            "id: [a, b]",
+            "id: {k: v}",
+        ] {
+            let fx = Fixture::new();
+            fx.write("records/contacts/a.md", &body(bad));
+            let issues = validate_working_set(&fx.store(), None).unwrap();
+            let issue = issues
+                .iter()
+                .find(|i| i.code == codes::FM_BAD_ID)
+                .unwrap_or_else(|| panic!("`{bad}` must fire FM_BAD_ID; got {issues:#?}"));
+            assert!(
+                matches!(issue.severity, Severity::Warning),
+                "FM_BAD_ID is a warning (additive v0.4 — it must never block a store): {issue:#?}"
+            );
+            assert_eq!(issue.key.as_deref(), Some("id"));
+            assert!(
+                !issue.is_error(),
+                "FM_BAD_ID must not fail validation: {issue:#?}"
+            );
+        }
+    }
+
+    /// Two records sharing a minted-form (ULID) id collide exactly like any
+    /// other id — `DUP_ID`, hard error, store-scoped (the v0.4 uniqueness
+    /// scope is the store).
+    #[test]
+    fn dup_id_fires_on_shared_ulid_ids() {
+        let fx = Fixture::new();
+        let rec = |name: &str| {
+            format!(
+                "---\ntype: contact\nid: 01j5qc3v9k4ym8rwbn2tqe6f7d\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: {name}\nname: {name}\n---\n\n# {name}\n"
+            )
+        };
+        fx.write("records/contacts/a.md", &rec("A"));
+        fx.write("records/contacts/b.md", &rec("B"));
+        let issues = fx.store_all();
+        assert_eq!(count(&issues, codes::DUP_ID), 1, "{issues:#?}");
+        let issue = issues.iter().find(|i| i.code == codes::DUP_ID).unwrap();
+        assert!(issue.is_error());
+        // The well-formed ULID itself stays silent — only the collision fires.
+        assert!(!has(&issues, codes::FM_BAD_ID), "{issues:#?}");
     }
 
     // ── DB.md structure ───────────────────────────────────────────────────────

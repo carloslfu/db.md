@@ -112,7 +112,10 @@ pub struct IndexRecord {
     pub created: Option<DateTime<FixedOffset>>,
     /// `updated` timestamp (the recency key for the `index.md` cap order).
     pub updated: Option<DateTime<FixedOffset>>,
-    /// Remaining type-specific frontmatter fields, verbatim.
+    /// Remaining type-specific frontmatter fields, verbatim — including the
+    /// record's `id` (SPEC v0.4), which rides here like any other frontmatter
+    /// field rather than as a dedicated column, so `--where id=…` resolves
+    /// through the generic field path and existing sidecars stay byte-stable.
     #[serde(flatten)]
     pub fields: BTreeMap<String, Value>,
 }

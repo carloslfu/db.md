@@ -13,7 +13,13 @@ The eval drives a **scripted, deterministic curator** (not an LLM — so the
 test is a stable CI gate, which the plan explicitly permits: "a Claude Code
 session OR scripted agent", Block 7) through the lifecycle-ordered sequence
 of real `dbmd` invocations a correct agent would issue against this store's
-`sources/` + `DB.md`. Every payload in that sequence — each record field,
+`sources/` + `DB.md`. One determinism carve-out: format v0.4's `dbmd write`
+mints a **random** lowercase ULID `id` when none is supplied, which a
+byte-for-byte golden cannot pin — so the scripted session passes an explicit
+sequential id (`--fm id=01j8e6prs0…`, the documented explicit-id-wins path)
+on every write, and the `id:` lines in this tree are those pinned values
+(mint randomness itself is covered by `writers.rs` and the
+`dbmd_core::ulid` unit tests, not here). Every payload in that sequence — each record field,
 each `summary`, each conclusion body, each full-path wiki-link — was **authored
 from the source evidence and the `DB.md` schemas/policies/instructions**, the
 same judgment a curator applies:

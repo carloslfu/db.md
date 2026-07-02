@@ -43,7 +43,9 @@ simple labels the agent can sort, filter, and repair, with store-specific
 schemas declared in `DB.md`. The `[[double brackets]]` are the
 relationships, the same links a wiki uses. The body holds what a database
 row usually throws away. A person reads it. Git versions it. A model reads
-it with full context. That is the whole format.
+it with full context. That is the whole format. (Records the tooling writes
+also carry a stable `id` — a lowercase ULID minted on create; recommended,
+not required, so a hand-written file like this one stays fully valid.)
 
 **A huge class of future software will not be built as database + backend +
 frontend. It will be built as readable context + agent harness + generated

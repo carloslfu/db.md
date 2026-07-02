@@ -23,16 +23,19 @@ independent) OR sort the tool output the same way before diffing.
 
 ## Coverage — 39 of the SPEC § Validation codes are seeded
 
-The SPEC § Validation table defines **48** codes. This corpus seeds
+The SPEC § Validation table defines **49** codes. This corpus seeds
 **39** of them (the seeding table below has 39 rows) and deliberately
 leaves the rest uncovered — the five `ASSET_*` asset-manifest codes,
-`FM_UNREADABLE`, `FM_MISSING_CREATED`, `FM_MISSING_UPDATED`, and
+`FM_UNREADABLE`, `FM_MISSING_CREATED`, `FM_MISSING_UPDATED`,
 `FM_BAD_META_TYPE` (every seeded records file carries a valid, or
-absent-defaulting-to-`fact`, `meta-type`). One of the
+absent-defaulting-to-`fact`, `meta-type`), and the v0.4 `FM_BAD_ID`
+(every explicit id in this corpus is a legal opaque token — v0.4 keeps
+hand-authored slug ids silent by design, so they must NOT fire it; the
+structural trigger is unit-tested in `dbmd-core`). One of the
 39, `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md
 line 494) and is grouped under `plan_extensions` in `coverage.json` for
 provenance — it still counts as a seeded SPEC code. `coverage.json`
-therefore records `all_spec_codes_covered: false` and lists those nine
+therefore records `all_spec_codes_covered: false` and lists those ten
 codes under `uncovered_spec_codes`.
 
 This is enforced, not asserted by hand: the e2e test computes

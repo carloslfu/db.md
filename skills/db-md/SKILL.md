@@ -52,7 +52,7 @@ dbmd query --type contact --where company=Acme       # structured frontmatter qu
 dbmd graph neighborhood records/contacts/sarah-chen --hops 2   # context in one call
 dbmd graph backlinks records/contacts/sarah-chen               # who points here (blast radius)
 
-# Write — create and connect (frontmatter is composed for you)
+# Write — create and connect (frontmatter is composed for you, incl. a stable ULID id)
 dbmd write records/meetings/standup.md --type meeting --summary "weekly sync"
 dbmd fm set <file> <key>=<value>                     # update one field, atomically
 dbmd link <from> <to>                                # append a wiki-link

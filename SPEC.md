@@ -1,4 +1,4 @@
-# db.md — v0.3
+# db.md — v0.4
 
 `db.md` is **the open standard for databases in plain files**. Records are markdown
 files with YAML frontmatter. Relationships are wiki-links. The database
@@ -36,7 +36,13 @@ open and intentionally simple.
 
 ## Status
 
-**Spec version:** `v0.3`. **v0.3 collapsed the layout to two folders:**
+**Spec version:** `v0.4` — additive over v0.3: the universal frontmatter
+contract gains a RECOMMENDED stable record `id` (a lowercase ULID,
+minted by `dbmd write` when absent; a record without one stays fully
+valid), and one paragraph reserves the `@brain/id` cross-store address
+shape (see [Addressing (reserved)](#addressing-reserved)). No v0.3
+store changes meaning or validity under v0.4.
+**History: v0.3 collapsed the layout to two folders:**
 `sources/` (evidence) + `records/` (everything the agent authors). The
 old `wiki/` layer is removed; its synthesis role moves onto a
 `meta-type: conclusion` field inside `records/`. This is a **breaking
@@ -165,7 +171,7 @@ minimum:
 ---
 type: <type>          # required — what kind of thing this is
 meta-type: <role>     # records only — fact | operational | conclusion (absent ⇒ fact)
-id: <id>              # optional; derived from path if absent
+id: <ulid>            # recommended — stable record id (lowercase ULID); minted on write
 created: <RFC3339>    # required for content files; auto-set on create
 updated: <RFC3339>    # required for content files; auto-maintained
 summary: <one-line>   # required for content files; the catalog line
@@ -216,6 +222,40 @@ meta-type: conclusion    # curator-synthesized narrative (the old wiki/)
   what that means now that it is a per-file property inside the
   many-writer `records/` folder.
 
+### The `id` field — stable identity, recommended
+
+`id` is the record's stable identity: the one value that survives rename
+and reorganization, where filename identity does not. It is
+**RECOMMENDED, not required** — a record with no `id` is fully valid
+(hand-written stores stay legal), and identity then falls back to the
+file path, which remains what wiki-links target.
+
+The recommended form is a **lowercase ULID** — 26 characters of
+Crockford base32, e.g. `01j5qc3v9k4ym8rwbn2tqe6f7d`. Why ULID:
+time-sortable (a natural fit for a store whose event records already
+order by time), compact and YAML-clean (one short unquoted token, no
+special characters), offline-mintable with zero coordination (any
+writer can mint one — no registry, no counter, no network),
+collision-safe at any realistic write rate, and widely understood.
+Lowercase is canonical: it reads like the rest of the frontmatter and
+stays shell-friendly.
+
+- **Minted by tooling on write.** `dbmd write` mints a lowercase ULID
+  when the new file carries no `id` (an explicit `--fm id=…` wins).
+  `dbmd fm init` does not retrofit one — adding ids to existing files
+  is the agent's call, not a side effect.
+- **Absent = valid.** No validation code fires on a missing `id`.
+- **Uniqueness scope = the store.** Two files in one store declaring
+  the same `id` is a hard error (`DUP_ID`). Nothing is claimed about
+  ids across stores — see [Addressing (reserved)](#addressing-reserved).
+- **Filename identity stays the link fallback.** Wiki-links target
+  store-relative paths, not ids; `id` layers stable identity on top of
+  path identity and replaces nothing.
+- **Hand-authored opaque ids stay legal.** `id` is an opaque token; the
+  ULID form is the recommendation, not a gate. `dbmd validate` warns
+  (`FM_BAD_ID`) only on an id that cannot work as an identifier at all
+  — a non-scalar value, an empty value, or one containing whitespace.
+
 **The `summary` field is canonical and required on every content file.** It is the **single source of truth** for what the file is about. Every hierarchical `index.md` reads this field directly to populate its catalog entries — no extraction rules, no recomputation. The agent writes a thoughtful summary when creating files (the curator's judgment), `dbmd fm init` writes a deterministic default if the agent doesn't (the type's `summary_template` from `DB.md ## Schemas`, or the file's first paragraph), and the agent can always override via `dbmd fm set <file> summary='...'`.
 
 **`summary` rules:**
@@ -237,7 +277,9 @@ meta-type: conclusion    # curator-synthesized narrative (the old wiki/)
   and maintains it on edit. **Operators don't write frontmatter by
   hand.**
 - `type` is required and is the primary way tools query the store.
-- `id` is optional; if absent, it's derived from the file path (e.g.
+- `id` is recommended, not required (see
+  [The `id` field](#the-id-field--stable-identity-recommended)); if
+  absent, the effective id derives from the file path (e.g.
   `records/profiles/sarah-chen.md` → id `sarah-chen`).
 - Timestamps are ISO-8601 (`2026-05-27T08:00:00-07:00`).
 - Unknown fields pass through. Tools that don't recognize a field
@@ -318,7 +360,7 @@ in `records/` plus `meta-type: conclusion`, not a single generic
 ```yaml
 ---
 type: contact
-id: sarah-chen
+id: 01j2vs3f8gq0h6x2m9t4kcyrbw
 created: 2026-05-22T10:00:00-07:00
 updated: 2026-05-22T10:00:00-07:00
 summary: "Director of Ops at Northstar; renewal champion who drove the 175-seat expansion"
@@ -473,6 +515,20 @@ key); see [Validation](#validation) for the complete code vocabulary.
 
 A reader that doesn't speak wiki-links treats them as text — no
 breakage.
+
+## Addressing (reserved)
+
+db.md reserves one cross-store address shape: **`@brain/id`** — a store
+handle, a slash, and a record `id` (e.g.
+`@acme-ops/01j5qc3v9k4ym8rwbn2tqe6f7d`). It names a record in another
+store the way a wiki-link names one in this store. **v0.4 reserves the
+shape only.** How a handle is registered, resolved, verified, or
+fetched is explicitly out of scope for db.md; resolution belongs to a
+future interconnect spec, link.md. Within a store nothing changes:
+wiki-links remain the only reference form the toolkit parses,
+validates, and rewrites, and a db.md tool encountering `@brain/id`
+treats it as plain text. Stores that want stable cross-store addresses
+someday are the reason `id` is recommended today.
 
 ## The `DB.md` file
 
@@ -1121,6 +1177,7 @@ see; grouped by category):
 | `FM_MALFORMED_YAML` | error | frontmatter block isn't valid YAML |
 | `FM_BAD_TIMESTAMP` | error | `created` or `updated` isn't ISO-8601 |
 | `FM_BAD_META_TYPE` | error | a record's `meta-type` is not one of `fact` / `operational` / `conclusion` |
+| `FM_BAD_ID` | warning | `id` is present but unusable as an identifier (non-scalar, empty, or contains whitespace); the recommended form is a lowercase ULID |
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |
 | `SUMMARY_EMPTY` | error | `summary` present but empty |
 | `SUMMARY_MULTILINE` | error | `summary` contains newlines |
@@ -1170,7 +1227,10 @@ v0.2 reworked the type-driven codes — it dropped the six type-specific
 `meta-type`) and retargeted `POLICY_IGNORED_TYPE_DERIVED` from the retired
 `wiki-page` type to `meta-type: conclusion` records. From v0.3 on the
 vocabulary is additive (new codes layer on; existing codes keep their
-meaning). Errors block; the agent resolves warnings and info at its
+meaning). v0.4 added `FM_BAD_ID` (warning — a structurally unusable
+`id` never blocks validation, so v0.3 stores keep passing; see
+[The `id` field](#the-id-field--stable-identity-recommended)).
+Errors block; the agent resolves warnings and info at its
 discretion — usually via `dbmd rename`, `dbmd link`, `dbmd fm set`, or
 `dbmd index rebuild`.
 
@@ -1698,6 +1758,19 @@ toolkit: `wiki/` is no longer a recognized layer, and `type: wiki-page`
 is retired. **From v0.3 forward, changes are additive again** — old v0.3
 stores stay readable, new fields and codes layer on top, and tools that
 don't recognize them ignore them.
+
+**v0.4 is additive** — the first release under that rule. Two changes,
+both retrofit-expensive to skip and cheap to carry: the universal
+frontmatter contract gains a RECOMMENDED stable record `id` (a
+lowercase ULID; `dbmd write` mints one when absent; a record without
+one stays fully valid, and filename identity remains the link
+fallback — see
+[The `id` field](#the-id-field--stable-identity-recommended)), and one
+paragraph reserves the `@brain/id` cross-store address shape without
+defining resolution (see
+[Addressing (reserved)](#addressing-reserved)). One validation code is
+added (`FM_BAD_ID`, warning). A v0.3 store validates unchanged under a
+v0.4 toolkit.
 
 **There is no migration command.** db.md is plumbing, not a scaffolder;
 migrating a v0.2 store is an agent's job, not a `dbmd` verb. A capable

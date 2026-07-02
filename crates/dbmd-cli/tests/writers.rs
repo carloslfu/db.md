@@ -1191,3 +1191,117 @@ fn spec_missing_override_path_is_a_runtime_error() {
     let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
     assert_eq!(v["error"]["code"], "SPEC_READ_FAILED");
 }
+
+// ── write: stable record id (format v0.4) ────────────────────────────────────
+
+#[test]
+fn write_mints_a_lowercase_ulid_id_when_absent() {
+    // SPEC § The `id` field: `dbmd write` mints a lowercase ULID when the new
+    // file carries no `id`. Assert the on-disk value is a WELL-FORMED lowercase
+    // ULID (not just that an `id:` line appears), that it sits in the canonical
+    // head position (right after `type` when no `meta-type` is present), and
+    // that two writes mint distinct ids.
+    let store = Store::new();
+    for name in ["jane", "amir"] {
+        let out = store.run(&[
+            "write",
+            &format!("records/contacts/{name}.md"),
+            "--type",
+            "contact",
+            "--summary",
+            name,
+        ]);
+        assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    }
+    let jane = std::fs::read_to_string(store.abs("records/contacts/jane.md")).unwrap();
+    let amir = std::fs::read_to_string(store.abs("records/contacts/amir.md")).unwrap();
+
+    let jane_id = fm_value(&jane, "id");
+    let amir_id = fm_value(&amir, "id");
+    for id in [&jane_id, &amir_id] {
+        assert!(
+            dbmd_core::ulid::is_ulid(id),
+            "minted id must be a lowercase ULID, got {id:?}"
+        );
+    }
+    assert_ne!(jane_id, amir_id, "two mints must be distinct");
+
+    // Canonical emit order: `id` directly follows `type` (no meta-type here).
+    let lines: Vec<&str> = jane.lines().collect();
+    assert_eq!(lines[1], "type: contact", "{jane}");
+    assert_eq!(lines[2], format!("id: {jane_id}"), "{jane}");
+}
+
+#[test]
+fn write_honors_explicit_fm_id_and_does_not_mint_over_it() {
+    // The documented escape hatch: an explicit `--fm id=…` wins over the mint
+    // (this is also what lets a scripted harness pin deterministic ids).
+    let store = Store::new();
+    let out = store.run(&[
+        "write",
+        "records/contacts/bob.md",
+        "--type",
+        "contact",
+        "--summary",
+        "Bob",
+        "--fm",
+        "id=custom-bob",
+    ]);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let written = std::fs::read_to_string(store.abs("records/contacts/bob.md")).unwrap();
+    assert_eq!(fm_value(&written, "id"), "custom-bob");
+    assert_eq!(
+        written.matches("\nid:").count() + usize::from(written.starts_with("id:")),
+        1,
+        "exactly one id line:\n{written}"
+    );
+}
+
+#[test]
+fn minted_id_is_queryable_via_where_id() {
+    // The id rides the write-through `index.jsonl` like any other frontmatter
+    // field, so `dbmd query --where id=<ulid>` resolves it through the generic
+    // field path — the store-scoped lookup a cross-store address will someday
+    // resolve INTO (SPEC § Addressing (reserved)).
+    let store = Store::new();
+    let out = store.run(&[
+        "write",
+        "records/contacts/jane.md",
+        "--type",
+        "contact",
+        "--summary",
+        "Jane",
+    ]);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let written = std::fs::read_to_string(store.abs("records/contacts/jane.md")).unwrap();
+    let id = fm_value(&written, "id");
+
+    let q = store.run(&["query", "--where", &format!("id={id}")]);
+    assert_eq!(q.code, Some(0), "stderr: {}", q.stderr);
+    assert_eq!(
+        q.stdout.trim(),
+        "records/contacts/jane.md",
+        "--where id= must return exactly the minted record"
+    );
+}
+
+#[test]
+fn fm_init_does_not_retrofit_an_id() {
+    // Only `write` mints (SPEC § The `id` field): `fm init` seeds the universal
+    // contract on an externally-dropped raw file but never adds an `id` —
+    // retrofitting ids onto existing files is the agent's call.
+    let store = Store::new();
+    store.seed("records/contacts/raw.md", "# Raw contact\n\nDropped in.\n");
+    // `fm` subcommands resolve the store from the cwd (no `--dir` flag).
+    let out = store.run_from_store_dir(&["fm", "init", "records/contacts/raw.md"]);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let after = std::fs::read_to_string(store.abs("records/contacts/raw.md")).unwrap();
+    assert!(
+        after.contains("created:") && after.contains("updated:"),
+        "fm init must have seeded the universal contract:\n{after}"
+    );
+    assert!(
+        !after.lines().any(|l| l.starts_with("id:")),
+        "fm init must not mint an id:\n{after}"
+    );
+}

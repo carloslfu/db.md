@@ -239,6 +239,13 @@ struct Session {
     store: PathBuf,
     /// The recorded invocations, in execution order.
     log: Vec<Invocation>,
+    /// Monotonic counter behind [`write_record`]'s pinned record ids. Format
+    /// v0.4's `dbmd write` mints a RANDOM lowercase ULID when no `id` is
+    /// supplied, and a random mint cannot be pinned by a byte-for-byte golden —
+    /// so the scripted session supplies deterministic ids via the documented
+    /// `--fm id=…`-wins path (mint randomness itself is covered by the
+    /// `writers.rs` integration tests and the `dbmd_core::ulid` unit tests).
+    next_id: u64,
 }
 
 impl Session {
@@ -257,6 +264,7 @@ impl Session {
             bin: release_dbmd(),
             store,
             log: Vec::new(),
+            next_id: 0,
         };
         (tmp, session)
     }
@@ -826,6 +834,15 @@ fn write_record(
     for kv in fm {
         args.push("--fm".into());
         args.push((*kv).into());
+    }
+    // Pin the record id (v0.4: `write` otherwise mints a RANDOM lowercase
+    // ULID, which a byte-for-byte golden cannot pin). The pinned value is a
+    // well-formed lowercase ULID — 26 Crockford-base32 chars, sequential in
+    // write order — exercising the documented `--fm id=…`-wins contract.
+    if !fm.iter().any(|kv| kv.starts_with("id=")) {
+        s.next_id += 1;
+        args.push("--fm".into());
+        args.push(format!("id=01j8e6prs0{:016}", s.next_id));
     }
     if let Some(bf) = body_file {
         args.push("--body-file".into());

@@ -2782,6 +2782,44 @@ mod tests {
         assert_eq!(reparsed.updated, fm.updated);
     }
 
+    /// Format v0.4: a minted-form (lowercase ULID) `id` round-trips verbatim
+    /// through parse → to_yaml → parse and holds its canonical head slot —
+    /// directly after `type` (and after `meta-type` when one is present),
+    /// before `created`. Pins the emit order for the id-carrying record shape
+    /// `dbmd write` produces.
+    #[test]
+    fn ulid_id_roundtrips_verbatim_in_head_position() {
+        let ulid = "01j5qc3v9k4ym8rwbn2tqe6f7d";
+        let yaml = format!(
+            "type: profile\nmeta-type: conclusion\nid: {ulid}\ncreated: 2026-05-27T08:00:00-07:00\nupdated: 2026-05-27T08:00:00-07:00\nsummary: x\n"
+        );
+        let fm = Frontmatter::parse(&yaml, Path::new("rt.md")).unwrap();
+        assert_eq!(
+            fm.id.as_deref(),
+            Some(ulid),
+            "id must parse into the typed field"
+        );
+
+        let emitted = fm.to_yaml();
+        let keys: Vec<&str> = emitted
+            .lines()
+            .filter(|l| !l.starts_with(['-', ' ']) && l.contains(':'))
+            .map(|l| l.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["type", "meta-type", "id", "created", "updated", "summary"],
+            "id must sit in the universal head; got:\n{emitted}"
+        );
+        assert!(
+            emitted.contains(&format!("id: {ulid}")),
+            "ULID must emit unquoted and verbatim; got:\n{emitted}"
+        );
+        let reparsed = Frontmatter::parse(&emitted, Path::new("rt.md")).unwrap();
+        assert_eq!(reparsed.id.as_deref(), Some(ulid));
+        assert_eq!(reparsed, fm, "round-trip must be lossless");
+    }
+
     #[test]
     fn to_yaml_omits_absent_optional_fields() {
         let fm = Frontmatter {

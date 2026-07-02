@@ -6,11 +6,63 @@ All notable changes to db.md are documented here. The format follows
 
 Two things version independently:
 
-- **The format** (`SPEC.md`) — **v0.3** (v0.1 was the first tagged release).
+- **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.5.1**.
+  `Cargo.toml`, currently **v0.6.0**.
 
 ## [Unreleased]
+
+## [0.6.0] — 2026-07-01
+
+### Format — v0.4 (additive: recommended `id` + reserved `@brain/id` address shape)
+
+The first additive format release under the from-v0.3-forward rule. Exactly two
+conventions ride in, chosen because they are the only retrofit-expensive pieces
+of cross-store addressing; everything with a trust boundary or a wire (keys,
+signing, feeds, grants, resolution) stays out of db.md by design.
+
+- **`id` joins the universal frontmatter contract as RECOMMENDED, not
+  required.** The recommended form is a **lowercase ULID** — 26 chars of
+  Crockford base32: time-sortable, compact and YAML-clean, offline-mintable
+  with zero coordination, collision-safe, widely understood. `dbmd write`
+  mints one when the new file carries no `id` (an explicit `--fm id=…` wins);
+  `dbmd fm init` never retrofits one. A record without an `id` stays fully
+  valid — hand-written stores remain legal — and filename identity stays the
+  link fallback (wiki-links still target paths). Uniqueness scope is the
+  store (`DUP_ID`, unchanged). SPEC § The `id` field.
+- **`@brain/id` reserved as the cross-store address shape** — a store handle,
+  a slash, a record id. SPEC § Addressing (reserved) reserves the shape
+  ONLY: registration, resolution, verification, and fetch are explicitly out
+  of scope for db.md and belong to a future interconnect spec (link.md). A
+  db.md tool encountering `@brain/id` treats it as plain text.
+- **One new validation code: `FM_BAD_ID` (warning).** Fires only on an id
+  that is structurally unusable as an identifier — non-scalar, empty, or
+  containing whitespace (the non-scalar shape also silently escaped
+  `DUP_ID`'s scalar read). The recommended ULID form is deliberately NOT a
+  gate: a v0.3 store with hand-authored slug ids (e.g.
+  `examples/research-wiki`) validates unchanged under v0.4, pinned by a
+  regression test that sweeps every shipped example store.
+
+### Toolkit
+
+- New `dbmd_core::ulid` module: `mint()` (48-bit ms timestamp + 80 random
+  bits, lowercase Crockford base32) and `is_ulid()`. Std-only — randomness
+  comes from OS-entropy-seeded `RandomState` hasher keys mixed with the
+  clock, the PID, and a per-process counter; zero new dependencies (the id's
+  contract is store-scoped uniqueness with `DUP_ID` as the backstop, not
+  unguessability).
+- `dbmd write` mints the id on every content-file create. The write-through
+  sidecar catalogs it like any other frontmatter field, so
+  `dbmd query --where id=…` resolves through the existing generic filter
+  path — regression-tested end to end (mint shape, explicit-id-wins,
+  `--where id=` lookup, `fm init` never minting).
+- The corpus-e agent eval now pins ids explicitly (`--fm id=…`, the
+  documented explicit-id-wins path) — a random mint cannot be pinned by a
+  byte-for-byte golden. Its EXPECTED tree gains exactly those `id` lines
+  (14 record files + their `index.jsonl` projections; verified id-only).
+
+Crate versions bump 0.5.1 → **0.6.0** (a new public module and new
+write-path output).
 
 ## [0.5.1] — 2026-06-30
 

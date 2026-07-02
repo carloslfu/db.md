@@ -47,6 +47,7 @@ pub mod stats;
 pub mod store;
 pub mod summary;
 pub mod time;
+pub mod ulid;
 pub mod validate;
 
 // ── Shared public types, re-exported at the crate root ──────────────────────
