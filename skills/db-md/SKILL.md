@@ -1,7 +1,7 @@
 ---
 name: db-md
 description: Operate a db.md store, the open standard for databases in plain files, with the `dbmd` CLI. Use when reading, writing, searching, validating, or curating any folder that has a DB.md at its root. Run `dbmd spec` for the full contract.
-version: 0.3.5
+version: 0.3.6
 license: Apache-2.0
 ---
 
@@ -52,7 +52,7 @@ dbmd query --type contact --where company=Acme       # structured frontmatter qu
 dbmd graph neighborhood records/contacts/sarah-chen --hops 2   # context in one call
 dbmd graph backlinks records/contacts/sarah-chen               # who points here (blast radius)
 
-# Write — create and connect (frontmatter is composed for you, incl. a stable ULID id)
+# Write — create and connect (frontmatter is composed for you, incl. a stable ULID id — minted by the tool, never composed by you)
 dbmd write records/meetings/standup.md --type meeting --summary "weekly sync"
 dbmd fm set <file> <key>=<value>                     # update one field, atomically
 dbmd link <from> <to>                                # append a wiki-link

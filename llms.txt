@@ -82,7 +82,7 @@ Read with `dbmd search` / `dbmd query` / `dbmd graph`; write with `dbmd write` /
 `dbmd log`. Every command takes `--json`. Read the store's `DB.md` (identity,
 policies, schemas) before writing. `dbmd write` mints a stable lowercase-ULID
 `id` for each new record (recommended, not required — files without one stay
-fully valid).
+fully valid); ids are minted by tooling — never compose a ULID by hand.
 
 ## Where a new store lives
 
