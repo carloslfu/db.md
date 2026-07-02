@@ -106,8 +106,10 @@ it looks. Outside artifacts (emails, PDFs, exports) come in as documentary
 sources; the operator's own pre-existing notes come in as testimonial `note`
 sources with `told_by`. What you author from them is a record, and synthesis
 carries `meta-type: conclusion`. Reorganize by type, meta-type, and links rather than
-mirroring the old folder tree. Preserve each source's provenance and verify
-nothing was lost. The move is only half the job: find whatever already
+mirroring the old folder tree. Rewrite imported link syntax to full
+store-relative wiki-links (or plain text when the target wasn't brought in) —
+short or broken links fail validation. Preserve each source's provenance and
+verify nothing was lost. The move is only half the job: find whatever already
 connects to it (skills, commands, scripts) and update them to point at the new
 store, so nothing keeps reading the old location. Don't create long-lived
 migration-map pages or temporary artifacts unless asked; git is the audit and

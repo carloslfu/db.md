@@ -1033,15 +1033,25 @@ source-first discipline above:
   — that claims an authorship the store can't defend.
 - **Reference vs. replace.** *Reference*: the external base stays the source of
   truth — import it under `sources/` and synthesize records from it. *Replace*:
-  the store becomes its living home — the content becomes `records/` (a vault
-  you authored and are lifting is your own synthesis → `meta-type: conclusion`),
-  and the raw export is kept under `sources/` as the frozen provenance/rollback
+  the store becomes its living home — the content becomes `records/`, but only
+  for content **this store's curator** authored and is lifting (its own prior
+  synthesis → `meta-type: conclusion`). The **operator's** own pre-existing
+  notes are testimony, not the curator's synthesis: they land as testimonial
+  `note` sources (`told_by`), and records are distilled from them. Either way
+  the raw export is kept under `sources/` as the frozen provenance/rollback
   copy. When unsure, default to reference; promote to records when the store is
   meant to own the content.
 - **Don't port the source system's folder tree.** Its hierarchy was built for
   humans clicking folders. Reorganize by `type` + `meta-type`, wiki-links, and
   the derived index; the old folder names become `type`/`tags`, not nested
   directories. Map by meaning, not by mirroring.
+- **Rewrite the source system's link syntax at ingest.** "Preserved verbatim"
+  is about content, not link syntax: an imported body's internal references
+  (`[[Sarah]]`, an Obsidian short link) must become full store-relative
+  wiki-links (`[[records/contacts/sarah-chen]]`) — or plain text when the
+  target was not brought in — otherwise the store fails its first
+  `dbmd validate` sweep (`WIKI_LINK_SHORT_FORM` / `WIKI_LINK_BROKEN`).
+  Rewriting the reference is not editing the evidence.
 
 ### Pre-write checks
 
