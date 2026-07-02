@@ -53,7 +53,7 @@ sha2 = "0.10"
 pdf-extract = "0.12"      # PDF text layer (MIT); 0.12 pulls lopdf >=0.42 (RUSTSEC-2026-0187 fix)
 calamine = "0.35"         # XLSX/ODS spreadsheet reader (MIT)
 html2text = "0.17"        # HTML → plain text (MIT)
-quick-xml = "0.40"        # docx/epub OOXML + XHTML parse (MIT)
+quick-xml = "0.41"        # docx/epub OOXML + XHTML parse (MIT); 0.41 fixes RUSTSEC-2026-0194/0195
 # `zip` with only the DEFLATE backend: docx/xlsx/epub containers use STORED +
 # DEFLATE only. Dropping default features removes the bzip2/lzma/zstd backends
 # (and the `bzip2-1.0.6`-licensed `libbz2-rs-sys`), shrinking the tree. The

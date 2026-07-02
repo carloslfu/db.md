@@ -121,6 +121,20 @@ ignore = [
     # lopdf move off ttf-parser, or we swap the PDF extractor; the daily advisory
     # schedule keeps it visible so it is not forgotten.
     "RUSTSEC-2026-0192",
+    # RUSTSEC-2026-0194 + RUSTSEC-2026-0195 — quick-xml < 0.41 DoS advisories
+    # (0194: quadratic duplicate-attribute-name check; 0195: unbounded
+    # `NsReader` namespace allocation). The workspace's direct quick-xml is
+    # bumped to 0.41 (fixed for real); these ignores cover only the remaining
+    # transitive copy, quick-xml 0.39.4 via calamine 0.35.0 (the xlsx/ods path
+    # of `dbmd extract`) — and calamine 0.35.0 is the newest release, so there
+    # is nothing to bump to. Actual exposure through calamine is 0194 only:
+    # it iterates `.attributes()` but never constructs an `NsReader` (the type
+    # 0195 affects), so the residual risk is quadratic CPU on a crafted
+    # spreadsheet handed to a local, user-invoked CLI — no server surface.
+    # Drop both ids when calamine ships a release on quick-xml >= 0.41; the
+    # daily advisory schedule keeps them visible so they are not forgotten.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 # ---------------------------------------------------------------------------
