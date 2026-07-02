@@ -165,7 +165,21 @@ cargo test -p dbmd-cli --test agent_eval -- --ignored perf_1m
 
 The test asserts the plan's 1M budgets (`log tail` ≤ 300 ms, `query` and
 typed `search` ≤ 12 s against the 400k-line emails sidecar, `validate --all`
-and `stats` ≤ 360 s). Pre-0.6.1 the containment-gate cost would have pushed
-typed search past its 12 s guard at 400k candidates; post-fix the projection
-is ~9–10 s. Run it after any change to the scan engine, the containment
-gate, or the sidecar layout.
+and `stats` ≤ 360 s). Run it after any change to the scan engine, the
+containment gate, or the sidecar layout.
+
+**First 0.6.1 run (2026-07-02, this machine):** corpus generated
+(1,000,000 files, ~2 min) and rebuilt to the fixed point; `log tail` and
+`query` passed their 1M guards; **`search --type email` measured 86 s
+against its 12 s guard — FAIL.** The projection above the fix (~9–10 s) was
+naive linear extrapolation from warm 10k numbers: at the 1m tier the emails
+type is 400,000 files (~40 % of the store), and per-candidate cost rises
+well past the 10k figure once the candidate set outruns page-cache warmth
+(~215 µs/file measured vs ~25 µs warm @10k). This is the busy-type caveat
+from § Scaling classes made concrete: typed search is honestly O(type), and
+a type holding 40 % of a million-file store is a sweep, not a loop op.
+Queued for the next toolkit release: re-model the 1M assertion around a
+per-candidate budget (the "flat" label is wrong for a type that scales with
+the store by construction), and/or the append+compact jsonl + parallel-scan
+fix family. `validate --all` / `stats` did not get measured (the test
+aborts at first failure); re-run after the re-model.
