@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 640px; overflow: hidden; }
+  body {
+    background: #f4f3ee;
+    font-family: "Inter", -apple-system, "Helvetica Neue", sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 84px 96px;
+    color: #0f172a;
+  }
+  .left {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    height: 100%;
+    max-width: 540px;
+  }
+  .wordmark {
+    font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, monospace;
+    font-size: 112px;
+    font-weight: 700;
+    letter-spacing: -0.05em;
+    color: #0f172a;
+  }
+  .tagline {
+    margin-top: 30px;
+    font-size: 37px;
+    line-height: 1.32;
+    font-weight: 500;
+    color: #334155;
+    max-width: 500px;
+  }
+  .footer {
+    font-size: 25px;
+    color: #94a3b8;
+    letter-spacing: 0.01em;
+  }
+  .record {
+    width: 470px;
+    background: rgba(255, 255, 255, 0.62);
+    border: 1.5px solid rgba(226, 232, 240, 0.9);
+    border-radius: 18px;
+    padding: 38px 42px;
+    font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, monospace;
+    font-size: 24px;
+    line-height: 1.82;
+    color: #0f172a;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+  .dim { color: #cbd5e1; }
+  .key { color: #94a3b8; }
+  .link { color: #475569; }
+</style>
+</head>
+<body>
+  <div class="left">
+    <div>
+      <div class="wordmark">db.md</div>
+      <div class="tagline">The open standard for databases in plain files.</div>
+    </div>
+    <div class="footer">Apache-2.0 &middot; plain files &middot; no vectors</div>
+  </div>
+  <div class="record">
+    <div class="dim">---</div>
+    <div><span class="key">type:</span> client</div>
+    <div><span class="key">created:</span> 2026-06-14</div>
+    <div><span class="key">summary:</span> Meridian retainer</div>
+    <div class="dim">---</div>
+    <div>Projects:</div>
+    <div class="link">[[project-meridian-site]]</div>
+  </div>
+</body>
+</html>
