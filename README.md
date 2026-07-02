@@ -365,6 +365,11 @@ internal tool, a customer database, any runtime with a folder of markdown.
 The [spec](SPEC.md) is the contract. The runtime is replaceable. **The
 files outlast both.**
 
+db.md needs no host. If you want one anyway, [Sevra](https://sevrahq.com)
+is the hosted home: your store kept always on, indexed, and curated. The
+standard stays neutral, Apache-2.0, and self-hostable no matter where a
+store lives.
+
 ## License
 
 [Apache-2.0](LICENSE), including the Apache patent grant and
