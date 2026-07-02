@@ -12,27 +12,14 @@ Two things version independently:
 
 ## [Unreleased]
 
-### Toolkit
-
-#### Security
-
-- **Bumped `quick-xml` 0.40 → 0.41 to clear
-  [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194) and
-  [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195)** — two
-  denial-of-service advisories against `quick-xml` < 0.41: a quadratic
-  duplicate-attribute-name check on start tags (0194) and unbounded `NsReader`
-  namespace allocation (0195). The exposed path was `dbmd extract` on an
-  untrusted docx/epub — 0194 only in practice, since extraction uses the plain
-  `Reader` (0195 affects `NsReader`, which nothing here constructs). The second,
-  transitive `quick-xml` copy (0.39.4 via `calamine`, the xlsx/ods path) has no
-  fixed release to move to yet; it is accepted with intent in `deny.toml` until
-  `calamine` ships on quick-xml ≥ 0.41. No API or extraction-output change.
-
 ## [0.6.1] — 2026-07-02
 
-### Toolkit — search containment gate amortized (format unchanged: v0.4)
+### Toolkit — search containment gate amortized + quick-xml security bump (format unchanged: v0.4)
 
-Perf-only release; no format change, no new behavior.
+Perf + dependency-security release; no format change, no new behavior. (The
+first `v0.6.1` tag died at the release preflight's cargo-deny gate when the
+quick-xml advisories published mid-release-day, with nothing shipped; this is
+the re-cut with the bump folded in.)
 
 - **`dbmd search` whole-store scans back at the ripgrep floor.** The 0.3.9
   security pass added a per-candidate containment gate
@@ -54,6 +41,20 @@ Perf-only release; no format change, no new behavior.
 - `tests/perf.py` — the repeated-timing driver behind `tests/PERF.md` — is
   now committed (it was a throwaway `/tmp` script when the 0.3.5 numbers
   were taken); `tests/PERF.md` re-measured on 0.6.1.
+
+#### Security
+
+- **Bumped `quick-xml` 0.40 → 0.41 to clear
+  [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194) and
+  [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195)** — two
+  denial-of-service advisories against `quick-xml` < 0.41: a quadratic
+  duplicate-attribute-name check on start tags (0194) and unbounded `NsReader`
+  namespace allocation (0195). The exposed path was `dbmd extract` on an
+  untrusted docx/epub — 0194 only in practice, since extraction uses the plain
+  `Reader` (0195 affects `NsReader`, which nothing here constructs). The second,
+  transitive `quick-xml` copy (0.39.4 via `calamine`, the xlsx/ods path) has no
+  fixed release to move to yet; it is accepted with intent in `deny.toml` until
+  `calamine` ships on quick-xml ≥ 0.41. No API or extraction-output change.
 
 ## [0.6.0] — 2026-07-01
 
