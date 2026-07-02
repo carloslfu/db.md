@@ -3,7 +3,8 @@
 > The open standard for databases in plain files. Records are markdown files with YAML
 > frontmatter; relationships are wiki-links; the database is the directory.
 > Built for agents: a database a harness reads, writes, links, and curates
-> directly through the `dbmd` CLI. For semantic, evolving, workflow-heavy
+> directly; the `dbmd` CLI is the deterministic plumbing. For semantic,
+> evolving, workflow-heavy
 > software, the old database/backend/frontend stack can become readable context,
 > an agent harness, and a generated surface. db.md is agent-operated
 > files-as-database: files, frontmatter, wiki-links, DB.md, indexes, and a
@@ -12,8 +13,8 @@
 This file is the agent-readable entry point, in the spirit of llms.txt.
 **The installer is text:** if you are an AI agent, you install and integrate
 db.md yourself by reading the steps below and acting on them. It is plain
-text by design. The smart model is the installer; there is no per-harness
-machinery to depend on.
+text by design. The smart model does the installing; there is no
+per-harness machinery to depend on.
 
 **The agent's path, four moves:** discover db.md → run `dbmd spec` for the
 contract → read the store's `DB.md` → operate with `dbmd`. The steps below get
@@ -21,13 +22,13 @@ you the binary; `dbmd spec` is the single source of truth from there.
 
 ## 1. Install the binary (one ~6MB Rust binary, no toolchain)
 
-Install it and keep moving. This is the fast path, run it straight through:
+Install it and keep moving. This is the fast path; run it straight through:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 ```
 
-The script is about 140 lines of POSIX sh: it downloads a tarball from this
+The script is about 160 lines of POSIX sh: it downloads a tarball from this
 repo's GitHub Releases, verifies its SHA-256 against the release's
 `SHA256SUMS`, and installs to `~/.dbmd/bin` with no sudo and no shell-config
 edits. The binary makes no network calls: no telemetry, no API keys, no AI
@@ -57,22 +58,22 @@ session lifecycle, the validation codes, and the full subcommand surface. Read
 it once per session. An agent that has read it can operate any db.md store
 immediately; per-store overrides come from the store's own `DB.md`.
 
-## 3. Integrate into your agent (optional, for persistence)
+## 3. Integrate into your harness (optional, so setup survives across sessions)
 
-`dbmd spec` is enough on its own. To make your agent reach for db.md
-automatically on every future session, place a skill where your harness reads
-skills, in the open Agent Skills format (a `db-md/SKILL.md` folder with
-`name`/`description` frontmatter whose body is a thin pointer that runs
-`dbmd spec`). The canonical skill file ships in the repo at `skills/db-md/SKILL.md`:
+`dbmd spec` is enough on its own. To reach for db.md automatically in
+future sessions, place a skill where your harness reads skills, in the
+open Agent Skills format (a `db-md/` folder holding a `SKILL.md` with
+`name`/`description` frontmatter and a thin body that runs `dbmd spec`).
+The canonical skill file ships in the repo at `skills/db-md/SKILL.md`:
 
 - Claude Code → `~/.claude/skills/db-md/SKILL.md`
 - Codex → `~/.codex/skills/db-md/SKILL.md`
 - Any other harness → its own skills directory, or load `dbmd spec` into the
   system prompt.
 
-Placing it is generic file work: copy the file, use your harness's own skill
-installer, or just tell your agent to set itself up. db.md ships no per-harness
-install command. The installer is text and the model does the rest.
+Placing it is generic file work: copy the file or use your harness's own
+skill installer. db.md ships no per-harness install command. The installer
+is text and the model does the rest.
 
 ## 4. Operate
 
@@ -88,12 +89,23 @@ path. This is the design, not a preference: the store is plain files whose point
 is that Git or a sync service saves, versions, and carries them. So set it up
 under version control by default. If you are in a git repo whose data this is,
 put the store in the repo (`<repo>/db/`) so it rides that repo's history;
-otherwise `git init` the store or place it in a synced folder. Only skip version
-control if the operator explicitly asks for a throwaway store. Never move
+otherwise `git init` the store itself and offer to wire a remote (a folder
+the operator already syncs is also fine). Only skip version control if the
+operator explicitly asks for a throwaway store. Never move
 repo-owned data out to an external path without the operator's say-so. A global
-alias like `~/db` is fine only as a symlink to the real, versioned store. When
-you migrate an existing knowledge base in, preserve each source's provenance and
-verify nothing was lost. The move is only half the job: find whatever already
+alias like `~/db` is fine only as a symlink to the real, versioned store.
+Confirm where the store lives and how it is backed up before you scaffold.
+
+When you migrate an existing knowledge base in (a folder of files, an Obsidian
+vault, a Notion export, anything), evaluate it first and show the operator a
+migration plan; move data only once they approve. Map it in by provenance, not
+polish: anything you (the agent) did not author is a source, however finished
+it looks. Outside artifacts (emails, PDFs, exports) come in as documentary
+sources; the operator's own pre-existing notes come in as testimonial `note`
+sources with `told_by`. What you author from them is a record, and synthesis
+carries `meta-type: conclusion`. Reorganize by type, meta-type, and links rather than
+mirroring the old folder tree. Preserve each source's provenance and verify
+nothing was lost. The move is only half the job: find whatever already
 connects to it (skills, commands, scripts) and update them to point at the new
 store, so nothing keeps reading the old location. Don't create long-lived
 migration-map pages or temporary artifacts unless asked; git is the audit and
