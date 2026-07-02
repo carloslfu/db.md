@@ -72,9 +72,11 @@ jobs:
           if [ -z "$ver" ]; then
             ver="$(gh release view --json tagName -q .tagName | sed 's/^v//')"
           fi
-          mkdir -p "mirror/${ver}"
-          gh release download "v${ver}" --dir "mirror/${ver}" --pattern 'dbmd-*.tar.gz' --pattern 'SHA256SUMS'
-          cp scripts/install.sh "mirror/${ver}/install.sh"
+          # install.sh fetches from "$DBMD_BASE_URL/v$version/…" (the real
+          # GitHub Releases layout), so the mirror tree must carry the v.
+          mkdir -p "mirror/v${ver}"
+          gh release download "v${ver}" --dir "mirror/v${ver}" --pattern 'dbmd-*.tar.gz' --pattern 'SHA256SUMS'
+          cp scripts/install.sh "mirror/v${ver}/install.sh"
           printf '%s\n' "$ver" > mirror/latest.txt
 
       - name: Resolve version
@@ -84,10 +86,10 @@ jobs:
           set -euo pipefail
           ver="$(tr -d '[:space:]' < mirror/latest.txt)"
           test -n "$ver" || { echo "::error::empty mirror/latest.txt" >&2; exit 1; }
-          test -d "mirror/${ver}" || { echo "::error::mirror/${ver} missing" >&2; exit 1; }
+          test -d "mirror/v${ver}" || { echo "::error::mirror/v${ver} missing" >&2; exit 1; }
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "Smoke-testing version: $ver"
-          ls -la "mirror/${ver}"
+          ls -la "mirror/v${ver}"
 
       - name: Re-upload mirror for the matrix jobs
         uses: actions/upload-artifact@v7
@@ -212,7 +214,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.fetch-artifacts.outputs.version }}"
-          dir="mirror/${version}"
+          dir="mirror/v${version}"
           tb="${BIN_NAME}-${version}-${{ matrix.target_name }}.tar.gz"
           test -f "$dir/$tb" || { echo "::error::missing $dir/$tb" >&2; exit 1; }
 

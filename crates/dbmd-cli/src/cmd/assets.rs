@@ -109,7 +109,7 @@ fn run_verify(ctx: &Context, args: &AssetsVerifyArgs) -> CliResult {
                 report.corrupt.len()
             ),
         )
-        .with_hint("run `vibecraft assets pull` (or your sync) to restore, then re-verify"));
+        .with_hint("restore the bytes via your asset transport or sync, then re-verify"));
     }
     Ok(())
 }

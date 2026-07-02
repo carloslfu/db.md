@@ -68,7 +68,8 @@ loop. See SPEC.md § Scale.
 
 ### Read
 - `dbmd search <query> [--type --in --where --linked-from --linked-to --updated-after --updated-before --created-after --created-before]` — embedded ripgrep over content + the frontmatter block; filters never parse the whole store
-- `dbmd fm get <file> <key>` / `dbmd fm query <key>=<value>` — `fm query` is sidecar-backed frontmatter filtering (the pre-write dedup primitive)
+- `dbmd query [--type --in --where <k>=<v> --updated/created-after/-before --limit]` — sidecar-backed frontmatter filtering (the pre-write dedup primitive; `--where id=<id>` is the id lookup)
+- `dbmd fm get <file> <key>` — read one frontmatter key
 - `dbmd graph backlinks|forwardlinks|neighborhood|orphans` — relationship retrieval; `orphans` is the SWEEP curation worklist
 - `dbmd tree [--layer --type]`
 - `dbmd outline <file>`
@@ -81,9 +82,13 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 - `dbmd write <path> --type <t> [--summary --fm --body-file]` — sharded source and event types resolve to date paths (`sources/<type>/<YYYY>/<MM>/`, `records/<type>/<YYYY>/<MM>/`); flat entity types stay flat; prints the resolved path. Mints a stable lowercase-ULID `id` when none is supplied (`--fm id=…` wins; recommended, not required — SPEC § The `id` field)
 - `dbmd fm set <file> <key>=<value>`
 - `dbmd fm init <file>` — generate canonical frontmatter + default
-  `summary`; the reconcile primitive for externally-dropped sources
+  `summary`; the reconcile primitive for externally-dropped sources.
+  Never mints an `id` — adding ids to existing files is the agent's
+  call (SPEC § The `id` field)
 - `dbmd link <from> <to>`
 - `dbmd rename <old> <new>` — move + rewrite incoming wiki-links
+- `dbmd format <file>` — re-emit frontmatter + body canonically (key
+  order, YAML style, whitespace); writes back in place
 
 ### Validate
 - `dbmd validate [--json]` — working-set by default (changed files
@@ -98,6 +103,12 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 - `dbmd index rebuild [--layer --folder --dry-run]` — from-scratch
   repair (after a bulk external drop into `sources/`, or to recover a
   damaged index)
+
+### Assets
+- `dbmd assets scan|verify|status|paths` — catalog, verify, and report
+  raw binary assets a wrapper declares (`asset:`/`assets:` frontmatter)
+  but Git should not carry; maintains the root `assets.jsonl` manifest,
+  never transports bytes (SPEC § Assets)
 
 ### Close
 - `dbmd log <kind> <object> [-m <note>]` — append to the active `log.md`; auto-rotates older months into `log/<YYYY-MM>.md`
@@ -171,7 +182,9 @@ overrides come from `DB.md` on every operation.
 
 ## Status
 
-The format (SPEC.md) is at v0.3. The single-binary all-Rust
+The format (SPEC.md) is at v0.4; the toolkit versions independently
+(currently 0.6.0 — see the [CHANGELOG](CHANGELOG.md) for both axes).
+The single-binary all-Rust
 `dbmd` described here is the active build target — treat this
 document as the toolkit contract the binary implements. The
 workspace is `crates/dbmd-core` (library) + `crates/dbmd-cli`

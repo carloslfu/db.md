@@ -1,4 +1,4 @@
-# db.md — v0.4
+# db.md — format v0.4
 
 `db.md` is **the open standard for databases in plain files**. Records are markdown
 files with YAML frontmatter. Relationships are wiki-links. The database
@@ -224,7 +224,7 @@ meta-type: conclusion    # curator-synthesized narrative (the old wiki/)
 
 ### The `id` field — stable identity, recommended
 
-`id` is the record's stable identity: the one value that survives rename
+`id` is a content file's stable identity: the one value that survives rename
 and reorganization, where filename identity does not. It is
 **RECOMMENDED, not required** — a record with no `id` is fully valid
 (hand-written stores stay legal), and identity then falls back to the
@@ -237,8 +237,8 @@ order by time), compact and YAML-clean (one short unquoted token, no
 special characters), offline-mintable with zero coordination (any
 writer can mint one — no registry, no counter, no network),
 collision-safe at any realistic write rate, and widely understood.
-Lowercase is canonical: it reads like the rest of the frontmatter and
-stays shell-friendly.
+Lowercase is the recommended form: it reads like the rest of the
+frontmatter and stays shell-friendly.
 
 - **Minted by tooling on write.** `dbmd write` mints a lowercase ULID
   when the new file carries no `id` (an explicit `--fm id=…` wins).
@@ -255,6 +255,9 @@ stays shell-friendly.
   ULID form is the recommendation, not a gate. `dbmd validate` warns
   (`FM_BAD_ID`) only on an id that cannot work as an identifier at all
   — a non-scalar value, an empty value, or one containing whitespace.
+- **Queryable like any field.** `id` rides the type-folder
+  `index.jsonl` with the rest of the frontmatter, so
+  `dbmd query --where id=<id>` is the lookup.
 
 **The `summary` field is canonical and required on every content file.** It is the **single source of truth** for what the file is about. Every hierarchical `index.md` reads this field directly to populate its catalog entries — no extraction rules, no recomputation. The agent writes a thoughtful summary when creating files (the curator's judgment), `dbmd fm init` writes a deterministic default if the agent doesn't (the type's `summary_template` from `DB.md ## Schemas`, or the file's first paragraph), and the agent can always override via `dbmd fm set <file> summary='...'`.
 
@@ -278,10 +281,12 @@ stays shell-friendly.
   hand.**
 - `type` is required and is the primary way tools query the store.
 - `id` is recommended, not required (see
-  [The `id` field](#the-id-field--stable-identity-recommended)); if
-  absent, the effective id derives from the file path (e.g.
-  `records/profiles/sarah-chen.md` → id `sarah-chen`).
-- Timestamps are ISO-8601 (`2026-05-27T08:00:00-07:00`).
+  [The `id` field](#the-id-field--stable-identity-recommended)); a
+  file without one is identified by its store-relative path — the
+  same identity wiki-links target.
+- Timestamps are full RFC3339 date-times
+  (`2026-05-27T08:00:00-07:00`); a bare date fails validation
+  (`FM_BAD_TIMESTAMP`).
 - Unknown fields pass through. Tools that don't recognize a field
   treat it as ambient context.
 
@@ -770,7 +775,7 @@ my-store/
 
 **Empty folders have no `index.md`.** Folders below the type-folder level (sub-sub-folders, if an operator creates them) are operator territory — not part of the canonical hierarchy, no auto-indexing.
 
-**Loose files (content directly at a layer root).** A content file MAY live directly at a layer root — `records/<file>.md` or `sources/<file>.md` — with no type-folder between it and the layer. Folder layout is convention, not enforcement (§ Layers), so this is a valid store: `dbmd write` never produces it (it routes every type to a canonical type-folder), but a bulk import or a hand-edit can. Such *loose* files are catalogued in the **layer's own `index.jsonl`** — the same complete, uncapped structured twin a type-folder carries, anchored at the layer dir — so structured reads (`dbmd query`, `dbmd query`, `dbmd search --type`, the dedup pre-write checks, `dbmd graph`) see a loose file exactly as they see a canonical one, with no whole-store walk. The layer `index.md` stays a type-folder rollup and does NOT list loose files (the layer `index.jsonl` is their catalog); a layer with no loose files carries no `index.jsonl`, so canonical stores are byte-unchanged. The layer `index.jsonl` is maintained write-through and rebuilt by `dbmd index rebuild`, byte-identically. `dbmd validate --all` reports `INDEX_JSONL_MISSING` when a loose file is absent from its layer `index.jsonl` (and `INDEX_JSONL_DESYNC` / `INDEX_JSONL_STALE` for a sidecar out of sync with the files), so a loose file is never *silently* missing from the catalog. (The canonical home for a record is still its type-folder; loose placement is supported, not encouraged — `dbmd rename`-ing a loose file into its type-folder removes the layer sidecar once the layer has no loose files left.) A layer — or an entire store — whose only content is loose files has **no rollup `index.md`** at the layer or root level: there are no type-folders to summarise, so the layer `index.jsonl` is the whole catalogue, and `dbmd validate` does not require a rollup that would have nothing to roll up.
+**Loose files (content directly at a layer root).** A content file MAY live directly at a layer root — `records/<file>.md` or `sources/<file>.md` — with no type-folder between it and the layer. Folder layout is convention, not enforcement (§ Layers), so this is a valid store: `dbmd write` never produces it (it routes every type to a canonical type-folder), but a bulk import or a hand-edit can. Such *loose* files are catalogued in the **layer's own `index.jsonl`** — the same complete, uncapped structured twin a type-folder carries, anchored at the layer dir — so structured reads (`dbmd query`, `dbmd search --type`, the dedup pre-write checks, `dbmd graph`) see a loose file exactly as they see a canonical one, with no whole-store walk. The layer `index.md` stays a type-folder rollup and does NOT list loose files (the layer `index.jsonl` is their catalog); a layer with no loose files carries no `index.jsonl`, so canonical stores are byte-unchanged. The layer `index.jsonl` is maintained write-through and rebuilt by `dbmd index rebuild`, byte-identically. `dbmd validate --all` reports `INDEX_JSONL_MISSING` when a loose file is absent from its layer `index.jsonl` (and `INDEX_JSONL_DESYNC` / `INDEX_JSONL_STALE` for a sidecar out of sync with the files), so a loose file is never *silently* missing from the catalog. (The canonical home for a record is still its type-folder; loose placement is supported, not encouraged — `dbmd rename`-ing a loose file into its type-folder removes the layer sidecar once the layer has no loose files left.) A layer — or an entire store — whose only content is loose files has **no rollup `index.md`** at the layer or root level: there are no type-folders to summarise, so the layer `index.jsonl` is the whole catalogue, and `dbmd validate` does not require a rollup that would have nothing to roll up.
 
 **Example — root `index.md`:**
 
@@ -868,7 +873,7 @@ PASS — 0 errors, 2 warnings (unknown type `proposal` in records/proposals/x.md
 - Append-only. The curator never rewrites past entries; if a finding is wrong, append a corrective entry below it.
 - Parseable with `grep "^## \[" log.md | tail -5` or any similar pipeline (or `dbmd log tail`).
 - **Rotation.** `log.md` is the active timeline; `dbmd log` automatically rolls older months into `log/<YYYY-MM>.md` on append. The full history is the archives plus the active file — one timeline, paginated so the active file (and every read of it) stays small no matter how old the store gets. `dbmd log tail` / `dbmd log since` reverse-read from the active file and cross into archives only when the requested range does.
-- **Concurrent-clone merges.** A single-writer store (one agent, one clone — the v0.3 contract; see [Writers and readers](#writers-and-readers)) never has a merge. When two git clones of a store both append (multi-machine sync, a shared repo), git's line merge conflicts on the shared end-of-file region. Resolution is the agent's: a curator with this SPEC in context semantically merges — keep both entries, order by timestamp. For merges where no agent is in the loop (a human, CI), set `log.md merge=union` in `.gitattributes`: because every entry is timestamped, the union driver keeps both sides (never drops one) and a later agent pass reorders. The derived `index.md` needs no merge logic at all — on conflict, regenerate it with `dbmd index rebuild`.
+- **Concurrent-clone merges.** A single-writer store (one agent, one clone — the standing contract; see [Writers and readers](#writers-and-readers)) never has a merge. When two git clones of a store both append (multi-machine sync, a shared repo), git's line merge conflicts on the shared end-of-file region. Resolution is the agent's: a curator with this SPEC in context semantically merges — keep both entries, order by timestamp. For merges where no agent is in the loop (a human, CI), set `log.md merge=union` in `.gitattributes`: because every entry is timestamped, the union driver keeps both sides (never drops one) and a later agent pass reorders. The derived `index.md` needs no merge logic at all — on conflict, regenerate it with `dbmd index rebuild`.
 
 ## The curator contract
 
@@ -1011,8 +1016,8 @@ ungrounded one — `dbmd validate` will not fail a record that has no
 source. The discipline keeps provenance *reconstructable*; it does not
 *prove* groundedness. Treat it as a contract the curator upholds, not a
 guarantee the format gives you. (A future opt-in `RECORD_UNGROUNDED`
-info-level check could surface obviously source-less records, but v0.3
-ships no such check by default; see [Roadmap](#roadmap).)
+info-level check could surface obviously source-less records, but the
+spec ships no such check by default; see [Roadmap](#roadmap).)
 
 ### Importing existing data
 
@@ -1331,8 +1336,8 @@ one writer in practice, the realistic blast radius is narrow — an
 external script writing into `records/` is the only way to violate it,
 and that script is the operator's own. (If a mechanical guard is wanted
 later, the existing `### Frozen pages` machinery, or a `conclusion`-aware
-write refusal, can reintroduce a path-independent lock; v0.3 does not
-ship one.)
+write refusal, can reintroduce a path-independent lock; the spec does
+not ship one today.)
 
 Files dropped into `sources/` by an external tool join the catalog
 when the agent next seeds them with `dbmd fm init` (write-through) or
@@ -1341,13 +1346,13 @@ are on disk and findable by `dbmd search` (ripgrep doesn't need the
 catalog), but not yet listed in `index.md`. The agent reconciles a
 bulk drop once, not file-by-file in the loop.
 
-**Single-agent-per-store is the v0.3 contract.** db.md does not
+**Single-agent-per-store is the standing contract.** db.md does not
 coordinate multiple curator agents writing to the same store
 concurrently. The operator runs one curator at a time. If multiple
 agents need to operate, give each its own store (and link the
 stores externally) or serialize via the operator's own tooling.
 Multi-agent coordination — locks, leases, conflict resolution —
-is out of scope at v0.3. This contract is also what keeps the
+is out of scope today. This contract is also what keeps the
 prose-only single-writer rule above tolerable in practice.
 
 ## Scale
@@ -1465,7 +1470,8 @@ misses synonyms — but the agent driving `dbmd` is a language model, so
 search. `dbmd` stays a dumb lexical tool and computes nothing; the model
 is the semantic layer, working over text the operator can read instead of
 vectors they cannot. This is the whole semantic story: no vectors to
-compute or store, now or ever, and nothing needed beyond the v0.2 toolkit.
+compute or store, now or ever, and nothing needed beyond what the
+toolkit already ships.
 (A maintained keyword index makes this a sublinear fast path at scale —
 see the [Roadmap](#roadmap) — but it is a *lexical* index, never a vector
 index; db.md adds no embeddings and no ANN.)
@@ -1506,7 +1512,9 @@ recorded in the manifest and kept out of the VCS path. An asset is never a
 wiki-link target: wiki-links are edges between markdown nodes and a binary is
 not a node, so assets never appear in `graph` / `rename` / `backlinks`.
 
-Declare assets with an `asset:` (single) or `assets:` (list) frontmatter key:
+Declare assets with an `asset:` (single) or `assets:` (list) frontmatter
+key (the examples elide the universal `id` / `created` / `updated`
+fields for brevity):
 
 ```yaml
 ---
@@ -1613,8 +1621,8 @@ codes are `ASSET_MANIFEST_MALFORMED`, `ASSET_UNDECLARED`, `ASSET_WRAPPER_BROKEN`
 
 ## Roadmap
 
-v0.3 is deliberately the simplest useful separated flavor: plain files,
-YAML frontmatter, wiki-links, embedded ripgrep, two folders + a
+The format is deliberately the simplest useful separated flavor: plain
+files, YAML frontmatter, wiki-links, embedded ripgrep, two folders + a
 `meta-type` field. No daemon, no engine, no magic. It is built for the
 low millions of files; the packed engine is the path beyond the point
 where literal directories, whole-tree walks, or git over the raw store
@@ -1744,7 +1752,14 @@ prompt interactively.
 
 ## Versioning
 
-The spec is versioned with the repo tag (`v0.1`, `v0.2`, `v0.3`, ...).
+**The format and the toolkit version independently.** This document
+carries the format version (`v0.1` … `v0.4` — the number in the title);
+the `dbmd` toolkit carries its own semver in `Cargo.toml`, and **repo
+tags track toolkit releases, not format versions** — tag `v0.4.0` was a
+toolkit release that implemented format v0.3, and format v0.4 shipped
+in toolkit 0.6.0. The [CHANGELOG](CHANGELOG.md) records both axes and
+names, for every toolkit release, the format version it implements.
+
 v0.2 generalized the type model (schema enforcement is solely the
 store's `## Schemas`; the example types are illustrative) and reworked
 the type-driven validation codes.
@@ -1770,7 +1785,7 @@ paragraph reserves the `@brain/id` cross-store address shape without
 defining resolution (see
 [Addressing (reserved)](#addressing-reserved)). One validation code is
 added (`FM_BAD_ID`, warning). A v0.3 store validates unchanged under a
-v0.4 toolkit.
+v0.4-conformant toolkit.
 
 **There is no migration command.** db.md is plumbing, not a scaffolder;
 migrating a v0.2 store is an agent's job, not a `dbmd` verb. A capable

@@ -25,8 +25,8 @@ travelers:
   - [[records/people/maya]]
   - [[records/people/jules]]
 home_base: [[records/places/kyoto-station]]
-created: 2026-01-12
-updated: 2026-06-03
+created: 2026-01-12T09:15:00-07:00
+updated: 2026-06-03T14:20:00-07:00
 ---
 
 # Kyoto spring trip
@@ -193,10 +193,12 @@ records conform to. There is no config format to learn. The agent writes
 | Backend logic | Agent harness plus deterministic `dbmd` operations |
 | UI | Chat, voice, forms, dashboards, or whatever the agent generates |
 
-The format is at v0.3, and its versioning policy from here is additive:
-new fields and codes layer on, existing stores keep validating. The
-contract is [SPEC.md](SPEC.md); the history is the
-[CHANGELOG](CHANGELOG.md).
+The format is at v0.4 and the `dbmd` toolkit at 0.6.0 — two versions
+because they are two things: SPEC.md carries the format's, the crates
+carry the toolkit's, and repo tags track toolkit releases. The format's
+policy from v0.3 on is additive: new fields and codes layer on,
+existing stores keep validating. The contract is [SPEC.md](SPEC.md);
+the history of both axes is the [CHANGELOG](CHANGELOG.md).
 
 ## What it is for
 
@@ -256,7 +258,7 @@ an opt-in test with published targets. Both are in
 [WHY.md](WHY.md#how-far-files-go).
 
 One writer, many readers. A store assumes a single curating agent; the
-v0.3 contract says so plainly, and teams share a store the way they share
+contract says so plainly, and teams share a store the way they share
 a repo: people direct the curator and read freely, clones move through
 git, append-only logs merge by union, and the derived indexes regenerate
 with `dbmd index rebuild` rather than merge. Want SQLite or a search index
@@ -337,7 +339,7 @@ bootstrap.
 
 ```
 db.md/
-├── SPEC.md          # the format, the curator contract, the validation codes (v0.3)
+├── SPEC.md          # the format, the curator contract, the validation codes (format v0.4)
 ├── WHY.md           # the argument: the stack collapse, the comparison field, the scale math
 ├── TOOLS.md         # the toolkit: every subcommand, install, agent bootstrap
 ├── llms.txt         # the agent-readable entry point

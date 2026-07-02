@@ -11,8 +11,8 @@
 //! every field is derivable, so a [`scan`] where the bytes are present
 //! reproduces it byte-for-byte, exactly like `index.jsonl`. db.md never
 //! transports the bytes and never names a storage provider; that is the
-//! VibeCraft layer's job, keyed off the SHA-256. This module never shells out
-//! to git and never touches the network.
+//! hosting/transport layer's job, keyed off the SHA-256. This module never
+//! shells out to git and never touches the network.
 //!
 //! Four operations — one write, three reads:
 //!   - [`scan`]   (write) discover declared assets, hash present files, rewrite the manifest
