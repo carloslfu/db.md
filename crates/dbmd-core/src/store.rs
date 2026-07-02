@@ -814,6 +814,20 @@ impl Store {
 /// `starts_with` comparison is symlink-stable on both sides (e.g. macOS's
 /// `/tmp` → `/private/tmp`).
 pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
+    reject_parent_components(store_root, candidate)?;
+
+    // Canonicalize the root so both sides of the containment check are in the
+    // same (fully-resolved) namespace. This also resolves any `..` the root
+    // itself carries (the user-supplied `--dir`), which the tail-only lexical
+    // check deliberately leaves in place.
+    let root = store_root.canonicalize()?;
+    resolve_within(&root, store_root, candidate)
+}
+
+/// The lexical half of the containment gate: reject any `..` component in the
+/// caller-influenced tail of `candidate` (the part beyond the trusted
+/// `store_root` prefix).
+fn reject_parent_components(store_root: &Path, candidate: &Path) -> std::io::Result<()> {
     // The `..` rejection below must apply only to the *caller-influenced* tail of
     // the candidate — never to a `..` the trusted `store_root` itself carries.
     // Callers build the candidate as `store_root.join(rel)`, so a user-supplied
@@ -847,13 +861,13 @@ pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io:
             ),
         ));
     }
+    Ok(())
+}
 
-    // Canonicalize the root so both sides of the containment check are in the
-    // same (fully-resolved) namespace. This also resolves any `..` the root
-    // itself carries (the user-supplied `--dir`), which the tail-only check above
-    // deliberately left in place.
-    let root = store_root.canonicalize()?;
-
+/// The resolution half of the containment gate, against a pre-canonicalized
+/// `root`: canonicalize `candidate` as far as it exists (peeling a virtual
+/// tail), reassemble, and require the result to stay under `root`.
+fn resolve_within(root: &Path, store_root: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
     // Resolve the candidate as far as it exists on disk. `canonicalize` fails on
     // a not-yet-existing leaf, so peel trailing components until the remaining
     // prefix exists, canonicalize that, then re-append the peeled tail. This
@@ -877,13 +891,13 @@ pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io:
                             // prefix: anchor the un-resolvable remainder at the
                             // canonical root so a relative candidate is judged
                             // against the store, not the process CWD.
-                            break root.clone();
+                            break root.to_path_buf();
                         }
                     }
                     None => {
                         // A root/prefix component with no file name and no
                         // on-disk existence: anchor at the canonical root.
-                        break root.clone();
+                        break root.to_path_buf();
                     }
                 }
             }
@@ -897,17 +911,92 @@ pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io:
         resolved.push(name);
     }
 
-    if resolved.starts_with(&root) {
+    if resolved.starts_with(root) {
         Ok(resolved)
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "path {} resolves outside the store root {}",
-                candidate.display(),
-                store_root.display()
-            ),
-        ))
+        Err(outside_store_err(candidate, store_root))
+    }
+}
+
+fn outside_store_err(candidate: &Path, store_root: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "path {} resolves outside the store root {}",
+            candidate.display(),
+            store_root.display()
+        ),
+    )
+}
+
+/// Hot-loop companion to [`ensure_path_within_store`]: identical per-candidate
+/// semantics, amortized cost. The single-shot gate re-canonicalizes the store
+/// root and walks the candidate's whole parent chain via `canonicalize` on
+/// every call — two realpath(3) chains per candidate, which at a 10k-file scan
+/// set dominates the scan itself. This helper canonicalizes the root ONCE at
+/// construction and memoizes each distinct parent directory's canonical form
+/// (scan candidates cluster into a few dozen type/shard folders), so the
+/// common candidate — an existing, non-symlink file in a known folder — costs
+/// one `lstat(2)` and a prefix check. Symlink leaves, missing files, and other
+/// corners fall back to the same full peel-resolution the single-shot gate
+/// runs, so no candidate gets a weaker check: a poisoned path still resolves
+/// (or fails) exactly as before.
+pub struct StoreContainment {
+    store_root: PathBuf,
+    /// The store root, canonicalized once at construction.
+    root: PathBuf,
+    /// Parent dir → its canonical form (memoized realpath).
+    dirs: BTreeMap<PathBuf, PathBuf>,
+}
+
+impl StoreContainment {
+    /// Canonicalize the store root once. Errs only if the root itself cannot
+    /// resolve (deleted mid-operation) — the same condition that would fail
+    /// every single-shot gate call.
+    pub fn new(store_root: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            store_root: store_root.to_path_buf(),
+            root: store_root.canonicalize()?,
+            dirs: BTreeMap::new(),
+        })
+    }
+
+    /// [`ensure_path_within_store`], amortized: same acceptance set, same
+    /// rejection set (see the struct doc).
+    pub fn resolve(&mut self, candidate: &Path) -> std::io::Result<PathBuf> {
+        reject_parent_components(&self.store_root, candidate)?;
+
+        // Fast path: an existing, non-symlink leaf under a memoizable parent.
+        // `symlink_metadata` (lstat, no path resolution) both proves existence
+        // and rules out a symlink leaf; the parent's canonical form resolves
+        // every symlink earlier in the chain, so `canonical(parent) + leaf` is
+        // exactly what `canonicalize(candidate)` would return.
+        if let (Ok(meta), Some(parent), Some(name)) = (
+            std::fs::symlink_metadata(candidate),
+            candidate.parent(),
+            candidate.file_name(),
+        ) {
+            if !meta.file_type().is_symlink() {
+                let canon_parent = match self.dirs.get(parent) {
+                    Some(p) => p.clone(),
+                    None => {
+                        let p = parent.canonicalize()?;
+                        self.dirs.insert(parent.to_path_buf(), p.clone());
+                        p
+                    }
+                };
+                let resolved = canon_parent.join(name);
+                return if resolved.starts_with(&self.root) {
+                    Ok(resolved)
+                } else {
+                    Err(outside_store_err(candidate, &self.store_root))
+                };
+            }
+        }
+
+        // Slow path — symlink leaf, missing file, no parent: the full peel,
+        // against the already-canonical root.
+        resolve_within(&self.root, &self.store_root, candidate)
     }
 }
 
@@ -3234,6 +3323,79 @@ mod tests {
             assert!(
                 ensure_path_within_store(&root, &link).is_err(),
                 "a symlink resolving outside the store must be rejected"
+            );
+        }
+    }
+
+    /// The amortized gate accepts and rejects exactly what the single-shot
+    /// gate does — same resolved paths, same failures — across every candidate
+    /// class: existing file (fast path), second file in the same folder
+    /// (memoized parent), missing leaf (slow-path peel), `..` tail, symlink
+    /// leaf escaping the store, and a symlinked PARENT dir escaping the store.
+    #[test]
+    fn store_containment_matches_single_shot_gate() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("store");
+        fs::create_dir_all(root.join("records/contacts")).unwrap();
+        fs::write(root.join("records/contacts/sarah.md"), "x").unwrap();
+        fs::write(root.join("records/contacts/jules.md"), "y").unwrap();
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("secret.md"), "TOPSECRET").unwrap();
+
+        let mut gate = StoreContainment::new(&root).expect("root canonicalizes");
+        let same = |cand: &Path, label: &str, gate: &mut StoreContainment| {
+            let single = ensure_path_within_store(&root, cand);
+            let amortized = gate.resolve(cand);
+            match (single, amortized) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "{label}: resolved paths differ"),
+                (Err(_), Err(_)) => {}
+                (s, a) => panic!("{label}: verdicts differ — single-shot {s:?} vs amortized {a:?}"),
+            }
+        };
+
+        same(
+            &root.join("records/contacts/sarah.md"),
+            "existing file",
+            &mut gate,
+        );
+        same(
+            &root.join("records/contacts/jules.md"),
+            "memoized parent",
+            &mut gate,
+        );
+        same(
+            &root.join("records/contacts/new-leaf.md"),
+            "missing leaf",
+            &mut gate,
+        );
+        same(
+            &root.join("records/contacts/../../outside/secret.md"),
+            "`..` tail",
+            &mut gate,
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // Symlink LEAF out of the store: slow path, rejected by both.
+            let link = root.join("records/contacts/escape.md");
+            symlink(outside_dir.join("secret.md"), &link).unwrap();
+            same(&link, "symlink leaf escape", &mut gate);
+            assert!(
+                gate.resolve(&link).is_err(),
+                "symlink leaf must be rejected"
+            );
+
+            // Symlinked PARENT dir out of the store: the fast path's parent
+            // canonicalize resolves it outside the root — rejected by both.
+            let linked_dir = root.join("records/linked");
+            symlink(&outside_dir, &linked_dir).unwrap();
+            let through = linked_dir.join("secret.md");
+            same(&through, "symlinked parent escape", &mut gate);
+            assert!(
+                gate.resolve(&through).is_err(),
+                "a candidate under a symlinked-out parent must be rejected"
             );
         }
     }

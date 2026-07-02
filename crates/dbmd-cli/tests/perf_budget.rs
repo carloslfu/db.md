@@ -100,6 +100,15 @@ const BUDGET_FM_QUERY: Duration = Duration::from_millis(300);
 /// Loop op: `search --type` resolves candidates via the sidecar, then scans only
 /// that set with embedded ripgrep. Plan budget: 300 ms @10k.
 const BUDGET_SEARCH_TYPED: Duration = Duration::from_millis(300);
+
+/// Loop op: `search` FREE-TEXT (unscoped) walks + scans every content file —
+/// the documented whole-store scan class. Asserted since the 0.6.1 containment
+/// fix: the 0.3.9 security gate silently tripled this op (2 realpath chains
+/// per candidate, ~375 ms @10k vs the ~150 ms rg floor) and no CI budget
+/// timed the free-text path, so nothing tripped. `StoreContainment` (root
+/// canonicalized once, parent dirs memoized) restored the floor; this row
+/// keeps the whole-store scan pinned to it.
+const BUDGET_SEARCH_FREETEXT: Duration = Duration::from_millis(300);
 /// Loop op: `log tail` reverse-reads from EOF, never a full parse. Plan budget:
 /// 50 ms. (Held to a generous floor below because, unlike the other loop ops,
 /// 50 ms is on the order of cold process-spawn on a shared CI box.)
@@ -562,6 +571,26 @@ fn budgets_hold_on_the_10k_scale_corpus() {
         "[perf] search Kickoff --type email: median {median:?} (budget {BUDGET_SEARCH_TYPED:?})"
     );
     assert_within_budget("search Kickoff --type email", median, BUDGET_SEARCH_TYPED);
+
+    // `search` free-text — the unscoped whole-store scan (walk + embedded-rg
+    // over all ~10k content files; zero-hit term so match volume is nil and
+    // the number is pure scan + containment cost).
+    let median = median_time(LOOP_ITERS, &|| {
+        vec![
+            "search".into(),
+            "zzz-perf-no-hit".into(),
+            "--dir".into(),
+            store_str.clone(),
+        ]
+    });
+    eprintln!(
+        "[perf] search zzz-perf-no-hit (free-text): median {median:?} (budget {BUDGET_SEARCH_FREETEXT:?})"
+    );
+    assert_within_budget(
+        "search zzz-perf-no-hit (free-text)",
+        median,
+        BUDGET_SEARCH_FREETEXT,
+    );
 
     // `log tail 20` — reverse-read from EOF, no full parse.
     let median = median_time(LOOP_ITERS, &|| {

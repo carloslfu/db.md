@@ -94,6 +94,14 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
     // ── Free-text scan over only the candidate set's bodies ──────────────────
     let mut matches: Vec<Match> = Vec::new();
     let mut searcher = build_searcher();
+    // The symlink-stable half of the containment gate (part 2 below), hoisted:
+    // the store root is canonicalized once and parent-dir resolutions are
+    // memoized across the loop (`StoreContainment`) instead of two full
+    // realpath chains per candidate — at a 10k-file scan set that overhead
+    // tripled the whole search. `None` (the root itself failed to canonicalize
+    // — deleted mid-search) makes every candidate skip, exactly as every
+    // per-candidate gate call would have failed.
+    let mut containment = dbmd_core::store::StoreContainment::new(&store.root).ok();
     'outer: for rel in &candidates {
         // Containment gate, part 1 — structural. A candidate path may have come
         // verbatim from a type-folder `index.jsonl` sidecar, which is an
@@ -119,9 +127,9 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
         // resolves outside the store root is silently skipped, exactly like a
         // stale/missing candidate below — a poisoned entry yields no results,
         // never an out-of-store read.
-        let abs = match dbmd_core::store::ensure_path_within_store(&store.root, &abs) {
-            Ok(resolved) => resolved,
-            Err(_) => continue 'outer,
+        let abs = match containment.as_mut().map(|c| c.resolve(&abs)) {
+            Some(Ok(resolved)) => resolved,
+            _ => continue 'outer,
         };
         let rel_str = path_to_str(rel);
         let scan = searcher.search_path(

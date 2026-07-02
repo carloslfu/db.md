@@ -8,211 +8,154 @@ and Block 6 § corpus-d).
 **The 1M tier is nightly / opt-in and is NOT run in CI.** It is wired as an
 opt-in `#[ignore]`-d test (`perf_1m_loop_ops_stay_flat_and_sweeps_stay_in_budget`
 in `crates/dbmd-cli/tests/agent_eval.rs`) — see [§ 1M tier](#1m-tier--opt-in-ignore-not-run-in-ci)
-below for how to run it. Its budgets are listed below as targets.
+below for how to run it. Its budgets are listed below as targets, with the
+extrapolation math stated per scaling class.
 
 ## Environment
 
 | | |
 |---|---|
 | Machine | Apple M3 Pro, 12 cores, 18 GB RAM |
-| OS | macOS 14.5 (23F79) |
+| OS | macOS 26.5.1 |
 | Toolchain | rustc 1.96.0 |
-| Binary | `target/release/dbmd` 0.3.5 (`--release`: LTO, codegen-units=1, strip) |
-| Corpus | `tests/corpora/corpus-d-scale` — 10,032 files (5,201 sources / 4,700 records / 100 wiki + indexes/log) |
-| Overflow folder | `sources/emails` = 3,000 files; `index.md` capped at 500 + `## More`; `index.jsonl` = 3,000 lines |
-| Largest jsonl | `sources/emails/index.jsonl` 3,000 / `records/expenses/index.jsonl` 2,000 |
-| Log rotation | active `log.md` (current month) + 5 archives (`log/2025-12 … 2026-04`) |
+| Binary | `target/release/dbmd` **0.6.1** (`--release`: LTO, codegen-units=1, strip) |
+| Corpus | `tests/corpora/corpus-d-scale` — 10,020 `.md` files (10,000 content: sources + records across date shards, two-layer v0.3+ layout) |
+| Precondition | corpus regenerated (`tests/gen-scale.rs`, deterministic seed), then `dbmd index rebuild` once to the fixed point → `validate --all` = 0 errors |
+| Startup floor | bare `dbmd --version` ≈ 3.2 ms (process spawn, included in every number) |
 
 ## Method
 
-- **Repeated timing**, not `hyperfine` (not installed on this host; the plan
-  permits "hyperfine or repeated timing"). A Python driver wraps each
-  invocation in `time.perf_counter()` around `subprocess.run` only — process
-  spawn of the driver itself is excluded; the `dbmd` process spawn IS included
-  (it is part of every real agent call). Bare `dbmd --version` startup is
-  **~1.9 ms**, so process spawn is negligible against every number below.
-- **Warm cache.** Each op runs a warmup pass (2–3 iterations, discarded) to
-  prime the page cache, then 6–20 timed iterations. Cold-cache is the
-  documented engine gap, not measured here (the plan treats the cold whole-tree
-  open wall as expected, not a regression).
-- **Read-only ops** (`fm query`, `search`, `graph *`, `log tail`, `validate`,
-  `validate --all`, `stats`) measured against the canonical corpus.
-- **Mutating ops** (`fm set`, `write`, `index rebuild`) measured against a
-  fresh `cp -R` copy of the corpus in `/tmp` so the canonical fixture stays
-  clean and write paths don't collide across iterations.
-- Reported: `min`, `p50` (median), `mean`, `max`, in milliseconds.
+The driver is **committed**: [`tests/perf.py`](perf.py) (the 0.3.5-era numbers
+came from a throwaway `/tmp` script; "reproduce" is now one command — see the
+driver's header). Repeated timing around `subprocess.run` only; the `dbmd`
+process spawn IS included (it is part of every real agent call). Warm cache
+(discarded warmup passes, then 12 timed iterations for loop ops / 6 for
+sweeps; `min`/`p50`/`mean`/`max` in ms). Read-only ops and sweeps run against
+the canonical corpus at the rebuild fixed point; mutating ops and the grown
+working-set validates run against a fresh copy in a temp dir. The working-set
+tiers grow the active `log.md` with real `dbmd log update` appends and time
+`validate --since 2020-01-01` (the anchor bypass, so the run is repeatable).
 
-Reproduce: `target/release/dbmd` built (`cargo build --release`), corpus
-generated (`tests/gen-scale.rs`, gitignored output), then the harness at
-`/tmp/perf.py` (not committed — a throwaway driver; the numbers are what ship).
+```
+rustc -O tests/gen-scale.rs -o /tmp/gen-scale
+/tmp/gen-scale 10k tests/corpora/corpus-d-scale
+(cd tests/corpora/corpus-d-scale && ../../../target/release/dbmd index rebuild)
+python3 tests/perf.py --bin target/release/dbmd --corpus tests/corpora/corpus-d-scale
+```
 
-## Results — loop ops (budgets @10k)
+## Results — loop ops (budgets @10k, measured 2026-07-02 on 0.6.1)
 
-| op | p50 | mean | max | budget | verdict |
-|---|---:|---:|---:|---:|:---|
-| `fm query status=active --type company` | **3.5 ms** | 3.5 | 3.7 | 300 ms | PASS |
-| `search Kickoff --type email` | **43 ms** | 43 | 45 | 300 ms | PASS |
-| `search Kickoff` (free-text, no `--type`) | **151 ms** | 196 | — | 300 ms | PASS |
-| `log tail 20` | **2.0 ms** | 2.0 | 2.3 | 50 ms | PASS |
-| `graph backlinks <company>` (unscoped) | **210 ms** | — | 371 | 200 ms | PASS (was 596 ms / 3x) |
-| `graph backlinks <company> --type contact` | **35 ms** | — | — | 200 ms | PASS |
-| `graph neighborhood <company> --hops 1` (unscoped) | **218 ms** | — | 357 | ~200 ms | PASS (was 608 ms / 3x) |
-| `fm set status=active <contact>` | **108 ms** | 108 | 117 | 100 ms | **OVER (marginal)** |
-| `write <new email source>` | **123 ms** | 123 | 127 | 100 ms | **OVER (marginal)** |
-| `validate` (working set, empty set) | **1.9 ms** | 1.9 | 2.1 | 1000 ms | PASS (empty) |
-| `validate` (working set, **14 changed**) | **180 ms** | — | 320 | 1000 ms | PASS (was 2,414 ms / 2.4x) |
-| `validate` (working set, **64 changed**) | **220 ms** | — | 230 | 1000 ms | PASS (was 9,378 ms / 9x) |
-| `validate` (working set, **264 changed**) | **370 ms** | — | 510 | 1000 ms | PASS (was 31,062 ms / 31x) |
+| op | p50 | mean | max | budget | verdict | 0.3.5 published |
+|---|---:|---:|---:|---:|:---|---:|
+| `query --where status=active --type company` ¹ | **27.9 ms** | 27.8 | 28.3 | 300 ms | PASS | 3.5 (`fm query`) |
+| `search Kickoff --type email` | **73.5 ms** | 73.6 | 74.6 | 300 ms | PASS | 43 |
+| `search Kickoff` (free-text, whole store) | **179.4 ms** | 180.0 | 184.2 | 300 ms | PASS | 151 |
+| `log tail 20` | **3.4 ms** | 3.4 | 3.6 | 50 ms | PASS | 2.0 |
+| `graph backlinks <company>` (unscoped) | **180.2 ms** | 180.4 | 182.9 | 200 ms | PASS | 210 |
+| `graph backlinks <company> --type contact` | **49.2 ms** | 49.2 | 49.7 | 200 ms | PASS | 35 |
+| `graph neighborhood <company> --hops 1` | **181.1 ms** | 181.3 | 182.4 | 200 ms | PASS | 218 |
+| `fm set status=<alt> <contact>` | **60.1 ms** | 61.2 | 69.0 | 100 ms | **PASS** ² | 108 (OVER) |
+| `write <new email source>` | **65.5 ms** | 65.6 | 66.8 | 100 ms | **PASS** ² | 123 (OVER) |
+| `validate` (working set, **empty** → full sweep) ³ | **907.7 ms** | 907.2 | 910.8 | 1,000 ms | PASS | 1.9 (stale row) |
+| `validate --since` (~14 changed) | **219.8 ms** | 219.6 | 221.0 | 1,000 ms | PASS | 180 |
+| `validate --since` (~64 changed) | **320.0 ms** | 320.0 | 322.5 | 1,000 ms | PASS | 220 |
+| `validate --since` (~264 changed) | **711.7 ms** | 710.7 | 818.9 | 1,000 ms | PASS | 370 |
+
+¹ Not comparable 1:1 to the 0.3.5 row: `fm query` printed paths off one
+sidecar; the 0.5.0 read-surface fold replaced it with `dbmd query`, which
+assembles complete records. 28 ms for the richer op is comfortably flat.
+
+² The 0.3.5 run's one standing finding — `fm set`/`write` marginally over
+their 100 ms budget on the O(folder-jsonl) read+rewrite — **cleared**: the
+write-path work landed across 0.4.x–0.6.0 roughly halved both. The budget is
+met with the compacted-rewrite design intact.
+
+³ By design, not a regression — see
+[§ validate's empty-set sweep](#validates-empty-set-sweep-is-by-design).
 
 ## Results — sweep ops (budgets @10k, off-loop)
 
-| op | p50 | mean | max | budget | verdict |
-|---|---:|---:|---:|---:|:---|
-| `validate --all` | **903 ms** | 928 | 1,053 | 5,000 ms | PASS |
-| `index rebuild` (full) | **515 ms** | 517 | 536 | 10,000 ms | PASS |
-| `stats` | **366 ms** | 370 | 473 | 5,000 ms | PASS |
+| op | p50 | mean | max | budget | verdict | 0.3.5 published |
+|---|---:|---:|---:|---:|:---|---:|
+| `validate --all` ⁴ | **1,454.9 ms** | 1,461.2 | 1,495.4 | 5,000 ms | PASS | 903 |
+| `index rebuild` (full) | **478.2 ms** | 478.5 | 480.2 | 10,000 ms | PASS | 515 |
+| `stats` | **295.9 ms** | 295.8 | 297.9 | 5,000 ms | PASS | 366 |
 
-The sweep ops are comfortably inside budget — they are honestly O(store) and
-the constant factor is low (sub-second to rebuild the full hierarchy / scan all
-10k files). No concern.
+⁴ `validate --all` grew ~60% across 0.4–0.6 as it gained checks (loose-file
+layer sidecars, `FM_BAD_ID`/`DUP_ID` on the id contract, jsonl desync
+classes) — honestly O(store) with a rising constant, still 3.4× inside
+budget.
 
-## The fast path works; the remaining gaps share one fix family
+## The 0.6.0 interlude — how a regression hid, and the fix (0.6.1)
 
-The healthy result first: every op that reads the **`index.jsonl` sidecar
-directly** is fast and flat —
+Re-measuring on 0.6.0 (2026-07-02, first re-run since 0.3.5) found free-text
+`search` at **402 ms — over its 300 ms budget** — and typed search at 143 ms.
+Root cause (verified by decomposition, not guessed): the 0.3.9 security pass
+(`d195550`) added the per-candidate containment gate
+(`ensure_path_within_store`) to the scan loop, and its implementation paid
+**two full `realpath(3)` chains per candidate — including re-canonicalizing
+the same store root once per file**. The scan engine itself never regressed:
+`rg -j1` over the same tree is ~150 ms, exactly the 0.3.5 measurement, and a
+zero-hit term cost the same 400 ms (per-candidate syscalls, not match
+volume). It went unnoticed because CI's `perf_budget.rs` timed only
+`--type`-scoped search.
 
-- `fm query --type contact` = **5 ms**; unscoped (all 10 sidecars) = **72 ms**.
-- `search` (embedded ripgrep over bodies) = **43 ms** typed, **151 ms**
-  free-text whole-store. The lone documented cold-walk op stays well inside
-  budget warm.
-- `graph backlinks --type contact` = **30 ms**.
-- `log tail 20` = **2 ms** (reverse-read from EOF, no full parse).
+**Fixed in 0.6.1** — `StoreContainment` (dbmd-core): the root is
+canonicalized once per search and parent-directory resolutions are memoized
+(candidates cluster into a few dozen type/shard folders), so the common
+candidate costs one `lstat(2)` + a prefix check. Symlink leaves, missing
+files, and every other corner still take the original full peel-resolution —
+the acceptance/rejection set is identical, pinned by an equivalence test
+(`store_containment_matches_single_shot_gate`) and the existing
+poisoned-sidecar regression tests. Free-text: 402 → **179 ms**; typed:
+143 → **74 ms**. CI now asserts the free-text scan too
+(`BUDGET_SEARCH_FREETEXT`), so this class of drift trips the gate next time.
 
-These confirm the sidecar architecture delivers the loop contract where it is
-actually used.
+## validate's empty-set sweep is by design
 
-The unscoped `graph` ops (finding 2) and `validate` working-set (finding 1) have
-since been moved onto the same single-pass embedded-ripgrep engine `search`
-rides — both collapsed a per-object / per-candidate re-read into a single store
-pass — and now hold their budgets. Only `fm set` / `write` (finding 3) remains,
-a marginal O(folder-jsonl) floor with its own fix family. See each finding for
-its current status and the `perf_budget.rs` gate for what is now enforced.
+The 0.3.5 table's "1.9 ms empty working set" row was **stale on its own
+publication day**: it was measured 2026-05-30, and `c9f0cc5` (2026-06-03,
+inside the v0.3.5 tag) deliberately changed the empty case — *"an externally
+edited or freshly copied store cannot pass vacuously"* — so `dbmd validate`
+with an empty changed set and no `--since` falls back to a full content
+sweep (`validate_content_sweep`: read + frontmatter parse + lints on every
+content file, ~900 ms @10k). The loop contract is unaffected: an agent that
+just wrote files has a non-empty working set and pays the O(changed) path
+(the `--since` rows above — one union-regex incoming-link pass over the
+store plus per-changed-file checks, flat-ish in the changed count). The
+empty-set sweep fires exactly when there is nothing cheaper worth proving.
+If a ms-class quiet-store `validate` is ever needed in the loop, the
+documented options are: sweep only when no validate anchor exists at all, a
+cheap freshness probe (walk + counts vs sidecars), or downgrading the
+fallback to the presence-scan class (~185 ms) — a deliberate design change,
+not a perf patch.
 
-### 1. `validate` (working set) was O(changed × store) — FIXED
+## Scaling classes — what extrapolates and how
 
-**Budget < 1 s @10k. Was 2.4 s at just 14 changed and scaling linearly —
-2.4 s → 9.4 s → 31 s at 14 → 64 → 264 changed objects (~110 ms per changed
-object); now 180 ms → 220 ms → 370 ms at the same 14 → 64 → 264, flat in the
-changed-set size.**
+Every op belongs to one of three classes; the 1M expectations follow from
+the class, and the flat classes are what the architecture exists to provide:
 
-The original cost: `validate_working_set` (`crates/dbmd-core/src/validate.rs`)
-read the changed set from `log.md` (correctly O(changed)), then for **each**
-changed object called `find_links_to(store, obj)` to find incoming linkers.
-`find_links_to` walks **every** `.md` in the store and ripgrep-scans each — once
-per changed object. So cost was `changed × full-store-read`, and the function
-comment's "bounded by the changed set, not store size" was only half true (the
-bound was changed-set, but each unit of it was a whole store read). It was the
-highest-impact finding: a realistic loop (touch 10–20 files, validate) already
-missed the budget by 2–3x at 10k and degraded without bound.
-
-The fix (the documented fix family): the incoming-linker discovery now runs as a
-**single** embedded-ripgrep pass over the store for the **union** of changed
-targets — `Store::find_links_to_any(&targets)` builds one alternation regex
-(`[[T1]]|[[T2]]|…`, each arm escaped + boundary-correct, identical per-target
-semantics to the single finder) and does **one** `.md` walk with a presence-only
-early-exit per file. That turns `changed × store` into a single `store` scan (the
-same scan class `search` free-text rides), with the per-file frontmatter checks
-staying O(changed). The result is flat in the changed-set size: the measured cost
-barely moves from 14 to 264 changed (180 → 370 ms), because the one store scan is
-the constant baseline and the only growth is parsing the (cheap) extra changed
-files. The sidecar `links` projection can't replace the scan — it omits
-body/typed-field edges — which is why this stays a content scan.
-
-`perf_budget.rs` now asserts it (`BUDGET_VALIDATE_WORKING`, exercised at a grown
-changed set of 250 via `grow_changed_set`), so a revert to the per-object loop —
-tens of seconds at hundreds of changed objects — fails CI.
-
-> Note on measuring it: the working set is "files with a mutating `log.md`
-> entry (`create|update|ingest|rename|delete|link`) newer than the latest
-> `validate` log entry." On the unmodified corpus that set is empty (the
-> corpus's newest `validate` entry post-dates every mutating entry), so a naive
-> `dbmd validate` reads 1.9 ms — **not representative**. The numbers above were
-> produced with `--since 2020-01-01` to include the corpus's real mutating
-> entries, plus appended `## […] update | [[<real-file>]]` entries to grow the
-> active `log.md` changed set to 64 and 264 (`changed_objects_since` reads only
-> the active `log.md`, so the appended entries must sit in the anchor month).
-> `fm set` / `write` do **not** auto-append a `log` entry (the six-step lifecycle
-> has the agent call `dbmd log` explicitly), so mutating a file does not by
-> itself enter the working set.
-
-### 2. `graph backlinks` (unscoped) and `graph neighborhood` — FIXED
-
-**Budget < 200 ms @10k. Was ~600 ms unscoped backlinks / ~608 ms neighborhood
-(1 hop); now ~210 ms / ~218 ms — the same scan class as `search` free-text
-(188 ms warm on this host). The `--type`-scoped backlinks stays 30–35 ms.**
-
-The original cost: `backlinks_filtered` (`crates/dbmd-core/src/graph.rs`) read
-the candidate set from the sidecars (fast), but then **confirmed each candidate
-by `read_to_string`-ing that file** (`file_links_to`) to catch body and
-typed-frontmatter-field links. An **unscoped** call has every record in the
-store as its candidate set, so it re-read all ~10k files → 600 ms.
-
-The reason for the confirm-read is real: the sidecar's `links` field is
-populated **only from the frontmatter `links:` array** (`index.rs`,
-`"links" => links = yaml_string_list(&v)`). It does **not** carry edges
-expressed in the body or in typed fields like `company: [[…]]`. So the sidecar's
-`links` is an *incomplete* forward-edge projection, and backlinks cannot trust
-it alone.
-
-**The fix (shipped — second option of the fix family below).** The **unscoped**
-`backlinks` path now resolves incoming edges with **one embedded-ripgrep pass**
-for `[[<target>]]` over the tree, via `Store::find_links_to` — the same
-presence-only `grep` + `ignore` scan engine `validate`'s working-set step and
-`dbmd links` already ride — instead of N `read_to_string` + YAML-parse
-confirmations. The raw hits are then narrowed to content files and emitted as
-canonical bare targets (the relationship view). This matches the literal link
-text wherever it lives (body or any frontmatter field), so the edge set is
-identical to the per-candidate parse. `graph neighborhood` inherits the win: at
-one hop it resolves the seed's incoming edges with that single pass.
-
-The **scoped** path (`--type` / `--in`) is unchanged — it still reads only the
-named type-folder sidecars for its candidate set and confirms with a single-file
-parse (O(folder), 30–35 ms). That is the I/O scope the design intends; the
-unscoped call now meets its own budget without it. Both paths are pinned by the
-10k perf gate (`crates/dbmd-cli/tests/perf_budget.rs`, `BUDGET_GRAPH_UNSCOPED`)
-so a revert to the per-candidate confirm-read fails CI.
-
-(The other fix-family option — making the sidecar `links` field carry the
-*complete* extracted edge set so backlinks could match against the sidecar
-without any confirm pass — was not taken: it would couple every write to
-full-file edge extraction and still leave the unscoped call reading every
-sidecar. The single tree scan is the same engine the rest of the toolkit's
-incoming-link logic already uses.)
-
-### 3. `fm set` / `write` are marginally over (108 / 123 ms vs 100 ms)
-
-Not O(store), and not folder-size-sensitive in a way that breaks the model:
-`fm set` is ~85 ms on a 60-file folder, ~107 ms on a 500-file folder — an
-O(folder) floor, not O(store). The cost is `Index::on_write`
-(`crates/dbmd-core/src/index.rs`): it reads the **entire** type-folder
-`index.jsonl` and **rewrites it compacted** on every write (deliberate — keeps
-the jsonl byte-identical to a rebuild and git-diffable, per the module doc),
-rather than an O(1) append. For the
-3,000-line emails jsonl that read+rewrite is the bulk of `write`'s 123 ms.
-
-This is a coherent design tradeoff (clean, rebuild-identical jsonl over
-append-only speed) and only ~8–23 ms over a tight 100 ms budget at 10k. It is
-worth flagging because the jsonl aggregates **across** date-shards, so a single
-busy type's jsonl keeps growing even though the shard *folders* stay bounded —
-i.e. this is the one loop-write cost that does not benefit from sharding and
-would widen at the 1M tier. Either accept the budget as O(folder-jsonl) or
-switch to genuine append + periodic compaction.
+- **Flat (O(1)-ish):** `log tail` (reverse-read from EOF), startup. Same
+  cost at any store size.
+- **Folder/changed-scoped (O(folder) / O(changed)):** `query`, typed
+  `search`, scoped `graph`, `fm set`, `write`, `validate` with a working
+  set. Cost follows the folder sidecar or the changed set, **not** the
+  store. The one caveat: a single busy type's `index.jsonl` aggregates
+  across date shards (the emails jsonl at the 1m tier is 400k lines), so
+  O(folder-jsonl) ops widen with type volume — that is the documented
+  trade for rebuild-identical, git-diffable sidecars.
+- **Store scans (O(store)):** free-text `search`, unscoped `graph`,
+  `validate --all`/empty-sweep, `index rebuild`, `stats`. Linear:
+  ~180 ms @10k ⇒ **~18 s @1M** for a free-text scan; `validate --all`
+  ~1.5 s @10k ⇒ **~2.5 min @1M**. These are the off-loop / sweep paths by
+  design — at 1M you scope your reads (that is what the sidecars are for)
+  and schedule your sweeps.
 
 ## 1M tier — opt-in (`#[ignore]`), NOT run in CI
 
 Per instructions the 1M tier is nightly/opt-in and is **not** executed by the
-default test run. It is wired as an opt-in, `#[ignore]`-d test so it can be run
-on demand without ever burdening CI:
+default test run. It is wired as an opt-in, `#[ignore]`-d test so it can be
+run on demand without ever burdening CI:
 
 ```
 # Generates a ~1M-file corpus-d-scale (minutes + several GB of disk), reaches
@@ -220,35 +163,9 @@ on demand without ever burdening CI:
 cargo test -p dbmd-cli --test agent_eval -- --ignored perf_1m
 ```
 
-The test
-(`perf_1m_loop_ops_stay_flat_and_sweeps_stay_in_budget` in
-`crates/dbmd-cli/tests/agent_eval.rs`) compiles + runs the standalone
-`tests/gen-scale.rs` generator at its `1m` tier, then asserts the loop ops stay
-**flat in store size** within the 1M budgets and the sweep ops stay within their
-linear budgets (same CI-headroom slack factor the 10k gate in `perf_budget.rs`
-uses). The generated corpus is gitignored
-(`tests/corpora/corpus-d-scale-1m/`) and lives only in a tempdir for the run.
-
-Plan targets the test asserts: loop ops `fm query` / `search` < 2 s,
-`log tail 20` < 50 ms; sweep ops `validate --all` < 60 s, `stats` < 60 s
-(`index rebuild` < 90 s is exercised as the fixed-point precondition). The
-opt-in test times the **sidecar-backed** loop ops (`fm query`, `search --type`,
-`log tail`) and the sweep ops at 1M. The previously-known-slow loop ops have all
-been moved onto a single embedded-ripgrep pass — the same whole-store-scan class
-as `search` free-text, an O(store) walk that holds within the generous loop
-budget: unscoped `graph backlinks`/`neighborhood` (finding 2) and `validate`
-working-set (finding 1, whose incoming-linker discovery is now one
-`find_links_to_any` pass for the whole changed set). Their 10k gate is
-`perf_budget.rs`; the 1M test's `--since`/grown-changed-set wiring for the
-working-set op is recorded here when the tier is actually run. The headline
-numbers are recorded to this file when the tier is actually run.
-
-## Summary
-
-| class | status |
-|---|---|
-| Sidecar reads (`fm query`, typed `backlinks`), `search`, `log tail` | PASS — fast, flat |
-| Sweep ops (`validate --all`, `index rebuild`, `stats`) | PASS — well inside budget |
-| `graph backlinks` unscoped / `graph neighborhood --hops 1` | PASS — single ripgrep pass, ~210 / ~218 ms (was ~600 ms); `--type`-scoped 30–35 ms |
-| `validate` working-set | PASS — single ripgrep pass for the whole changed set, flat 180–370 ms @14–264 changed (was O(changed × store): 2.4 s @14 → 31 s @264) |
-| `fm set` / `write` | marginal — O(folder-jsonl), 108 / 123 ms vs 100 ms |
+The test asserts the plan's 1M budgets (`log tail` ≤ 300 ms, `query` and
+typed `search` ≤ 12 s against the 400k-line emails sidecar, `validate --all`
+and `stats` ≤ 360 s). Pre-0.6.1 the containment-gate cost would have pushed
+typed search past its 12 s guard at 400k candidates; post-fix the projection
+is ~9–10 s. Run it after any change to the scan engine, the containment
+gate, or the sidecar layout.

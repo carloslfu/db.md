@@ -8,9 +8,36 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.6.0**.
+  `Cargo.toml`, currently **v0.6.1**.
 
 ## [Unreleased]
+
+## [0.6.1] — 2026-07-02
+
+### Toolkit — search containment gate amortized (format unchanged: v0.4)
+
+Perf-only release; no format change, no new behavior.
+
+- **`dbmd search` whole-store scans back at the ripgrep floor.** The 0.3.9
+  security pass added a per-candidate containment gate
+  (`ensure_path_within_store`) that re-canonicalized the store root and
+  walked the candidate's whole parent chain via `realpath` on every file —
+  at a 10k-file scan set that overhead tripled the scan (measured ~375 ms
+  free-text vs the ~150 ms `rg -j1` floor; typed ~140 ms vs ~45 ms). The new
+  `StoreContainment` helper (dbmd-core) keeps the identical acceptance /
+  rejection semantics — the poisoned-sidecar regression tests are unchanged
+  and an equivalence test pins fast path == single-shot gate across every
+  candidate class — but canonicalizes the root once per search and memoizes
+  parent-dir resolution, so the common candidate costs one `lstat(2)`.
+  Symlink leaves, missing files, and other corners still take the full
+  peel-resolution slow path.
+- **CI now times the free-text scan.** `perf_budget.rs` gained a
+  `BUDGET_SEARCH_FREETEXT` assertion (zero-hit unscoped search, 300 ms
+  budget × the CI slack) — the regression above was invisible precisely
+  because only `--type`-scoped search was budgeted.
+- `tests/perf.py` — the repeated-timing driver behind `tests/PERF.md` — is
+  now committed (it was a throwaway `/tmp` script when the 0.3.5 numbers
+  were taken); `tests/PERF.md` re-measured on 0.6.1.
 
 ## [0.6.0] — 2026-07-01
 
