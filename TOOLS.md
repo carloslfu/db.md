@@ -183,7 +183,7 @@ overrides come from `DB.md` on every operation.
 ## Status
 
 The format (SPEC.md) is at v0.4; the toolkit versions independently
-(currently 0.6.0 — see the [CHANGELOG](CHANGELOG.md) for both axes).
+(currently 0.6.1 — see the [CHANGELOG](CHANGELOG.md) for both axes).
 The single-binary all-Rust
 `dbmd` described here is the active build target — treat this
 document as the toolkit contract the binary implements. The
