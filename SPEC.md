@@ -1022,7 +1022,7 @@ spec ships no such check by default; see [Roadmap](#roadmap).)
 ### Importing existing data
 
 Bringing an existing knowledge base in — a folder of notes, an Obsidian
-vault, a Notion export, another wiki — follows three rules on top of the
+vault, a Notion export, another wiki — follows four rules on top of the
 source-first discipline above:
 
 - **Provenance, not polish, decides the layer.** An artifact you did not

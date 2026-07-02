@@ -127,6 +127,7 @@ client.
 - unique: email
 
 ### project
+- name (required, string)
 - client (required, link to records/clients/)
 - status (enum: active, on-hold, delivered, archived)
 - next_step (string)

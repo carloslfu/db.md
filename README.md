@@ -21,6 +21,7 @@ type: trip
 name: Kyoto spring trip
 dates: 2026-04-11..2026-04-18
 status: planning
+summary: Seven days in Kyoto with Maya and Jules; ryokan booked, one open afternoon still unplanned
 travelers:
   - [[records/people/maya]]
   - [[records/people/jules]]
@@ -44,8 +45,9 @@ schemas declared in `DB.md`. The `[[double brackets]]` are the
 relationships, the same links a wiki uses. The body holds what a database
 row usually throws away. A person reads it. Git versions it. A model reads
 it with full context. That is the whole format. (Records the tooling writes
-also carry a stable `id` — a lowercase ULID minted on create; recommended,
-not required, so a hand-written file like this one stays fully valid.)
+also carry a stable `id`, a lowercase ULID minted on create. It is
+recommended, not required: a hand-written file like this one stays fully
+valid.)
 
 **A huge class of future software will not be built as database + backend +
 frontend. It will be built as readable context + agent harness + generated
@@ -193,7 +195,7 @@ records conform to. There is no config format to learn. The agent writes
 | Backend logic | Agent harness plus deterministic `dbmd` operations |
 | UI | Chat, voice, forms, dashboards, or whatever the agent generates |
 
-The format is at v0.4 and the `dbmd` toolkit at 0.6.1 — two versions
+The format is at v0.4 and the `dbmd` toolkit at 0.6.1. Two versions,
 because they are two things: SPEC.md carries the format's, the crates
 carry the toolkit's, and repo tags track toolkit releases. The format's
 policy from v0.3 on is additive: new fields and codes layer on,
