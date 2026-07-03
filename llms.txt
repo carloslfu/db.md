@@ -79,7 +79,8 @@ is text and the model does the rest.
 
 Read with `dbmd search` / `dbmd query` / `dbmd graph`; write with `dbmd write` /
 `dbmd fm set` / `dbmd link`; validate with `dbmd validate`; record with
-`dbmd log`. Every command takes `--json`. Read the store's `DB.md` (identity,
+`dbmd log` (store-wide actions like `validate` take a `-` object:
+`dbmd log validate - -m "..."`). Every command takes `--json`. Read the store's `DB.md` (identity,
 policies, schemas) before writing. `dbmd write` mints a stable lowercase-ULID
 `id` for each new record (recommended, not required — files without one stay
 fully valid); ids are minted by tooling — never compose a ULID by hand.
@@ -108,7 +109,13 @@ sources with `told_by`. What you author from them is a record, and synthesis
 carries `meta-type: conclusion`. Reorganize by type, meta-type, and links rather than
 mirroring the old folder tree. Rewrite imported link syntax to full
 store-relative wiki-links (or plain text when the target wasn't brought in) —
-short or broken links fail validation. Preserve each source's provenance and
+short or broken links fail validation. When you bring a file in with
+`dbmd write --body-file`, strip that file's own frontmatter first: the body is
+the content after its closing `---`, and `--body-file` embeds whatever you pass
+verbatim, so an unstripped file lands a second frontmatter block inside the body
+that `validate` does not catch. Event and source writes shard by date, so the
+path `dbmd write` prints is the real one: read it back and link to the resolved
+path, not the path you requested. Preserve each source's provenance and
 verify nothing was lost. The move is only half the job: find whatever already
 connects to it (skills, commands, scripts) and update them to point at the new
 store, so nothing keeps reading the old location. Don't create long-lived
