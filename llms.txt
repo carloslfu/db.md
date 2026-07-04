@@ -113,7 +113,7 @@ short or broken links fail validation. When you bring a file in with
 `dbmd write --body-file`, strip that file's own frontmatter first: the body is
 the content after its closing `---`, and `--body-file` embeds whatever you pass
 verbatim, so an unstripped file lands a second frontmatter block inside the body
-that `validate` does not catch. Event and source writes shard by date, so the
+(`dbmd validate` flags this as `FM_IN_BODY`). Event and source writes shard by date, so the
 path `dbmd write` prints is the real one: read it back and link to the resolved
 path, not the path you requested. Preserve each source's provenance and
 verify nothing was lost. The move is only half the job: find whatever already
