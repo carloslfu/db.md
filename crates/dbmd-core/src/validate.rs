@@ -123,6 +123,11 @@ pub mod codes {
     /// contains whitespace). Warning: the recommended lowercase-ULID form is
     /// never enforced — hand-authored opaque ids stay legal (SPEC v0.4).
     pub const FM_BAD_ID: &str = "FM_BAD_ID";
+    /// the body of a content file opens with a second `---` frontmatter block
+    /// (typically an imported source file's own frontmatter embedded verbatim
+    /// as the body). Warning: the file still parses because the real
+    /// frontmatter is valid, but the leftover block is body text, not fields.
+    pub const FM_IN_BODY: &str = "FM_IN_BODY";
     /// content file has no `summary`.
     pub const SUMMARY_MISSING: &str = "SUMMARY_MISSING";
     /// `summary` present but empty.
@@ -521,6 +526,33 @@ fn check_content_file(
     // Without these guards the two scopes disagree on the same store.
     if !is_root_meta_file(rel) && !is_index_catalog_file(rel) {
         check_body_wiki_links(store, rel, &body, fm_end_line, basenames, issues);
+    }
+
+    // A second, misplaced frontmatter block opening the body — the classic
+    // import artifact: a source file that carried its own `---…---` frontmatter
+    // was embedded verbatim as the record body (e.g. `dbmd write --body-file`
+    // on an un-stripped Obsidian/Notion note). The file still parses because
+    // the real frontmatter at the top is valid, so nothing else flags it; this
+    // is the honest backstop for a silent-but-malformed import.
+    if is_content && body_opens_with_frontmatter(&body) {
+        push(
+            issues,
+            Severity::Warning,
+            codes::FM_IN_BODY,
+            rel,
+            Some(fm_end_line + 1),
+            None,
+            "the body opens with a second `---` frontmatter block; the record's \
+             frontmatter is the block at the top of the file, so this one is body \
+             text (usually an imported file's own frontmatter left in place)"
+                .into(),
+            Some(
+                "delete the leftover `---…---` block from the body, or move its \
+                 fields into the record's frontmatter"
+                    .into(),
+            ),
+            vec![],
+        );
     }
 
     Some(Parsed { fm, fm_yaml })
@@ -2716,6 +2748,28 @@ fn split_frontmatter(text: &str) -> Option<(String, String, u32)> {
         .collect::<Vec<_>>()
         .join("\n");
     Some((yaml, body, close_line))
+}
+
+/// True when `body` opens with a second frontmatter block: a leading `---`
+/// fence pair whose contents parse as a non-empty YAML mapping. Requiring a
+/// MAPPING is what keeps a `---` thematic-break rule or a fenced ```yaml
+/// example from false-firing — only genuinely misplaced frontmatter parses as
+/// a mapping. Leading blank lines are skipped so `\n---\n…` is still caught.
+/// Reuses the same fence-splitting the format itself uses, so this fires
+/// exactly when the body would independently parse as having frontmatter.
+fn body_opens_with_frontmatter(body: &str) -> bool {
+    let start: String = body
+        .lines()
+        .skip_while(|l| l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    match split_frontmatter(&start) {
+        Some((yaml, _, _)) => matches!(
+            serde_norway::from_str::<Value>(&yaml),
+            Ok(Value::Mapping(m)) if !m.is_empty()
+        ),
+        None => false,
+    }
 }
 
 /// Read just the `summary` field of a file, or `None` if absent/unparseable.
@@ -6701,6 +6755,59 @@ mod tests {
             !issues.iter().any(|i| i.code == codes::DB_MD_SCHEMA_FIELD
                 && matches!(i.key.as_deref(), Some("date") | Some("amount"))),
             "required key fields must not warn: {issues:#?}"
+        );
+    }
+
+    /// The double-frontmatter import artifact: a source file's own `---…---`
+    /// embedded verbatim as the record body (the `dbmd write --body-file` on an
+    /// un-stripped note). The record's real frontmatter at the top is valid, so
+    /// only `FM_IN_BODY` should surface the leftover block.
+    #[test]
+    fn body_leading_frontmatter_block_is_warning() {
+        let fx = Fixture::new();
+        fx.write(
+            "records/notes/imported.md",
+            "---\ntype: note\nsummary: an imported daily note\ncreated: 2026-06-02T09:00:00-07:00\nupdated: 2026-06-02T09:00:00-07:00\n---\n---\ntags: [daily]\n---\n# 2026-06-02\n\nSigned the SOW.\n",
+        );
+        let issues = fx.store_all();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.code == codes::FM_IN_BODY && i.severity == Severity::Warning),
+            "a body opening with a second frontmatter block must warn: {issues:#?}"
+        );
+    }
+
+    /// A `---` thematic-break rule around prose is NOT frontmatter (it parses
+    /// as a scalar, not a mapping), so it must not false-fire `FM_IN_BODY`.
+    #[test]
+    fn body_thematic_break_rules_do_not_warn() {
+        let fx = Fixture::new();
+        fx.write(
+            "records/notes/rules.md",
+            "---\ntype: note\nsummary: a note using horizontal rules\ncreated: 2026-06-02T09:00:00-07:00\nupdated: 2026-06-02T09:00:00-07:00\n---\n---\nJust some prose between two rules.\n---\nMore text.\n",
+        );
+        let issues = fx.store_all();
+        assert!(
+            !has(&issues, codes::FM_IN_BODY),
+            "a `---` thematic rule around prose (not a YAML mapping) must NOT warn: {issues:#?}"
+        );
+    }
+
+    /// A fenced ```yaml / ```markdown example that shows a frontmatter block is
+    /// body content, not a second frontmatter block — the fence line, not
+    /// `---`, opens the body, so `FM_IN_BODY` must stay silent.
+    #[test]
+    fn body_fenced_frontmatter_example_does_not_warn() {
+        let fx = Fixture::new();
+        fx.write(
+            "records/notes/doc.md",
+            "---\ntype: note\nsummary: a note showing an example record\ncreated: 2026-06-02T09:00:00-07:00\nupdated: 2026-06-02T09:00:00-07:00\n---\n```markdown\n---\ntype: contact\nname: Sam\n---\n```\n",
+        );
+        let issues = fx.store_all();
+        assert!(
+            !has(&issues, codes::FM_IN_BODY),
+            "a fenced example block (body opens with a code fence, not `---`) must NOT warn: {issues:#?}"
         );
     }
 

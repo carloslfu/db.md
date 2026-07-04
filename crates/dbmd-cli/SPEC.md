@@ -1022,7 +1022,7 @@ spec ships no such check by default; see [Roadmap](#roadmap).)
 ### Importing existing data
 
 Bringing an existing knowledge base in — a folder of notes, an Obsidian
-vault, a Notion export, another wiki — follows four rules on top of the
+vault, a Notion export, another wiki — follows five rules on top of the
 source-first discipline above:
 
 - **Provenance, not polish, decides the layer.** An artifact you did not
@@ -1052,6 +1052,14 @@ source-first discipline above:
   target was not brought in — otherwise the store fails its first
   `dbmd validate` sweep (`WIKI_LINK_SHORT_FORM` / `WIKI_LINK_BROKEN`).
   Rewriting the reference is not editing the evidence.
+- **Strip a source file's own frontmatter when you lift its body.** A file
+  passed to `dbmd write --body-file` is embedded verbatim, so a note that
+  carries its own `---…---` frontmatter (every Obsidian file) lands a *second*
+  frontmatter block inside the record body — the record's real frontmatter is
+  the block `dbmd` writes at the top, and the leftover one is now body text.
+  Drop it first (the body is the content after the source's closing `---`), or
+  `dbmd validate` flags it (`FM_IN_BODY`). Stripping the source's frontmatter is
+  not editing the evidence: the frozen copy under `sources/` keeps it.
 
 ### Pre-write checks
 
@@ -1193,6 +1201,7 @@ see; grouped by category):
 | `FM_BAD_TIMESTAMP` | error | `created` or `updated` isn't ISO-8601 |
 | `FM_BAD_META_TYPE` | error | a record's `meta-type` is not one of `fact` / `operational` / `conclusion` |
 | `FM_BAD_ID` | warning | `id` is present but unusable as an identifier (non-scalar, empty, or contains whitespace); the recommended form is a lowercase ULID |
+| `FM_IN_BODY` | warning | a content file's body opens with a second `---` frontmatter block (typically an imported file's own frontmatter embedded verbatim as body text); the record's real frontmatter is the block at the top of the file, so strip the leftover one |
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |
 | `SUMMARY_EMPTY` | error | `summary` present but empty |
 | `SUMMARY_MULTILINE` | error | `summary` contains newlines |

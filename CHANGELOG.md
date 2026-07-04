@@ -8,9 +8,31 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.6.1**.
+  `Cargo.toml`, currently **v0.6.2**.
 
 ## [Unreleased]
+
+## [0.6.2] — 2026-07-03
+
+### Toolkit — `validate` catches a second frontmatter block in the body (format unchanged: v0.4)
+
+A new `FM_IN_BODY` warning. It fires when a content file's body opens with a
+second `---…---` frontmatter block — the classic import artifact: a source
+file that carried its own frontmatter (every Obsidian note) was embedded
+verbatim as the record body, so the record now has the canonical frontmatter
+`dbmd` wrote at the top AND a leftover block opening its body. The file still
+parses (the real frontmatter is valid), so nothing flagged it before; a
+migration could silently produce a store full of double-frontmatter files that
+validated clean. The check reuses the format's own fence-splitting and fires
+only when the leading block parses as a non-empty YAML **mapping**, so a `---`
+thematic-break rule or a fenced ` ```yaml ` example never false-fires.
+
+The `dbmd write --body-file` primitive stays verbatim by design (predictable,
+no silent byte-mutation); the validator is the honest backstop, and `SPEC.md`'s
+"Importing existing data" section now states the strip-the-source-frontmatter
+rule (with the `FM_IN_BODY` reference). Surfaced by a cold migration rehearsal
+against the public docs. Format is unchanged — a v0.4 store validates the same,
+plus this one advisory warning where a body genuinely carries a stray block.
 
 ## [0.6.1] — 2026-07-02
 
