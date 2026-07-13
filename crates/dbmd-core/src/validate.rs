@@ -3475,13 +3475,7 @@ fn extract_index_entry_summary(after: &str) -> Option<String> {
         }
     }
     // Require an em dash or hyphen separator before the summary.
-    let s = if let Some(rest) = s.strip_prefix('—') {
-        rest.trim()
-    } else if let Some(rest) = s.strip_prefix('-') {
-        rest.trim()
-    } else {
-        return None;
-    };
+    let s = s.strip_prefix('—').or_else(|| s.strip_prefix('-'))?.trim();
     if s.is_empty() {
         return None;
     }
