@@ -174,5 +174,41 @@ impl From<std::io::Error> for CliError {
     }
 }
 
+/// Map a link.md client error onto a [`CliError`]: every wire-or-config
+/// failure is a `Runtime` (exit `1`) with a stable machine code — an agent
+/// branches on the string code, not new exit numbers (the numeric table is a
+/// locked contract and the link verbs add no new class to it).
+impl From<dbmd_core::linkmd::LinkError> for CliError {
+    fn from(err: dbmd_core::linkmd::LinkError) -> Self {
+        use dbmd_core::linkmd::LinkError as L;
+        let message = err.to_string();
+        match err {
+            L::NoHub => CliError::new(ExitCode::Runtime, "NO_HUB", message),
+            L::NoCredential => CliError::new(ExitCode::Runtime, "NO_CREDENTIAL", message),
+            L::BadKey => CliError::new(ExitCode::Runtime, "BAD_CREDENTIAL", message),
+            L::UnsafeHub { .. } => CliError::new(ExitCode::Runtime, "HUB_NOT_HTTPS", message),
+            L::Transport { .. } => CliError::new(ExitCode::Runtime, "HUB_UNREACHABLE", message),
+            L::Http { code, .. } => {
+                let e = CliError::new(ExitCode::Runtime, "HUB_ERROR", message);
+                match code {
+                    Some(c) => e.with_hint(format!("hub error code: {c}")),
+                    None => e,
+                }
+            }
+            L::NotJson { .. } => CliError::new(ExitCode::Runtime, "HUB_NOT_JSON", message),
+            L::ResponseTooLarge => CliError::new(ExitCode::Runtime, "RESPONSE_TOO_LARGE", message),
+            L::BadAddress { .. } => CliError::new(ExitCode::Runtime, "BAD_ADDRESS", message)
+                .with_hint(
+                    "addresses are `@brain`, `@brain/<record-id>`, or `@brain/<store-path>.md`",
+                ),
+            L::UnsafePath { .. } => CliError::new(ExitCode::Runtime, "UNSAFE_PATH", message),
+            L::PushTooLarge { .. } => CliError::new(ExitCode::Runtime, "PUSH_TOO_LARGE", message),
+            L::NotUtf8 { .. } => CliError::new(ExitCode::Runtime, "NOT_UTF8", message),
+            L::Io(_) => CliError::new(ExitCode::Runtime, "IO_ERROR", message),
+            L::Store(_) => CliError::new(ExitCode::Runtime, "STORE_ERROR", message),
+        }
+    }
+}
+
 /// Convenience result alias for subcommand bodies.
 pub type CliResult = std::result::Result<(), CliError>;

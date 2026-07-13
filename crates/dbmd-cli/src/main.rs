@@ -119,6 +119,11 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Link(args) => cmd::link::run(ctx, args),
         Command::Rename(args) => cmd::rename::run(ctx, args),
         Command::Assets(args) => cmd::assets::run(ctx, args),
+        Command::Resolve(args) => cmd::resolve::run(ctx, args),
+        Command::Sync(args) => cmd::sync::run(ctx, args),
+        Command::Grant(args) => cmd::grant::run(ctx, args),
+        Command::Propose(args) => cmd::propose::run(ctx, args),
+        Command::Subscribe(args) => cmd::subscribe::run(ctx, args),
         Command::Spec(args) => cmd::spec::run(ctx, args),
     }
 }

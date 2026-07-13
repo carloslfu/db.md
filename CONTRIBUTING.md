@@ -78,7 +78,7 @@ do the work; `rg` is the thin binary.)
   [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES). Licenses must stay inside the
   allowlist in `deny.toml` and `crates/dbmd-cli/tests/license_policy.rs`
   (MIT / Apache-2.0 / BSD / 0BSD / Unlicense / MPL-2.0 / Zlib /
-  Unicode-3.0) — no GPL/AGPL/LGPL-static.
+  Unicode-3.0 / ISC / CDLA-Permissive-2.0) — no GPL/AGPL/LGPL-static.
 - **AI/LLM dependencies.** `dbmd` is deterministic and ships zero
   AI: no provider SDKs, no API keys, no model calls, and no
   embeddings / vectors / ANN — ever. The user's own agent harness

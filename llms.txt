@@ -31,8 +31,10 @@ curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/instal
 The script is about 160 lines of POSIX sh: it downloads a tarball from this
 repo's GitHub Releases, verifies its SHA-256 against the release's
 `SHA256SUMS`, and installs to `~/.dbmd/bin` with no sudo and no shell-config
-edits. The binary makes no network calls: no telemetry, no API keys, no AI
-SDKs.
+edits. The binary never phones home: no telemetry, no auto-update, no AI
+SDKs. Its only network I/O is the link.md client verbs (`dbmd
+resolve/sync/grant/propose/subscribe`), which run solely when you invoke
+them against a hub you configure.
 
 Alternatives: `brew install carloslfu/tap/dbmd` for the prebuilt release, or
 `cargo install dbmd-cli` to build from crates.io if you already have Rust.

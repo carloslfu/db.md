@@ -39,6 +39,16 @@ pub mod extract;
 pub mod fsx;
 pub mod graph;
 pub mod index;
+// The link.md CLIENT (feature `link`, default-on): the five interconnect
+// verbs — resolve / sync / grant / propose / subscribe — spoken against a
+// user-configured hub. One binary, two specs (the git precedent); the db.md
+// FORMAT is untouched — a store never needs link.md to be valid db.md, and a
+// format-only consumer drops this module (and its HTTP/TLS closure) with
+// `default-features = false`. Deliberately NOT re-exported at the crate root:
+// the root re-exports are the format toolkit's locked interface, and the wire
+// client reads best module-qualified (`linkmd::HubConfig`).
+#[cfg(feature = "link")]
+pub mod linkmd;
 pub mod log;
 pub mod parser;
 pub mod query;

@@ -55,6 +55,12 @@ const ALLOWED: &[&str] = &[
     "MPL-2.0",
     "Zlib",
     "Unicode-3.0",
+    // The link.md client's TLS stack (ureq → rustls): rustls-webpki +
+    // untrusted are plain ISC; ring is `Apache-2.0 AND ISC` (conjunctive).
+    "ISC",
+    // webpki-roots — the bundled CCADB root-certificate data (a permissive
+    // DATA license: no copyleft, no patent traps).
+    "CDLA-Permissive-2.0",
 ];
 
 /// The two targets the released `dbmd` binary is built for. We union the
@@ -71,6 +77,11 @@ const DOCUMENTED_NONTRIVIAL: &[(&str, &str)] = &[
     ("unicode-ident", "(MIT OR Apache-2.0) AND Unicode-3.0"),
     ("encoding_rs", "(Apache-2.0 OR MIT) AND BSD-3-Clause"),
     ("zlib-rs", "Zlib"),
+    // The link.md client's TLS stack (feature `link`, default-on).
+    ("ring", "Apache-2.0 AND ISC"),
+    ("rustls-webpki", "ISC"),
+    ("untrusted", "ISC"),
+    ("webpki-roots", "CDLA-Permissive-2.0"),
 ];
 
 /// Resolve `cargo metadata` for one target and return its parsed JSON.

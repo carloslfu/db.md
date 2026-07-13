@@ -113,6 +113,39 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 ### Close
 - `dbmd log <kind> <object> [-m <note>]` — append to the active `log.md`; auto-rotates older months into `log/<YYYY-MM>.md`
 
+### Interconnect (the link.md client)
+
+One binary, two specs: `dbmd` also speaks the link.md client verbs
+against a hub — a server that hosts, indexes, and serves db.md stores.
+The db.md FORMAT is untouched (SPEC.md reserves only the `@brain/id`
+address *shape*); these are client capabilities, never store
+requirements. No hub is baked in: the hub URL comes from `--hub`, the
+`DBMD_HUB_URL` env var, or a `hub = <URL>` line in the store-local
+`.dbmd/config` (precedence in that order); the credential is the
+`DBMD_HUB_KEY` env var, never a file in the store. Non-HTTPS hubs are
+refused (loopback exempt). Zero AI, zero telemetry: network I/O happens
+only when a verb is explicitly invoked.
+
+- `dbmd resolve @brain[/<id>]` — a bare `@brain` returns the brain card
+  (metadata + index stats); `@brain/<record-id>` (the reserved address
+  shape; a `@brain/<store-path>.md` form also works) returns the full
+  record, frontmatter + body
+- `dbmd sync @brain [--out DIR]` — pull the granted slice as plain
+  files (never deletes local files; divergence is reported) and rebuild
+  the local index catalog; `--push` sends the local store as a
+  whole-store snapshot (content `.md` + `DB.md` + `assets.jsonl`;
+  derived catalogs and local history stay local)
+- `dbmd grant issue|list|revoke` — the capability model, owner-side:
+  grant read or write to a principal (by email in v0), scoped to an
+  optional store-path prefix, with an optional `--until` expiry
+- `dbmd propose <site> --app <slug> --body/--body-file` — write without
+  trust: submit evidence to a published site's inbox; it lands in the
+  owner's `sources/inbox/` for their curator to accept or reject
+  (unauthenticated by design)
+- `dbmd subscribe @brain [--once] [--since N] [--interval S]` — follow
+  the brain's feed head; emits one event line per advance (NDJSON under
+  `--json`), `--once` for a single head read
+
 ## The library: `dbmd-core`
 
 All logic lives in `dbmd-core`, a Rust library crate; the `dbmd`
@@ -120,8 +153,11 @@ binary is thin CLI wrappers (parse args, call the library, format
 output). Any Rust tool — an Obsidian plugin, a Notion exporter, an
 LSP server, a custom agent harness — can `cargo add dbmd-core` and
 get the full library: parser, store walk, wiki-link graph,
-validation, stats, query, index/log ops. Precedent: ripgrep's
-`grep` + `ignore` libs do the work; `rg` is the thin binary.
+validation, stats, query, index/log ops, and the link.md client
+(`linkmd`, cargo feature `link`, default-on — a format-only consumer
+drops it and its HTTP/TLS closure with `default-features = false`).
+Precedent: ripgrep's `grep` + `ignore` libs do the work; `rg` is the
+thin binary.
 
 ## Install
 

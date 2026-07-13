@@ -8,12 +8,15 @@ Dependency licensing policy (enforced): permissive only. The allowlist of
 accepted SPDX license identifiers is:
 
     MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, 0BSD, Unlicense,
-    MPL-2.0, Zlib, Unicode-3.0
+    MPL-2.0, Zlib, Unicode-3.0, ISC, CDLA-Permissive-2.0
 
 No GPL, no AGPL, no LGPL-static. Zero AI/LLM dependencies — no provider
 SDKs, no API keys, no model calls, no embeddings/vector/ANN crates of any
 kind. Ripgrep is embedded via the `grep` + `ignore` libraries (no bundled
-`rg` binary, no shelling out).
+`rg` binary, no shelling out). The toolkit never phones home on its own (no
+telemetry, no auto-update): the only network I/O is the link.md client verbs
+(`dbmd resolve/sync/grant/propose/subscribe`), which run only when explicitly
+invoked against a hub the user configured, over the TLS stack recorded below.
 
 This policy is mechanically enforced by TWO gates over the whole resolved
 tree, not by hand-maintaining this prose:
@@ -39,8 +42,8 @@ source of truth, this prose is the summary. Adding a dependency under any
 license not on the allowlist fails BOTH until the license is reviewed and
 added to `deny.toml` AND the test — and recorded in this file.
 
-Three shipped crates carry an obligation beyond plain MIT/Apache and so are
-called out explicitly (all three remain permissive and on the allowlist):
+Seven shipped crates carry an obligation beyond plain MIT/Apache and so are
+called out explicitly (all remain permissive and on the allowlist):
 
 - unicode-ident  (MIT OR Apache-2.0) AND Unicode-3.0
     The `Unicode-3.0` term is CONJUNCTIVE — it cannot be opted out of by
@@ -56,10 +59,23 @@ called out explicitly (all three remain permissive and on the allowlist):
 - zlib-rs        Zlib
     A single (non-OR) Zlib license — the permissive Zlib license binds.
     Pulled in under flate2's `zlib-rs` backend (docx/xlsx/epub DEFLATE).
+- ring           Apache-2.0 AND ISC
+    The TLS stack's cryptography (via ureq → rustls, the link.md client
+    verbs). The `ISC` term is CONJUNCTIVE — it always binds alongside
+    Apache-2.0 (ring is a BoringSSL derivative whose new code is ISC).
+- rustls-webpki  ISC
+    X.509 path validation for rustls. A single (non-OR) ISC license binds.
+- untrusted      ISC
+    ring's untrusted-input parsing helper. A single ISC license binds.
+- webpki-roots   CDLA-Permissive-2.0
+    The bundled Mozilla/CCADB root-certificate DATA rustls verifies TLS
+    against — a permissive *data* license (no copyleft, no patent traps);
+    § 2.1 requires the agreement text travel with shared copies, so it is
+    reproduced in the attribution section below.
 
 All other shipped crates resolve to MIT and/or Apache-2.0 (often as one
-branch of an `OR` expression alongside BSD/0BSD/Zlib/BSL-1.0 alternatives,
-which we discharge via the MIT/Apache branch).
+branch of an `OR` expression alongside BSD/0BSD/Zlib/BSL-1.0/ISC
+alternatives, which we discharge via the MIT/Apache branch).
 
 ============================================================
 Direct Rust dependencies (dbmd-core)
@@ -144,6 +160,35 @@ YAML crate choice: `serde_norway` (a maintained `serde_yaml` fork).
 unmaintained (RUSTSEC-2025-0068 / RUSTSEC-2025-0067). `serde_norway` and
 its `unsafe-libyaml-norway` backend carry no open advisories. Same
 MIT OR Apache-2.0 license.
+
+The link.md client transport (the `linkmd` module — the `resolve` / `sync`
+/ `grant` / `propose` / `subscribe` verbs; cargo feature `link`, default-on,
+dropped by `default-features = false`). Deterministic transport plumbing
+only: no AI/LLM, no telemetry, no auto-update — network I/O happens solely
+when a verb is explicitly invoked against a user-configured hub.
+
+- ureq             2.12.x   MIT OR Apache-2.0   — blocking HTTP client (no
+                                                  async runtime), built with
+                                                  default-features = false +
+                                                  `tls` and `gzip` only. The
+                                                  `tls` feature pulls the
+                                                  rustls stack below; `gzip`
+                                                  rides the flate2 already in
+                                                  the tree
+  (transitive: rustls `Apache-2.0 OR ISC OR MIT` — discharged via MIT;
+   rustls-pki-types, base64, url/idna + the icu_* Unicode tables
+   (MIT/Apache/Unicode-3.0, same obligations as unicode-ident above), log,
+   once_cell — MIT OR Apache-2.0; subtle, zeroize — BSD-3-Clause /
+   MIT-or-Apache; and the four call-outs above: ring `Apache-2.0 AND ISC`,
+   rustls-webpki ISC, untrusted ISC, webpki-roots CDLA-Permissive-2.0)
+
+TLS stack choice — license + portability: rustls with its `ring` provider
+is the one stack that is (a) permissively licensed end to end, (b) free of
+OpenSSL and system-TLS linkage so the released musl-static binaries carry
+their own trust store on any distro, and (c) the same stack the wider Rust
+CLI ecosystem ships. `aws-lc-rs` (the alternative provider) was excluded:
+its `aws-lc-sys` build carries OpenSSL-license portions and a cmake/C
+toolchain requirement, both of which this toolkit avoids.
 
 ============================================================
 Dev-only dependencies (not shipped in the binary)
@@ -350,6 +395,160 @@ LICENSE (Zlib, zlib-rs):
        misrepresented as being the original software.
 
     3. This notice may not be removed or altered from any source distribution.
+
+ring
+----
+- SPDX: `Apache-2.0 AND ISC`
+- Repository: https://github.com/briansmith/ring
+- Pulled in (shipped, not dev-only) transitively via ureq → rustls as the
+  TLS cryptography provider (the link.md client verbs).
+
+ring is a BoringSSL derivative: code sourced from BoringSSL carries the
+Apache-2.0 (and in places ISC) terms noted per-file upstream; ring's own
+new code is ISC. The `AND ISC` term is *conjunctive and mandatory* — it
+cannot be waived by taking Apache-2.0 alone — so ring's ISC permission
+notice is reproduced verbatim below (the crate ships it as
+LICENSE-other-bits; the Apache-2.0 half is covered by the requirements at
+the end of this file).
+
+LICENSE-other-bits (ISC, ring):
+
+    Copyright 2015-2025 Brian Smith.
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+    SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+    OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+    CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+rustls-webpki
+-------------
+- SPDX: `ISC`
+- Repository: https://github.com/rustls/webpki
+- Pulled in (shipped, not dev-only) transitively via ureq → rustls (X.509
+  certificate path validation for the link.md client's TLS).
+
+LICENSE (ISC, rustls-webpki):
+
+    Copyright 2015 Brian Smith.
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+untrusted
+---------
+- SPDX: `ISC`
+- Repository: https://github.com/briansmith/untrusted
+- Pulled in (shipped, not dev-only) transitively via ring (untrusted-input
+  parsing for the TLS stack).
+
+LICENSE.txt (ISC, untrusted):
+
+    Copyright 2015-2016 Brian Smith.
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+webpki-roots
+------------
+- SPDX: `CDLA-Permissive-2.0`
+- Repository: https://github.com/rustls/webpki-roots
+- Pulled in (shipped, not dev-only) transitively via ureq → rustls: the
+  bundled Mozilla/CCADB root-certificate DATA the link.md client verifies
+  TLS server certificates against.
+
+The Community Data License Agreement — Permissive 2.0 is a permissive DATA
+license (no copyleft, no restrictions on results). Its § 2.1 requires that
+the text of the agreement be made available with shared copies of the data,
+so it is reproduced verbatim below.
+
+LICENSE (CDLA-Permissive-2.0, webpki-roots):
+
+    Community Data License Agreement - Permissive - Version 2.0
+
+    This is the Community Data License Agreement - Permissive, Version
+    2.0 (the "agreement"). Data Provider(s) and Data Recipient(s) agree
+    as follows:
+
+    1. Provision of the Data
+
+    1.1. A Data Recipient may use, modify, and share the Data made
+    available by Data Provider(s) under this agreement if that Data
+    Recipient follows the terms of this agreement.
+
+    1.2. This agreement does not impose any restriction on a Data
+    Recipient's use, modification, or sharing of any portions of the
+    Data that are in the public domain or that may be used, modified,
+    or shared under any other legal exception or limitation.
+
+    2. Conditions for Sharing Data
+
+    2.1. A Data Recipient may share Data, with or without modifications, so
+    long as the Data Recipient makes available the text of this agreement
+    with the shared Data.
+
+    3. No Restrictions on Results
+
+    3.1. This agreement does not impose any restriction or obligations
+    with respect to the use, modification, or sharing of Results.
+
+    4. No Warranty; Limitation of Liability
+
+    4.1. All Data Recipients receive the Data subject to the following
+    terms:
+
+    THE DATA IS PROVIDED ON AN "AS IS" BASIS, WITHOUT REPRESENTATIONS,
+    WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED
+    INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OR CONDITIONS OF TITLE,
+    NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+    NO DATA PROVIDER SHALL HAVE ANY LIABILITY FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING
+    WITHOUT LIMITATION LOST PROFITS), HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE DATA OR RESULTS,
+    EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+    5. Definitions
+
+    5.1. "Data" means the material received by a Data Recipient under
+    this agreement.
+
+    5.2. "Data Provider" means any person who is the source of Data
+    provided under this agreement and in reliance on a Data Recipient's
+    agreement to its terms.
+
+    5.3. "Data Recipient" means any person who receives Data directly
+    or indirectly from a Data Provider and agrees to the terms of this
+    agreement.
+
+    5.4. "Results" means any outcome obtained by computational analysis
+    of Data, including for example machine learning models and models'
+    insights.
 
 ============================================================
 Apache-2.0 redistribution requirements

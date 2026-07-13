@@ -12,6 +12,58 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Toolkit — the link.md client verbs (format unchanged: v0.4)
+
+`dbmd` now speaks the link.md CLIENT against a hub — one binary, two specs,
+the git precedent (one binary carries both the object format and the wire
+protocol). Five new subcommands, all in `dbmd-core`'s new `linkmd` module
+(cargo feature `link`, default-on; a format-only library consumer drops it
+and its HTTP/TLS closure with `default-features = false`):
+
+- `dbmd resolve @brain[/<id>]` — the brain card, or a record by its
+  db.md ULID `id` (the reserved `@brain/id` address shape; a
+  `@brain/<store-path>.md` form also resolves) with frontmatter + body.
+- `dbmd sync @brain [--out DIR]` — pull the granted slice as plain files
+  (path-safety-gated before the first write; never deletes local files —
+  divergence is reported; rebuilds the local index catalog after) and
+  `--push`, which sends the local store as a whole-store snapshot (content
+  `.md` + `DB.md` + `assets.jsonl`; derived catalogs and local history stay
+  local; the hub's ~4 MB / 50k-file JSON caps are enforced client-side
+  before the upload).
+- `dbmd grant issue|list|revoke` — the capability model, owner-side: read
+  or write to a principal (email in v0), optional store-path-prefix scope,
+  optional `--until` expiry.
+- `dbmd propose <site> --app <slug> --body/--body-file` — write without
+  trust: evidence into a published site's inbox, landing in the owner's
+  `sources/inbox/` for their curator. Unauthenticated by design; the
+  credential is verifiably never sent through this door.
+- `dbmd subscribe @brain [--once] [--since N] [--interval S]` — follow the
+  feed head; one event line per advance (NDJSON under `--json`).
+
+Configuration is explicit and neutral — **no default hub is baked in**: the
+hub URL resolves `--hub` > `DBMD_HUB_URL` > `hub = <URL>` in the store-local
+`.dbmd/config` (a hidden toolkit file every store walk already skips); the
+credential is the `DBMD_HUB_KEY` env var only, never a file in the store.
+Non-HTTPS hubs are refused (loopback exempt for local hub development), and
+error surfaces are agent-parseable: stable machine codes (`NO_HUB`,
+`NO_CREDENTIAL`, `HUB_NOT_HTTPS`, `HUB_UNREACHABLE`, `HUB_ERROR`,
+`HUB_NOT_JSON`, `BAD_ADDRESS`, `UNSAFE_PATH`, `PUSH_TOO_LARGE`, …) on the
+existing exit-code contract (no new exit numbers).
+
+The FORMAT is untouched: SPEC.md still reserves only the `@brain/id` shape,
+a store never needs link.md to be valid db.md, and the toolkit still never
+phones home on its own — network I/O happens solely when a verb is invoked.
+
+Dependencies: `ureq` (default-features off; `tls` + `gzip`) with the rustls
+stack — pure-Rust TLS, no OpenSSL, no system TLS, so the released static
+binaries carry their own trust store. Two new (permissive) license
+identifiers entered the allowlist with it — ISC (ring, rustls-webpki,
+untrusted) and CDLA-Permissive-2.0 (webpki-roots, the CCADB root-bundle
+data) — recorded with verbatim call-outs in THIRD_PARTY_NOTICES and pinned
+by the `license_policy` test. Also: `crossbeam-epoch` lockfile-bumped
+0.9.18 → 0.9.20 (RUSTSEC-2026-0204, a pre-existing advisory via `ignore`;
+compatible-version update, no manifest change).
+
 ## [0.6.2] — 2026-07-03
 
 ### Toolkit — `validate` catches a second frontmatter block in the body (format unchanged: v0.4)

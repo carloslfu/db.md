@@ -156,6 +156,34 @@ pub enum Command {
     /// root `assets.jsonl` manifest; never transports bytes, never runs git.
     Assets(AssetsArgs),
 
+    // ── Interconnect: the link.md client ─────────────────────────────────────
+    /// Resolve an `@brain[/id]` address against a hub: a bare `@brain` returns
+    /// the brain card (metadata + index stats); `@brain/<record-id>` (or
+    /// `@brain/<store-path>.md`) returns the full record, frontmatter + body.
+    Resolve(ResolveArgs),
+
+    /// Pull the granted slice of a hosted brain to a local directory as plain
+    /// files (default), or `--push` the local store to the hub as a whole-store
+    /// snapshot. Pull never deletes local files (divergence is reported);
+    /// push replaces the hosted copy with the local one — pull first if the
+    /// hosted side may have records the local copy lacks.
+    Sync(SyncArgs),
+
+    /// Issue, list, or revoke capability grants on a brain you own. v0 grants
+    /// name a hub principal by email; scope is a store-path prefix; a scoped
+    /// grant is read-only.
+    Grant(GrantArgs),
+
+    /// Submit evidence to a published site's inbox — write without trust. The
+    /// submission lands in the owner's `sources/inbox/` (never as truth) for
+    /// their curator to accept or reject. Unauthenticated by design.
+    Propose(ProposeArgs),
+
+    /// Follow a brain's feed head: poll the hub and emit an event line each
+    /// time the feed advances (one JSON object per line under `--json`).
+    /// `--once` reads the current head and exits.
+    Subscribe(SubscribeArgs),
+
     // ── Agent bootstrap ──────────────────────────────────────────────────────
     /// Print the bundled canonical SPEC.md (compiled in at build time). The
     /// installation point: `dbmd spec` loads the standard into an agent's
@@ -837,6 +865,229 @@ pub struct AssetsStatusArgs {
 #[derive(Debug, Args)]
 pub struct AssetsPathsArgs {
     /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The link.md client verbs (resolve / sync / grant / propose / subscribe)
+//
+// Shared configuration on every verb: `--hub <URL>` beats the `DBMD_HUB_URL`
+// env var beats the `hub = <URL>` line in the store-local `.dbmd/config`;
+// there is NO default hub (the toolkit is neutral — a hub is whatever you
+// point it at). The credential is the `DBMD_HUB_KEY` env var, never a file in
+// the store. Non-HTTPS hubs are refused (loopback exempt).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd resolve <ADDRESS>` — `@brain` card or `@brain/<id>` record.
+#[derive(Debug, Args)]
+pub struct ResolveArgs {
+    /// The address: `@brain` (brain id or your slug), `@brain/<record-id>`
+    /// (lowercase ULID), or `@brain/<store-path>.md`. The `@` is optional.
+    #[arg(value_name = "ADDRESS")]
+    pub address: String,
+
+    /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+
+    /// Directory whose `.dbmd/config` supplies the hub URL when the flag and
+    /// env var are absent. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd sync <BRAIN>` — pull the granted slice; `--push` sends the local store.
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// The brain to sync with: its id (lowercase ULID) or your slug for it.
+    /// A leading `@` is accepted.
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+
+    /// Push the local store (at `--dir`) to the hub instead of pulling.
+    /// Whole-store snapshot semantics: the hosted copy becomes exactly the
+    /// local content set.
+    #[arg(long)]
+    pub push: bool,
+
+    /// Pull destination directory. Defaults to `./<slug>` (created if
+    /// missing); existing files are overwritten, never deleted.
+    #[arg(long, value_name = "DIR", conflicts_with = "push")]
+    pub out: Option<String>,
+
+    /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+
+    /// Store root: the push source, and where `.dbmd/config` is read from.
+    /// Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd grant <sub>` — the capability model, owner-side.
+#[derive(Debug, Args)]
+pub struct GrantArgs {
+    /// Which grant operation to run.
+    #[command(subcommand)]
+    pub command: GrantCommand,
+}
+
+/// The `dbmd grant` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum GrantCommand {
+    /// Issue (or refresh) a grant: `dbmd grant issue @brain someone@example.com
+    /// --can read --scope records/clients/ --until 2026-09-01`.
+    Issue(GrantIssueArgs),
+
+    /// List the active grants (and pending invites) on a brain you own.
+    List(GrantListArgs),
+
+    /// Revoke a grant (or cancel a pending invite) by its id.
+    Revoke(GrantRevokeArgs),
+}
+
+/// The two capabilities a v0 hub enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GrantCapability {
+    /// Read the granted slice.
+    Read,
+    /// Read and push (whole-store; a path-scoped grant is read-only).
+    Write,
+}
+
+/// `dbmd grant issue <BRAIN> <GRANTEE>`.
+#[derive(Debug, Args)]
+pub struct GrantIssueArgs {
+    /// The brain to grant on: its id or your slug (leading `@` accepted).
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+
+    /// The grantee — a hub principal named by email (v0; key-named grantees
+    /// arrive with the protocol's signing layer).
+    #[arg(value_name = "GRANTEE")]
+    pub grantee: String,
+
+    /// The capability to grant.
+    #[arg(long, value_enum, default_value_t = GrantCapability::Read, value_name = "CAP")]
+    pub can: GrantCapability,
+
+    /// Limit the grant to a store-path prefix (e.g. `records/clients/`).
+    /// A scoped grant is read-only.
+    #[arg(long, value_name = "PREFIX")]
+    pub scope: Option<String>,
+
+    /// Expiry as an ISO 8601 instant or date (e.g. `2026-09-01`). Absent =
+    /// until revoked.
+    #[arg(long, value_name = "ISO8601")]
+    pub until: Option<String>,
+
+    /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+
+    /// Directory whose `.dbmd/config` supplies the hub URL when the flag and
+    /// env var are absent. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd grant list <BRAIN>`.
+#[derive(Debug, Args)]
+pub struct GrantListArgs {
+    /// The brain whose grants to list (id or your slug; leading `@` accepted).
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+
+    /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+
+    /// Directory whose `.dbmd/config` supplies the hub URL when the flag and
+    /// env var are absent. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd grant revoke <BRAIN> <GRANT_ID>`.
+#[derive(Debug, Args)]
+pub struct GrantRevokeArgs {
+    /// The brain the grant lives on (id or your slug; leading `@` accepted).
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+
+    /// The grant (or pending-invite) id to revoke, from `grant list`.
+    #[arg(value_name = "GRANT_ID")]
+    pub grant_id: String,
+
+    /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+
+    /// Directory whose `.dbmd/config` supplies the hub URL when the flag and
+    /// env var are absent. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd propose <SITE> --app <SLUG>` — evidence into a published inbox.
+#[derive(Debug, Args)]
+pub struct ProposeArgs {
+    /// The published site handle to propose to (leading `@` accepted).
+    #[arg(value_name = "SITE")]
+    pub site: String,
+
+    /// The site's app page that accepts submissions (a published page
+    /// declaring the `write-inbox` capability).
+    #[arg(long, value_name = "SLUG")]
+    pub app: String,
+
+    /// The submission text, inline.
+    #[arg(long, value_name = "TEXT", conflicts_with = "body_file")]
+    pub body: Option<String>,
+
+    /// Read the submission text from this file (e.g. a record to propose).
+    #[arg(long, value_name = "PATH")]
+    pub body_file: Option<String>,
+
+    /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+
+    /// Directory whose `.dbmd/config` supplies the hub URL when the flag and
+    /// env var are absent. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd subscribe <BRAIN>` — follow the feed head.
+#[derive(Debug, Args)]
+pub struct SubscribeArgs {
+    /// The brain to follow: its id or your slug (leading `@` accepted).
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+
+    /// Baseline sequence: emit an event only when the head moves past this.
+    /// Defaults to the head observed on the first poll.
+    #[arg(long, value_name = "SEQ")]
+    pub since: Option<u64>,
+
+    /// Seconds between polls (the hub serves head reads cheaply; stay
+    /// polite). Minimum 1.
+    #[arg(long, value_name = "SECS", default_value_t = 30)]
+    pub interval: u64,
+
+    /// Read the current head once, report it, and exit (no loop).
+    #[arg(long)]
+    pub once: bool,
+
+    /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+
+    /// Directory whose `.dbmd/config` supplies the hub URL when the flag and
+    /// env var are absent. Defaults to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub dir: String,
 }

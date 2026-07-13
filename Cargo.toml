@@ -22,7 +22,8 @@ authors = ["Carlos Galarza"]
 
 # Shared dependency versions pinned once for the whole workspace.
 # Licenses are recorded in THIRD_PARTY_NOTICES (permissive only — MIT /
-# Apache-2.0 / BSD-2/3-Clause+0BSD / Unlicense / MPL-2.0 / Zlib / Unicode-3.0;
+# Apache-2.0 / BSD-2/3-Clause+0BSD / Unlicense / MPL-2.0 / Zlib / Unicode-3.0 /
+# ISC / CDLA-Permissive-2.0;
 # no GPL/AGPL/LGPL-static, and zero AI/LLM deps). The full allowlist and the
 # shipped crates that carry the non-MIT/Apache terms (Unicode-3.0, BSD-3-Clause,
 # Zlib) are enumerated in THIRD_PARTY_NOTICES and enforced by the
@@ -65,6 +66,18 @@ quick-xml = "0.41"        # docx/epub OOXML + XHTML parse (MIT); 0.41 fixes RUST
 # so zip 8.x's 1.88 requirement is no longer the blocker; bumping it is a
 # separate, unneeded change.)
 zip = { version = "7.2", default-features = false, features = ["deflate"] }
+# HTTP client for the link.md client verbs (dbmd-core's `linkmd` module,
+# feature `link`, default-on; a format-only library consumer opts out with
+# default-features = false). Blocking, rustls-based TLS (no OpenSSL, no system
+# TLS) so the released static binaries carry their own trust stack on every
+# distro. ureq itself is MIT OR Apache-2.0; its TLS closure adds ring
+# (`Apache-2.0 AND ISC`), rustls-webpki + untrusted (ISC), and webpki-roots
+# (CDLA-Permissive-2.0, the CCADB root-bundle data license) — all permissive,
+# all on the allowlist, all recorded with call-outs in THIRD_PARTY_NOTICES.
+# Zero AI/LLM: this is transport plumbing, and the toolkit still never phones
+# home on its own (no telemetry, no auto-update) — network I/O happens only
+# when a link verb is explicitly invoked against a hub the user configured.
+ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
 tempfile = "3"
 insta = "1"
 assert_cmd = "2"

@@ -43,6 +43,19 @@ calamine = { workspace = true }
 html2text = { workspace = true }
 quick-xml = { workspace = true }
 zip = { workspace = true }
+# The link.md client transport (`linkmd` module, feature `link`). Optional so
+# a format-only consumer can drop the HTTP/TLS closure with
+# `default-features = false`; the `dbmd` binary ships with it on.
+ureq = { workspace = true, optional = true }
+
+[features]
+# `link` = the link.md client verbs (resolve / sync / grant / propose /
+# subscribe) — the `linkmd` module and its HTTP transport. Default-on so the
+# shipped `dbmd` binary and `cargo test --workspace` cover it; library
+# consumers who want only the db.md FORMAT toolkit opt out with
+# `default-features = false` (the store never needs link.md to be valid db.md).
+default = ["link"]
+link = ["dep:ureq"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

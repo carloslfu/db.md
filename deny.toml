@@ -53,6 +53,17 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "Unicode-3.0",
+    # ISC entered with the link.md client's TLS stack (ureq → rustls):
+    # rustls-webpki + untrusted are plain ISC, and ring is `Apache-2.0 AND ISC`
+    # (conjunctive — the ISC term always binds). ISC is functionally
+    # MIT-equivalent (OpenBSD's license of choice); the call-outs live in
+    # THIRD_PARTY_NOTICES.
+    "ISC",
+    # webpki-roots — the bundled Mozilla/CCADB root-certificate DATA the TLS
+    # stack verifies against — ships under CDLA-Permissive-2.0, a permissive
+    # data license (no copyleft, no patent traps). Recorded with a call-out in
+    # THIRD_PARTY_NOTICES.
+    "CDLA-Permissive-2.0",
 ]
 # Crates that publish no SPDX `license` field must be confirmed by hash here.
 # Empty: every crate in the current graph carries a recognized SPDX expression.
