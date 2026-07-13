@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::cli::{GrantArgs, GrantCapability, GrantCommand};
 use crate::context::Context;
 use crate::error::CliResult;
+use crate::sanitize::sanitize;
 
 /// Run `dbmd grant`.
 pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
@@ -34,28 +35,30 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                 return Ok(());
             }
             // 202-pending (no account yet — an invite was parked) vs 201-granted.
+            // Every string below is hub-authored → terminal-sanitized.
             let pending = body
                 .get("pending")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let cap = body
-                .get("capability")
-                .and_then(Value::as_str)
-                .unwrap_or(capability(a.can).as_str());
+            let cap = sanitize(
+                body.get("capability")
+                    .and_then(Value::as_str)
+                    .unwrap_or(capability(a.can).as_str()),
+            );
             if pending {
                 println!(
                     "invited {} ({cap}) — the grant activates when they sign up",
                     a.grantee
                 );
             } else {
-                let id = body.get("id").and_then(Value::as_str).unwrap_or("?");
+                let id = sanitize(body.get("id").and_then(Value::as_str).unwrap_or("?"));
                 println!("granted {cap} to {} (grant {id})", a.grantee);
             }
             if let Some(scope) = body.get("scopePrefix").and_then(Value::as_str) {
-                println!("scope: {scope}");
+                println!("scope: {}", sanitize(scope));
             }
             if let Some(until) = body.get("expiresAt").and_then(Value::as_str) {
-                println!("expires: {until}");
+                println!("expires: {}", sanitize(until));
             }
             Ok(())
         }
@@ -81,28 +84,31 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                 println!("no grants");
                 return Ok(());
             }
+            // Every field is hub-authored → terminal-sanitized on the way out.
+            let field =
+                |v: &Value, key: &str| sanitize(v.get(key).and_then(Value::as_str).unwrap_or("?"));
             for g in &grants {
                 println!(
                     "{}  {}  {}{}{}",
-                    g.get("id").and_then(Value::as_str).unwrap_or("?"),
-                    g.get("capability").and_then(Value::as_str).unwrap_or("?"),
-                    g.get("email").and_then(Value::as_str).unwrap_or("?"),
+                    field(g, "id"),
+                    field(g, "capability"),
+                    field(g, "email"),
                     g.get("scopePrefix")
                         .and_then(Value::as_str)
-                        .map(|s| format!("  scope={s}"))
+                        .map(|s| format!("  scope={}", sanitize(s)))
                         .unwrap_or_default(),
                     g.get("expiresAt")
                         .and_then(Value::as_str)
-                        .map(|s| format!("  until={s}"))
+                        .map(|s| format!("  until={}", sanitize(s)))
                         .unwrap_or_default(),
                 );
             }
             for i in &invites {
                 println!(
                     "{}  {}  {}  (invited, pending signup)",
-                    i.get("id").and_then(Value::as_str).unwrap_or("?"),
-                    i.get("capability").and_then(Value::as_str).unwrap_or("?"),
-                    i.get("email").and_then(Value::as_str).unwrap_or("?"),
+                    field(i, "id"),
+                    field(i, "capability"),
+                    field(i, "email"),
                 );
             }
             Ok(())

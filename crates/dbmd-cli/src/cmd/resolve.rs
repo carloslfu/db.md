@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::cli::ResolveArgs;
 use crate::context::Context;
 use crate::error::CliResult;
+use crate::sanitize::sanitize;
 
 /// Run `dbmd resolve`.
 pub fn run(ctx: &Context, args: &ResolveArgs) -> CliResult {
@@ -58,6 +59,10 @@ pub fn run(ctx: &Context, args: &ResolveArgs) -> CliResult {
                 print_field(doc, "type", "type");
                 print_field(doc, "summary", "summary");
                 if let Some(text) = doc.get("body").and_then(Value::as_str) {
+                    // Hub-authored text: strip terminal control sequences
+                    // before it reaches a human terminal (`--json` above
+                    // returned the verbatim body already).
+                    let text = sanitize(text);
                     println!();
                     print!("{text}");
                     if !text.ends_with('\n') {
@@ -70,11 +75,12 @@ pub fn run(ctx: &Context, args: &ResolveArgs) -> CliResult {
     Ok(())
 }
 
-/// Print `label: <string value>` when the field is a non-empty string.
+/// Print `label: <string value>` when the field is a non-empty string. The
+/// value is hub-authored, so it is terminal-sanitized on the way out.
 fn print_field(v: &Value, key: &str, label: &str) {
     if let Some(s) = v.get(key).and_then(Value::as_str) {
         if !s.is_empty() {
-            println!("{label}: {s}");
+            println!("{label}: {}", sanitize(s));
         }
     }
 }

@@ -83,6 +83,12 @@ const MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
 /// The hub's per-push file-count cap, mirrored client-side.
 const MAX_PUSH_FILES: usize = 50_000;
 
+/// The hub's inbox cap on one `propose` submission body, mirrored client-side
+/// so an oversized body fails before the upload, not after (the same
+/// fail-before-upload contract as the push caps). Public so the CLI can
+/// pre-check a `--body-file` from file metadata without reading it.
+pub const MAX_PROPOSE_BYTES: u64 = 16 * 1024;
+
 /// Bounded connect so a dead hub fails fast; a generous read window so a
 /// large export on a slow link still completes.
 const CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -162,6 +168,15 @@ pub enum LinkError {
         reason: String,
     },
 
+    /// A grant id whose shape cannot travel as a URL path segment.
+    #[error(
+        "invalid grant id `{given}` — grant ids come from `grant list` (lowercase letters, digits, hyphens)"
+    )]
+    BadGrantId {
+        /// The raw id as typed.
+        given: String,
+    },
+
     /// An exported file path that would escape or pollute the destination
     /// (absolute, `..`, a dot-leading segment, or an illegal character). The
     /// hub is not trusted with local path layout.
@@ -179,6 +194,16 @@ pub enum LinkError {
     PushTooLarge {
         /// Which cap was hit, human-readable.
         detail: String,
+    },
+
+    /// The propose body exceeds the hub's inbox cap.
+    #[error(
+        "propose body too large ({bytes} bytes) — the hub's inbox caps one submission at {} KB",
+        MAX_PROPOSE_BYTES / 1024
+    )]
+    ProposeTooLarge {
+        /// The offending body size in bytes.
+        bytes: u64,
     },
 
     /// A store file that is not valid UTF-8 cannot travel the JSON push path.
@@ -214,6 +239,16 @@ pub enum AddressTarget {
     /// shape; unambiguous because a ULID is never a path.
     Path(String),
 }
+
+/// Why a brain reference failed [`is_safe_ref`] — shared by [`Address::parse`]
+/// and the per-verb entry gates so the two surfaces never drift.
+const BAD_BRAIN_REASON: &str =
+    "the brain reference must be a brain id (lowercase ULID) or a slug (lowercase letters, digits, hyphens)";
+
+/// Why an address target failed its shape check — shared by [`Address::parse`]
+/// and the [`resolve`] entry gate.
+const BAD_TARGET_REASON: &str =
+    "the part after `/` must be a record id (lowercase ULID) or a store-relative `.md` path";
 
 /// A parsed `@brain[/target]` address. `brain` is a hub brain reference — the
 /// brain's ULID id (works for any caller, including cross-party on a public
@@ -252,9 +287,7 @@ impl Address {
             return Err(bad("missing brain reference before `/`"));
         }
         if !is_safe_ref(brain) {
-            return Err(bad(
-                "the brain reference must be a brain id (lowercase ULID) or a slug (lowercase letters, digits, hyphens)",
-            ));
+            return Err(bad(BAD_BRAIN_REASON));
         }
 
         let target = match rest {
@@ -263,9 +296,7 @@ impl Address {
             Some(r) if crate::ulid::is_ulid(r) => Some(AddressTarget::Id(r.to_string())),
             Some(r) => {
                 if !safe_store_rel_path(r) || !r.ends_with(".md") {
-                    return Err(bad(
-                        "the part after `/` must be a record id (lowercase ULID) or a store-relative `.md` path",
-                    ));
+                    return Err(bad(BAD_TARGET_REASON));
                 }
                 Some(AddressTarget::Path(r.to_string()))
             }
@@ -310,6 +341,49 @@ pub fn safe_store_rel_path(p: &str) -> bool {
     }
     p.split('/')
         .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.starts_with('.'))
+}
+
+/// Entry gate for every verb that embeds a caller-supplied brain reference in
+/// a URL path segment. `resolve` reaches the same check through
+/// [`Address::parse`]; the raw-ref verbs (`sync`, `grant`, `subscribe`) call
+/// this directly, so a ref carrying `/`, `..`, `?`, `#`, or any other
+/// URL-reshaping byte is refused before a request exists (the `url` crate
+/// normalizes dot segments, so an unvalidated ref would redirect the
+/// authenticated request to a different hub path).
+fn require_safe_ref(brain: &str) -> LinkResult<()> {
+    if is_safe_ref(brain) {
+        Ok(())
+    } else {
+        Err(LinkError::BadAddress {
+            given: brain.to_string(),
+            reason: BAD_BRAIN_REASON.to_string(),
+        })
+    }
+}
+
+/// Entry gate for the published-site handle `propose` embeds in its URL path.
+fn require_valid_handle(handle: &str) -> LinkResult<()> {
+    if is_valid_handle(handle) {
+        Ok(())
+    } else {
+        Err(LinkError::BadAddress {
+            given: handle.to_string(),
+            reason: "the site handle must be lowercase letters, digits, hyphens".to_string(),
+        })
+    }
+}
+
+/// Entry gate for the grant id `grant revoke` embeds in its URL path. Hub
+/// grant ids are lowercase ULIDs; the gate accepts the same URL-path-clean
+/// shape as a brain ref rather than pinning one mint scheme.
+fn require_safe_grant_id(id: &str) -> LinkResult<()> {
+    if is_safe_ref(id) {
+        Ok(())
+    } else {
+        Err(LinkError::BadGrantId {
+            given: id.to_string(),
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,7 +471,9 @@ fn assert_safe_hub(hub: &str) -> LinkResult<()> {
         None => hostport.split(':').next().unwrap_or(""),
     };
     let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
-    if scheme == "https" || loopback {
+    // Scheme matching is case-insensitive (RFC 3986): an uppercase-scheme
+    // HTTPS hub is still HTTPS, not a cleartext refusal.
+    if scheme.eq_ignore_ascii_case("https") || loopback {
         Ok(())
     } else {
         Err(LinkError::UnsafeHub {
@@ -538,6 +614,23 @@ fn ensure_ok(r: HubResponse, what: &'static str) -> LinkResult<Value> {
 /// signing layer). `@brain/<id>` and `@brain/<path>.md` return the full
 /// record, frontmatter + body.
 pub fn resolve(cfg: &HubConfig, addr: &Address) -> LinkResult<Value> {
+    // `Address::parse` refuses these shapes already, but `Address` has public
+    // fields — re-assert at the wire so a hand-built address can never
+    // reshape the request path.
+    require_safe_ref(&addr.brain)?;
+    if let Some(target) = &addr.target {
+        let (given, ok) = match target {
+            AddressTarget::Id(id) => (id, crate::ulid::is_ulid(id)),
+            AddressTarget::Path(p) => (p, safe_store_rel_path(p) && p.ends_with(".md")),
+        };
+        if !ok {
+            return Err(LinkError::BadAddress {
+                given: given.clone(),
+                reason: BAD_TARGET_REASON.to_string(),
+            });
+        }
+    }
+
     let path = match &addr.target {
         None => format!("/api/hub/brains/{}", addr.brain),
         Some(AddressTarget::Id(id)) => {
@@ -580,6 +673,7 @@ pub struct PullReport {
 /// *reported* in `extra_local` instead). Returns the report; rebuilding the
 /// local index catalog afterwards is the caller's (cheap, optional) step.
 pub fn sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult<PullReport> {
+    require_safe_ref(brain)?;
     let path = format!("/api/hub/brains/{brain}/export");
     let body = ensure_ok(
         request(cfg, "GET", &path, None, Auth::Required)?,
@@ -704,6 +798,7 @@ pub fn collect_push_files(store: &Store) -> LinkResult<Vec<(String, String)>> {
 /// mirror the hub's JSON-path limits so an oversized push fails before the
 /// upload.
 pub fn sync_push(cfg: &HubConfig, brain: &str, files: &[(String, String)]) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
     if files.len() > MAX_PUSH_FILES {
         return Err(LinkError::PushTooLarge {
             detail: format!("{} files", files.len()),
@@ -768,6 +863,7 @@ pub fn grant_issue(
     scope: Option<&str>,
     until: Option<&str>,
 ) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
     let mut body = json!({
         "email": grantee,
         "capability": can.as_str(),
@@ -787,6 +883,7 @@ pub fn grant_issue(
 
 /// List the active grants (and pending invites) on `brain`. Owner-side.
 pub fn grant_list(cfg: &HubConfig, brain: &str) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
     let path = format!("/api/hub/brains/{brain}/grants");
     ensure_ok(
         request(cfg, "GET", &path, None, Auth::Required)?,
@@ -797,6 +894,8 @@ pub fn grant_list(cfg: &HubConfig, brain: &str) -> LinkResult<Value> {
 /// Revoke a grant (or cancel a pending invite) by id. Owner-side; revocation
 /// is soft on the hub (the audit trail survives).
 pub fn grant_revoke(cfg: &HubConfig, brain: &str, grant_id: &str) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
+    require_safe_grant_id(grant_id)?;
     let path = format!("/api/hub/brains/{brain}/grants/{grant_id}");
     ensure_ok(
         request(cfg, "DELETE", &path, None, Auth::Required)?,
@@ -815,6 +914,12 @@ pub fn grant_revoke(cfg: &HubConfig, brain: &str, grant_id: &str) -> LinkResult<
 /// owner's curator accepts or rejects it. Returns the hub's `{id, path}`
 /// receipt.
 pub fn propose(cfg: &HubConfig, handle: &str, app: &str, body: &str) -> LinkResult<Value> {
+    require_valid_handle(handle)?;
+    if body.len() as u64 > MAX_PROPOSE_BYTES {
+        return Err(LinkError::ProposeTooLarge {
+            bytes: body.len() as u64,
+        });
+    }
     let payload = json!({ "app": app, "body": body });
     let path = format!("/api/hub/sites/{handle}/inbox");
     ensure_ok(
@@ -843,6 +948,7 @@ pub struct Head {
 /// not yet serve per-entry feed reads, so v0 subscription is head-movement
 /// detection — the caller re-pulls (or re-queries) on advance.
 pub fn head(cfg: &HubConfig, brain: &str) -> LinkResult<Head> {
+    require_safe_ref(brain)?;
     let path = format!("/api/hub/brains/{brain}");
     let body = ensure_ok(
         request(cfg, "GET", &path, None, Auth::Required)?,
@@ -983,6 +1089,19 @@ mod tests {
     }
 
     #[test]
+    fn https_guard_matches_the_scheme_case_insensitively() {
+        // RFC 3986 schemes are case-insensitive: an uppercase-scheme HTTPS
+        // hub is still HTTPS, never a misleading non-HTTPS refusal.
+        assert!(assert_safe_hub("HTTPS://hub.example.com").is_ok());
+        assert!(assert_safe_hub("Https://hub.example.com").is_ok());
+        // And an uppercase plain-HTTP hub is still refused outside loopback.
+        assert!(matches!(
+            assert_safe_hub("HTTP://hub.example.com"),
+            Err(LinkError::UnsafeHub { .. })
+        ));
+    }
+
+    #[test]
     fn clean_key_refuses_paste_artifacts_without_echoing() {
         assert_eq!(clean_key("  vc_account_abc  ").unwrap(), "vc_account_abc");
         for bad in ["vc account", "vc\naccount", "ключ", ""] {
@@ -991,6 +1110,136 @@ mod tests {
             assert!(
                 !err.to_string().contains(bad.trim()) || bad.trim().is_empty(),
                 "error must not echo the key"
+            );
+        }
+    }
+
+    // ── Verb entry gates: refs must never reshape the request path ──────────
+
+    /// A config whose hub passes the loopback guard but is never listened on:
+    /// every refusal below must come from the entry gate BEFORE a request
+    /// exists — a dial on this dead port would surface `Transport` instead.
+    fn dead_hub() -> HubConfig {
+        HubConfig {
+            hub: "http://127.0.0.1:9".to_string(),
+            key: Some("k".to_string()),
+        }
+    }
+
+    #[test]
+    fn verb_entry_gates_accept_the_hub_ref_shapes() {
+        for ok in ["acme-ops", "a", "01j5qc3v9k4ym8rwbn2tqe6f7d"] {
+            assert!(require_safe_ref(ok).is_ok(), "brain ref {ok:?}");
+            assert!(require_valid_handle(ok).is_ok(), "handle {ok:?}");
+            assert!(require_safe_grant_id(ok).is_ok(), "grant id {ok:?}");
+        }
+    }
+
+    #[test]
+    fn raw_ref_verbs_refuse_url_reshaping_brain_refs_before_any_request() {
+        let cfg = dead_hub();
+        for bad in ["../up", "a/b", "a?x=1", "a#frag", "a%2e%2e", "A", "a b", ""] {
+            assert!(
+                matches!(
+                    sync_pull(&cfg, bad, None),
+                    Err(LinkError::BadAddress { .. })
+                ),
+                "sync_pull must refuse {bad:?}"
+            );
+            assert!(
+                matches!(sync_push(&cfg, bad, &[]), Err(LinkError::BadAddress { .. })),
+                "sync_push must refuse {bad:?}"
+            );
+            assert!(
+                matches!(
+                    grant_issue(&cfg, bad, "maya@example.com", Capability::Read, None, None),
+                    Err(LinkError::BadAddress { .. })
+                ),
+                "grant_issue must refuse {bad:?}"
+            );
+            assert!(
+                matches!(grant_list(&cfg, bad), Err(LinkError::BadAddress { .. })),
+                "grant_list must refuse {bad:?}"
+            );
+            assert!(
+                matches!(
+                    grant_revoke(&cfg, bad, "01j5qc3v9k4ym8rwbn2tqe6f7f"),
+                    Err(LinkError::BadAddress { .. })
+                ),
+                "grant_revoke must refuse brain {bad:?}"
+            );
+            assert!(
+                matches!(head(&cfg, bad), Err(LinkError::BadAddress { .. })),
+                "head must refuse {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_revoke_refuses_url_reshaping_grant_ids() {
+        let cfg = dead_hub();
+        for bad in ["../01j", "a/b", "id?x=1", "id#frag", "ID", ""] {
+            assert!(
+                matches!(
+                    grant_revoke(&cfg, "acme", bad),
+                    Err(LinkError::BadGrantId { .. })
+                ),
+                "grant_revoke must refuse grant id {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn propose_refuses_url_reshaping_handles_and_oversize_bodies_before_upload() {
+        let cfg = dead_hub();
+        for bad in ["../up", "a/b", "a?x=1", "a#frag", "A", ""] {
+            assert!(
+                matches!(
+                    propose(&cfg, bad, "intake", "hi"),
+                    Err(LinkError::BadAddress { .. })
+                ),
+                "propose must refuse handle {bad:?}"
+            );
+        }
+        let oversize = "a".repeat(MAX_PROPOSE_BYTES as usize + 1);
+        assert!(matches!(
+            propose(&cfg, "acme-site", "intake", &oversize),
+            Err(LinkError::ProposeTooLarge { .. })
+        ));
+        // A clean handle + in-cap body passes both gates: the failure is now
+        // the (dead) wire, proving the gates refuse shape, not the verb.
+        assert!(matches!(
+            propose(&cfg, "acme-site", "intake", "hi"),
+            Err(LinkError::Transport { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_refuses_a_hand_built_unsafe_address() {
+        let cfg = dead_hub();
+        for brain in ["../up", "a/b", "a?x", "a#f"] {
+            let addr = Address {
+                brain: brain.to_string(),
+                target: None,
+            };
+            assert!(
+                matches!(resolve(&cfg, &addr), Err(LinkError::BadAddress { .. })),
+                "resolve must refuse brain {brain:?}"
+            );
+        }
+        for target in [
+            AddressTarget::Id("01j5qc3v9k4ym8rwbn2tqe6f7d?id=other".to_string()),
+            AddressTarget::Id("01J5QC3V9K4YM8RWBN2TQE6F7D".to_string()), // not the minted shape
+            AddressTarget::Path("../up.md".to_string()),
+            AddressTarget::Path("records/x.md#frag".to_string()),
+        ] {
+            let addr = Address {
+                brain: "acme".to_string(),
+                target: Some(target.clone()),
+            };
+            assert!(
+                matches!(resolve(&cfg, &addr), Err(LinkError::BadAddress { .. })),
+                "resolve must refuse target {target:?}"
             );
         }
     }

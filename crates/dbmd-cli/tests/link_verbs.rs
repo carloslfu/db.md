@@ -758,6 +758,191 @@ fn subscribe_once_reports_the_current_head_as_one_json_line() {
     hub.finish();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hardening: refs never reshape the request path; hub strings never reach the
+// terminal raw; oversize propose bodies never reach the wire
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A dead loopback hub: it passes the HTTPS guard, but any DIAL surfaces
+/// `HUB_UNREACHABLE` — so a shape refusal proves the gate fired before a
+/// request existed.
+const DEAD_HUB: &str = "http://127.0.0.1:9";
+
+#[test]
+fn every_verb_refuses_url_reshaping_refs_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    seed_store(store.path());
+
+    for bad in ["../up", "a/b", "a?x=1", "a#frag"] {
+        for (cwd, args) in [
+            (dir.path(), vec!["sync", bad, "--json"]),
+            (store.path(), vec!["sync", bad, "--push", "--json"]),
+            (
+                dir.path(),
+                vec!["grant", "issue", bad, "maya@example.com", "--json"],
+            ),
+            (dir.path(), vec!["grant", "list", bad, "--json"]),
+            (
+                dir.path(),
+                vec!["grant", "revoke", bad, RECORD_ID, "--json"],
+            ),
+            (
+                dir.path(),
+                vec!["propose", bad, "--app", "intake", "--body", "x", "--json"],
+            ),
+            (dir.path(), vec!["subscribe", bad, "--once", "--json"]),
+        ] {
+            let out = run_dbmd(cwd, &args, Some(DEAD_HUB), Some("k"));
+            assert_eq!(
+                out.code,
+                Some(1),
+                "args {args:?} ref {bad:?}: {}",
+                out.stderr
+            );
+            assert_eq!(
+                error_code(&out.stderr),
+                "BAD_ADDRESS",
+                "args {args:?} ref {bad:?}: {}",
+                out.stderr
+            );
+        }
+
+        // The grant id travels as its own path segment and is gated with its
+        // own machine code.
+        let out = run_dbmd(
+            dir.path(),
+            &["grant", "revoke", "acme", bad, "--json"],
+            Some(DEAD_HUB),
+            Some("k"),
+        );
+        assert_eq!(out.code, Some(1), "grant id {bad:?}: {}", out.stderr);
+        assert_eq!(
+            error_code(&out.stderr),
+            "BAD_GRANT_ID",
+            "grant id {bad:?}: {}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn propose_body_file_over_the_inbox_cap_fails_before_the_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.md");
+    std::fs::write(
+        &big,
+        vec![b'a'; dbmd_core::linkmd::MAX_PROPOSE_BYTES as usize + 1],
+    )
+    .unwrap();
+
+    // Dead hub: reaching the wire would surface HUB_UNREACHABLE, so
+    // PROPOSE_TOO_LARGE proves the refusal happened before the upload — and
+    // before the file was even read (the check runs on metadata).
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "propose",
+            "@acme-site",
+            "--app",
+            "intake",
+            "--body-file",
+            big.to_str().unwrap(),
+            "--json",
+        ],
+        Some(DEAD_HUB),
+        None,
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(error_code(&out.stderr), "PROPOSE_TOO_LARGE");
+    assert!(
+        out.stderr.contains("16 KB"),
+        "the message must name the cap: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn hub_strings_render_terminal_sanitized_in_text_mode_and_verbatim_in_json() {
+    // The summary and body carry an ANSI escape sequence and a BEL: text mode
+    // strips them; `--json` is a machine surface and stays byte-verbatim.
+    let doc = format!(
+        "{{\"brain\":\"{BRAIN_ID}\",\"document\":{{\"path\":\"records/clients/lumio.md\",\"id\":\"{RECORD_ID}\",\"type\":\"client\",\"summary\":\"\\u001b[31mEVIL\\u0007summary\",\"body\":\"# Lumio\\u001b[2J\\u0007 ok\\n\"}}}}"
+    );
+    let hub = MockHub::serve(vec![(200, doc.clone()), (200, doc)]);
+    let dir = tempfile::tempdir().unwrap();
+    let addr = format!("@{BRAIN_ID}/{RECORD_ID}");
+
+    let text = run_dbmd(dir.path(), &["resolve", &addr], Some(&hub.url), Some("k"));
+    assert_eq!(text.code, Some(0), "stderr: {}", text.stderr);
+    assert!(
+        text.stdout.contains("summary: EVILsummary"),
+        "stdout: {:?}",
+        text.stdout
+    );
+    assert!(
+        text.stdout.contains("# Lumio ok"),
+        "stdout: {:?}",
+        text.stdout
+    );
+    assert!(
+        !text.stdout.contains('\u{1b}') && !text.stdout.contains('\u{7}'),
+        "text mode must strip control bytes: {:?}",
+        text.stdout
+    );
+
+    let json = run_dbmd(
+        dir.path(),
+        &["resolve", &addr, "--json"],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(json.code, Some(0), "stderr: {}", json.stderr);
+    let v: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(
+        v["document"]["summary"], "\u{1b}[31mEVIL\u{7}summary",
+        "--json must stay verbatim"
+    );
+
+    hub.finish();
+}
+
+#[test]
+fn hub_error_messages_render_terminal_sanitized_in_text_mode() {
+    let error_body = "{\"error\":\"\\u001b[2Jboom\\u0007\",\"code\":\"kaboom\"}".to_string();
+    let hub = MockHub::serve(vec![(500, error_body.clone()), (500, error_body)]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let text = run_dbmd(dir.path(), &["resolve", "@acme"], Some(&hub.url), Some("k"));
+    assert_eq!(text.code, Some(1));
+    assert!(text.stderr.contains("boom"), "stderr: {:?}", text.stderr);
+    assert!(
+        !text.stderr.contains('\u{1b}') && !text.stderr.contains('\u{7}'),
+        "text-mode errors must strip control bytes: {:?}",
+        text.stderr
+    );
+
+    let json = run_dbmd(
+        dir.path(),
+        &["resolve", "@acme", "--json"],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(json.code, Some(1));
+    let v: serde_json::Value =
+        serde_json::from_str(json.stderr.lines().next().unwrap_or("{}")).unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains('\u{1b}'),
+        "--json errors must stay verbatim: {:?}",
+        json.stderr
+    );
+
+    hub.finish();
+}
+
 #[test]
 fn subscribe_once_with_since_reports_head_against_the_baseline() {
     let hub = MockHub::serve(vec![(

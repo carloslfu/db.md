@@ -30,6 +30,7 @@ mod cli;
 mod cmd;
 mod context;
 mod error;
+mod sanitize;
 
 use clap::Parser;
 
@@ -133,11 +134,15 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
 fn emit_error(ctx: &Context, err: &CliError) {
     if ctx.json {
         // Compact, one-line JSON so callers can parse stderr line-by-line.
+        // Verbatim: JSON string encoding neutralizes control bytes itself.
         eprintln!("{}", err.to_json());
     } else {
-        eprintln!("dbmd: {}", err.message);
+        // Error text can carry hub-authored strings (the hub's own `error`
+        // message, its machine `code` in the hint) — strip terminal control
+        // sequences before they reach a human terminal.
+        eprintln!("dbmd: {}", sanitize::sanitize(&err.message));
         if let Some(hint) = &err.hint {
-            eprintln!("  hint: {hint}");
+            eprintln!("  hint: {}", sanitize::sanitize(hint));
         }
     }
 }

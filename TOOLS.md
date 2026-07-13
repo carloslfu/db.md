@@ -115,6 +115,9 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 
 ### Interconnect (the link.md client)
 
+Unreleased: these five verbs are on `main` and not yet in the released
+v0.6.2 binary; they ship with the next toolkit release.
+
 One binary, two specs: `dbmd` also speaks the link.md client verbs
 against a hub — a server that hosts, indexes, and serves db.md stores.
 The db.md FORMAT is untouched (SPEC.md reserves only the `@brain/id`

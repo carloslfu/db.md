@@ -201,8 +201,13 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
                 .with_hint(
                     "addresses are `@brain`, `@brain/<record-id>`, or `@brain/<store-path>.md`",
                 ),
+            L::BadGrantId { .. } => CliError::new(ExitCode::Runtime, "BAD_GRANT_ID", message)
+                .with_hint("copy the id from `dbmd grant list <brain>`"),
             L::UnsafePath { .. } => CliError::new(ExitCode::Runtime, "UNSAFE_PATH", message),
             L::PushTooLarge { .. } => CliError::new(ExitCode::Runtime, "PUSH_TOO_LARGE", message),
+            L::ProposeTooLarge { .. } => {
+                CliError::new(ExitCode::Runtime, "PROPOSE_TOO_LARGE", message)
+            }
             L::NotUtf8 { .. } => CliError::new(ExitCode::Runtime, "NOT_UTF8", message),
             L::Io(_) => CliError::new(ExitCode::Runtime, "IO_ERROR", message),
             L::Store(_) => CliError::new(ExitCode::Runtime, "STORE_ERROR", message),

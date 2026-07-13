@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use crate::cli::SyncArgs;
 use crate::context::Context;
 use crate::error::CliResult;
+use crate::sanitize::sanitize;
 
 /// Run `dbmd sync`.
 pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
@@ -66,7 +67,9 @@ fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) 
         report.files,
         if report.files == 1 { "" } else { "s" },
         report.head_seq,
-        report.dest,
+        // Without --out the destination derives from the hub's slug —
+        // hub-authored, so terminal-sanitized.
+        sanitize(&report.dest),
     );
     if let Some(n) = index_note {
         println!("index: {n}");

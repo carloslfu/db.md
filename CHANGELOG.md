@@ -50,6 +50,20 @@ error surfaces are agent-parseable: stable machine codes (`NO_HUB`,
 `HUB_NOT_JSON`, `BAD_ADDRESS`, `UNSAFE_PATH`, `PUSH_TOO_LARGE`, …) on the
 existing exit-code contract (no new exit numbers).
 
+A pre-release adversarial pass hardened the client surface before it ships:
+every caller-supplied ref that travels as a URL path segment — the brain
+ref on `sync` / `grant` / `subscribe`, the site handle on `propose`, the
+grant id on `grant revoke` — is shape-validated at the library entry, so a
+ref carrying `/`, `..`, `?`, or `#` is refused (`BAD_ADDRESS`,
+`BAD_GRANT_ID`) before any request exists; the HTTPS-or-loopback guard
+matches the scheme case-insensitively (an `HTTPS://` hub no longer draws a
+misleading non-HTTPS refusal); hub-sourced strings (record bodies, names,
+grant fields, error messages) are stripped of ANSI/C0 terminal control
+sequences in text output — `--json` stays byte-verbatim; and
+`propose --body-file` fails from file metadata, before the read, when the
+body exceeds the hub's 16 KB inbox cap (`PROPOSE_TOO_LARGE`), the same
+fail-before-upload contract as the push caps.
+
 The FORMAT is untouched: SPEC.md still reserves only the `@brain/id` shape,
 a store never needs link.md to be valid db.md, and the toolkit still never
 phones home on its own — network I/O happens solely when a verb is invoked.

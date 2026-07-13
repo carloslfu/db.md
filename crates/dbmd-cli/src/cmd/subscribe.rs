@@ -22,6 +22,7 @@ use dbmd_core::linkmd::{self, LinkError};
 use crate::cli::SubscribeArgs;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
+use crate::sanitize::sanitize;
 
 /// Run `dbmd subscribe`.
 pub fn run(ctx: &Context, args: &SubscribeArgs) -> CliResult {
@@ -65,7 +66,9 @@ pub fn run(ctx: &Context, args: &SubscribeArgs) -> CliResult {
     }
 }
 
-/// One event line. Text: `seq <prev> -> <seq>`; JSON: a compact object.
+/// One event line. Text: `seq <prev> -> <seq>`; JSON: a compact object. The
+/// brain id in the text form is hub-authored → terminal-sanitized (the JSON
+/// stream stays verbatim).
 fn emit(ctx: &Context, head: &linkmd::Head, prev: u64) {
     if ctx.json {
         let mut v = serde_json::to_value(head).unwrap_or_default();
@@ -73,8 +76,13 @@ fn emit(ctx: &Context, head: &linkmd::Head, prev: u64) {
         // Compact, one object per line: this is a stream, not a document.
         println!("{v}");
     } else if head.seq == prev {
-        println!("{} at feed seq {}", head.brain, head.seq);
+        println!("{} at feed seq {}", sanitize(&head.brain), head.seq);
     } else {
-        println!("{} advanced: feed seq {} -> {}", head.brain, prev, head.seq);
+        println!(
+            "{} advanced: feed seq {} -> {}",
+            sanitize(&head.brain),
+            prev,
+            head.seq
+        );
     }
 }
