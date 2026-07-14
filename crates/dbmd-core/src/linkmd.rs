@@ -9,7 +9,8 @@
 //! plain markdown, and SPEC.md reserves only the `@brain/id` address *shape*.
 //! Everything with a wire or a trust boundary — addressing across stores,
 //! pulling/pushing a hosted copy, capability grants, the propose door, feed
-//! polling — lives here, as a *client capability*, never a format requirement.
+//! polling and signed-entry verification — lives here, as a *client
+//! capability*, never a format requirement.
 //!
 //! # What this client speaks
 //!
@@ -18,11 +19,11 @@
 //! | verb | binding |
 //! | --- | --- |
 //! | `resolve` | `GET /api/hub/brains/<brain>` (the brain card) and `GET /api/hub/brains/<brain>/resolve?id=…` / `?path=…` (a record) |
-//! | `sync` (pull) | `GET /api/hub/brains/<brain>/export` — the granted slice as plain files |
-//! | `sync` (push) | `POST /api/hub/brains/<brain>/push` — the local store as a snapshot |
+//! | `sync` (pull) | `GET /api/hub/brains/<brain>/export?format=pack` — an immutable pack, or the granted slice as plain files |
+//! | `sync` (push) | `POST /api/hub/brains/<brain>/push` for small snapshots; presign/upload/commit for large snapshots |
 //! | `grant` | `GET` / `POST /api/hub/brains/<brain>/grants`, `DELETE /api/hub/brains/<brain>/grants/<id>` |
 //! | `propose` | `POST /api/hub/sites/<handle>/inbox` — evidence in, without trust (unauthenticated by design) |
-//! | `subscribe` | `GET /api/hub/brains/<brain>` polled for feed-head movement |
+//! | `subscribe` | `GET /api/hub/brains/<brain>` + `/feed` for a locally verified signed head |
 //!
 //! # Configuration — no default hub, credential never in the store
 //!
@@ -47,15 +48,19 @@
 //!
 //! This client binds to what a hub enforces **today**: grantees are hub
 //! principals (an email), grant scopes are store-path prefixes, pushes are
-//! whole-store snapshots, and `subscribe` reports feed-head movement (the hub
-//! does not yet serve per-entry feed reads). Record signing and brain keypairs
-//! are the protocol's next layer and are absent here by design — nothing in
-//! this module invents key custody.
+//! whole-store snapshots, and `subscribe` reports feed-head movement. The hub
+//! signs each committed snapshot in a hash-chained feed with a per-brain
+//! Ed25519 identity; this client verifies the content-addressed pack before it
+//! touches disk and verifies the signed feed head on every subscription read.
 
-use std::io::Read;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ring::signature::{UnparsedPublicKey, ED25519};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::fsx::write_atomic;
 use crate::store::Store;
@@ -76,12 +81,14 @@ pub const CONFIG_REL_PATH: &str = ".dbmd/config";
 /// rather than silently truncated.
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The hub's JSON push path is serverless-capped (~4 MB body); mirror it
-/// client-side so an oversized push fails before the upload, not after.
+/// Direct JSON pushes stay below the serverless request-body cap. Larger
+/// snapshots switch to the bounded object-store pack lane.
 const MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
 
 /// The hub's per-push file-count cap, mirrored client-side.
-const MAX_PUSH_FILES: usize = 50_000;
+const MAX_PUSH_FILES: usize = 100_000;
+const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The hub's inbox cap on one `propose` submission body, mirrored client-side
 /// so an oversized body fails before the upload, not after (the same
@@ -186,10 +193,11 @@ pub enum LinkError {
         path: String,
     },
 
-    /// The push payload exceeds the hub's JSON-path caps.
+    /// The store exceeds the hub's bounded whole-snapshot caps.
     #[error(
-        "push too large ({detail}) — the hub's JSON push path caps at ~{} MB / {MAX_PUSH_FILES} files; larger brains need the hub's pack path, which is not a dbmd verb yet",
-        MAX_PUSH_BYTES / (1024 * 1024)
+        "push too large ({detail}) — one snapshot caps at {} MB uncompressed, {} MB compressed, and {MAX_PUSH_FILES} files",
+        MAX_STORE_BYTES / (1024 * 1024),
+        MAX_PACK_BYTES / (1024 * 1024)
     )]
     PushTooLarge {
         /// Which cap was hit, human-readable.
@@ -211,6 +219,20 @@ pub enum LinkError {
     NotUtf8 {
         /// The store-relative path of the offending file.
         path: String,
+    },
+
+    /// A downloaded pack failed validation before any local write.
+    #[error("invalid store pack: {message}")]
+    InvalidPack {
+        /// Hash, ZIP, path, count, or expansion failure.
+        message: String,
+    },
+
+    /// A signed feed entry, hash chain, or advertised feed head did not verify.
+    #[error("invalid signed feed: {message}")]
+    InvalidFeed {
+        /// The failed integrity condition, without untrusted secret material.
+        message: String,
     },
 
     /// Local filesystem failure while materializing a pull or reading a push.
@@ -460,20 +482,25 @@ fn config_file_hub(path: &Path) -> Option<String> {
 /// The bearer key must never travel in cleartext; only loopback hosts may
 /// skip TLS (local development against a hub on localhost).
 fn assert_safe_hub(hub: &str) -> LinkResult<()> {
-    let (scheme, rest) = hub.split_once("://").ok_or_else(|| LinkError::UnsafeHub {
+    let parsed = url::Url::parse(hub).map_err(|_| LinkError::UnsafeHub {
         hub: hub.to_string(),
     })?;
-    // Host = authority up to the first '/', minus any port — with the
-    // bracketed-IPv6 form handled so `http://[::1]:3000` counts as loopback.
-    let hostport = rest.split('/').next().unwrap_or("");
-    let host = match hostport.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => hostport.split(':').next().unwrap_or(""),
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(LinkError::UnsafeHub {
+            hub: hub.to_string(),
+        });
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     };
-    let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
-    // Scheme matching is case-insensitive (RFC 3986): an uppercase-scheme
-    // HTTPS hub is still HTTPS, not a cleartext refusal.
-    if scheme.eq_ignore_ascii_case("https") || loopback {
+    if parsed.scheme().eq_ignore_ascii_case("https") || loopback {
         Ok(())
     } else {
         Err(LinkError::UnsafeHub {
@@ -519,6 +546,10 @@ enum Auth {
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .user_agent(concat!("dbmd/", env!("CARGO_PKG_VERSION")))
+        // Never follow a redirect while a bearer, a store pack, or a signed
+        // response is in flight. Callers see the 3xx as a non-success instead
+        // of letting an origin steer sensitive material elsewhere.
+        .redirects(0)
         .timeout_connect(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout_read(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
         .build()
@@ -572,6 +603,78 @@ fn request(
         status,
         body: parsed,
     })
+}
+
+fn assert_safe_presigned_url(raw: &str) -> LinkResult<()> {
+    let parsed = url::Url::parse(raw).map_err(|_| LinkError::InvalidPack {
+        message: "the hub returned an invalid object-store URL".to_string(),
+    })?;
+    if !parsed.scheme().eq_ignore_ascii_case("https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(LinkError::InvalidPack {
+            message: "the hub returned an unsafe object-store URL".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn put_presigned(raw: &str, headers: &Value, bytes: &[u8]) -> LinkResult<()> {
+    assert_safe_presigned_url(raw)?;
+    let mut req = agent().put(raw);
+    if let Some(map) = headers.as_object() {
+        for (name, value) in map {
+            if let Some(value) = value.as_str() {
+                req = req.set(name, value);
+            }
+        }
+    }
+    match req.send_bytes(bytes) {
+        Ok(resp) if resp.status() < 300 => Ok(()),
+        Ok(resp) | Err(ureq::Error::Status(_, resp)) => Err(LinkError::Http {
+            what: "pack upload",
+            status: resp.status(),
+            message: "object store rejected the upload".to_string(),
+            code: None,
+        }),
+        Err(ureq::Error::Transport(err)) => Err(LinkError::Transport {
+            hub: "the object store".to_string(),
+            message: err.to_string(),
+        }),
+    }
+}
+
+fn get_presigned(raw: &str) -> LinkResult<Vec<u8>> {
+    assert_safe_presigned_url(raw)?;
+    let resp = match agent().get(raw).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(_, resp)) => {
+            return Err(LinkError::Http {
+                what: "pack download",
+                status: resp.status(),
+                message: "object store rejected the download".to_string(),
+                code: None,
+            })
+        }
+        Err(ureq::Error::Transport(err)) => {
+            return Err(LinkError::Transport {
+                hub: "the object store".to_string(),
+                message: err.to_string(),
+            })
+        }
+    };
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(MAX_PACK_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PACK_BYTES {
+        return Err(LinkError::InvalidPack {
+            message: "download exceeds the compressed-size limit".to_string(),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Unwrap a successful JSON body, or shape the failure: a >=400 surfaces the
@@ -674,16 +777,19 @@ pub struct PullReport {
 /// local index catalog afterwards is the caller's (cheap, optional) step.
 pub fn sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult<PullReport> {
     require_safe_ref(brain)?;
-    let path = format!("/api/hub/brains/{brain}/export");
+    let path = format!("/api/hub/brains/{brain}/export?format=pack");
     let body = ensure_ok(
         request(cfg, "GET", &path, None, Auth::Required)?,
         "sync pull",
     )?;
 
-    let slug = body
+    let remote_slug = body
         .get("slug")
         .and_then(Value::as_str)
-        .unwrap_or(brain)
+        .filter(|slug| is_safe_slug(slug));
+    let slug = remote_slug
+        .or_else(|| is_safe_slug(brain).then_some(brain))
+        .unwrap_or("brain")
         .to_string();
     let brain_id = body
         .get("brain")
@@ -691,38 +797,83 @@ pub fn sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult
         .unwrap_or(brain)
         .to_string();
     let head_seq = body.get("headSeq").and_then(Value::as_u64).unwrap_or(0);
-    let files = body
-        .get("files")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
     let dest: PathBuf = match out {
         Some(p) => p.to_path_buf(),
         None => PathBuf::from(&slug),
     };
-    std::fs::create_dir_all(&dest)?;
+    let entries =
+        if let Some(url) = body.get("url").and_then(Value::as_str) {
+            let expected = body
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|hash| {
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+                .ok_or_else(|| LinkError::InvalidPack {
+                    message: "the hub returned an invalid SHA-256".to_string(),
+                })?;
+            let bytes = get_presigned(url)?;
+            let actual = format!("{:x}", Sha256::digest(&bytes));
+            if actual != expected {
+                return Err(LinkError::InvalidPack {
+                    message: "SHA-256 verification failed".to_string(),
+                });
+            }
+            parse_store_pack(bytes)?
+        } else {
+            let files = body.get("files").and_then(Value::as_array).ok_or_else(|| {
+                LinkError::InvalidPack {
+                    message: "the hub returned neither a pack nor a file manifest".to_string(),
+                }
+            })?;
+            let mut entries = Vec::with_capacity(files.len());
+            for file in files {
+                let path = file.get("path").and_then(Value::as_str).ok_or_else(|| {
+                    LinkError::InvalidPack {
+                        message: "a file entry has no string path".to_string(),
+                    }
+                })?;
+                let content = file.get("content").and_then(Value::as_str).ok_or_else(|| {
+                    LinkError::InvalidPack {
+                        message: format!("file `{path}` has no string content"),
+                    }
+                })?;
+                entries.push((path.to_string(), content.as_bytes().to_vec()));
+            }
+            entries
+        };
 
-    // Gate every path BEFORE the first write so a hostile entry anywhere in
-    // the export aborts the pull with nothing partially materialized.
-    let mut entries: Vec<(String, String)> = Vec::with_capacity(files.len());
-    for f in &files {
-        let p = f.get("path").and_then(Value::as_str).unwrap_or_default();
-        let content = f.get("content").and_then(Value::as_str).unwrap_or_default();
-        if !safe_store_rel_path(p) {
-            return Err(LinkError::UnsafePath {
-                path: p.to_string(),
+    // Gate the complete manifest before the first filesystem mutation.
+    let mut seen = std::collections::HashSet::new();
+    for (path, _) in &entries {
+        if !safe_store_rel_path(path) {
+            return Err(LinkError::UnsafePath { path: path.clone() });
+        }
+        if !seen.insert(path) {
+            return Err(LinkError::InvalidPack {
+                message: format!("duplicate path `{path}`"),
             });
         }
-        entries.push((p.to_string(), content.to_string()));
     }
+    std::fs::create_dir_all(&dest)?;
+    let real_dest = std::fs::canonicalize(&dest)?;
 
     for (p, content) in &entries {
         let abs = dest.join(p);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
+            let real_parent = std::fs::canonicalize(parent)?;
+            if !real_parent.starts_with(&real_dest) {
+                return Err(LinkError::UnsafePath { path: p.clone() });
+            }
         }
-        write_atomic(&abs, content.as_bytes())?;
+        if std::fs::symlink_metadata(&abs).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(LinkError::UnsafePath { path: p.clone() });
+        }
+        write_atomic(&abs, content)?;
     }
 
     // Divergence report: local content files the export did not carry. Only
@@ -750,6 +901,75 @@ pub fn sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult
         dest: dest.to_string_lossy().into_owned(),
         extra_local,
     })
+}
+
+fn is_safe_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 63
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn parse_store_pack(bytes: Vec<u8>) -> LinkResult<Vec<(String, Vec<u8>)>> {
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|err| LinkError::InvalidPack {
+            message: format!("ZIP parse failed: {err}"),
+        })?;
+    if archive.is_empty() || archive.len() > MAX_PUSH_FILES {
+        return Err(LinkError::InvalidPack {
+            message: format!("invalid file count {}", archive.len()),
+        });
+    }
+    let mut total = 0u64;
+    let mut entries = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|err| LinkError::InvalidPack {
+                message: format!("ZIP entry failed: {err}"),
+            })?;
+        if file.is_dir() {
+            continue;
+        }
+        let path = file.name().to_string();
+        if file.enclosed_name().is_none() || !safe_store_rel_path(&path) {
+            return Err(LinkError::UnsafePath { path });
+        }
+        if file
+            .unix_mode()
+            .is_some_and(|mode| !matches!(mode & 0o170000, 0 | 0o100000))
+        {
+            return Err(LinkError::InvalidPack {
+                message: format!("non-file entry `{path}`"),
+            });
+        }
+        total = total.saturating_add(file.size());
+        if total > MAX_STORE_BYTES {
+            return Err(LinkError::InvalidPack {
+                message: "expanded content exceeds the 512 MB limit".to_string(),
+            });
+        }
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)
+            .map_err(|err| LinkError::InvalidPack {
+                message: format!("could not decompress `{path}`: {err}"),
+            })?;
+        if content.len() as u64 != file.size() {
+            return Err(LinkError::InvalidPack {
+                message: format!("length mismatch for `{path}`"),
+            });
+        }
+        entries.push((path, content));
+    }
+    if entries.is_empty() {
+        return Err(LinkError::InvalidPack {
+            message: "pack contains no files".to_string(),
+        });
+    }
+    Ok(entries)
 }
 
 /// Collect the files a push sends: the store's owned text — `DB.md`,
@@ -804,13 +1024,10 @@ pub fn sync_push(cfg: &HubConfig, brain: &str, files: &[(String, String)]) -> Li
             detail: format!("{} files", files.len()),
         });
     }
-    let total: usize = files
-        .iter()
-        .map(|(p, c)| p.len() + c.len() + 32) // 32 ≈ per-entry JSON framing
-        .sum();
-    if total > MAX_PUSH_BYTES {
+    let raw_total: u64 = files.iter().map(|(_, content)| content.len() as u64).sum();
+    if raw_total > MAX_STORE_BYTES {
         return Err(LinkError::PushTooLarge {
-            detail: format!("~{} bytes of payload", total),
+            detail: format!("{raw_total} uncompressed bytes"),
         });
     }
 
@@ -820,11 +1037,73 @@ pub fn sync_push(cfg: &HubConfig, brain: &str, files: &[(String, String)]) -> Li
             .map(|(p, c)| json!({ "path": p, "content": c }))
             .collect::<Vec<_>>(),
     });
-    let path = format!("/api/hub/brains/{brain}/push");
+    if body.to_string().len() <= MAX_PUSH_BYTES {
+        let path = format!("/api/hub/brains/{brain}/push");
+        return ensure_ok(
+            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            "sync push",
+        );
+    }
+
+    let pack = build_store_pack(files)?;
+    if pack.len() as u64 > MAX_PACK_BYTES {
+        return Err(LinkError::PushTooLarge {
+            detail: format!("{} compressed bytes", pack.len()),
+        });
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&pack));
+    let meta = json!({ "sha256": sha256, "bytes": pack.len() });
+    let presigned = ensure_ok(
+        request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{brain}/packs/presign"),
+            Some(&meta),
+            Auth::Required,
+        )?,
+        "prepare pack upload",
+    )?;
+    let url = presigned
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LinkError::InvalidPack {
+            message: "the hub returned no upload URL".to_string(),
+        })?;
+    put_presigned(url, presigned.get("headers").unwrap_or(&Value::Null), &pack)?;
     ensure_ok(
-        request(cfg, "POST", &path, Some(&body), Auth::Required)?,
-        "sync push",
+        request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{brain}/packs/commit"),
+            Some(&meta),
+            Auth::Required,
+        )?,
+        "commit pack",
     )
+}
+
+fn build_store_pack(files: &[(String, String)]) -> LinkResult<Vec<u8>> {
+    let mut sorted: Vec<_> = files.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default())
+        .unix_permissions(0o600);
+    for (path, content) in sorted {
+        writer
+            .start_file(path, options)
+            .map_err(|err| LinkError::InvalidPack {
+                message: format!("could not create ZIP entry `{path}`: {err}"),
+            })?;
+        writer.write_all(content.as_bytes())?;
+    }
+    writer
+        .finish()
+        .map(Cursor::into_inner)
+        .map_err(|err| LinkError::InvalidPack {
+            message: format!("could not finish ZIP: {err}"),
+        })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -937,16 +1216,142 @@ pub fn propose(cfg: &HubConfig, handle: &str, app: &str, body: &str) -> LinkResu
 pub struct Head {
     /// The brain id.
     pub brain: String,
-    /// The hub's indexed feed cursor — advances on every accepted write.
+    /// The hub's durable feed cursor — advances on every accepted write.
     pub seq: u64,
     /// The hub's `updatedAt` for the brain, when present.
     #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// SHA-256 of the exact signed head entry.
+    #[serde(rename = "feedHash", skip_serializing_if = "Option::is_none")]
+    pub feed_hash: Option<String>,
+    /// Whether the head entry's content hash, identity, and Ed25519 signature
+    /// were verified locally. Path-scoped grants get head movement only.
+    pub verified: bool,
 }
 
-/// Read the brain's current feed head. `subscribe` polls this: the hub does
-/// not yet serve per-entry feed reads, so v0 subscription is head-movement
-/// detection — the caller re-pulls (or re-queries) on advance.
+#[derive(Debug, Deserialize, Serialize)]
+struct FeedFile {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FeedEntry {
+    v: u8,
+    seq: u64,
+    ts: String,
+    brain: String,
+    public_key: String,
+    kind: String,
+    op: String,
+    pack_sha256: String,
+    files: Vec<FeedFile>,
+    removed: Vec<String>,
+    prev_entry_hash: Option<String>,
+    sig: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedFeedEntry<'a> {
+    v: u8,
+    seq: u64,
+    ts: &'a str,
+    brain: &'a str,
+    public_key: &'a str,
+    kind: &'a str,
+    op: &'a str,
+    pack_sha256: &'a str,
+    files: &'a [FeedFile],
+    removed: &'a [String],
+    prev_entry_hash: &'a Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedItem {
+    hash: String,
+    entry: FeedEntry,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedIdentity {
+    fingerprint: String,
+    #[serde(rename = "publicKeySpki")]
+    public_key_spki: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedResponse {
+    #[serde(rename = "headSeq")]
+    head_seq: u64,
+    #[serde(rename = "feedHash")]
+    feed_hash: Option<String>,
+    identity: Option<FeedIdentity>,
+    entries: Vec<FeedItem>,
+    #[serde(rename = "scopeLimited")]
+    scope_limited: bool,
+}
+
+fn invalid_feed(message: impl Into<String>) -> LinkError {
+    LinkError::InvalidFeed {
+        message: message.into(),
+    }
+}
+
+fn verify_feed_item(item: &FeedItem, identity: &FeedIdentity) -> LinkResult<()> {
+    const ED25519_SPKI_PREFIX: &[u8] = &[
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let entry = &item.entry;
+    let public_der = URL_SAFE_NO_PAD
+        .decode(&entry.public_key)
+        .map_err(|_| invalid_feed("public key is not base64url"))?;
+    if public_der.len() != ED25519_SPKI_PREFIX.len() + 32
+        || !public_der.starts_with(ED25519_SPKI_PREFIX)
+        || identity.public_key_spki != entry.public_key
+    {
+        return Err(invalid_feed("public key does not match the brain card"));
+    }
+    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&public_der));
+    if fingerprint != identity.fingerprint || entry.brain != format!("ed25519:{fingerprint}") {
+        return Err(invalid_feed(
+            "brain fingerprint does not match its public key",
+        ));
+    }
+    let unsigned = UnsignedFeedEntry {
+        v: entry.v,
+        seq: entry.seq,
+        ts: &entry.ts,
+        brain: &entry.brain,
+        public_key: &entry.public_key,
+        kind: &entry.kind,
+        op: &entry.op,
+        pack_sha256: &entry.pack_sha256,
+        files: &entry.files,
+        removed: &entry.removed,
+        prev_entry_hash: &entry.prev_entry_hash,
+    };
+    let message =
+        serde_json::to_vec(&unsigned).map_err(|_| invalid_feed("could not canonicalize entry"))?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(&entry.sig)
+        .map_err(|_| invalid_feed("signature is not base64url"))?;
+    UnparsedPublicKey::new(&ED25519, &public_der[ED25519_SPKI_PREFIX.len()..])
+        .verify(&message, &signature)
+        .map_err(|_| invalid_feed("Ed25519 signature verification failed"))?;
+
+    let mut exact = serde_json::to_vec(entry).map_err(|_| invalid_feed("could not hash entry"))?;
+    exact.push(b'\n');
+    let actual_hash = format!("{:x}", Sha256::digest(&exact));
+    if actual_hash != item.hash {
+        return Err(invalid_feed("entry SHA-256 does not match"));
+    }
+    Ok(())
+}
+
+/// Read and locally verify the brain's current signed feed head. `subscribe`
+/// polls this as movement detection; the caller re-pulls or re-queries after
+/// an advance.
 pub fn head(cfg: &HubConfig, brain: &str) -> LinkResult<Head> {
     require_safe_ref(brain)?;
     let path = format!("/api/hub/brains/{brain}");
@@ -954,26 +1359,143 @@ pub fn head(cfg: &HubConfig, brain: &str) -> LinkResult<Head> {
         request(cfg, "GET", &path, None, Auth::Required)?,
         "subscribe",
     )?;
+    let resolved_brain = body
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or(brain)
+        .to_string();
+    let seq = body.get("headSeq").and_then(Value::as_u64).unwrap_or(0);
+    let advertised_hash = body
+        .get("feedHash")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let updated_at = body
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if seq == 0 {
+        return Ok(Head {
+            brain: resolved_brain,
+            seq,
+            updated_at,
+            feed_hash: None,
+            verified: true,
+        });
+    }
+
+    let feed_value = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{brain}/feed?after={}&limit=1", seq - 1),
+            None,
+            Auth::Required,
+        )?,
+        "subscribe feed",
+    )?;
+    let feed: FeedResponse = serde_json::from_value(feed_value)
+        .map_err(|_| invalid_feed("hub returned an invalid feed shape"))?;
+    if feed.head_seq != seq || feed.feed_hash != advertised_hash {
+        return Err(invalid_feed("brain card and feed head disagree"));
+    }
+    if feed.scope_limited {
+        return Ok(Head {
+            brain: resolved_brain,
+            seq,
+            updated_at,
+            feed_hash: advertised_hash,
+            verified: false,
+        });
+    }
+    let identity = feed
+        .identity
+        .as_ref()
+        .ok_or_else(|| invalid_feed("feed has no brain identity"))?;
+    let item = feed
+        .entries
+        .first()
+        .ok_or_else(|| invalid_feed("feed head entry is missing"))?;
+    if item.entry.seq != seq || Some(&item.hash) != advertised_hash.as_ref() {
+        return Err(invalid_feed(
+            "advertised feed hash does not address the head entry",
+        ));
+    }
+    verify_feed_item(item, identity)?;
     Ok(Head {
-        brain: body
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or(brain)
-            .to_string(),
-        seq: body
-            .get("indexedFeedSeq")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        updated_at: body
-            .get("updatedAt")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        brain: resolved_brain,
+        seq,
+        updated_at,
+        feed_hash: advertised_hash,
+        verified: true,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_feed_item_verifies_identity_hash_and_signature() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        const PREFIX: &[u8] = &[
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut spki = PREFIX.to_vec();
+        spki.extend_from_slice(pair.public_key().as_ref());
+        let public_key = URL_SAFE_NO_PAD.encode(&spki);
+        let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&spki));
+        let mut entry = FeedEntry {
+            v: 1,
+            seq: 1,
+            ts: "2026-07-14T00:00:00.000Z".to_string(),
+            brain: format!("ed25519:{fingerprint}"),
+            public_key: public_key.clone(),
+            kind: "push".to_string(),
+            op: "snapshot".to_string(),
+            pack_sha256: "a".repeat(64),
+            files: vec![FeedFile {
+                path: "DB.md".to_string(),
+                sha256: "b".repeat(64),
+                bytes: 3,
+            }],
+            removed: vec![],
+            prev_entry_hash: None,
+            sig: String::new(),
+        };
+        let unsigned = UnsignedFeedEntry {
+            v: entry.v,
+            seq: entry.seq,
+            ts: &entry.ts,
+            brain: &entry.brain,
+            public_key: &entry.public_key,
+            kind: &entry.kind,
+            op: &entry.op,
+            pack_sha256: &entry.pack_sha256,
+            files: &entry.files,
+            removed: &entry.removed,
+            prev_entry_hash: &entry.prev_entry_hash,
+        };
+        entry.sig =
+            URL_SAFE_NO_PAD.encode(pair.sign(&serde_json::to_vec(&unsigned).unwrap()).as_ref());
+        let mut exact = serde_json::to_vec(&entry).unwrap();
+        exact.push(b'\n');
+        let item = FeedItem {
+            hash: format!("{:x}", Sha256::digest(&exact)),
+            entry,
+        };
+        let identity = FeedIdentity {
+            fingerprint,
+            public_key_spki: public_key,
+        };
+        assert!(verify_feed_item(&item, &identity).is_ok());
+        let mut tampered = item;
+        tampered.entry.pack_sha256 = "c".repeat(64);
+        assert!(verify_feed_item(&tampered, &identity).is_err());
+    }
 
     // ── Address parsing ─────────────────────────────────────────────────────
 
@@ -1084,6 +1606,14 @@ mod tests {
         ));
         assert!(matches!(
             assert_safe_hub("hub.example.com"),
+            Err(LinkError::UnsafeHub { .. })
+        ));
+        assert!(matches!(
+            assert_safe_hub("http://localhost:80@127.0.0.1:1"),
+            Err(LinkError::UnsafeHub { .. })
+        ));
+        assert!(matches!(
+            assert_safe_hub("https://hub.example.com@attacker.example"),
             Err(LinkError::UnsafeHub { .. })
         ));
     }

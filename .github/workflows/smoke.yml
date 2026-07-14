@@ -55,7 +55,7 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       # Assemble the local mirror tree from the GitHub Release assets for the
       # requested (or latest) version. On a workflow_run trigger the version is
@@ -92,7 +92,7 @@ jobs:
           ls -la "mirror/v${ver}"
 
       - name: Re-upload mirror for the matrix jobs
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: smoke-mirror
           path: mirror/
@@ -123,10 +123,10 @@ jobs:
             os: ubuntu-latest
             runnable: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Download smoke mirror
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: smoke-mirror
           path: mirror

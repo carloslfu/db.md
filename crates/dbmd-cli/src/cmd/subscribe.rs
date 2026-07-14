@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dbmd subscribe` — follow a brain's feed head.
+//! `dbmd subscribe` — follow a brain's signed feed head.
 //!
-//! v0 subscription is head-movement detection: the hub does not yet serve
-//! per-entry feed reads, so the client polls the brain's feed cursor and
-//! emits an event each time it advances (the caller re-pulls or re-queries on
-//! advance). `--once` reads the current head and exits — the composable
+//! The client polls the brain's feed cursor and locally verifies the head's
+//! identity, SHA-256, and Ed25519 signature before emitting an advance. A
+//! path-scoped grant receives movement only because a signed full manifest
+//! would disclose out-of-scope paths. `--once` reads the current head and exits — the composable
 //! building block; the loop is a convenience over it.
 //!
 //! Output contract: one event per line. Under `--json` each line is a single

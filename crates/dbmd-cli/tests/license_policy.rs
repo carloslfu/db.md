@@ -48,11 +48,9 @@ use serde_json::Value;
 const ALLOWED: &[&str] = &[
     "MIT",
     "Apache-2.0",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "0BSD",
     "Unlicense",
-    "MPL-2.0",
     "Zlib",
     "Unicode-3.0",
     // The link.md client's TLS stack (ureq → rustls): rustls-webpki +

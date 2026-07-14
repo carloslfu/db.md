@@ -209,6 +209,8 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
                 CliError::new(ExitCode::Runtime, "PROPOSE_TOO_LARGE", message)
             }
             L::NotUtf8 { .. } => CliError::new(ExitCode::Runtime, "NOT_UTF8", message),
+            L::InvalidPack { .. } => CliError::new(ExitCode::Runtime, "INVALID_PACK", message),
+            L::InvalidFeed { .. } => CliError::new(ExitCode::Runtime, "INVALID_FEED", message),
             L::Io(_) => CliError::new(ExitCode::Runtime, "IO_ERROR", message),
             L::Store(_) => CliError::new(ExitCode::Runtime, "STORE_ERROR", message),
         }

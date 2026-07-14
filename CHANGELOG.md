@@ -8,9 +8,11 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.6.2**.
+  `Cargo.toml`, currently **v0.6.3**.
 
 ## [Unreleased]
+
+## [0.6.3] — 2026-07-14
 
 ### Toolkit — the link.md client verbs (format unchanged: v0.4)
 
@@ -28,8 +30,10 @@ and its HTTP/TLS closure with `default-features = false`):
   divergence is reported; rebuilds the local index catalog after) and
   `--push`, which sends the local store as a whole-store snapshot (content
   `.md` + `DB.md` + `assets.jsonl`; derived catalogs and local history stay
-  local; the hub's ~4 MB / 50k-file JSON caps are enforced client-side
-  before the upload).
+  local). Small snapshots use the direct JSON lane. Larger snapshots use a
+  deterministic ZIP pack uploaded through a short-lived object-store URL,
+  then committed by hash. Both lanes enforce 100,000 files and 512 MB
+  uncompressed; packs cap at 256 MB compressed.
 - `dbmd grant issue|list|revoke` — the capability model, owner-side: read
   or write to a principal (email in v0), optional store-path-prefix scope,
   optional `--until` expiry.
@@ -37,8 +41,9 @@ and its HTTP/TLS closure with `default-features = false`):
   trust: evidence into a published site's inbox, landing in the owner's
   `sources/inbox/` for their curator. Unauthenticated by design; the
   credential is verifiably never sent through this door.
-- `dbmd subscribe @brain [--once] [--since N] [--interval S]` — follow the
-  feed head; one event line per advance (NDJSON under `--json`).
+- `dbmd subscribe @brain [--once] [--since N] [--interval S]` — fetch and
+  locally verify the current Ed25519-signed feed head against the brain card;
+  emit one event line per advance (NDJSON under `--json`).
 
 Configuration is explicit and neutral — **no default hub is baked in**: the
 hub URL resolves `--hub` > `DBMD_HUB_URL` > `hub = <URL>` in the store-local
@@ -63,6 +68,15 @@ sequences in text output — `--json` stays byte-verbatim; and
 `propose --body-file` fails from file metadata, before the read, when the
 body exceeds the hub's 16 KB inbox cap (`PROPOSE_TOO_LARGE`), the same
 fail-before-upload contract as the push caps.
+
+The same pass closes the large-store and trust-boundary failure modes. Hub
+URLs with userinfo are refused so credentials cannot be smuggled into an
+authority. Presigned upload/download URLs must be HTTPS, never receive the hub
+bearer, and cannot redirect. Store packs are hash-bound, file-count and expanded-size
+bounded, duplicate-path-free, and rejected on absolute paths, traversal,
+non-regular entries, and symlinks before any local write. Pull extraction is
+staged and containment-checked. Feed heads are accepted only when their brain
+identity, sequence, pack hash, and Ed25519 signature all verify locally.
 
 The FORMAT is untouched: SPEC.md still reserves only the `@brain/id` shape,
 a store never needs link.md to be valid db.md, and the toolkit still never

@@ -47,6 +47,9 @@ zip = { workspace = true }
 # a format-only consumer can drop the HTTP/TLS closure with
 # `default-features = false`; the `dbmd` binary ships with it on.
 ureq = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 
 [features]
 # `link` = the link.md client verbs (resolve / sync / grant / propose /
@@ -55,7 +58,7 @@ ureq = { workspace = true, optional = true }
 # consumers who want only the db.md FORMAT toolkit opt out with
 # `default-features = false` (the store never needs link.md to be valid db.md).
 default = ["link"]
-link = ["dep:ureq"]
+link = ["dep:ureq", "dep:url", "dep:base64", "dep:ring"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

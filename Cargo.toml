@@ -10,7 +10,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 # MSRV 1.88: forced by the `pdf-extract 0.12` security update (RUSTSEC-2026-0187),
 # whose `lopdf 0.42` uses stable let-chains (Rust 1.88+). Verified as the exact
@@ -22,7 +22,7 @@ authors = ["Carlos Galarza"]
 
 # Shared dependency versions pinned once for the whole workspace.
 # Licenses are recorded in THIRD_PARTY_NOTICES (permissive only — MIT /
-# Apache-2.0 / BSD-2/3-Clause+0BSD / Unlicense / MPL-2.0 / Zlib / Unicode-3.0 /
+# Apache-2.0 / BSD-3-Clause+0BSD / Unlicense / Zlib / Unicode-3.0 /
 # ISC / CDLA-Permissive-2.0;
 # no GPL/AGPL/LGPL-static, and zero AI/LLM deps). The full allowlist and the
 # shipped crates that carry the non-MIT/Apache terms (Unicode-3.0, BSD-3-Clause,
@@ -78,6 +78,12 @@ zip = { version = "7.2", default-features = false, features = ["deflate"] }
 # home on its own (no telemetry, no auto-update) — network I/O happens only
 # when a link verb is explicitly invoked against a hub the user configured.
 ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
+# Full authority parsing for the link.md HTTPS/loopback transport guard.
+url = "2"
+# link.md feed verification. Both are already in the shipped TLS dependency
+# closure; direct use adds no new crate or license surface.
+base64 = "0.22"
+ring = "0.17"
 tempfile = "3"
 insta = "1"
 assert_cmd = "2"

@@ -31,6 +31,20 @@ const DBMD: &str = env!("CARGO_BIN_EXE_dbmd");
 const BRAIN_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";
 const RECORD_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7e";
 
+// A deterministic, independently generated Ed25519 fixture. The feed entry's
+// signature covers its unsigned canonical JSON and `feedHash` covers the exact
+// signed JSON plus its trailing newline, matching the hub contract.
+const SIGNED_HEAD_HASH: &str = "d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd";
+const SIGNED_HEAD_CARD: &str = r#"{"id":"01j5qc3v9k4ym8rwbn2tqe6f7d","headSeq":41,"feedHash":"d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd","updatedAt":"2026-07-13T00:00:00.000Z"}"#;
+const SIGNED_HEAD_FEED: &str = r#"{"headSeq":41,"feedHash":"d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd","identity":{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","publicKeySpki":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU"},"entries":[{"hash":"d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd","entry":{"v":1,"seq":41,"ts":"2026-07-14T00:00:00.000Z","brain":"ed25519:plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","public_key":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU","kind":"push","op":"snapshot","pack_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","files":[{"path":"DB.md","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bytes":3}],"removed":[],"prev_entry_hash":null,"sig":"TEozQnDFrOBDvYR2x_pfgah2Oyr3xGZX3acjvAmrniytxN0x6J5bgQwd0Vso1fgWJqvO3UPytDMN8QFJeRRQBw"}}],"scopeLimited":false}"#;
+
+fn signed_head_responses() -> Vec<(u16, String)> {
+    vec![
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
+    ]
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The mock hub
 // ─────────────────────────────────────────────────────────────────────────────
@@ -461,7 +475,10 @@ fn sync_pull_materializes_files_rebuilds_index_and_reports() {
     assert!(dest.join("records/clients/index.md").is_file());
 
     let reqs = hub.finish();
-    assert_eq!(reqs[0].path, format!("/api/hub/brains/{BRAIN_ID}/export"));
+    assert_eq!(
+        reqs[0].path,
+        format!("/api/hub/brains/{BRAIN_ID}/export?format=pack")
+    );
 }
 
 #[test]
@@ -737,10 +754,7 @@ fn propose_requires_exactly_one_body_source() {
 
 #[test]
 fn subscribe_once_reports_the_current_head_as_one_json_line() {
-    let hub = MockHub::serve(vec![(
-        200,
-        format!("{{\"id\":\"{BRAIN_ID}\",\"indexedFeedSeq\":41,\"updatedAt\":\"2026-07-13T00:00:00.000Z\"}}"),
-    )]);
+    let hub = MockHub::serve(signed_head_responses());
     let dir = tempfile::tempdir().unwrap();
     let out = run_dbmd(
         dir.path(),
@@ -755,7 +769,13 @@ fn subscribe_once_reports_the_current_head_as_one_json_line() {
     let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(v["brain"], BRAIN_ID);
     assert_eq!(v["seq"], 41);
-    hub.finish();
+    assert_eq!(v["feedHash"], SIGNED_HEAD_HASH);
+    assert_eq!(v["verified"], true);
+    let requests = hub.finish();
+    assert_eq!(
+        requests[1].path,
+        format!("/api/hub/brains/{BRAIN_ID}/feed?after=40&limit=1")
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -945,10 +965,7 @@ fn hub_error_messages_render_terminal_sanitized_in_text_mode() {
 
 #[test]
 fn subscribe_once_with_since_reports_head_against_the_baseline() {
-    let hub = MockHub::serve(vec![(
-        200,
-        format!("{{\"id\":\"{BRAIN_ID}\",\"indexedFeedSeq\":41}}"),
-    )]);
+    let hub = MockHub::serve(signed_head_responses());
     let dir = tempfile::tempdir().unwrap();
     let out = run_dbmd(
         dir.path(),

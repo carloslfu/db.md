@@ -42,15 +42,9 @@
 allow = [
     "MIT",
     "Apache-2.0",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "0BSD",
     "Unlicense",
-    # MPL-2.0 is permitted by policy but no MPL crate is in the tree today, so
-    # `cargo deny` emits a (non-fatal) "license-not-encountered" warning for it.
-    # That warning is expected; keep MPL-2.0 listed so a future weak-copyleft
-    # MPL dep passes without a policy change. Add nothing stronger (no LGPL/GPL).
-    "MPL-2.0",
     "Zlib",
     "Unicode-3.0",
     # ISC entered with the link.md client's TLS stack (ureq → rustls):

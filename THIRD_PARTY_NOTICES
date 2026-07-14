@@ -7,8 +7,8 @@ the single `dbmd` binary), with their licenses.
 Dependency licensing policy (enforced): permissive only. The allowlist of
 accepted SPDX license identifiers is:
 
-    MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, 0BSD, Unlicense,
-    MPL-2.0, Zlib, Unicode-3.0, ISC, CDLA-Permissive-2.0
+    MIT, Apache-2.0, BSD-3-Clause, 0BSD, Unlicense, Zlib,
+    Unicode-3.0, ISC, CDLA-Permissive-2.0
 
 No GPL, no AGPL, no LGPL-static. Zero AI/LLM dependencies — no provider
 SDKs, no API keys, no model calls, no embeddings/vector/ANN crates of any
