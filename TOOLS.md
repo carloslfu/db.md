@@ -21,7 +21,7 @@ so there are no external tools to install or license.
   indexes, queries, and links.
 - **Permissive dependency policy.** No GPL, no AGPL, no AI SDKs, no
   vector database crates anywhere in the binary.
-- **One install.** ~6MB, cross-platform (darwin / linux ×
+- **One install.** One static binary, cross-platform (darwin / linux ×
   x86_64 / arm64).
 
 ## Why one binary, not a kit

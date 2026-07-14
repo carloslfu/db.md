@@ -1725,7 +1725,7 @@ the installer. Two layers, both reachable as text — the repo-root
 `llms.txt` is the agent-readable entry point:
 
 ```bash
-# 1 — get the binary (one ~6MB binary, no toolchain; brew or cargo also work)
+# 1 — get the binary (one static binary, no toolchain; brew or cargo also work)
 curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.sh | sh
 
 # 2 — load the contract (the single source of truth)

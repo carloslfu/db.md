@@ -20,7 +20,7 @@ per-harness machinery to depend on.
 contract → read the store's `DB.md` → operate with `dbmd`. The steps below get
 you the binary; `dbmd spec` is the single source of truth from there.
 
-## 1. Install the binary (one ~6MB Rust binary, no toolchain)
+## 1. Install the binary (one static Rust binary, no toolchain)
 
 Install it and keep moving. This is the fast path; run it straight through:
 
