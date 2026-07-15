@@ -100,6 +100,8 @@ pub const MAX_PROPOSE_BYTES: u64 = 16 * 1024;
 /// large export on a slow link still completes.
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const READ_TIMEOUT_SECS: u64 = 120;
+const CONNECT_ATTEMPTS: usize = 3;
+const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 
 /// Everything that can go wrong on the wire or at its edges. Each variant maps
 /// onto one stable CLI error code; messages are single-line and never echo the
@@ -567,27 +569,36 @@ fn request(
     auth: Auth,
 ) -> LinkResult<HubResponse> {
     let url = format!("{}{}", cfg.hub, path);
-    let mut req = agent().request(method, &url);
-    if auth == Auth::Required {
-        req = req.set("authorization", &format!("Bearer {}", cfg.require_key()?));
-    }
-
-    let result = match body {
-        Some(v) => req
-            .set("content-type", "application/json")
-            .send_string(&v.to_string()),
-        None => req.call(),
+    let credential = match auth {
+        Auth::Required => Some(format!("Bearer {}", cfg.require_key()?)),
+        Auth::None => None,
     };
-
+    let encoded_body = body.map(Value::to_string);
+    let http = agent();
+    let result = with_connect_retries(|| {
+        let mut req = http.request(method, &url);
+        if let Some(value) = &credential {
+            req = req.set("authorization", value);
+        }
+        match &encoded_body {
+            Some(value) => req
+                .set("content-type", "application/json")
+                .send_string(value)
+                .map_err(Box::new),
+            None => req.call().map_err(Box::new),
+        }
+    });
     let resp = match result {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(_, resp)) => resp,
-        Err(ureq::Error::Transport(t)) => {
-            return Err(LinkError::Transport {
-                hub: cfg.hub.clone(),
-                message: t.to_string(),
-            })
-        }
+        Err(error) => match *error {
+            ureq::Error::Status(_, resp) => resp,
+            ureq::Error::Transport(error) => {
+                return Err(LinkError::Transport {
+                    hub: cfg.hub.clone(),
+                    message: error.to_string(),
+                });
+            }
+        },
     };
 
     let status = resp.status();
@@ -603,6 +614,40 @@ fn request(
         status,
         body: parsed,
     })
+}
+
+/// These failures happen before any HTTP request reaches the hub, so retrying
+/// cannot duplicate a mutation. Mid-stream I/O is deliberately excluded: once
+/// bytes may have crossed the wire, the caller must rely on the verb's own
+/// idempotency contract instead of guessing.
+fn is_pre_request_transport(kind: ureq::ErrorKind) -> bool {
+    matches!(
+        kind,
+        ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::ProxyConnect
+    )
+}
+
+fn with_connect_retries(
+    mut send: impl FnMut() -> Result<ureq::Response, Box<ureq::Error>>,
+) -> Result<ureq::Response, Box<ureq::Error>> {
+    let mut attempt = 0;
+    loop {
+        match send() {
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    ureq::Error::Transport(transport)
+                        if is_pre_request_transport(transport.kind())
+                ) && attempt + 1 < CONNECT_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    CONNECT_RETRY_BACKOFF_MS[attempt],
+                ));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn assert_safe_presigned_url(raw: &str) -> LinkResult<()> {
@@ -623,47 +668,62 @@ fn assert_safe_presigned_url(raw: &str) -> LinkResult<()> {
 
 fn put_presigned(raw: &str, headers: &Value, bytes: &[u8]) -> LinkResult<()> {
     assert_safe_presigned_url(raw)?;
-    let mut req = agent().put(raw);
-    if let Some(map) = headers.as_object() {
-        for (name, value) in map {
-            if let Some(value) = value.as_str() {
-                req = req.set(name, value);
+    let http = agent();
+    let result = with_connect_retries(|| {
+        let mut req = http.put(raw);
+        if let Some(map) = headers.as_object() {
+            for (name, value) in map {
+                if let Some(value) = value.as_str() {
+                    req = req.set(name, value);
+                }
             }
         }
-    }
-    match req.send_bytes(bytes) {
+        req.send_bytes(bytes).map_err(Box::new)
+    });
+    match result {
         Ok(resp) if resp.status() < 300 => Ok(()),
-        Ok(resp) | Err(ureq::Error::Status(_, resp)) => Err(LinkError::Http {
+        Ok(resp) => Err(LinkError::Http {
             what: "pack upload",
             status: resp.status(),
             message: "object store rejected the upload".to_string(),
             code: None,
         }),
-        Err(ureq::Error::Transport(err)) => Err(LinkError::Transport {
-            hub: "the object store".to_string(),
-            message: err.to_string(),
-        }),
+        Err(error) => match *error {
+            ureq::Error::Status(_, resp) => Err(LinkError::Http {
+                what: "pack upload",
+                status: resp.status(),
+                message: "object store rejected the upload".to_string(),
+                code: None,
+            }),
+            ureq::Error::Transport(err) => Err(LinkError::Transport {
+                hub: "the object store".to_string(),
+                message: err.to_string(),
+            }),
+        },
     }
 }
 
 fn get_presigned(raw: &str) -> LinkResult<Vec<u8>> {
     assert_safe_presigned_url(raw)?;
-    let resp = match agent().get(raw).call() {
+    let http = agent();
+    let resp = match with_connect_retries(|| http.get(raw).call().map_err(Box::new)) {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(_, resp)) => {
-            return Err(LinkError::Http {
-                what: "pack download",
-                status: resp.status(),
-                message: "object store rejected the download".to_string(),
-                code: None,
-            })
-        }
-        Err(ureq::Error::Transport(err)) => {
-            return Err(LinkError::Transport {
-                hub: "the object store".to_string(),
-                message: err.to_string(),
-            })
-        }
+        Err(error) => match *error {
+            ureq::Error::Status(_, resp) => {
+                return Err(LinkError::Http {
+                    what: "pack download",
+                    status: resp.status(),
+                    message: "object store rejected the download".to_string(),
+                    code: None,
+                });
+            }
+            ureq::Error::Transport(err) => {
+                return Err(LinkError::Transport {
+                    hub: "the object store".to_string(),
+                    message: err.to_string(),
+                });
+            }
+        },
     };
     let mut bytes = Vec::new();
     resp.into_reader()
@@ -1654,6 +1714,39 @@ mod tests {
             hub: "http://127.0.0.1:9".to_string(),
             key: Some("k".to_string()),
         }
+    }
+
+    #[test]
+    fn request_retries_a_connection_failure_before_sending() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let listener = TcpListener::bind(address).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+        let cfg = HubConfig {
+            hub: format!("http://{address}"),
+            key: None,
+        };
+
+        let response = request(&cfg, "GET", "/retry", None, Auth::None).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, Some(json!({ "ok": true })));
+        server.join().unwrap();
     }
 
     #[test]

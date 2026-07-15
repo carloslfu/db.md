@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.6.3**.
+  `Cargo.toml`, currently **v0.6.4**.
 
 ## [Unreleased]
+
+## [0.6.4] — 2026-07-14
+
+### Toolkit — resilient link transport (format unchanged: v0.4)
+
+- Link verbs now retry bounded DNS, TCP, proxy-connect, and TLS-handshake
+  failures that occur before any HTTP request reaches the hub. Mid-stream I/O
+  is deliberately not guessed or replayed.
+- The same pre-request retry contract covers content-addressed presigned pack
+  uploads and downloads. A deterministic regression starts the loopback hub
+  after the first refused connection and proves the next bounded attempt wins.
 
 ## [0.6.3] — 2026-07-14
 
