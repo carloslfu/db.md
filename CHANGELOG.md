@@ -8,9 +8,35 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.6.4**.
+  `Cargo.toml`, currently **v0.6.5**.
 
 ## [Unreleased]
+
+## [0.6.5] — 2026-07-17
+
+### Format prose — the grounding doctrine, stated precisely (format unchanged: v0.4)
+
+- SPEC.md now distinguishes **re-grounding** (what the curator does on
+  demand: answering *"what supports this record now?"* against
+  everything the store holds, including evidence the writer never saw)
+  from **write-time lineage** (*"which inputs the writer read"* —
+  unrecoverable unless recorded, which is exactly why unsaved testimony
+  is the one mandated capture). Curator step 10 is now "Re-grounds
+  records on demand"; the Source-first provenance section carries the
+  full statement. Declared lineage stays a per-store `## Schemas`
+  choice; a declared link is the author's assertion, checkable for
+  shape and existence, never proof of causal truth.
+- `meta-type: fact` now states that the name marks the *shape* (an
+  atomic assertion recorded as data), not a truth warrant; the
+  two-folders section states that evidence is what was received or
+  said, not adjudicated truth.
+- The speculative `RECORD_UNGROUNDED` roadmap tease is removed,
+  replaced by the reason no groundedness check ships: a mechanical
+  check can only detect *absent links*, and an absent link is not a
+  defect under the discipline — groundedness is a judgment over
+  meaning, the curator's job. The validation vocabulary is untouched.
+- Toolkit code unchanged; this release re-bundles the spec so
+  `dbmd spec` prints the current text.
 
 ## [0.6.4] — 2026-07-14
 

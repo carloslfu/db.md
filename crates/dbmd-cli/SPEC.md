@@ -131,7 +131,10 @@ data vs. synthesis) that v0.2 expressed as a separate `wiki/` folder.
     expenses, meetings, decisions, invoices, contacts, companies.
     Frontmatter-heavy (the structured "row"), body-light or empty.
     Write-mostly, occasionally amended. "Relational but not that much,
-    it's still markdown."
+    it's still markdown." The name marks the *shape* — an atomic
+    assertion recorded as data — not a truth warrant: a `fact` can be
+    wrong, and it is corrected by evidence and revision (the curator's
+    contradiction discipline), never guaranteed by the label.
   - **`meta-type: operational`** — operating state the agent maintains:
     a running counter, a task list, a status board, a config the agent
     edits. Atomic like a fact, but mutated as state rather than appended
@@ -143,8 +146,10 @@ data vs. synthesis) that v0.2 expressed as a separate `wiki/` folder.
     **single-voice** (see [Writers and readers](#writers-and-readers)).
 
 The pattern: *sources are evidence; `fact`/`operational` records are
-data; `conclusion` records are understanding.* Same store, two folders,
-one cross-cutting field.
+data; `conclusion` records are understanding.* Evidence is what was
+received or said, not adjudicated truth — two sources can disagree,
+and the store keeps the disagreement rather than resolving it. Same
+store, two folders, one cross-cutting field.
 
 ### How an agent uses db.md — four moves, in order
 
@@ -934,17 +939,18 @@ user's choice. **db.md ships no LLM runtime and no API keys.**
 9. **Maintains cross-references** (a `profile` conclusion about a
    person links to the contact record, the company record, and
    meeting records).
-10. **Reconstructs provenance on demand.** Every record *should* trace
+10. **Re-grounds records on demand.** Every record *should* trace
     to a source — documentary or testimonial — but db.md does **not**
-    materialize that as a mandatory per-record link. The agent
-    reconstructs the chain when it is needed (audit, contradiction,
-    review) by matching record to source *by meaning* — which is what
-    the agent is good at and what makes per-record provenance links
-    premature. Persistent documentary sources are always
-    reconstructable; only ephemeral testimony must be captured up
-    front (step 6). This is a **discipline that keeps provenance
-    reconstructable**, not a mechanical guarantee that every record is
-    grounded — see [the honesty note below](#a-note-on-what-is-and-isnt-enforced).
+    materialize that as a mandatory per-record link. When grounding is
+    needed (audit, contradiction, review), the agent re-derives it by
+    matching record to evidence *by meaning* — answering *"what
+    supports this record now?"* — which is what the agent is good at
+    and what makes per-record provenance links premature. Persistent documentary
+    sources are always there to be re-found; only ephemeral testimony
+    must be captured up front (step 6). This is a **discipline that
+    keeps records re-groundable**, not a mechanical guarantee that
+    every record is grounded — and re-grounding is support, not
+    history; see [the honesty note below](#a-note-on-what-is-and-isnt-enforced).
 11. **Flags contradictions** (two sources disagree on a contact's
     employer) without silently picking a winner. Canonical
     mechanism: append a `## Open questions` section to the relevant
@@ -995,12 +1001,32 @@ The discipline behind steps 6 and 10, stated once:
   PDF, an export under `sources/`) or testimonial (a `note` under
   `sources/notes/`). Records are the agent's distillation of evidence;
   the evidence is what makes a record defensible.
-- **Provenance is reconstructed, not linked.** db.md does not require a
-  per-record link back to its source, and ships no check that one
-  exists. The reconstruction tool is the agent: it matches a record to
-  its source by meaning when provenance is actually needed. A persistent
-  document is always there to be re-found, so materializing the link at
-  write time is premature.
+- **Grounding is re-derived on demand, not materialized.** db.md does
+  not require a per-record link back to its source, and ships no check
+  that one exists. The re-derivation tool is the agent: when grounding
+  is actually needed, it matches the record to supporting evidence by
+  meaning — against **everything the store holds at that moment**,
+  including evidence the original writer never saw. Be precise about
+  what this answers: *"what supports this record now?"* — the question
+  that decides whether a record is defensible. It does not recover
+  *"which inputs the writer read at write time"* — that history is
+  information, and information never recorded is gone; no tool and no
+  model can re-derive it. (`log.md` keeps a narrative trace of curator
+  actions — prose history, not per-record lineage.) db.md chooses the
+  first question deliberately. A materialized lineage link ages
+  *silently*: new evidence arrives without any write touching the
+  record, which is exactly the staleness that write-through refresh
+  cannot catch — while a persistent document is always there to be
+  re-found, and the re-derived answer grows richer as the store grows,
+  because new evidence joins it. The one input that genuinely cannot
+  be re-found — unsaved testimony — is exactly the one this discipline
+  captures at write time (next bullet). A store that wants *declared*
+  lineage can define link fields for it in its own `DB.md ## Schemas`
+  (the example types table's conclusion types carry a `derived_from`
+  list); a declared link records the author's assertion, checked by
+  `dbmd validate` for link existence always and for shape where a
+  `link to <prefix>/` modifier applies — it is not proof that the
+  assertion is causally true.
 - **Testimony is the exception that must be captured.** An unsaved
   conversation cannot be reconstructed. So when a fact arrives only in
   chat, the agent writes the `note` source *coupled to* the create or
@@ -1013,11 +1039,16 @@ The discipline behind steps 6 and 10, stated once:
 mechanically enforced invariant.** With no required link and no shipped
 check, the toolkit cannot itself tell a grounded record from an
 ungrounded one — `dbmd validate` will not fail a record that has no
-source. The discipline keeps provenance *reconstructable*; it does not
+source. The discipline keeps records *re-groundable*; it does not
 *prove* groundedness. Treat it as a contract the curator upholds, not a
-guarantee the format gives you. (A future opt-in `RECORD_UNGROUNDED`
-info-level check could surface obviously source-less records, but the
-spec ships no such check by default; see [Roadmap](#roadmap).)
+guarantee the format gives you. The spec deliberately ships no
+groundedness check: a mechanical check can only detect *absent links*,
+not absent grounding — and under this discipline an absent link is not
+a defect. Telling a grounded record from an ungrounded one is a
+judgment over meaning, which is the curator's job, made at read time
+with the whole store available. (Declared lineage fields are the
+checked exception — see *Grounding is re-derived on demand* above:
+validation of the declaration, never of its truth.)
 
 ### Importing existing data
 
@@ -1028,7 +1059,7 @@ source-first discipline above:
 - **Provenance, not polish, decides the layer.** An artifact you did not
   author is a *source*, however finished it looks. A polished external wiki is
   evidence: it lands under `sources/`, and the `meta-type: conclusion` records
-  are the synthesis *your* agent writes *from* it (reconstructable by meaning,
+  are the synthesis *your* agent writes *from* it (re-groundable by meaning,
   per above). Don't file someone else's synthesis directly as your conclusions
   — that claims an authorship the store can't defend.
 - **Reference vs. replace.** *Reference*: the external base stays the source of

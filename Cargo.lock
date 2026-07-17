@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "dbmd-cli"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "dbmd-core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "base64",
  "calamine",
