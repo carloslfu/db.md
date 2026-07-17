@@ -195,7 +195,7 @@ records conform to. There is no config format to learn. The agent writes
 | Backend logic | Agent harness plus deterministic `dbmd` operations |
 | UI | Chat, voice, forms, dashboards, or whatever the agent generates |
 
-The format is at v0.4 and the `dbmd` toolkit at 0.6.4. Two versions,
+The format is at v0.4 and the `dbmd` toolkit at 0.6.5. Two versions,
 because they are two things: SPEC.md carries the format's, the crates
 carry the toolkit's, and repo tags track toolkit releases. The format's
 policy from v0.3 on is additive: new fields and codes layer on,
