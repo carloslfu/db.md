@@ -8,7 +8,31 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.7.0**.
+  `Cargo.toml`, currently **v0.7.1**.
+
+## [0.7.1] — 2026-07-19
+
+### Fixed
+
+- **Reading a file no longer fails on a non-RFC3339 `created`/`updated`.** The
+  parse now keeps an unparseable timestamp verbatim (the typed accessor stays
+  absent, the value round-trips byte-for-byte) instead of erroring, matching
+  how every other universal key already degrades — a non-scalar `type` or
+  `summary` is preserved, never destroyed.
+
+  This made `dbmd format` — and `fm`, `link`, `rename`, all of which read
+  through the same path — **fail outright on any store carrying a date-only
+  stamp** (`created: 2026-04-10`), the single most common legacy spelling in
+  migrated stores. A store could not be canonicalized precisely because it was
+  imperfect, which is backwards: canonicalization is what imperfect stores
+  need. Reported by a host running `format` over real brains.
+
+  The read/write asymmetry is deliberate and now explicit: **reading tolerates
+  what a store already contains; `Frontmatter::set` still refuses to author a
+  malformed value**, and `validate` still reports `FM_BAD_TIMESTAMP` (it reads
+  the raw YAML, so leniency in the parser costs no enforcement). A value is
+  never silently "repaired" — guessing a time zone for a date-only stamp is a
+  data decision, not a formatting one.
 
 ## [0.7.0] — 2026-07-19
 

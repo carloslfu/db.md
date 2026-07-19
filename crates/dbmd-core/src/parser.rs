@@ -510,8 +510,35 @@ impl Frontmatter {
                         fm.extra.insert(key, v);
                     }
                 },
-                "created" => fm.created = parse_timestamp(&v, "created", file)?,
-                "updated" => fm.updated = parse_timestamp(&v, "updated", file)?,
+                // Same preserve-don't-destroy rule as the scalar keys above,
+                // applied to the two typed ones. A value that is not RFC3339
+                // has nowhere to live in the typed `Option<DateTime>`, so it
+                // rides in `extra` verbatim and `to_yaml` re-emits it byte-for-
+                // byte; the typed accessor stays None because there is no
+                // timestamp to offer.
+                //
+                // The READ path is deliberately tolerant while `set` (the write
+                // path) stays strict: a store is whatever it already is —
+                // date-only stamps are the single most common legacy spelling
+                // in migrated stores — and refusing to PARSE one made every
+                // file-touching command (`format`, `fm`, `link`, `rename`)
+                // unusable on exactly the imperfect stores that most need them.
+                // Reporting the defect is `validate`'s job, and it still does:
+                // `FM_BAD_TIMESTAMP` is raised from the raw YAML value, never
+                // from this parse (validate.rs — `is_iso8601` over
+                // `scalar_string`), so leniency here costs no enforcement.
+                "created" => match parse_timestamp(&v, "created", file) {
+                    Ok(ts) => fm.created = ts,
+                    Err(_) => {
+                        fm.extra.insert(key, v);
+                    }
+                },
+                "updated" => match parse_timestamp(&v, "updated", file) {
+                    Ok(ts) => fm.updated = ts,
+                    Err(_) => {
+                        fm.extra.insert(key, v);
+                    }
+                },
                 "summary" => match scalar_string(&v) {
                     Some(s) => fm.summary = Some(s),
                     None => {
@@ -2683,18 +2710,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_non_rfc3339_timestamp() {
-        // A date-only value is not a full RFC3339 timestamp; created/updated
-        // require the full form.
+    fn parse_preserves_non_rfc3339_timestamp_verbatim() {
+        // A date-only value is not a full RFC3339 timestamp, so the typed
+        // accessor stays None — but the READ path must never destroy it or
+        // refuse the file. It rides in `extra` and round-trips byte-for-byte,
+        // exactly like a non-scalar `type`/`summary`. `validate` is what
+        // reports it (FM_BAD_TIMESTAMP, raised from the raw YAML value).
+        //
+        // Regression: erroring here made `dbmd format` (and `fm`/`link`/
+        // `rename`, all of which go through `read_file`) fail outright on any
+        // store carrying a legacy date-only stamp — the common migrated shape.
         let yaml = "type: email\ncreated: 2026-05-27";
-        let err = Frontmatter::parse(yaml, Path::new("bad.md")).unwrap_err();
-        match err {
-            ParseError::BadTimestamp { key, value, .. } => {
-                assert_eq!(key, "created");
-                assert_eq!(value, "2026-05-27");
-            }
-            other => panic!("expected BadTimestamp, got {other:?}"),
-        }
+        let fm = Frontmatter::parse(yaml, Path::new("bad.md")).unwrap();
+        assert!(fm.created.is_none(), "unparseable stamp offers no typed value");
+        assert_eq!(
+            fm.extra.get("created").and_then(Value::as_str),
+            Some("2026-05-27"),
+            "the operator's bytes must survive the read"
+        );
+        assert!(
+            fm.to_yaml().contains("created: 2026-05-27"),
+            "and must re-emit verbatim; got:\n{}",
+            fm.to_yaml()
+        );
+    }
+
+    #[test]
+    fn set_still_refuses_to_author_a_bad_timestamp() {
+        // The read/write asymmetry is the point: tolerate what a store already
+        // contains, never CREATE a malformed value. (`set_timestamp_validates_
+        // rfc3339` covers the same boundary from the write side.)
+        let mut fm = Frontmatter::parse("type: email\ncreated: 2026-05-27", Path::new("b.md"))
+            .expect("read tolerates the legacy stamp");
+        assert!(matches!(
+            fm.set("created", "still-not-a-date").unwrap_err(),
+            ParseError::BadTimestamp { .. }
+        ));
     }
 
     #[test]
