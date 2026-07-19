@@ -19,7 +19,7 @@
 use std::path::Path;
 
 use dbmd_core::emit::{self, Emit, EmittedFile};
-use dbmd_core::store::Layer;
+use dbmd_core::store::{EdgeSpan, Layer};
 use dbmd_core::Store;
 
 use crate::cli::EmitArgs;
@@ -81,9 +81,28 @@ fn file_json(f: &EmittedFile) -> serde_json::Value {
         "summary": f.summary,
         "body": f.body,
         "links": f.links,
+        "link_spans": f.link_spans.iter().map(link_span_json).collect::<Vec<_>>(),
         "created": f.created.map(|t| t.to_rfc3339()),
         "updated": f.updated.map(|t| t.to_rfc3339()),
         "sha256": f.sha256,
+    })
+}
+
+/// One wiki-link occurrence: where it sits in `body` and what it says.
+///
+/// `start`/`end` are BYTE offsets into this file's `body` string, `[start,
+/// end)` covering the whole `[[…]]` token — a consumer splices at them without
+/// knowing the grammar, which is the point (the alternative is every renderer
+/// re-implementing bracket scanning AND fence tracking). `target` is the same
+/// canonical spelling `links` carries, minus the appended `.md`; `raw` is the
+/// inner text verbatim for hosts with their own conventions.
+fn link_span_json(s: &EdgeSpan) -> serde_json::Value {
+    serde_json::json!({
+        "target": s.target,
+        "raw": s.raw,
+        "alias": s.alias,
+        "start": s.start,
+        "end": s.end,
     })
 }
 

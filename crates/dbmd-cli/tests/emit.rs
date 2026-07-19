@@ -314,3 +314,67 @@ fn a_non_store_dir_fails_with_not_a_store_exit_3() {
     let err: serde_json::Value = serde_json::from_str(stderr.trim()).expect("structured error");
     assert_eq!(err["error"]["code"], "NOT_A_STORE");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// link_spans — the positional view a renderer splices on
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A host that renders wiki-links needs to know WHERE the tokens are, not just
+/// which targets exist. Without that it must re-find them itself, which means
+/// re-implementing bracket scanning and — the part that rots — fence tracking.
+/// These pin the contract that makes the re-implementation unnecessary.
+#[test]
+fn link_spans_are_body_occurrences_a_consumer_can_splice_on() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    write_db_md(&root);
+    std::fs::create_dir_all(root.join("records/notes")).unwrap();
+    std::fs::write(
+        root.join("records/notes/doc.md"),
+        "---\ntype: note\nsummary: Spans fixture.\nrelated: \"[[records/notes/in-fm]]\"\n---\n\n\
+         How you write a link:\n\n\
+         ```markdown\n[[records/notes/fenced-example]]\n```\n\n\
+         A real one: [[records/notes/target|The Target]] here.\n",
+    )
+    .unwrap();
+
+    let dump = emit_json(&root);
+    let doc = file(&dump, "records/notes/doc.md");
+    let spans = doc["link_spans"]
+        .as_array()
+        .expect("link_spans is an array");
+    let body = doc["body"].as_str().expect("body is a string");
+
+    // The edge SET carries the frontmatter link (it is a real edge) and the
+    // body link; the fenced example is an edge to neither view.
+    let links: Vec<&str> = doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert_eq!(links, ["records/notes/in-fm.md", "records/notes/target.md"]);
+
+    // The positional view is BODY-only, so exactly one occurrence: the
+    // frontmatter link has no span, and the fenced example is not a link.
+    assert_eq!(
+        spans.len(),
+        1,
+        "expected one body occurrence, got {spans:?}"
+    );
+    let s = &spans[0];
+    assert_eq!(s["target"], "records/notes/target");
+    assert_eq!(s["alias"], "The Target");
+    assert_eq!(s["raw"], "records/notes/target|The Target");
+
+    // The span indexes `body` exactly — the splice a renderer performs.
+    let (start, end) = (
+        s["start"].as_u64().unwrap() as usize,
+        s["end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&body[start..end], "[[records/notes/target|The Target]]");
+    let spliced = format!("{}<LINK>{}", &body[..start], &body[end..]);
+    assert!(spliced.contains("A real one: <LINK> here."));
+    // And the fenced example survived the splice untouched — the whole point.
+    assert!(spliced.contains("[[records/notes/fenced-example]]"));
+}

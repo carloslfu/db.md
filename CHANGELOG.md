@@ -8,7 +8,33 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.7.1**.
+  `Cargo.toml`, currently **v0.7.2**.
+
+## [0.7.2] — 2026-07-19
+
+### Added
+
+- **`dbmd emit` now carries `link_spans`** — every wiki-link occurrence in a
+  file's body, in document order, each with the byte range `[start, end)` it
+  covers in `body`, plus the canonical `target`, the `|alias`, and the inner
+  text `raw`.
+
+  `links` answers "what does this file link to" (a deduped set — the graph's
+  view). `link_spans` answers "where exactly are the tokens" — the view a
+  RENDERER needs, because turning `[[…]]` into markup is a splice at a
+  position, not a set operation. Without it, every host that renders db.md
+  re-implements bracket scanning and, inevitably, fence tracking; the two
+  implementations then disagree. (The motivating bug, found in a hosting hub:
+  its renderer rewrote wiki-links inside fenced code blocks into live links,
+  corrupting the examples on exactly the pages that documented the syntax.)
+
+  Body-only by design: a `[[…]]` in a frontmatter value is a real edge and
+  appears in `links`, but it is field data rather than markdown rendered in
+  place, so it has no span. A `#fragment` stays inside `target` — fragments
+  are not in the format, so splitting one is a host convention.
+
+  Additive: existing `emit` consumers are unaffected. Format (SPEC v0.4)
+  untouched.
 
 ## [0.7.1] — 2026-07-19
 

@@ -1135,6 +1135,106 @@ pub fn extract_edge_targets(text: &str) -> Vec<String> {
 /// `a`), trimmed, and canonicalized. The triple-bracket flow-form mis-encoding
 /// (`[[[a]], …]`) is skipped, matching validate. Shared by both the frontmatter
 /// and body scans in [`extract_edge_targets`] so they honor one link grammar.
+/// One wiki-link OCCURRENCE in a body, with the byte span it covers.
+///
+/// [`extract_edge_targets`] answers "what does this file link to" — deduped,
+/// order-insensitive, the graph's view. This answers "where, exactly, are the
+/// link tokens" — the view a RENDERER needs, because rewriting `[[…]]` into
+/// presentation markup is a splice at a position, not a set operation.
+///
+/// Exposing it is what keeps the grammar in one place. A host that must render
+/// wiki-links otherwise has to re-find the tokens itself, which means a second
+/// implementation of `[[`/`]]`/`|` scanning and — the part that always rots —
+/// a second implementation of fence tracking. (Observed in the wild: a hub
+/// whose renderer rewrote fenced example links into live links, corrupting the
+/// code samples on exactly the pages that documented the syntax.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSpan {
+    /// The canonical target, byte-identical to the string
+    /// [`extract_edge_targets`] yields for this occurrence — so the extension
+    /// is NOT appended here (callers that want a store path add `.md`, exactly
+    /// as `emit` does).
+    pub target: String,
+    /// The inner text verbatim (between `[[` and `]]`), untrimmed and unsplit,
+    /// so a host with its own conventions can reinterpret it.
+    pub raw: String,
+    /// The `|alias` label, if the occurrence carries one.
+    ///
+    /// A `#fragment` is deliberately NOT split out: fragments are not in the
+    /// format (they ride inside the target — see `canonical_link_target`), so
+    /// splitting one is a host convention, not db.md grammar.
+    pub alias: Option<String>,
+    /// Byte offsets into the body passed in — `[start, end)` covers the whole
+    /// `[[…]]` token including both bracket pairs.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Every wiki-link occurrence in a BODY, in document order, with byte spans.
+///
+/// Body-only by design: this exists for renderers, which format bodies. A
+/// `[[…]]` in a frontmatter VALUE is a real edge (and
+/// [`extract_edge_targets`] reports it), but it is data being displayed by a
+/// field, never markdown being rendered in place, so it has no useful span
+/// here. Pass the body — a full file's text works too, but its frontmatter
+/// block is then treated as body text.
+///
+/// Fence tracking is identical to [`extract_edge_targets`]'s body pass: a
+/// `[[…]]` inside ``` or `~~~` is a documentation example and yields nothing.
+pub fn extract_edge_spans(body: &str) -> Vec<EdgeSpan> {
+    let mut out = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+    // `lines()` discards offsets, so walk the byte ranges directly and keep the
+    // running base — spans must index the caller's original string.
+    let mut base = 0usize;
+    for line in body.split_inclusive('\n') {
+        let trimmed_len = line.trim_end_matches('\n').len();
+        let content = line[..trimmed_len].trim_end_matches('\r');
+        if let Some(f) = fence {
+            if fence_closes(content, f) {
+                fence = None;
+            }
+        } else if let Some(opened) = fence_opens(content) {
+            fence = Some(opened);
+        } else {
+            push_edge_spans_in_line(content, base, &mut out);
+        }
+        base += line.len();
+    }
+    out
+}
+
+fn push_edge_spans_in_line(line: &str, base: usize, out: &mut Vec<EdgeSpan>) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(close) = line[i + 2..].find("]]") {
+                let inner = &line[i + 2..i + 2 + close];
+                let end = i + 2 + close + 2;
+                let mut parts = inner.splitn(2, '|');
+                let raw_target = parts.next().unwrap_or(inner).trim();
+                let alias = parts.next().map(str::trim).filter(|a| !a.is_empty());
+                if !raw_target.is_empty() && !raw_target.starts_with('[') {
+                    let canonical = canonical_link_target(raw_target);
+                    if !canonical.is_empty() {
+                        out.push(EdgeSpan {
+                            target: canonical,
+                            raw: inner.to_string(),
+                            alias: alias.map(str::to_string),
+                            start: base + i,
+                            end: base + end,
+                        });
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
 fn push_edges_in_line(line: &str, out: &mut Vec<String>) {
     let bytes = line.as_bytes();
     let mut i = 0usize;
@@ -3433,6 +3533,67 @@ After fence [[records/companies/acme]].
             ],
             "fenced example link must not be an edge"
         );
+    }
+
+    #[test]
+    fn edge_spans_agree_with_edge_targets_on_every_body_shape() {
+        // THE anti-drift guarantee. Two extractors over one grammar is exactly
+        // the duplication this type exists to prevent elsewhere, so the pair
+        // must never disagree: same links, same order, same fence decisions.
+        // Every hostile body shape the target tests cover, in one corpus.
+        let bodies = [
+            "Plain [[records/contacts/sarah]] link.",
+            "See [[ records/contacts/sarah ]] and [[records/companies/acme|Acme Inc]].",
+            "Fenced:\n\n```markdown\n[[records/ghost]]\n```\n\nAfter [[records/real]].",
+            "~~~\n[[records/tilde-ghost]]\n~~~\n[[records/after-tilde]]",
+            "   ```\n[[records/indented-fence-ghost]]\n   ```\n[[records/after]]",
+            "````\n```\n[[records/nested-ghost]]\n```\n````\n[[records/after-long]]",
+            "Mis-encoded [[[a]], [[b]]] and real [[records/x]].",
+            "Unclosed [[records/never-closed and then [[records/ok]].",
+            "Empty [[]] and blank [[   ]] and real [[records/y]].",
+            "Multi [[a]] on [[b]] one [[c]] line.",
+            "Anchored [[records/x#section]] and aliased [[records/y#s|Label]].",
+            "Trailing newline body [[records/z]]\n",
+            "", // degenerate
+        ];
+        for body in bodies {
+            let spans = extract_edge_spans(body);
+            let targets = extract_edge_targets(body);
+            assert_eq!(
+                spans.iter().map(|s| s.target.clone()).collect::<Vec<_>>(),
+                targets,
+                "span targets diverged from edge targets for body:\n{body}"
+            );
+            // And every span must actually index the `[[…]]` token it claims.
+            for s in &spans {
+                let slice = &body[s.start..s.end];
+                assert!(
+                    slice.starts_with("[[") && slice.ends_with("]]"),
+                    "span {}..{} is not a wiki-link token (got {slice:?}) in:\n{body}",
+                    s.start,
+                    s.end
+                );
+                assert_eq!(
+                    &slice[2..slice.len() - 2],
+                    s.raw,
+                    "span raw text must be the token's inner text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edge_spans_carry_alias_and_keep_fragments_in_the_target() {
+        let spans = extract_edge_spans("Go [[records/notes/x#setup|Read the setup]] now.");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].alias.as_deref(), Some("Read the setup"));
+        // The fragment stays IN the target — fragments are not in the format.
+        assert_eq!(spans[0].target, "records/notes/x#setup");
+        assert_eq!(spans[0].raw, "records/notes/x#setup|Read the setup");
+        // A splice over the span replaces exactly the token.
+        let body = "Go [[records/notes/x#setup|Read the setup]] now.";
+        let out = format!("{}LINK{}", &body[..spans[0].start], &body[spans[0].end..]);
+        assert_eq!(out, "Go LINK now.");
     }
 
     #[test]

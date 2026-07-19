@@ -83,8 +83,11 @@ loop. See SPEC.md § Scale.
   normalized wiki-link targets, file-bytes SHA-256), so a host — a
   hub, an indexer, a migration — ingests a store as a pure consumer of
   `dbmd` output instead of reimplementing the parse; text mode prints
-  the would-be-emitted paths. (Unreleased: on `main`, ships with the
-  next toolkit release.)
+  the would-be-emitted paths. Each file also carries `link_spans`: every
+  wiki-link occurrence in the body, in order, with the byte range it
+  covers — the positional view a RENDERER needs, so rewriting `[[…]]`
+  into markup is a splice at an offset rather than a second
+  implementation of bracket scanning and fence tracking.
 
 ### Write
 Each write maintains the `index.md` catalog write-through (no rebuild step in the loop).

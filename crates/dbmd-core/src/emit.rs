@@ -44,7 +44,7 @@ use sha2::{Digest, Sha256};
 use crate::index::{parse_ts, scalar_string, yaml_to_json_value};
 use crate::parser::split_frontmatter;
 use crate::render::{heading_level, heading_text};
-use crate::store::{self, Layer, Store};
+use crate::store::{self, EdgeSpan, Layer, Store};
 
 /// One file of the dump: the store-relative identity, the parsed frontmatter
 /// (values verbatim), the derived fields, the verbatim body, the normalized
@@ -78,6 +78,15 @@ pub struct EmittedFile {
     /// the on-disk spelling, so a target matches a document `path` directly.
     /// Dangling targets are included (existence is `validate`'s concern).
     pub links: Vec<String>,
+    /// Every wiki-link OCCURRENCE in the body, in document order, with the byte
+    /// span it covers in `body` — the positional view `links` cannot give
+    /// (`links` is a deduped set; a renderer needs to splice at offsets).
+    ///
+    /// Body-only, deliberately: a `[[…]]` in a frontmatter VALUE is a real edge
+    /// (and appears in `links`) but is field data, never markdown rendered in
+    /// place, so it has no span. Empty for `DB.md` and for bodies with no
+    /// links.
+    pub link_spans: Vec<EdgeSpan>,
     /// Frontmatter `created`, when present and RFC3339-parseable.
     pub created: Option<DateTime<FixedOffset>>,
     /// Frontmatter `updated`, when present and RFC3339-parseable.
@@ -211,6 +220,11 @@ fn emit_file(store: &Store, rel: &Path) -> crate::Result<EmittedFile> {
         }
     }
 
+    // Positional occurrences over the BODY only (see the field docs). The
+    // shared extractor guarantees these agree with `links` on every fence
+    // decision — one grammar, two views.
+    let link_spans = store::extract_edge_spans(&body);
+
     Ok(EmittedFile {
         path: rel.to_string_lossy().replace('\\', "/"),
         layer,
@@ -221,6 +235,7 @@ fn emit_file(store: &Store, rel: &Path) -> crate::Result<EmittedFile> {
         summary,
         body,
         links,
+        link_spans,
         created,
         updated,
         sha256,
