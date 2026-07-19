@@ -2722,7 +2722,10 @@ mod tests {
         // store carrying a legacy date-only stamp — the common migrated shape.
         let yaml = "type: email\ncreated: 2026-05-27";
         let fm = Frontmatter::parse(yaml, Path::new("bad.md")).unwrap();
-        assert!(fm.created.is_none(), "unparseable stamp offers no typed value");
+        assert!(
+            fm.created.is_none(),
+            "unparseable stamp offers no typed value"
+        );
         assert_eq!(
             fm.extra.get("created").and_then(Value::as_str),
             Some("2026-05-27"),
