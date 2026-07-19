@@ -8,9 +8,9 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.6.5**.
+  `Cargo.toml`, currently **v0.7.0**.
 
-## [Unreleased]
+## [0.7.0] — 2026-07-19
 
 ### Added
 

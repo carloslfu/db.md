@@ -36,7 +36,7 @@ path = "src/main.rs"
 [dependencies]
 # `link` requested explicitly (not just via default) so the binary keeps the
 # link.md client verbs even if a future build turns core defaults off.
-dbmd-core = { path = "../dbmd-core", version = "0.6.5", features = ["link"] }
+dbmd-core = { path = "../dbmd-core", version = "0.7.0", features = ["link"] }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
