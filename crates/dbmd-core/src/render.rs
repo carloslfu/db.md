@@ -376,7 +376,10 @@ fn parse_sections(body: &str) -> Vec<Section> {
 /// The ATX heading level of a line (number of leading `#`), or 0 if the line is
 /// not a heading. Allows up to three leading spaces (CommonMark), requires a
 /// space (or end-of-line) after the `#` run, and caps the run at six.
-fn heading_level(line: &str) -> u8 {
+/// `pub(crate)` because the `emit` dump derives a file's title from its first
+/// `#` heading through this same rule, so every surface agrees on what a
+/// heading is.
+pub(crate) fn heading_level(line: &str) -> u8 {
     let indent = line.len() - line.trim_start_matches(' ').len();
     if indent > 3 {
         return 0;
@@ -402,7 +405,9 @@ fn heading_level(line: &str) -> u8 {
 /// yields `Title`, but `## C#` yields `C#` — the `#` there is part of the
 /// heading text, not a closing fence. So the trailing `#` run is stripped only
 /// when it is preceded by whitespace (or is the entire trimmed content).
-fn heading_text(line: &str, level: u8) -> String {
+/// `pub(crate)`: the `emit` dump extracts its first-`#`-heading title through
+/// this same rule.
+pub(crate) fn heading_text(line: &str, level: u8) -> String {
     let indent = line.len() - line.trim_start_matches(' ').len();
     let after_hashes = &line[indent + level as usize..];
     let trimmed = after_hashes.trim();

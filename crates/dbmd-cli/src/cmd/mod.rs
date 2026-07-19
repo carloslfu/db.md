@@ -20,6 +20,7 @@
 //! returns it.)
 
 pub mod assets;
+pub mod emit;
 pub mod extract;
 pub mod fm;
 pub mod format;

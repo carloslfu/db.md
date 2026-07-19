@@ -12,6 +12,21 @@ Two things version independently:
 
 ## [Unreleased]
 
+### Added
+
+- `dbmd emit` — the whole-store structured dump: every content file plus
+  `DB.md` as one JSON document under `--json`, each file carrying its parsed
+  frontmatter (values verbatim), derived fields (layer, `type`, effective
+  `meta-type` — records only, absent ⇒ `fact` — title from `name`/`title`/the
+  first `#` heading, `summary`, `created`/`updated`), the verbatim body, the
+  normalized wiki-link targets (fence-aware, alias stripped, `.md` appended,
+  deduped; dangling targets kept), and the SHA-256 of the file bytes. The
+  host-integration surface: a hosting hub or indexer ingests a store as a
+  pure consumer of `dbmd` output instead of reimplementing the parse.
+  Read-only and lenient (a malformed file degrades to body-only, never aborts
+  the dump); text mode prints the would-be-emitted paths. The format is
+  untouched — this is a toolkit read surface, not a SPEC change.
+
 ## [0.6.5] — 2026-07-17
 
 ### Format prose — the grounding doctrine, stated precisely (format unchanged: v0.4)

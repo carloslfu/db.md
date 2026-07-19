@@ -1118,8 +1118,9 @@ fn read_frontmatter(abs: &Path) -> crate::Result<FileMeta> {
 /// sequences/mappings/null. **Must stay identical to `validate::scalar_string`**
 /// so the index writer and the validator coerce `type`/`summary` the same way
 /// (see [`read_frontmatter`]); an unquoted `summary: 2026` becomes `"2026"` in
-/// both, not a placeholder here and a real value there.
-fn scalar_string(v: &serde_norway::Value) -> Option<String> {
+/// both, not a placeholder here and a real value there. `pub(crate)` because
+/// the `emit` projection coerces the same fields through the same rule.
+pub(crate) fn scalar_string(v: &serde_norway::Value) -> Option<String> {
     match v {
         serde_norway::Value::String(s) => Some(s.clone()),
         serde_norway::Value::Number(n) => Some(n.to_string()),
@@ -1181,7 +1182,13 @@ fn yaml_string_or_wiki_link_literal(v: &serde_norway::Value) -> Option<String> {
         .or_else(|| unquoted_wiki_link_literal(v))
 }
 
-fn yaml_to_json_value(v: &serde_norway::Value) -> Value {
+/// Project a frontmatter YAML value into its verbatim JSON form: scalars and
+/// collections as written, with the one YAML ambiguity resolved — an unquoted
+/// inline wiki-link (`field: [[x]]`, which YAML reads as `Seq[Seq[String]]`)
+/// becomes its `[[x]]` string literal. The single value projection the sidecar
+/// records carry; `pub(crate)` because the `emit` dump projects frontmatter
+/// through the same rule so `emit` and `query --json` present identical shapes.
+pub(crate) fn yaml_to_json_value(v: &serde_norway::Value) -> Value {
     if let Some(link) = unquoted_wiki_link_literal(v) {
         return Value::String(link);
     }
@@ -1217,8 +1224,10 @@ fn unquoted_wiki_link_literal(v: &serde_norway::Value) -> Option<String> {
     Some(format!("[[{target}]]"))
 }
 
-/// Parse an RFC3339 timestamp scalar.
-fn parse_ts(s: &str) -> Option<DateTime<FixedOffset>> {
+/// Parse an RFC3339 timestamp scalar. `pub(crate)` because the `emit`
+/// projection reads `created`/`updated` through the same lenient rule
+/// (unparseable ⇒ `None`, never an abort).
+pub(crate) fn parse_ts(s: &str) -> Option<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(s.trim()).ok()
 }
 

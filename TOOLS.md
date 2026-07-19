@@ -76,6 +76,15 @@ loop. See SPEC.md § Scale.
 - `dbmd stats` — store metrics (SWEEP)
 - `dbmd extract <file>` — PDF / docx / xlsx / epub / html → plain text
 - `dbmd index show [<path>]`
+- `dbmd emit` — the whole-store structured dump (SWEEP; read-only):
+  every content file plus `DB.md` as one JSON document under `--json`
+  (parsed frontmatter with values verbatim, derived
+  layer/type/meta-type/title/summary/timestamps, verbatim body,
+  normalized wiki-link targets, file-bytes SHA-256), so a host — a
+  hub, an indexer, a migration — ingests a store as a pure consumer of
+  `dbmd` output instead of reimplementing the parse; text mode prints
+  the would-be-emitted paths. (Unreleased: on `main`, ships with the
+  next toolkit release.)
 
 ### Write
 Each write maintains the `index.md` catalog write-through (no rebuild step in the loop).

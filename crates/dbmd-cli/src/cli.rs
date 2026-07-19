@@ -123,6 +123,18 @@ pub enum Command {
     /// precomputed.
     Stats(StatsArgs),
 
+    // ── Read: the whole-store structured dump ────────────────────────────────
+    /// Emit the whole store as one structured JSON document (`--json`): every
+    /// content file (`sources/` + `records/`, derived catalogs skipped) plus
+    /// `DB.md`, each with its parsed frontmatter (values verbatim), derived
+    /// fields (layer, type, effective meta-type, title, summary, timestamps),
+    /// verbatim body, normalized wiki-link targets, and the SHA-256 of the
+    /// file bytes. The host-integration surface: a hub or indexer ingests a
+    /// store as a pure consumer of `dbmd` output instead of reimplementing
+    /// the parse. Read-only; a SWEEP. Text mode prints the store-relative
+    /// paths that would be emitted, one per line.
+    Emit(EmitArgs),
+
     /// Print the section / sub-section outline of a single file.
     Outline(OutlineArgs),
 
@@ -555,6 +567,18 @@ pub struct TreeArgs {
 /// `dbmd stats` — on-demand store overview (a SWEEP).
 #[derive(Debug, Args)]
 pub struct StatsArgs {
+    /// Store root. Defaults to the current directory.
+    #[arg(value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// emit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd emit` — the whole-store structured dump (a SWEEP; read-only).
+#[derive(Debug, Args)]
+pub struct EmitArgs {
     /// Store root. Defaults to the current directory.
     #[arg(value_name = "DIR", default_value = ".")]
     pub dir: String,

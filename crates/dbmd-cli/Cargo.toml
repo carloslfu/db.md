@@ -58,6 +58,10 @@ regex = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 insta = { workspace = true }
+# The `emit` e2e test recomputes the dump's file-bytes SHA-256 independently.
+# Dev-only — never shipped; the same crate is already a `dbmd-core` runtime
+# dep, so this adds no new crate or license surface to the tree.
+sha2 = { workspace = true }
 # Integration-test driver for the `dbmd` binary (spawn, assert exit code +
 # stdout/stderr). Dev-only — never shipped in the binary. MIT OR Apache-2.0
 # (transitive `predicates`, `bstr`, `doc-comment`); recorded in

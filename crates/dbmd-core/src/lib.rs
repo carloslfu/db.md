@@ -35,6 +35,7 @@
 //!   `index.jsonl` sidecars instead, never a frontmatter tree scan.
 
 pub mod assets;
+pub mod emit;
 pub mod extract;
 pub mod fsx;
 pub mod graph;

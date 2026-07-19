@@ -113,6 +113,7 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Fm(args) => cmd::fm::run(ctx, args),
         Command::Tree(args) => cmd::tree::run(ctx, args),
         Command::Stats(args) => cmd::stats::run(ctx, args),
+        Command::Emit(args) => cmd::emit::run(ctx, args),
         Command::Outline(args) => cmd::outline::run(ctx, args),
         Command::Index(args) => cmd::index::run(ctx, args),
         Command::Log(args) => cmd::log::run(ctx, args),
