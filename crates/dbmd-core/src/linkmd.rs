@@ -1732,6 +1732,195 @@ fn verify_feed_item(item: &FeedItem, identity: &FeedIdentity) -> LinkResult<()> 
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// mirror — verified replication: the whole feed + files, re-servable
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What `dbmd mirror` materialized.
+#[derive(Debug, Serialize)]
+pub struct MirrorReport {
+    /// The brain id.
+    pub brain: String,
+    /// The mirrored feed head.
+    #[serde(rename = "headSeq")]
+    pub head_seq: u64,
+    /// The head entry hash (the feed's advertised converged state).
+    #[serde(rename = "feedHash")]
+    pub feed_hash: Option<String>,
+    /// Signed feed entries verified and stored.
+    pub entries: u64,
+    /// The brain's multikey, pinned in `.dbmd/config` (TOFU).
+    pub pinned: String,
+    /// Store files materialized by the pull.
+    pub files: usize,
+}
+
+/// The mirror state directory, relative to the mirror root.
+pub const MIRROR_REL_DIR: &str = ".dbmd/mirror";
+
+/// SHA-256 hex of one feed entry's stored bytes (`exact JSON + "\n"`) — the
+/// entry hash every consumer recomputes (SPEC §5.3).
+pub fn feed_entry_hash(exact_sans_newline: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{exact_sans_newline}\n").as_bytes())
+    )
+}
+
+fn config_pin(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("pin") {
+            let rest = rest.trim_start();
+            if let Some(value) = rest.strip_prefix('=') {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Replicate a brain with full verification (link.md §5.4 over the WHOLE
+/// chain, not just the head): every entry's signature, hash, sequence
+/// contiguity, and prev-hash linkage are checked before its exact bytes are
+/// stored under `.dbmd/mirror/feed/<seq>.json`; the identity is pinned in
+/// `.dbmd/config` (trust-on-first-use — a later mirror against a different
+/// identity refuses); the store files are pulled beside it. feed + files =
+/// the provable full copy, re-servable by `dbmd serve` — signatures survive
+/// re-hosting, which is what makes the export an export.
+pub fn mirror(cfg: &HubConfig, brain: &str, dest: &Path) -> LinkResult<MirrorReport> {
+    require_safe_ref(brain)?;
+    let card = head(cfg, brain)?;
+    let brain_id = card.brain.clone();
+
+    let mirror_dir = dest.join(MIRROR_REL_DIR);
+    let feed_dir = mirror_dir.join("feed");
+    std::fs::create_dir_all(&feed_dir)?;
+
+    let mut expected_seq: u64 = 1;
+    let mut prev_hash: Option<String> = None;
+    let mut identity: Option<FeedIdentity> = None;
+    let mut stored: u64 = 0;
+    let advertised: Option<String> = loop {
+        let path = format!(
+            "/api/hub/brains/{brain_id}/feed?after={}&limit=100",
+            expected_seq - 1
+        );
+        let body = ensure_ok(request(cfg, "GET", &path, None, Auth::Required)?, "mirror")?;
+        let page: FeedResponse = serde_json::from_value(body)
+            .map_err(|_| invalid_feed("feed response did not parse"))?;
+        if page.scope_limited {
+            return Err(invalid_feed(
+                "this grant is path-scoped — mirroring needs full-store read",
+            ));
+        }
+        let page_identity = page
+            .identity
+            .ok_or_else(|| invalid_feed("feed response carried no identity"))?;
+        if let Some(existing) = &identity {
+            if existing.fingerprint != page_identity.fingerprint {
+                return Err(invalid_feed("identity changed mid-mirror"));
+            }
+        }
+        for item in &page.entries {
+            if item.entry.seq != expected_seq {
+                return Err(invalid_feed(format!(
+                    "expected entry {expected_seq}, feed served {}",
+                    item.entry.seq
+                )));
+            }
+            if item.entry.prev_entry_hash != prev_hash {
+                return Err(invalid_feed(format!(
+                    "entry {} does not chain to its predecessor",
+                    item.entry.seq
+                )));
+            }
+            verify_feed_item(item, &page_identity)?;
+            let mut exact = serde_json::to_vec(&item.entry)
+                .map_err(|_| invalid_feed("could not serialize entry"))?;
+            exact.push(b'\n');
+            crate::fsx::write_atomic(&feed_dir.join(format!("{}.json", item.entry.seq)), &exact)?;
+            prev_hash = Some(item.hash.clone());
+            expected_seq += 1;
+            stored += 1;
+        }
+        identity = Some(page_identity);
+        if expected_seq > page.head_seq || page.entries.is_empty() {
+            if expected_seq <= page.head_seq {
+                return Err(invalid_feed("feed page was empty before the head"));
+            }
+            break page.feed_hash.clone();
+        }
+    };
+    if prev_hash != advertised {
+        return Err(invalid_feed(
+            "the verified chain does not converge on the advertised head",
+        ));
+    }
+    let identity = identity.ok_or_else(|| invalid_feed("brain has no identity"))?;
+    let multikey = format!("ed25519:{}", identity.fingerprint);
+
+    // TOFU pin: first mirror writes it; every later mirror must match it.
+    let config_path = dest.join(CONFIG_REL_PATH);
+    match config_pin(&config_path) {
+        Some(pinned) if pinned != multikey => {
+            return Err(invalid_feed(format!(
+                "pinned identity {pinned} does not match served identity {multikey} — refusing"
+            )));
+        }
+        Some(_) => {}
+        None => {
+            let mut text = std::fs::read_to_string(&config_path).unwrap_or_default();
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&format!("pin = {multikey}\n"));
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            crate::fsx::write_atomic(&config_path, text.as_bytes())?;
+        }
+    }
+
+    crate::fsx::write_atomic(
+        &mirror_dir.join("identity.json"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "fingerprint": identity.fingerprint,
+                "publicKeySpki": identity.public_key_spki,
+            })
+        )
+        .as_bytes(),
+    )?;
+    crate::fsx::write_atomic(
+        &mirror_dir.join("head.json"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "brain": brain_id,
+                "headSeq": card.seq,
+                "feedHash": prev_hash,
+            })
+        )
+        .as_bytes(),
+    )?;
+
+    let pulled = sync_pull(cfg, &brain_id, Some(dest))?;
+    Ok(MirrorReport {
+        brain: brain_id,
+        head_seq: card.seq,
+        feed_hash: prev_hash,
+        entries: stored,
+        pinned: multikey,
+        files: pulled.files,
+    })
+}
+
 /// Read and locally verify the brain's current signed feed head. `subscribe`
 /// polls this as movement detection; the caller re-pulls or re-queries after
 /// an advance.

@@ -1231,3 +1231,129 @@ fn propose_to_a_brain_id_uses_the_brain_inbox_and_optional_auth() {
     let requests = hub.finish();
     assert_eq!(requests[0].header("authorization"), Some("Bearer k"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mirror + serve — federation v0 (link-md-ship F)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VEC_CARD: &str = r#"{"id":"01k0abcdefghjkmnpqrstvwxyz","headSeq":3,"feedHash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","updatedAt":"2026-07-23T00:00:03.000Z"}"#;
+const VEC_HEADPAGE: &str = r#"{"brain":"01k0abcdefghjkmnpqrstvwxyz","headSeq":3,"feedHash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","identity":{"fingerprint":"ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","publicKeySpki":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4"},"entries":[{"hash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","entry":{"v":1,"seq":3,"ts":"2026-07-23T00:00:03.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"edit","op":"snapshot","pack_sha256":"04b744b2038c45a40f921e5985c66e525c352c84eb4306de5784ff00526516c1","files":[],"removed":["records/note.md"],"prev_entry_hash":"f6571c54b7e19b80fce21f134a51ef62f5612b99dd4b537bd49f54dc87d81769","sig":"x4CTOMHWU7KhxldQZWGeoUMhXOnwMW0qsQsFB0mhHbWqyx0kHEnoT4SyzvkhDE6p47pbdW3bZBSuPptQHD5iCQ"}}],"nextAfter":3,"hasMore":false,"scopeLimited":false}"#;
+const VEC_FULLFEED: &str = r#"{"brain":"01k0abcdefghjkmnpqrstvwxyz","headSeq":3,"feedHash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","identity":{"fingerprint":"ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","publicKeySpki":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4"},"entries":[{"hash":"115d34fe8f8375fae7e82208d679e9031eaf092cdd2ab9aa1c0294e9b9d7abaf","entry":{"v":1,"seq":1,"ts":"2026-07-23T00:00:01.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"push","op":"snapshot","pack_sha256":"6e808470fef12de964a8c9a446c1d60f334e6262c4a84ab1721b265659506146","files":[{"path":"DB.md","sha256":"b5a507d2fc555b66c9a829fcf9a6e2e1e7f351c30af57d9b79d036d8a0bef560","bytes":11},{"path":"records/note.md","sha256":"d5cd8c4150ccdd6969f469a0297f9cc49b0b851ac801415ea842fce7b8ad7026","bytes":8}],"removed":[],"prev_entry_hash":null,"sig":"LuTyjtV3VdBvGp6sBTqHmNwd1ELP4cQx1MPBrZt-9Ec0TfnScBeAFBMtgY-af_2yDXl0zneycoK5oFXaG5OxDw"}},{"hash":"f6571c54b7e19b80fce21f134a51ef62f5612b99dd4b537bd49f54dc87d81769","entry":{"v":1,"seq":2,"ts":"2026-07-23T00:00:02.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"edit","op":"snapshot","pack_sha256":"bc32d2bfda48d1429731eeb598927281a9e99803c6da6cdac752a378a2ef57f5","files":[{"path":"records/note.md","sha256":"4e880fb6c5735c3ce2018a23557429f1ef7c0eb07e2dc0638e4bf955a6665d58","bytes":8}],"removed":[],"prev_entry_hash":"115d34fe8f8375fae7e82208d679e9031eaf092cdd2ab9aa1c0294e9b9d7abaf","sig":"3DaK7U-Ug2cBnQ5qb2G6NPyBDyjWNcH6-G3W1XH_g88M9C5GgqwDf3EsccoTDdgDpFFSQ6hHg61Fcg1R9Io0Ag"}},{"hash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","entry":{"v":1,"seq":3,"ts":"2026-07-23T00:00:03.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"edit","op":"snapshot","pack_sha256":"04b744b2038c45a40f921e5985c66e525c352c84eb4306de5784ff00526516c1","files":[],"removed":["records/note.md"],"prev_entry_hash":"f6571c54b7e19b80fce21f134a51ef62f5612b99dd4b537bd49f54dc87d81769","sig":"x4CTOMHWU7KhxldQZWGeoUMhXOnwMW0qsQsFB0mhHbWqyx0kHEnoT4SyzvkhDE6p47pbdW3bZBSuPptQHD5iCQ"}}],"nextAfter":3,"hasMore":false,"scopeLimited":false}"#;
+const VEC_EXPORT: &str = r#"{"brain":"01k0abcdefghjkmnpqrstvwxyz","slug":"vector-brain","headSeq":3,"files":[{"path":"DB.md","content":"---\ntype: db-md\n---\n\n# Vector\n"}]}"#;
+const VEC_BRAIN: &str = "01k0abcdefghjkmnpqrstvwxyz";
+const VEC_HASH_1: &str = "115d34fe8f8375fae7e82208d679e9031eaf092cdd2ab9aa1c0294e9b9d7abaf";
+const VEC_HASH_3: &str = "50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a";
+
+#[test]
+fn mirror_verifies_the_whole_chain_stores_exact_bytes_and_pins() {
+    let hub = MockHub::serve(vec![
+        (200, VEC_CARD.to_string()),
+        (200, VEC_HEADPAGE.to_string()),
+        (200, VEC_FULLFEED.to_string()),
+        (200, VEC_EXPORT.to_string()),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("mirror");
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "mirror",
+            &format!("@{VEC_BRAIN}"),
+            "--dir",
+            dest.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(report["entries"], 3);
+    assert_eq!(report["headSeq"], 3);
+    assert_eq!(report["files"], 1);
+    assert!(report["pinned"].as_str().unwrap().starts_with("ed25519:"));
+    // Exact bytes stored: entry 1's file carries the signed serialization.
+    let raw1 = std::fs::read_to_string(dest.join(".dbmd/mirror/feed/1.json")).unwrap();
+    assert!(raw1.contains("\"seq\":1") && raw1.ends_with('\n'));
+    assert!(
+        VEC_FULLFEED.contains(raw1.trim_end()),
+        "stored bytes are the served bytes"
+    );
+    let pin = std::fs::read_to_string(dest.join(".dbmd/config")).unwrap();
+    assert!(pin.contains("pin = ed25519:"), "config: {pin}");
+    // Store file materialized by the pull.
+    assert!(dest.join("DB.md").exists());
+    hub.finish();
+}
+
+#[test]
+fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
+    // Mirror from the mock hub first.
+    let hub = MockHub::serve(vec![
+        (200, VEC_CARD.to_string()),
+        (200, VEC_HEADPAGE.to_string()),
+        (200, VEC_FULLFEED.to_string()),
+        (200, VEC_EXPORT.to_string()),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("mirror");
+    let mirrored = run_dbmd(
+        dir.path(),
+        &[
+            "mirror",
+            &format!("@{VEC_BRAIN}"),
+            "--dir",
+            dest.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(mirrored.code, Some(0), "stderr: {}", mirrored.stderr);
+    hub.finish();
+
+    // Serve it, read the bound URL from the first stdout line.
+    let mut child = std::process::Command::new(DBMD)
+        .args([
+            "serve",
+            "--dir",
+            dest.to_str().unwrap(),
+            "--addr",
+            "127.0.0.1:0",
+            "--json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn dbmd serve");
+    let mut first = String::new();
+    {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        reader.read_line(&mut first).expect("serve announce line");
+    }
+    let announce: serde_json::Value = serde_json::from_str(first.trim()).expect("serve json line");
+    let url = announce["serving"].as_str().unwrap().to_string();
+
+    // A SECOND dbmd verifies the ORIGINAL signatures against the reference
+    // node — no hub in the loop. Federation v0.
+    let sub = run_dbmd(
+        dir.path(),
+        &["subscribe", &format!("@{VEC_BRAIN}"), "--once", "--json"],
+        Some(&url),
+        Some("k"),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(sub.code, Some(0), "stderr: {}", sub.stderr);
+    let line: serde_json::Value = serde_json::from_str(sub.stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(line["verified"], true);
+    assert_eq!(line["seq"], 3);
+    assert_eq!(line["feedHash"], VEC_HASH_3);
+    assert_eq!(line["brain"], VEC_BRAIN);
+    let stored1 = std::fs::read_to_string(dest.join(".dbmd/mirror/feed/1.json")).unwrap();
+    assert_eq!(
+        dbmd_core::linkmd::feed_entry_hash(stored1.trim_end()),
+        VEC_HASH_1,
+        "the first mirrored entry hashes to its vector hash"
+    );
+}

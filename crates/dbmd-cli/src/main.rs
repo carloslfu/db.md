@@ -127,6 +127,8 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Propose(args) => cmd::propose::run(ctx, args),
         Command::Subscribe(args) => cmd::subscribe::run(ctx, args),
         Command::Key(args) => cmd::key::run(ctx, args),
+        Command::Mirror(args) => cmd::mirror::run(ctx, args),
+        Command::Serve(args) => cmd::serve::run(ctx, args),
         Command::Spec(args) => cmd::spec::run(ctx, args),
     }
 }

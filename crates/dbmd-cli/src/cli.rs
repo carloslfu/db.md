@@ -196,6 +196,20 @@ pub enum Command {
     /// `--once` reads the current head and exits.
     Subscribe(SubscribeArgs),
 
+    /// Replicate a brain with FULL verification: every signed feed entry's
+    /// signature, hash, and chain linkage checked before its exact bytes are
+    /// stored under `.dbmd/mirror/`; the identity is pinned in `.dbmd/config`
+    /// (trust-on-first-use); the store files are pulled beside it. The result
+    /// is a provable full copy that `dbmd serve` can re-serve — signatures
+    /// survive re-hosting.
+    Mirror(MirrorArgs),
+
+    /// Serve a mirrored brain read-only over the hub HTTP binding (card, feed,
+    /// export) on loopback — the reference node. A second `dbmd` can
+    /// `subscribe`/`sync` against it and re-verify the ORIGINAL signatures,
+    /// hub-independent: federation v0.
+    Serve(ServeArgs),
+
     /// Agent signing keys (link.md §8). `dbmd key generate` mints an Ed25519
     /// keypair locally — the secret lands in a 0600 file and NEVER leaves the
     /// machine; register the printed `publicKeySpki` with your hub, then set
@@ -1151,4 +1165,29 @@ pub struct KeyGenerateArgs {
     /// Where to write the private key file (e.g. `~/.config/dbmd/agent.key`).
     #[arg(long, value_name = "FILE")]
     pub out: String,
+}
+
+/// `dbmd mirror <BRAIN> --dir <DIR>`.
+#[derive(Debug, Args)]
+pub struct MirrorArgs {
+    /// The brain to mirror: its id (lowercase ULID) or your slug for it
+    /// (leading `@` accepted).
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+
+    /// Where to materialize the mirror (created if absent).
+    #[arg(long, value_name = "DIR")]
+    pub dir: String,
+}
+
+/// `dbmd serve --dir <DIR> [--addr 127.0.0.1:0]`.
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// The mirrored directory to serve (must contain `.dbmd/mirror/`).
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+
+    /// The address to bind. Loopback by default; port 0 picks a free port.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
+    pub addr: String,
 }
