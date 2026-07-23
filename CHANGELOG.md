@@ -8,7 +8,37 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.7.2**.
+  `Cargo.toml`, currently **v0.8.0**.
+
+## [0.8.0] — 2026-07-23
+
+### Added
+
+The link.md interconnect client grows its identity and federation surface
+(the reference client for [link.md](https://github.com/carloslfu/link.md) v0):
+
+- **`dbmd key generate`** — mint an Ed25519 agent/brain keypair locally; the
+  PKCS#8 secret is written 0600 and never leaves the machine, and the public
+  `multikey` + `publicKeySpki` are printed for hub registration.
+- **`DBMD_AGENT_KEY_FILE`** — sign every authenticated request with a
+  `LinkMD-Sig` proof of possession instead of sending a bearer, so nothing
+  reusable ever crosses the wire or lands in a log or transcript. The agent
+  key outranks the bearer when both are set.
+- **`DBMD_BRAIN_KEY_FILE`** — self-custody push: `sync --push` signs each
+  wire-profile-v1 feed entry locally and ships it through the pack flow; the
+  hub verifies and stores the exact bytes but holds no key.
+- **`dbmd key rotate`** — rotate a self-custodied brain key (link.md §9.1):
+  the new key is signed by the old one, and pre-rotation history keeps
+  verifying.
+- **`dbmd mirror`** — replicate a brain with full chain verification (every
+  signature, hash, and link), pinning its identity trust-on-first-use.
+- **`dbmd serve`** — re-serve a mirror read-only over the hub HTTP binding
+  (a std-only reference node); a downstream `dbmd` re-verifies the original
+  signatures with no hub in the loop.
+- **Key grantees** — `dbmd grant issue @brain <publicKeySpki>` grants to a
+  bare multikey holder (a cross-party person or agent with no hub account).
+- **Brain-addressed propose** — a ULID `propose` target posts to the brain's
+  own inbox, authenticating opportunistically for a larger actor-class budget.
 
 ## [0.7.2] — 2026-07-19
 
