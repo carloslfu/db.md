@@ -1719,9 +1719,8 @@ fn verify_feed_item(item: &FeedItem, identity: &FeedIdentity) -> LinkResult<()> 
         .map_err(|_| invalid_feed("public key is not base64url"))?;
     if public_der.len() != ED25519_SPKI_PREFIX.len() + 32
         || !public_der.starts_with(ED25519_SPKI_PREFIX)
-        || identity.public_key_spki != entry.public_key
     {
-        return Err(invalid_feed("public key does not match the brain card"));
+        return Err(invalid_feed("entry public key is not a valid Ed25519 SPKI"));
     }
     let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&public_der));
     if entry.brain != format!("ed25519:{fingerprint}") {
