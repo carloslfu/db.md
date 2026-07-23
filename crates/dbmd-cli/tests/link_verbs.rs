@@ -1168,3 +1168,66 @@ fn an_agent_key_signs_requests_instead_of_sending_a_bearer() {
         "authorization leaked a bearer: {auth}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Brain-addressed propose — the §7.4 generalization (link-md-ship E)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn propose_to_a_brain_id_uses_the_brain_inbox_and_optional_auth() {
+    // Anonymous (no credential configured): the brain door, no auth header —
+    // the public-brain open-door path.
+    let hub = MockHub::serve(vec![(
+        201,
+        r#"{"id":"x","path":"sources/inbox/x.md"}"#.to_string(),
+    )]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "propose",
+            &format!("@{BRAIN_ID}"),
+            "--app",
+            "intake",
+            "--body",
+            "hello",
+            "--json",
+        ],
+        Some(&hub.url),
+        None,
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let requests = hub.finish();
+    assert_eq!(
+        requests[0].path,
+        format!("/api/hub/brains/{BRAIN_ID}/inbox")
+    );
+    assert!(
+        requests[0].header("authorization").is_none(),
+        "anonymous propose must not invent a credential"
+    );
+
+    // With a bearer configured, Optional auth sends it (bigger actor-class
+    // budget) — while a SITE-handle propose stays unauthenticated by design.
+    let hub = MockHub::serve(vec![(
+        201,
+        r#"{"id":"x","path":"sources/inbox/x.md"}"#.to_string(),
+    )]);
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "propose",
+            &format!("@{BRAIN_ID}"),
+            "--app",
+            "intake",
+            "--body",
+            "hello",
+            "--json",
+        ],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let requests = hub.finish();
+    assert_eq!(requests[0].header("authorization"), Some("Bearer k"));
+}

@@ -718,6 +718,10 @@ enum Auth {
     Required,
     /// Send no credential — the propose door is unauthenticated by design.
     None,
+    /// Send the configured credential when one exists, otherwise nothing —
+    /// brain-addressed propose works anonymously on public brains, and an
+    /// authenticated caller earns a bigger actor-class budget.
+    Optional,
 }
 
 fn agent() -> ureq::Agent {
@@ -752,6 +756,15 @@ fn request(
             Some(key) => linkmd_sig_header(key, method, path, encoded_body.as_deref())?,
             None => format!("Bearer {}", cfg.require_key()?),
         }),
+        Auth::Optional => match &cfg.agent_key {
+            Some(key) => Some(linkmd_sig_header(
+                key,
+                method,
+                path,
+                encoded_body.as_deref(),
+            )?),
+            None => cfg.key.as_deref().map(|k| format!("Bearer {k}")),
+        },
         Auth::None => None,
     };
     let http = agent();
@@ -1440,9 +1453,17 @@ pub fn propose(cfg: &HubConfig, handle: &str, app: &str, body: &str) -> LinkResu
         });
     }
     let payload = json!({ "app": app, "body": body });
-    let path = format!("/api/hub/sites/{handle}/inbox");
+    // A ULID-shaped target is a bare brain address (link.md §7.4's
+    // generalization): the brain inbox door, open on public brains, where a
+    // configured credential earns a bigger actor-class budget. Anything else
+    // is a published-site handle: that door is unauthenticated by design.
+    let (path, auth) = if crate::ulid::is_ulid(handle) {
+        (format!("/api/hub/brains/{handle}/inbox"), Auth::Optional)
+    } else {
+        (format!("/api/hub/sites/{handle}/inbox"), Auth::None)
+    };
     ensure_ok(
-        request(cfg, "POST", &path, Some(&payload), Auth::None)?,
+        request(cfg, "POST", &path, Some(&payload), auth)?,
         "propose",
     )
 }
