@@ -72,6 +72,13 @@ pub const HUB_URL_ENV: &str = "DBMD_HUB_URL";
 /// credential source — see the module docs for why it is never store-based.
 pub const HUB_KEY_ENV: &str = "DBMD_HUB_KEY";
 
+/// Environment variable naming the PATH of a self-custodied BRAIN key file
+/// (link.md §2.4). When set, `sync --push` signs each feed entry locally and
+/// ships it through the pack flow — the hub verifies and stores the exact
+/// client bytes and can never sign for the brain. Same file format as agent
+/// keys (`dbmd key generate`).
+pub const BRAIN_KEY_FILE_ENV: &str = "DBMD_BRAIN_KEY_FILE";
+
 /// Environment variable naming the PATH of an agent signing key file
 /// (link.md §8 `LinkMD-Sig` proof of possession). When set, authenticated
 /// requests are signed per-request with the agent's Ed25519 key instead of
@@ -442,6 +449,9 @@ pub struct HubConfig {
     /// The agent signing key, when [`AGENT_KEY_FILE_ENV`] names one. Wins
     /// over the bearer for authenticated requests (link.md §8).
     pub agent_key: Option<AgentSigningKey>,
+    /// The self-custodied brain signing key, when [`BRAIN_KEY_FILE_ENV`]
+    /// names one — `sync --push` then signs feed entries locally (§2.4).
+    pub brain_key: Option<AgentSigningKey>,
 }
 
 /// A loaded agent signing key: the PKCS#8 secret plus its derived public
@@ -451,6 +461,8 @@ pub struct AgentSigningKey {
     pkcs8: Vec<u8>,
     /// The key's public identity, `ed25519:<base64url sha256(SPKI)>`.
     pub multikey: String,
+    /// The full public key, `base64url(SPKI DER)` — what feed entries carry.
+    pub public_key_spki: String,
 }
 
 impl std::fmt::Debug for AgentSigningKey {
@@ -493,10 +505,16 @@ pub fn hub_config(flag_hub: Option<&str>, dir: &Path) -> LinkResult<HubConfig> {
         None => None,
     };
 
+    let brain_key = match env_nonempty(BRAIN_KEY_FILE_ENV) {
+        Some(path) => Some(load_agent_key(Path::new(&path))?),
+        None => None,
+    };
+
     Ok(HubConfig {
         hub,
         key,
         agent_key,
+        brain_key,
     })
 }
 
@@ -525,12 +543,16 @@ fn agent_keypair(pkcs8: &[u8]) -> LinkResult<ring::signature::Ed25519KeyPair> {
         .map_err(|_| bad_agent_key("not an Ed25519 PKCS#8 key"))
 }
 
-fn multikey_for(pair: &ring::signature::Ed25519KeyPair) -> String {
+/// Derive `(publicKeySpki b64u, multikey)` from a keypair.
+fn public_identity_for(pair: &ring::signature::Ed25519KeyPair) -> (String, String) {
     use ring::signature::KeyPair as _;
     let mut spki = Vec::with_capacity(44);
     spki.extend_from_slice(&ED25519_SPKI_PREFIX);
     spki.extend_from_slice(pair.public_key().as_ref());
-    format!("ed25519:{}", URL_SAFE_NO_PAD.encode(Sha256::digest(&spki)))
+    (
+        URL_SAFE_NO_PAD.encode(&spki),
+        format!("ed25519:{}", URL_SAFE_NO_PAD.encode(Sha256::digest(&spki))),
+    )
 }
 
 /// Load and validate the agent key file: one base64url line of PKCS#8.
@@ -540,8 +562,12 @@ fn load_agent_key(path: &Path) -> LinkResult<AgentSigningKey> {
     let pkcs8 = URL_SAFE_NO_PAD
         .decode(text.trim())
         .map_err(|_| bad_agent_key("the key file is not one base64url line"))?;
-    let multikey = multikey_for(&agent_keypair(&pkcs8)?);
-    Ok(AgentSigningKey { pkcs8, multikey })
+    let (public_key_spki, multikey) = public_identity_for(&agent_keypair(&pkcs8)?);
+    Ok(AgentSigningKey {
+        pkcs8,
+        multikey,
+        public_key_spki,
+    })
 }
 
 /// What `dbmd key generate` returns: the public identity to register plus
@@ -572,10 +598,7 @@ pub fn generate_agent_key(out: &Path) -> LinkResult<GeneratedAgentKey> {
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
         .map_err(|_| bad_agent_key("key generation failed"))?;
     let pair = agent_keypair(pkcs8.as_ref())?;
-    use ring::signature::KeyPair as _;
-    let mut spki = Vec::with_capacity(44);
-    spki.extend_from_slice(&ED25519_SPKI_PREFIX);
-    spki.extend_from_slice(pair.public_key().as_ref());
+    let (spki_b64u, multikey) = public_identity_for(&pair);
 
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() {
@@ -590,8 +613,8 @@ pub fn generate_agent_key(out: &Path) -> LinkResult<GeneratedAgentKey> {
     }
 
     Ok(GeneratedAgentKey {
-        multikey: multikey_for(&pair),
-        public_key_spki: URL_SAFE_NO_PAD.encode(&spki),
+        multikey,
+        public_key_spki: spki_b64u,
         key_file: out.display().to_string(),
     })
 }
@@ -624,6 +647,73 @@ fn linkmd_sig_header(
     let fingerprint = key.multikey.trim_start_matches("ed25519:");
     Ok(format!(
         "LinkMD-Sig v1,key=ed25519:{fingerprint},ts={ts},sig={sig}"
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Self-custody feed entries — the client signs what the hub only verifies
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One `files` element of a wire-profile-v1 feed entry (SPEC §5.1: fields in
+/// exactly this order).
+#[derive(Serialize)]
+struct WireFeedFile {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+/// The unsigned entry in the normative §5.1 field order — serde serializes
+/// struct fields in declaration order, which IS the wire contract.
+#[derive(Serialize)]
+struct UnsignedWireEntry<'a> {
+    v: u8,
+    seq: u64,
+    ts: String,
+    brain: &'a str,
+    public_key: &'a str,
+    kind: &'a str,
+    op: &'a str,
+    pack_sha256: &'a str,
+    files: &'a [WireFeedFile],
+    removed: &'a [String],
+    prev_entry_hash: Option<&'a str>,
+}
+
+/// Build and sign a wire-profile-v1 `push` feed entry with a self-custodied
+/// brain key: serialize the unsigned entry compactly in the normative order,
+/// Ed25519-sign those exact bytes, splice `sig` on as the final field. The
+/// returned string is the exact serialization the hub stores verbatim (plus
+/// one trailing newline) and every independent reader re-derives.
+fn self_custody_entry(
+    key: &AgentSigningKey,
+    seq: u64,
+    ts: String,
+    pack_sha256: &str,
+    files: &[WireFeedFile],
+    prev_entry_hash: Option<&str>,
+) -> LinkResult<String> {
+    let removed: [String; 0] = [];
+    let unsigned = serde_json::to_string(&UnsignedWireEntry {
+        v: 1,
+        seq,
+        ts,
+        brain: &key.multikey,
+        public_key: &key.public_key_spki,
+        kind: "push",
+        op: "snapshot",
+        pack_sha256,
+        files,
+        removed: &removed,
+        prev_entry_hash,
+    })
+    .expect("serialize feed entry");
+    let pair = agent_keypair(&key.pkcs8)?;
+    let sig = URL_SAFE_NO_PAD.encode(pair.sign(unsigned.as_bytes()).as_ref());
+    Ok(format!(
+        "{},\"sig\":\"{}\"}}",
+        &unsigned[..unsigned.len() - 1],
+        sig
     ))
 }
 
@@ -1284,18 +1374,23 @@ pub fn sync_push(cfg: &HubConfig, brain: &str, files: &[(String, String)]) -> Li
         });
     }
 
-    let body = json!({
-        "files": files
-            .iter()
-            .map(|(p, c)| json!({ "path": p, "content": c }))
-            .collect::<Vec<_>>(),
-    });
-    if body.to_string().len() <= MAX_PUSH_BYTES {
-        let path = format!("/api/hub/brains/{brain}/push");
-        return ensure_ok(
-            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
-            "sync push",
-        );
+    // Self-custody (a brain key is configured): the JSON fast path is
+    // hub-signed by construction, so every push goes through the pack flow
+    // with a locally signed entry — the hub verifies and can never sign.
+    if cfg.brain_key.is_none() {
+        let body = json!({
+            "files": files
+                .iter()
+                .map(|(p, c)| json!({ "path": p, "content": c }))
+                .collect::<Vec<_>>(),
+        });
+        if body.to_string().len() <= MAX_PUSH_BYTES {
+            let path = format!("/api/hub/brains/{brain}/push");
+            return ensure_ok(
+                request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+                "sync push",
+            );
+        }
     }
 
     let pack = build_store_pack(files)?;
@@ -1305,7 +1400,34 @@ pub fn sync_push(cfg: &HubConfig, brain: &str, files: &[(String, String)]) -> Li
         });
     }
     let sha256 = format!("{:x}", Sha256::digest(&pack));
-    let meta = json!({ "sha256": sha256, "bytes": pack.len() });
+    let mut meta = json!({ "sha256": sha256, "bytes": pack.len() });
+    if let Some(key) = &cfg.brain_key {
+        // Head state pins seq + prev; a concurrent writer surfaces as the
+        // hub's 422 on commit (re-run to retry against the new head).
+        let current = head(cfg, brain)?;
+        let mut manifest: Vec<WireFeedFile> = files
+            .iter()
+            .map(|(path, content)| WireFeedFile {
+                path: path.clone(),
+                sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+                bytes: content.len() as u64,
+            })
+            .collect();
+        manifest.sort_by(|a, b| a.path.cmp(&b.path));
+        let ts = crate::now()
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let entry = self_custody_entry(
+            key,
+            current.seq + 1,
+            ts,
+            &sha256,
+            &manifest,
+            current.feed_hash.as_deref(),
+        )?;
+        meta["entry"] = Value::String(entry);
+    }
     let presigned = ensure_ok(
         request(
             cfg,
@@ -1758,6 +1880,44 @@ mod tests {
         assert!(verify_feed_item(&tampered, &identity).is_err());
     }
 
+    #[test]
+    fn a_self_custody_entry_verifies_like_any_hub_entry() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let (spki, multikey) = public_identity_for(&pair);
+        let key = AgentSigningKey {
+            pkcs8: pkcs8.as_ref().to_vec(),
+            multikey: multikey.clone(),
+            public_key_spki: spki.clone(),
+        };
+        let files = vec![WireFeedFile {
+            path: "DB.md".to_string(),
+            sha256: "a".repeat(64),
+            bytes: 3,
+        }];
+        let raw = self_custody_entry(
+            &key,
+            1,
+            "2026-07-23T12:00:00.000Z".to_string(),
+            &"c".repeat(64),
+            &files,
+            None,
+        )
+        .unwrap();
+        // The exact client serialization parses as a feed entry and passes the
+        // SAME verifier every subscribe read runs — the self-custody path
+        // produces first-class wire-profile-v1 entries.
+        let entry: FeedEntry = serde_json::from_str(&raw).unwrap();
+        let hash = format!("{:x}", Sha256::digest(format!("{raw}\n").as_bytes()));
+        let item = FeedItem { hash, entry };
+        let identity = FeedIdentity {
+            fingerprint: multikey.trim_start_matches("ed25519:").to_string(),
+            public_key_spki: spki,
+        };
+        assert!(verify_feed_item(&item, &identity).is_ok());
+    }
+
     // ── Address parsing ─────────────────────────────────────────────────────
 
     #[test]
@@ -1915,6 +2075,7 @@ mod tests {
             hub: "http://127.0.0.1:9".to_string(),
             key: Some("k".to_string()),
             agent_key: None,
+            brain_key: None,
         }
     }
 
@@ -1944,6 +2105,7 @@ mod tests {
             hub: format!("http://{address}"),
             key: None,
             agent_key: None,
+            brain_key: None,
         };
 
         let response = request(&cfg, "GET", "/retry", None, Auth::None).unwrap();
