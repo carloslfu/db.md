@@ -1406,3 +1406,75 @@ fn grant_issue_detects_a_key_grantee_and_sends_key_spki() {
         "a key grantee must not be an email"
     );
 }
+
+#[test]
+fn key_rotate_signs_with_the_old_key_and_writes_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_file = dir.path().join("old.key");
+    let new_file = dir.path().join("new.key");
+    // Mint the current brain key.
+    let gen = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            old_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(gen.code, Some(0), "stderr: {}", gen.stderr);
+    let old_multikey = serde_json::from_str::<serde_json::Value>(&gen.stdout).unwrap()["multikey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The hub echoes an identity with a `previous` list; the CLI reports it.
+    let hub = MockHub::serve(vec![(
+        200,
+        format!(
+            r#"{{"brain":"{BRAIN_ID}","identity":{{"fingerprint":"newfp","multikey":"ed25519:newfp","previous":[{{"fingerprint":"{}"}}]}}}}"#,
+            old_multikey.trim_start_matches("ed25519:")
+        ),
+    )]);
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "rotate",
+            &format!("@{BRAIN_ID}"),
+            "--key-file",
+            old_file.to_str().unwrap(),
+            "--out",
+            new_file.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let requests = hub.finish();
+    assert_eq!(
+        requests[0].path,
+        format!("/api/hub/brains/{BRAIN_ID}/rotate")
+    );
+    // The statement's old side is the current key; it carries op=rotate + sig.
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    let stmt: serde_json::Value =
+        serde_json::from_str(body["statement"].as_str().unwrap()).unwrap();
+    assert_eq!(stmt["op"], "rotate");
+    assert_eq!(stmt["brain"], old_multikey);
+    assert!(stmt["sig"].as_str().is_some());
+    assert!(stmt["new_brain"].as_str().unwrap().starts_with("ed25519:"));
+    // The new key file exists and differs from the old.
+    assert!(new_file.exists());
+    assert_ne!(
+        std::fs::read_to_string(&old_file).unwrap(),
+        std::fs::read_to_string(&new_file).unwrap()
+    );
+    // The report surfaces the rotated-from identity.
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(report["previous"][0], old_multikey);
+}

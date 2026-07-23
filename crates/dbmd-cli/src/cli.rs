@@ -1157,6 +1157,12 @@ pub enum KeyCommand {
     /// public identity (`multikey` + `publicKeySpki`) is printed for hub
     /// registration.
     Generate(KeyGenerateArgs),
+
+    /// Rotate a self-custodied brain's key (link.md §9.1): mint a fresh
+    /// keypair, sign the rotation statement with the OLD key, send it to the
+    /// hub, and write the new secret to `--out` only after the hub accepts.
+    /// History keeps verifying — the old identity moves into `previous`.
+    Rotate(KeyRotateArgs),
 }
 
 /// `dbmd key generate --out <FILE>`.
@@ -1190,4 +1196,20 @@ pub struct ServeArgs {
     /// The address to bind. Loopback by default; port 0 picks a free port.
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
     pub addr: String,
+}
+
+/// `dbmd key rotate <BRAIN> --key-file <OLD> --out <NEW>`.
+#[derive(Debug, Args)]
+pub struct KeyRotateArgs {
+    /// The brain to rotate: its id or your slug (leading `@` accepted).
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+
+    /// The CURRENT brain key file (what signs the rotation statement).
+    #[arg(long, value_name = "FILE")]
+    pub key_file: String,
+
+    /// Where to write the NEW private key file (0600, never overwriting).
+    #[arg(long, value_name = "FILE")]
+    pub out: String,
 }

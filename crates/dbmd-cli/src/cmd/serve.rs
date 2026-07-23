@@ -30,6 +30,8 @@ struct ServeState {
     entries: Vec<(u64, String, String)>,
     /// (store-relative path, UTF-8 content) — the materialized store.
     files: Vec<(String, String)>,
+    /// Rotation history, served verbatim so old entries keep verifying.
+    previous: serde_json::Value,
 }
 
 fn load_state(dir: &Path) -> Result<ServeState, String> {
@@ -55,6 +57,10 @@ fn load_state(dir: &Path) -> Result<ServeState, String> {
         .as_str()
         .unwrap_or_default()
         .to_string();
+    let previous = identity
+        .get("previous")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     if brain.is_empty() || fingerprint.is_empty() {
         return Err("mirror state is incomplete".to_string());
     }
@@ -79,6 +85,7 @@ fn load_state(dir: &Path) -> Result<ServeState, String> {
         public_key_spki,
         entries,
         files,
+        previous,
     })
 }
 
@@ -141,6 +148,7 @@ fn handle(state: &ServeState, path_and_query: &str, stream: &mut TcpStream) {
     let identity = serde_json::json!({
         "fingerprint": state.fingerprint,
         "publicKeySpki": state.public_key_spki,
+        "previous": state.previous,
     });
     if path == base {
         let card = serde_json::json!({

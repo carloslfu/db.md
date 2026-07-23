@@ -555,6 +555,13 @@ fn public_identity_for(pair: &ring::signature::Ed25519KeyPair) -> (String, Strin
     )
 }
 
+/// Load and validate a signing-key file (agent or brain — same format):
+/// one base64url line of PKCS#8. Public so `dbmd key rotate` can load the
+/// old key explicitly.
+pub fn load_signing_key(path: &Path) -> LinkResult<AgentSigningKey> {
+    load_agent_key(path)
+}
+
 /// Load and validate the agent key file: one base64url line of PKCS#8.
 fn load_agent_key(path: &Path) -> LinkResult<AgentSigningKey> {
     let text = std::fs::read_to_string(path)
@@ -1670,6 +1677,18 @@ struct FeedIdentity {
     fingerprint: String,
     #[serde(rename = "publicKeySpki")]
     public_key_spki: String,
+    /// Rotation history (link.md §9.1): identities this brain previously
+    /// signed as. Entries verify against current OR previous — rotation
+    /// never invalidates history.
+    #[serde(default)]
+    previous: Vec<PreviousIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviousIdentity {
+    fingerprint: String,
+    #[serde(rename = "publicKeySpki")]
+    public_key_spki: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1705,9 +1724,21 @@ fn verify_feed_item(item: &FeedItem, identity: &FeedIdentity) -> LinkResult<()> 
         return Err(invalid_feed("public key does not match the brain card"));
     }
     let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&public_der));
-    if fingerprint != identity.fingerprint || entry.brain != format!("ed25519:{fingerprint}") {
+    if entry.brain != format!("ed25519:{fingerprint}") {
         return Err(invalid_feed(
             "brain fingerprint does not match its public key",
+        ));
+    }
+    // The signer must be the brain's CURRENT identity or a PREVIOUS one
+    // (link.md §9.1 rotation) — never an arbitrary self-consistent key.
+    let known = fingerprint == identity.fingerprint
+        || identity
+            .previous
+            .iter()
+            .any(|p| p.fingerprint == fingerprint && p.public_key_spki == entry.public_key);
+    if !known {
+        return Err(invalid_feed(
+            "entry signer is not this brain's identity (current or rotated-from)",
         ));
     }
     let unsigned = UnsignedFeedEntry {
@@ -1739,6 +1770,109 @@ fn verify_feed_item(item: &FeedItem, identity: &FeedIdentity) -> LinkResult<()> 
         return Err(invalid_feed("entry SHA-256 does not match"));
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// key rotation — link.md §9.1: the new key, signed by the old one
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The unsigned rotation statement in its normative field order.
+#[derive(Serialize)]
+struct UnsignedRotation<'a> {
+    v: u8,
+    op: &'a str,
+    brain: &'a str,
+    public_key: &'a str,
+    new_brain: &'a str,
+    new_public_key: &'a str,
+    ts: String,
+}
+
+/// What `dbmd key rotate` returns.
+#[derive(Debug, Serialize)]
+pub struct RotationReport {
+    /// The brain id rotated.
+    pub brain: String,
+    /// The NEW identity the hub now serves.
+    pub multikey: String,
+    /// Where the new PKCS#8 secret landed (0600).
+    #[serde(rename = "keyFile")]
+    pub key_file: String,
+    /// Prior identities (newest first) the feed still verifies against.
+    pub previous: Vec<String>,
+}
+
+/// Rotate a self-custodied brain's key: mint a fresh keypair, build the
+/// §9.1 statement — the new key, signed by the OLD key, normative
+/// serialization — send it to the hub, and only after the hub accepts write
+/// the new secret to `out` (0600, refusing overwrite). The old key file is
+/// left untouched for the owner to retire.
+pub fn rotate_brain_key(
+    cfg: &HubConfig,
+    brain: &str,
+    old_key: &AgentSigningKey,
+    out: &Path,
+) -> LinkResult<RotationReport> {
+    require_safe_ref(brain)?;
+    if out.exists() {
+        return Err(bad_agent_key(
+            "the output file already exists — refusing to overwrite a key",
+        ));
+    }
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| bad_agent_key("key generation failed"))?;
+    let pair = agent_keypair(pkcs8.as_ref())?;
+    let (new_spki, new_multikey) = public_identity_for(&pair);
+
+    let ts = crate::now()
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let unsigned = serde_json::to_string(&UnsignedRotation {
+        v: 1,
+        op: "rotate",
+        brain: &old_key.multikey,
+        public_key: &old_key.public_key_spki,
+        new_brain: &new_multikey,
+        new_public_key: &new_spki,
+        ts,
+    })
+    .expect("serialize rotation");
+    let old_pair = agent_keypair(&old_key.pkcs8)?;
+    let sig = URL_SAFE_NO_PAD.encode(old_pair.sign(unsigned.as_bytes()).as_ref());
+    let statement = format!("{},\"sig\":\"{}\"}}", &unsigned[..unsigned.len() - 1], sig);
+
+    let body = json!({ "statement": statement });
+    let path = format!("/api/hub/brains/{brain}/rotate");
+    let response = ensure_ok(
+        request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+        "key rotate",
+    )?;
+    let previous = response
+        .get("identity")
+        .and_then(|i| i.get("previous"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("fingerprint").and_then(Value::as_str))
+                .map(|f| format!("ed25519:{f}"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    std::fs::write(out, format!("{}\n", URL_SAFE_NO_PAD.encode(pkcs8.as_ref())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(RotationReport {
+        brain: brain.to_string(),
+        multikey: new_multikey,
+        key_file: out.display().to_string(),
+        previous,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1895,6 +2029,16 @@ pub fn mirror(cfg: &HubConfig, brain: &str, dest: &Path) -> LinkResult<MirrorRep
         }
     }
 
+    let previous: Vec<serde_json::Value> = identity
+        .previous
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "fingerprint": p.fingerprint,
+                "publicKeySpki": p.public_key_spki,
+            })
+        })
+        .collect();
     crate::fsx::write_atomic(
         &mirror_dir.join("identity.json"),
         format!(
@@ -1902,6 +2046,7 @@ pub fn mirror(cfg: &HubConfig, brain: &str, dest: &Path) -> LinkResult<MirrorRep
             serde_json::json!({
                 "fingerprint": identity.fingerprint,
                 "publicKeySpki": identity.public_key_spki,
+                "previous": previous,
             })
         )
         .as_bytes(),
@@ -2071,6 +2216,7 @@ mod tests {
         let identity = FeedIdentity {
             fingerprint,
             public_key_spki: public_key,
+            previous: Vec::new(),
         };
         assert!(verify_feed_item(&item, &identity).is_ok());
         let mut tampered = item;
@@ -2112,6 +2258,7 @@ mod tests {
         let identity = FeedIdentity {
             fingerprint: multikey.trim_start_matches("ed25519:").to_string(),
             public_key_spki: spki,
+            previous: Vec::new(),
         };
         assert!(verify_feed_item(&item, &identity).is_ok());
     }

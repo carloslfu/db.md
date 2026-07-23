@@ -44,5 +44,24 @@ pub fn run(ctx: &Context, args: &KeyArgs) -> CliResult {
             }
             Ok(())
         }
+        KeyCommand::Rotate(rotate) => {
+            let brain = rotate.brain.trim().trim_start_matches('@');
+            let cfg = linkmd::hub_config(None, Path::new("."))?;
+            let old_key = linkmd::load_signing_key(Path::new(&rotate.key_file))?;
+            let report = linkmd::rotate_brain_key(&cfg, brain, &old_key, Path::new(&rotate.out))?;
+            if ctx.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("serialize")
+                );
+            } else {
+                println!("rotated {}: now {}", report.brain, report.multikey);
+                println!(
+                    "new key file: {} (0600 — retire the old file yourself)",
+                    report.key_file
+                );
+            }
+            Ok(())
+        }
     }
 }
