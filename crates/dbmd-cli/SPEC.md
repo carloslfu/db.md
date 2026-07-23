@@ -538,7 +538,9 @@ future interconnect spec, link.md. Within a store nothing changes:
 wiki-links remain the only reference form the toolkit parses,
 validates, and rewrites, and a db.md tool encountering `@brain/id`
 treats it as plain text. Stores that want stable cross-store addresses
-someday are the reason `id` is recommended today.
+someday are the reason `id` is recommended today. (link.md's v0 draft is
+public at github.com/carloslfu/link.md; db.md still reserves the shape only
+and remains valid without it.)
 
 ## The `DB.md` file
 

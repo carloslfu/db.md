@@ -33,10 +33,10 @@ repo's GitHub Releases, verifies its SHA-256 against the release's
 `SHA256SUMS`, and installs to `~/.dbmd/bin` with no sudo and no shell-config
 edits. The binary never phones home: no telemetry, no auto-update, no AI
 SDKs. Its only network I/O is the link.md client verbs (`dbmd
-resolve/sync/grant/propose/subscribe`), which run solely when you invoke
-them against a hub you configure. (The link.md verbs are unreleased — on
-`main`, not yet in the v0.6.2 release this script installs; they arrive with
-the next release. Every other command below is in the released binary.)
+resolve/sync/grant/propose/subscribe`, plus `key`/`mirror`/`serve` for
+identity and the reference node), which run solely when you invoke them
+against a hub you configure. (The link.md client shipped in v0.8.0; its
+spec — a v0 draft — is public at github.com/carloslfu/link.md.)
 
 Alternatives: `brew install carloslfu/tap/dbmd` for the prebuilt release, or
 `cargo install dbmd-cli` to build from crates.io if you already have Rust.
