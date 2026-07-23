@@ -1518,10 +1518,19 @@ pub fn grant_issue(
     until: Option<&str>,
 ) -> LinkResult<Value> {
     require_safe_ref(brain)?;
-    let mut body = json!({
-        "email": grantee,
-        "capability": can.as_str(),
-    });
+    // Grantee shape decides the axis: a base64url Ed25519 SPKI is a bare
+    // multikey holder (link.md §6 cross-party keys — no hub account; the
+    // printed `publicKeySpki` from `dbmd key generate`); anything else is a
+    // hub principal named by email.
+    let is_key_grantee = URL_SAFE_NO_PAD
+        .decode(grantee)
+        .map(|der| der.len() == 44 && der.starts_with(&ED25519_SPKI_PREFIX))
+        .unwrap_or(false);
+    let mut body = if is_key_grantee {
+        json!({ "keySpki": grantee, "capability": can.as_str() })
+    } else {
+        json!({ "email": grantee, "capability": can.as_str() })
+    };
     if let Some(s) = scope {
         body["scopePrefix"] = json!(s);
     }

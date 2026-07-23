@@ -1357,3 +1357,52 @@ fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
         "the first mirrored entry hashes to its vector hash"
     );
 }
+
+#[test]
+fn grant_issue_detects_a_key_grantee_and_sends_key_spki() {
+    // A base64url Ed25519 SPKI grantee (what `dbmd key generate` prints)
+    // rides the keySpki axis; an email stays on the email axis.
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("agent.key");
+    let gen = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            key_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(gen.code, Some(0), "stderr: {}", gen.stderr);
+    let spki = serde_json::from_str::<serde_json::Value>(&gen.stdout).unwrap()["publicKeySpki"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let hub = MockHub::serve(vec![(201, r#"{"id":"g1"}"#.to_string())]);
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "grant",
+            "issue",
+            &format!("@{BRAIN_ID}"),
+            &spki,
+            "--can",
+            "read",
+            "--json",
+        ],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let requests = hub.finish();
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(body["keySpki"], spki);
+    assert!(
+        body.get("email").is_none(),
+        "a key grantee must not be an email"
+    );
+}
