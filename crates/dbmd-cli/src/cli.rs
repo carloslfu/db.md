@@ -196,6 +196,13 @@ pub enum Command {
     /// `--once` reads the current head and exits.
     Subscribe(SubscribeArgs),
 
+    /// Agent signing keys (link.md §8). `dbmd key generate` mints an Ed25519
+    /// keypair locally — the secret lands in a 0600 file and NEVER leaves the
+    /// machine; register the printed `publicKeySpki` with your hub, then set
+    /// `DBMD_AGENT_KEY_FILE` to sign every authenticated request instead of
+    /// sending a bearer (nothing reusable on the wire).
+    Key(KeyArgs),
+
     // ── Agent bootstrap ──────────────────────────────────────────────────────
     /// Print the bundled canonical SPEC.md (compiled in at build time). The
     /// installation point: `dbmd spec` loads the standard into an agent's
@@ -1119,3 +1126,29 @@ pub struct SubscribeArgs {
 // (install-skill / uninstall-skill removed: the installer is text — `dbmd spec`
 // + the repo-root `llms.txt` + the distributable `skills/db-md/SKILL.md`. Agents
 // and harness skill-installers place the skill; dbmd ships no per-harness code.)
+
+/// `dbmd key <sub>` — agent signing keys (link.md §8).
+#[derive(Debug, Args)]
+pub struct KeyArgs {
+    /// Which key operation to run.
+    #[command(subcommand)]
+    pub command: KeyCommand,
+}
+
+/// The `dbmd key` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Mint a fresh Ed25519 agent keypair: the PKCS#8 secret is written to
+    /// `--out` (one base64url line, mode 0600, never overwriting), and the
+    /// public identity (`multikey` + `publicKeySpki`) is printed for hub
+    /// registration.
+    Generate(KeyGenerateArgs),
+}
+
+/// `dbmd key generate --out <FILE>`.
+#[derive(Debug, Args)]
+pub struct KeyGenerateArgs {
+    /// Where to write the private key file (e.g. `~/.config/dbmd/agent.key`).
+    #[arg(long, value_name = "FILE")]
+    pub out: String,
+}

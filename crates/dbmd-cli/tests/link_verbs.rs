@@ -183,7 +183,8 @@ fn run_dbmd(cwd: &Path, args: &[&str], hub: Option<&str>, key: Option<&str>) -> 
     cmd.args(args)
         .current_dir(cwd)
         .env_remove("DBMD_HUB_URL")
-        .env_remove("DBMD_HUB_KEY");
+        .env_remove("DBMD_HUB_KEY")
+        .env_remove("DBMD_AGENT_KEY_FILE");
     if let Some(h) = hub {
         cmd.env("DBMD_HUB_URL", h);
     }
@@ -1055,4 +1056,115 @@ fn subscribe_refuses_the_tampered_ts_minted_vector() {
     assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
     assert_eq!(error_code(&out.stderr), "INVALID_FEED");
     hub.finish();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent signing keys — `dbmd key generate` + LinkMD-Sig signed requests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Like `run_dbmd`, but authenticating with an agent key file instead of a
+/// bearer (link.md §8 — `DBMD_AGENT_KEY_FILE`).
+fn run_dbmd_signed(cwd: &Path, args: &[&str], hub: &str, key_file: &Path) -> Output {
+    let mut cmd = Command::new(DBMD);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("DBMD_HUB_URL")
+        .env_remove("DBMD_HUB_KEY")
+        .env("DBMD_HUB_URL", hub)
+        .env("DBMD_AGENT_KEY_FILE", key_file);
+    let out = cmd.output().expect("spawn dbmd");
+    Output {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn key_generate_mints_an_identity_writes_0600_and_refuses_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("agent.key");
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            key_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    let multikey = v["multikey"].as_str().unwrap();
+    // `ed25519:` + a 43-char base64url sha256 fingerprint.
+    assert!(multikey.starts_with("ed25519:"), "multikey: {multikey}");
+    assert_eq!(multikey.len(), 8 + 43, "multikey: {multikey}");
+    assert!(v["publicKeySpki"].as_str().unwrap().len() > 40);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&key_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "key file mode: {mode:o}");
+    }
+    // Refuses to clobber an existing key.
+    let again = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            key_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(again.code, Some(1));
+    assert_eq!(error_code(&again.stderr), "BAD_AGENT_KEY");
+}
+
+#[test]
+fn an_agent_key_signs_requests_instead_of_sending_a_bearer() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("agent.key");
+    let gen = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            key_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(gen.code, Some(0), "stderr: {}", gen.stderr);
+    let minted: serde_json::Value = serde_json::from_str(&gen.stdout).unwrap();
+    let multikey = minted["multikey"].as_str().unwrap().to_string();
+
+    let hub = MockHub::serve(vec![(200, SIGNED_HEAD_CARD.to_string())]);
+    let out = run_dbmd_signed(
+        dir.path(),
+        &["resolve", &format!("@{BRAIN_ID}"), "--json"],
+        &hub.url,
+        &key_file,
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let requests = hub.finish();
+    let auth = requests[0]
+        .header("authorization")
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        auth.starts_with(&format!("LinkMD-Sig v1,key={multikey},ts=")),
+        "authorization: {auth}"
+    );
+    assert!(
+        !auth.contains("Bearer"),
+        "authorization leaked a bearer: {auth}"
+    );
 }

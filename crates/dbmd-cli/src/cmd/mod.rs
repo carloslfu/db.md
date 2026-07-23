@@ -27,6 +27,7 @@ pub mod format;
 pub mod grant;
 pub mod graph;
 pub mod index;
+pub mod key;
 pub mod link;
 pub mod log;
 pub mod outline;

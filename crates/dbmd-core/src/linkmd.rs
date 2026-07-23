@@ -68,9 +68,18 @@ use crate::store::Store;
 /// Environment variable naming the hub base URL (e.g. `https://hub.example.com`).
 pub const HUB_URL_ENV: &str = "DBMD_HUB_URL";
 
-/// Environment variable carrying the hub bearer credential. The one and only
-/// credential source — see the module docs for why it is never file-based.
+/// Environment variable carrying the hub bearer credential. The bearer
+/// credential source — see the module docs for why it is never store-based.
 pub const HUB_KEY_ENV: &str = "DBMD_HUB_KEY";
+
+/// Environment variable naming the PATH of an agent signing key file
+/// (link.md §8 `LinkMD-Sig` proof of possession). When set, authenticated
+/// requests are signed per-request with the agent's Ed25519 key instead of
+/// carrying a bearer: the signature binds method + path + body + a ±60s
+/// window, so nothing reusable ever crosses the wire or lands in a log or an
+/// agent transcript. The file holds the base64url PKCS#8 key minted by
+/// `dbmd key generate`; the path is not a secret, the file is (mode 0600).
+pub const AGENT_KEY_FILE_ENV: &str = "DBMD_AGENT_KEY_FILE";
 
 /// The store-local config file, relative to the store root. Holds non-secret
 /// toolkit state (`hub = <URL>`); hidden, so every store walk skips it.
@@ -124,6 +133,15 @@ pub enum LinkError {
         "the hub credential in {HUB_KEY_ENV} contains whitespace or non-ASCII characters — re-copy it (the key is not shown here on purpose)"
     )]
     BadKey,
+
+    /// The agent signing key file named by [`AGENT_KEY_FILE_ENV`] is missing,
+    /// unreadable, or not a valid Ed25519 PKCS#8 — key material is never
+    /// echoed.
+    #[error("invalid agent signing key ({message}) — mint one with `dbmd key generate`")]
+    BadAgentKey {
+        /// What failed, without any key material.
+        message: String,
+    },
 
     /// A non-HTTPS hub outside loopback: the bearer key would travel in cleartext.
     #[error("refusing non-HTTPS hub {hub} — the credential would travel in cleartext (localhost is exempt)")]
@@ -421,6 +439,27 @@ pub struct HubConfig {
     pub hub: String,
     /// The bearer credential, when the environment carries one.
     pub key: Option<String>,
+    /// The agent signing key, when [`AGENT_KEY_FILE_ENV`] names one. Wins
+    /// over the bearer for authenticated requests (link.md §8).
+    pub agent_key: Option<AgentSigningKey>,
+}
+
+/// A loaded agent signing key: the PKCS#8 secret plus its derived public
+/// multikey. Debug never prints key material.
+#[derive(Clone)]
+pub struct AgentSigningKey {
+    pkcs8: Vec<u8>,
+    /// The key's public identity, `ed25519:<base64url sha256(SPKI)>`.
+    pub multikey: String,
+}
+
+impl std::fmt::Debug for AgentSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentSigningKey")
+            .field("multikey", &self.multikey)
+            .field("pkcs8", &"<redacted>")
+            .finish()
+    }
 }
 
 impl HubConfig {
@@ -449,7 +488,143 @@ pub fn hub_config(flag_hub: Option<&str>, dir: &Path) -> LinkResult<HubConfig> {
         None => None,
     };
 
-    Ok(HubConfig { hub, key })
+    let agent_key = match env_nonempty(AGENT_KEY_FILE_ENV) {
+        Some(path) => Some(load_agent_key(Path::new(&path))?),
+        None => None,
+    };
+
+    Ok(HubConfig {
+        hub,
+        key,
+        agent_key,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent signing keys — link.md §8 `LinkMD-Sig` proof of possession
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The DER prefix that wraps a raw Ed25519 public key into a
+/// SubjectPublicKeyInfo (RFC 8410).
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+fn bad_agent_key(message: &str) -> LinkError {
+    LinkError::BadAgentKey {
+        message: message.to_string(),
+    }
+}
+
+fn agent_keypair(pkcs8: &[u8]) -> LinkResult<ring::signature::Ed25519KeyPair> {
+    // `from_pkcs8` wants ring's own v2 encoding (private + public); keys from
+    // other tools are often PKCS#8 v1, which `maybe_unchecked` accepts by
+    // deriving the public half itself.
+    ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8)
+        .or_else(|_| ring::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8))
+        .map_err(|_| bad_agent_key("not an Ed25519 PKCS#8 key"))
+}
+
+fn multikey_for(pair: &ring::signature::Ed25519KeyPair) -> String {
+    use ring::signature::KeyPair as _;
+    let mut spki = Vec::with_capacity(44);
+    spki.extend_from_slice(&ED25519_SPKI_PREFIX);
+    spki.extend_from_slice(pair.public_key().as_ref());
+    format!("ed25519:{}", URL_SAFE_NO_PAD.encode(Sha256::digest(&spki)))
+}
+
+/// Load and validate the agent key file: one base64url line of PKCS#8.
+fn load_agent_key(path: &Path) -> LinkResult<AgentSigningKey> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| bad_agent_key(&format!("cannot read the key file: {e}")))?;
+    let pkcs8 = URL_SAFE_NO_PAD
+        .decode(text.trim())
+        .map_err(|_| bad_agent_key("the key file is not one base64url line"))?;
+    let multikey = multikey_for(&agent_keypair(&pkcs8)?);
+    Ok(AgentSigningKey { pkcs8, multikey })
+}
+
+/// What `dbmd key generate` returns: the public identity to register plus
+/// where the secret landed.
+#[derive(Debug, Serialize)]
+pub struct GeneratedAgentKey {
+    /// `ed25519:<fingerprint>` — the grantable/registerable identity.
+    pub multikey: String,
+    /// base64url SPKI DER — what a hub's register endpoint takes.
+    #[serde(rename = "publicKeySpki")]
+    pub public_key_spki: String,
+    /// Where the PKCS#8 secret was written (mode 0600).
+    #[serde(rename = "keyFile")]
+    pub key_file: String,
+}
+
+/// Mint a fresh Ed25519 agent keypair. The secret is written to `out`
+/// (base64url PKCS#8, one line, 0600, refusing to overwrite); only public
+/// identity is returned. The private key never enters a store and never
+/// travels — requests carry per-request signatures instead (link.md §8).
+pub fn generate_agent_key(out: &Path) -> LinkResult<GeneratedAgentKey> {
+    if out.exists() {
+        return Err(bad_agent_key(
+            "the output file already exists — refusing to overwrite a key",
+        ));
+    }
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| bad_agent_key("key generation failed"))?;
+    let pair = agent_keypair(pkcs8.as_ref())?;
+    use ring::signature::KeyPair as _;
+    let mut spki = Vec::with_capacity(44);
+    spki.extend_from_slice(&ED25519_SPKI_PREFIX);
+    spki.extend_from_slice(pair.public_key().as_ref());
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(out, format!("{}\n", URL_SAFE_NO_PAD.encode(pkcs8.as_ref())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(GeneratedAgentKey {
+        multikey: multikey_for(&pair),
+        public_key_spki: URL_SAFE_NO_PAD.encode(&spki),
+        key_file: out.display().to_string(),
+    })
+}
+
+/// Build the `LinkMD-Sig` v1 header for one request:
+/// `canonical = "v1" LF METHOD LF path+query LF ts LF (sha256hex(body) | "-")`.
+fn linkmd_sig_header(
+    key: &AgentSigningKey,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> LinkResult<String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| bad_agent_key("system clock is before the epoch"))?
+        .as_secs();
+    let body_hash = match body {
+        Some(b) => format!("{:x}", Sha256::digest(b.as_bytes())),
+        None => "-".to_string(),
+    };
+    let canonical = format!(
+        "v1\n{}\n{}\n{}\n{}",
+        method.to_uppercase(),
+        path,
+        ts,
+        body_hash
+    );
+    let pair = agent_keypair(&key.pkcs8)?;
+    let sig = URL_SAFE_NO_PAD.encode(pair.sign(canonical.as_bytes()).as_ref());
+    let fingerprint = key.multikey.trim_start_matches("ed25519:");
+    Ok(format!(
+        "LinkMD-Sig v1,key=ed25519:{fingerprint},ts={ts},sig={sig}"
+    ))
 }
 
 /// An env var, treated as absent when unset or empty (an empty
@@ -569,11 +744,16 @@ fn request(
     auth: Auth,
 ) -> LinkResult<HubResponse> {
     let url = format!("{}{}", cfg.hub, path);
+    let encoded_body = body.map(Value::to_string);
+    // An agent signing key outranks the bearer: possession proofs put nothing
+    // reusable on the wire, so when both are configured the stronger one wins.
     let credential = match auth {
-        Auth::Required => Some(format!("Bearer {}", cfg.require_key()?)),
+        Auth::Required => Some(match &cfg.agent_key {
+            Some(key) => linkmd_sig_header(key, method, path, encoded_body.as_deref())?,
+            None => format!("Bearer {}", cfg.require_key()?),
+        }),
         Auth::None => None,
     };
-    let encoded_body = body.map(Value::to_string);
     let http = agent();
     let result = with_connect_retries(|| {
         let mut req = http.request(method, &url);
@@ -1713,6 +1893,7 @@ mod tests {
         HubConfig {
             hub: "http://127.0.0.1:9".to_string(),
             key: Some("k".to_string()),
+            agent_key: None,
         }
     }
 
@@ -1741,6 +1922,7 @@ mod tests {
         let cfg = HubConfig {
             hub: format!("http://{address}"),
             key: None,
+            agent_key: None,
         };
 
         let response = request(&cfg, "GET", "/retry", None, Auth::None).unwrap();
