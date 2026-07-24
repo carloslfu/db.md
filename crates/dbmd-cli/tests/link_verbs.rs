@@ -395,7 +395,12 @@ fn resolve_ulid_target_queries_by_id_and_path_target_by_path() {
 
 #[test]
 fn hub_http_error_surfaces_hub_message_and_code() {
-    let hub = MockHub::serve(vec![(404, "{\"error\":\"Brain not found\"}".to_string())]);
+    // `@ghost` 404s on the direct lookup; the registry is then consulted and
+    // also 404s, so the ORIGINAL direct error surfaces (not the registry miss).
+    let hub = MockHub::serve(vec![
+        (404, "{\"error\":\"Brain not found\"}".to_string()),
+        (404, "{\"error\":\"Not found\"}".to_string()),
+    ]);
     let dir = tempfile::tempdir().unwrap();
     let out = run_dbmd(
         dir.path(),
@@ -1477,4 +1482,98 @@ fn key_rotate_signs_with_the_old_key_and_writes_the_new_one() {
     // The report surfaces the rotated-from identity.
     let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(report["previous"][0], old_multikey);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Registry resolution — federation v0 phonebook (link-md-ship E5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn resolve_follows_the_registry_to_a_foreign_home_and_pins_the_key() {
+    // A SECOND node (the home) serves the card; the registry (the caller's hub)
+    // points at it. `dbmd resolve @handle` follows and verifies the fingerprint.
+    let home = MockHub::serve(vec![(
+        200,
+        format!(
+            r#"{{"id":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","publicKeySpki":"x"}}}}"#
+        ),
+    )]);
+    let reg = MockHub::serve(vec![
+        (404, r#"{"error":"Brain not found"}"#.to_string()),
+        (
+            200,
+            format!(
+                r#"{{"handle":"acme-studio","home":"{}","brain":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ"}}}}"#,
+                home.url
+            ),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&reg.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["id"], BRAIN_ID);
+    assert_eq!(v["resolvedVia"], "registry");
+    assert_eq!(v["home"], home.url);
+    reg.finish();
+    home.finish();
+}
+
+#[test]
+fn resolve_refuses_when_the_home_identity_does_not_match_the_registry() {
+    // The home serves a DIFFERENT fingerprint than the registry advertised —
+    // a rogue home, or a stale/rebound registry. The client must refuse.
+    let home = MockHub::serve(vec![(
+        200,
+        format!(
+            r#"{{"id":"{BRAIN_ID}","identity":{{"fingerprint":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","publicKeySpki":"x"}}}}"#
+        ),
+    )]);
+    let reg = MockHub::serve(vec![
+        (404, r#"{"error":"Brain not found"}"#.to_string()),
+        (
+            200,
+            format!(
+                r#"{{"handle":"acme-studio","home":"{}","brain":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ"}}}}"#,
+                home.url
+            ),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&reg.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
+    assert_eq!(error_code(&out.stderr), "INVALID_FEED");
+    reg.finish();
+    home.finish();
+}
+
+#[test]
+fn resolve_hits_direct_first_and_never_touches_the_registry_when_it_resolves() {
+    // A hosted handle / the caller's own slug resolves directly — no registry
+    // round-trip. The registry is only consulted on a direct 404.
+    let hub = MockHub::serve(vec![(
+        200,
+        format!(r#"{{"id":"{BRAIN_ID}","slug":"acme-studio"}}"#),
+    )]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let requests = hub.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/hub/brains/acme-studio");
 }

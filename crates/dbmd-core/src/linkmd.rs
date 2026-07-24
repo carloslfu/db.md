@@ -1066,6 +1066,101 @@ fn ensure_ok(r: HubResponse, what: &'static str) -> LinkResult<Value> {
 /// index stats — the v0 form of the card; keys arrive with the protocol's
 /// signing layer). `@brain/<id>` and `@brain/<path>.md` return the full
 /// record, frontmatter + body.
+/// GET an absolute URL as JSON with NO credential — used to fetch a brain card
+/// from a FOREIGN home during registry resolution. The hub credential is never
+/// sent to another origin (a deliberate security property); the home is
+/// HTTPS-or-loopback guarded like any hub.
+fn get_json_absolute(url: &str) -> LinkResult<Value> {
+    assert_safe_hub(url)?;
+    let http = agent();
+    let resp = match with_connect_retries(|| http.get(url).call().map_err(Box::new)) {
+        Ok(resp) => resp,
+        Err(error) => match *error {
+            ureq::Error::Status(status, resp) => {
+                let _ = resp;
+                return Err(LinkError::Http {
+                    what: "registry home fetch",
+                    status,
+                    message: "the home node rejected the card request".to_string(),
+                    code: None,
+                });
+            }
+            ureq::Error::Transport(err) => {
+                return Err(LinkError::Transport {
+                    hub: url.to_string(),
+                    message: err.to_string(),
+                });
+            }
+        },
+    };
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(LinkError::ResponseTooLarge);
+    }
+    serde_json::from_slice(&buf).map_err(|_| LinkError::InvalidFeed {
+        message: "the home node returned invalid JSON".to_string(),
+    })
+}
+
+/// Resolve a bare `@handle` through the federation registry (link.md §7.1,
+/// E5): look the handle up in the hub's registry, fetch the brain card from
+/// the returned HOME node, and PIN — the card's identity fingerprint must
+/// equal the registry's, or resolution fails. Returns the card enriched with
+/// the resolved `home`, or `Ok(None)` when the registry has no such handle
+/// (so the caller can fall back to a direct lookup).
+pub fn resolve_registry(cfg: &HubConfig, handle: &str) -> LinkResult<Option<Value>> {
+    require_safe_ref(handle)?;
+    let reg = request(
+        cfg,
+        "GET",
+        &format!("/api/hub/registry/{handle}"),
+        None,
+        Auth::None,
+    )?;
+    if reg.status == 404 {
+        return Ok(None);
+    }
+    let body = ensure_ok(reg, "registry resolve")?;
+    let home = body
+        .get("home")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("registry entry has no home"))?;
+    let brain = body
+        .get("brain")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("registry entry has no brain"))?;
+    let want_fp = body
+        .get("identity")
+        .and_then(|i| i.get("fingerprint"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("registry entry has no identity fingerprint"))?;
+
+    let home = home.trim_end_matches('/');
+    let card = get_json_absolute(&format!("{home}/api/hub/brains/{brain}"))?;
+    let got_fp = card
+        .get("identity")
+        .and_then(|i| i.get("fingerprint"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if got_fp != want_fp {
+        return Err(invalid_feed(
+            "the home node served an identity that does not match the registry — refusing",
+        ));
+    }
+    let mut out = card;
+    if let Value::Object(map) = &mut out {
+        map.insert("home".to_string(), Value::String(home.to_string()));
+        map.insert(
+            "resolvedVia".to_string(),
+            Value::String("registry".to_string()),
+        );
+    }
+    Ok(Some(out))
+}
+
 pub fn resolve(cfg: &HubConfig, addr: &Address) -> LinkResult<Value> {
     // `Address::parse` refuses these shapes already, but `Address` has public
     // fields — re-assert at the wire so a hand-built address can never
@@ -1093,7 +1188,17 @@ pub fn resolve(cfg: &HubConfig, addr: &Address) -> LinkResult<Value> {
             format!("/api/hub/brains/{}/resolve?path={p}", addr.brain)
         }
     };
-    ensure_ok(request(cfg, "GET", &path, None, Auth::Required)?, "resolve")
+    // Direct first: the caller's own slug and hub-hosted public handles resolve
+    // here unchanged. Only a bare `@handle` the hub can't resolve directly
+    // (404) falls through to the federation registry — how a handle reaches a
+    // brain on ANOTHER node (link.md §7.1, E5).
+    let direct = request(cfg, "GET", &path, None, Auth::Required)?;
+    if direct.status == 404 && addr.target.is_none() && !crate::ulid::is_ulid(&addr.brain) {
+        if let Some(card) = resolve_registry(cfg, &addr.brain)? {
+            return Ok(card);
+        }
+    }
+    ensure_ok(direct, "resolve")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
