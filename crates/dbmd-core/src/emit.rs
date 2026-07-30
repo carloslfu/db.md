@@ -113,9 +113,7 @@ pub struct Emit {
 /// unreadable file, a broken walk) — malformed content degrades per the
 /// module contract, it never aborts the dump.
 pub fn compute(store: &Store) -> crate::Result<Emit> {
-    let mut rels: Vec<PathBuf> = store.walk()?;
-    rels.push(PathBuf::from("DB.md"));
-    rels.sort();
+    let rels = walk_rels(store)?;
 
     let mut files = Vec::with_capacity(rels.len());
     let mut sources = 0usize;
@@ -136,8 +134,23 @@ pub fn compute(store: &Store) -> crate::Result<Emit> {
     })
 }
 
-/// Project one store-relative file into its [`EmittedFile`].
-fn emit_file(store: &Store, rel: &Path) -> crate::Result<EmittedFile> {
+/// The exact file set a dump covers, in the exact order it emits: every
+/// content file per [`Store::walk`] plus the root `DB.md`, path-sorted.
+/// One definition, shared by [`compute`] and streaming consumers (the
+/// `--ndjson` CLI mode projects these one at a time), so the two forms can
+/// never disagree on membership or order.
+pub fn walk_rels(store: &Store) -> crate::Result<Vec<PathBuf>> {
+    let mut rels: Vec<PathBuf> = store.walk()?;
+    rels.push(PathBuf::from("DB.md"));
+    rels.sort();
+    Ok(rels)
+}
+
+/// Project one store-relative file into its [`EmittedFile`]. Public for
+/// streaming consumers ([`walk_rels`] supplies the canonical file set);
+/// the lenient-degrade contract is the module's, identical under
+/// [`compute`] and per-file use.
+pub fn emit_file(store: &Store, rel: &Path) -> crate::Result<EmittedFile> {
     let abs = store.abs_path(rel);
     let bytes = std::fs::read(&abs)?;
     let sha256 = sha256_hex(&bytes);

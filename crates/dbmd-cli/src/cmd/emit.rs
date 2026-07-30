@@ -24,11 +24,22 @@ use dbmd_core::Store;
 
 use crate::cli::EmitArgs;
 use crate::context::Context;
-use crate::error::{CliError, CliResult};
+use crate::error::{CliError, CliResult, ExitCode};
 
 /// Run `dbmd emit`.
 pub fn run(ctx: &Context, args: &EmitArgs) -> CliResult {
     let store = Store::open_strict(Path::new(&args.dir))?;
+
+    // NDJSON: the streaming form. Project one file at a time and print it as
+    // one compact line — the exact `files[]` element shape in the exact
+    // `compute` order (one membership/order definition: `emit::walk_rels`) —
+    // so the whole dump never exists in this process, and a consumer reading
+    // line-by-line never holds it either. This is the mode a hosting hub
+    // ingests large stores through; `--json` stays the single-document form.
+    if args.ndjson {
+        return ndjson_dump(&store);
+    }
+
     let dump = emit::compute(&store).map_err(CliError::from)?;
 
     if ctx.json {
@@ -37,6 +48,42 @@ pub fn run(ctx: &Context, args: &EmitArgs) -> CliResult {
         print!("{}", text_dump(&dump));
     }
     Ok(())
+}
+
+/// Streaming form: walk the canonical dump set (`emit::walk_rels` — the SAME
+/// membership and order `compute` uses), project each file, write it as one
+/// compact JSON line, drop it. Line-buffered through one stdout lock so a
+/// consumer sees whole lines; a broken pipe (downstream `head` closed early)
+/// is a benign truncation and exits 0, per the toolkit-wide contract
+/// (`cmd/search.rs` documents the rationale). Every other write error is a
+/// real IO_ERROR.
+fn ndjson_dump(store: &Store) -> CliResult {
+    use std::io::Write as _;
+
+    let rels = emit::walk_rels(store).map_err(CliError::from)?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut written: std::io::Result<()> = Ok(());
+    for rel in &rels {
+        // Projection failures (unreadable file, broken walk) are real runtime
+        // errors and keep their store-error mapping; only WRITE errors get the
+        // broken-pipe leniency below.
+        let file = emit::emit_file(store, rel).map_err(CliError::from)?;
+        let line = serde_json::to_string(&file_json(&file))
+            .map_err(|e| CliError::new(ExitCode::Runtime, "JSON_ENCODE_FAILED", e.to_string()))?;
+        written = writeln!(out, "{line}");
+        if written.is_err() {
+            break;
+        }
+    }
+    if written.is_ok() {
+        written = out.flush();
+    }
+    match written {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(CliError::from(e)),
+    }
 }
 
 /// Human form: the store-relative paths that would be emitted, one per line

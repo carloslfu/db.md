@@ -378,3 +378,56 @@ fn link_spans_are_body_occurrences_a_consumer_can_splice_on() {
     // And the fenced example survived the splice untouched — the whole point.
     assert!(spliced.contains("[[records/notes/fenced-example]]"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NDJSON: the streaming form of the same contract
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `emit --ndjson` is `--json`'s `files[]` verbatim, one compact object per
+/// line, same membership and order, no envelope — the property a streaming
+/// consumer (a hosting hub) relies on: concatenating the lines reconstructs
+/// the array exactly, so the two forms can never drift.
+#[test]
+fn ndjson_lines_equal_json_files_array_in_order() {
+    let (_tmp, root) = fixture();
+    let dump = emit_json(&root);
+
+    let out = dbmd()
+        .args(["emit", "--ndjson"])
+        .arg(&root)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("utf8 stdout");
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+        .collect();
+
+    assert_eq!(
+        serde_json::Value::Array(lines),
+        dump["files"],
+        "ndjson lines must equal the --json files[] array, in order"
+    );
+}
+
+/// The global `--json` flag composes with (and is redundant with) `--ndjson`:
+/// the streaming form already IS machine output, so both spellings produce
+/// identical NDJSON — never the enveloped document.
+#[test]
+fn ndjson_wins_when_global_json_is_also_set() {
+    let (_tmp, root) = fixture();
+    let plain = dbmd()
+        .args(["emit", "--ndjson"])
+        .arg(&root)
+        .assert()
+        .success();
+    let both = dbmd()
+        .args(["--json", "emit", "--ndjson"])
+        .arg(&root)
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8(plain.get_output().stdout.clone()).unwrap(),
+        String::from_utf8(both.get_output().stdout.clone()).unwrap(),
+    );
+}

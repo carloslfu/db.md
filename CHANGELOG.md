@@ -8,7 +8,22 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.1**.
+  `Cargo.toml`, currently **v0.8.2**.
+
+## [0.8.2] — 2026-07-30
+
+### Added
+
+- **`dbmd emit --ndjson` — the streaming form of the dump.** One compact JSON
+  object per line: exactly the `--json` form's `files[]` element shape, in the
+  same deterministic order, with no envelope or summary. Both sides stream —
+  each file is projected, printed, and dropped, and a line-reading consumer
+  never holds the whole dump — so a host ingests stores whose single-document
+  dump would not fit an execution buffer. Concatenating the lines reconstructs
+  `files[]` verbatim (pinned by test); `--json` is unchanged.
+  `dbmd_core::emit` gains `walk_rels` (the canonical dump membership + order)
+  and a public `emit_file` so external streaming consumers share the one
+  definition.
 
 ## [0.8.1] — 2026-07-30
 

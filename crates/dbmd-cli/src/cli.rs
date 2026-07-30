@@ -603,6 +603,16 @@ pub struct EmitArgs {
     /// Store root. Defaults to the current directory.
     #[arg(value_name = "DIR", default_value = ".")]
     pub dir: String,
+
+    /// Stream the dump as NDJSON: one compact JSON object per line — exactly
+    /// the `--json` form's `files[]` element shape, in the same deterministic
+    /// order, with no envelope or summary. The streaming form of the same
+    /// contract: a consumer that concatenates the lines gets `files[]`
+    /// verbatim, and neither side ever holds the whole dump (each file is
+    /// projected, printed, and dropped). Implies machine output; the global
+    /// `--json` flag is redundant with it.
+    #[arg(long)]
+    pub ndjson: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

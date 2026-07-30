@@ -87,7 +87,12 @@ loop. See SPEC.md § Scale.
   wiki-link occurrence in the body, in order, with the byte range it
   covers — the positional view a RENDERER needs, so rewriting `[[…]]`
   into markup is a splice at an offset rather than a second
-  implementation of bracket scanning and fence tracking.
+  implementation of bracket scanning and fence tracking. `--ndjson`
+  streams the same contract: one compact JSON object per line — exactly
+  the `--json` `files[]` element shape, same membership and order, no
+  envelope — projected, printed, and dropped one file at a time, so
+  neither `dbmd` nor a line-reading consumer ever holds the whole dump
+  (the large-store ingestion mode).
 
 ### Write
 Each write maintains the `index.md` catalog write-through (no rebuild step in the loop).
