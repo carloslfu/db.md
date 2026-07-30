@@ -79,7 +79,7 @@ with your approval, preserving where every piece came from. Stores are
 version-controlled by default: plain files that Git or any sync service
 saves and carries.
 
-Installing by hand gets you the same binary, about 6MB, macOS and Linux,
+Installing by hand gets you the same binary, macOS and Linux,
 no toolchain:
 
 ```bash
