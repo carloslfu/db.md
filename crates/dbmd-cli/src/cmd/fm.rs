@@ -315,7 +315,7 @@ fn bump_updated_unless_explicit(fm: &mut parser::Frontmatter, mutated_key: &str)
 }
 
 /// Locate the db.md store the agent is operating in by walking UP from the
-/// current working directory to the **outermost** ancestor carrying a `DB.md`
+/// current working directory to the nearest ancestor carrying a `DB.md`
 /// marker, then open it. This is what makes `fm set` / `fm init` work from any
 /// subdirectory of a store, not only from the exact root — matching the
 /// ancestor-walk `dbmd format` does, while keeping the store anchored on the
@@ -323,17 +323,14 @@ fn bump_updated_unless_explicit(fm: &mut parser::Frontmatter, mutated_key: &str)
 /// containment check still rejects a file *outside* this store with
 /// `PATH_OUTSIDE_STORE` rather than silently retargeting a different store.
 ///
-/// Anchoring to the outermost (shallowest) store, rather than the first `DB.md`
-/// found walking up, keeps an interior content file that merely happens to be
-/// named `DB.md` (a store state the spec blesses as ordinary content) from
-/// hijacking discovery. When no ancestor is a store, the error carries an
-/// actionable hint (run from inside a store / author a `DB.md`) instead of the
-/// central generic "pass the store path" hint, which is unactionable here:
-/// `fm set` / `fm init` take no `--dir`.
+/// The nearest ancestor wins. A descendant `DB.md` starts a distinct store
+/// boundary; its files must never be mutated using an outer store's policy or
+/// indexes. When no ancestor is a store, the error carries an actionable hint
+/// because `fm set` / `fm init` take no `--dir`.
 fn locate_store_from_cwd() -> Result<Store, CliError> {
     let start = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
 
-    match outermost_store_root(&start) {
+    match nearest_store_root(&start) {
         Some(root) => Store::open_strict(&root).map_err(CliError::from),
         None => Err(CliError::new(
             ExitCode::NotAStore,
@@ -349,21 +346,12 @@ fn locate_store_from_cwd() -> Result<Store, CliError> {
     }
 }
 
-/// Walk `start` and every ancestor, returning the **outermost** (shallowest)
-/// directory that is a db.md store root, or `None` when no ancestor is a store.
-/// Choosing the outermost match — not the first one found walking up — is what
-/// stops an interior content file named `DB.md` from shadowing the real store
-/// root.
-fn outermost_store_root(start: &Path) -> Option<PathBuf> {
-    let mut outermost: Option<&Path> = None;
-    let mut dir: Option<&Path> = Some(start);
-    while let Some(d) = dir {
-        if Store::is_db_md_store(d) {
-            outermost = Some(d);
-        }
-        dir = d.parent();
-    }
-    outermost.map(|p| p.to_path_buf())
+/// Walk `start` and its ancestors, returning the nearest db.md store root.
+fn nearest_store_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|path| Store::is_db_md_store(path))
+        .map(Path::to_path_buf)
 }
 
 /// Parse a `--in <layer>` value into a [`Layer`], or a usage error.
@@ -461,38 +449,35 @@ mod tests {
 
     /// Store discovery must walk UP from a subdirectory to the store root — the
     /// same ancestor-walk `dbmd format` uses — so `fm set` / `fm init` work from
-    /// any subdirectory of a store, and an interior content file named `DB.md`
-    /// must not shadow the real outermost store root.
+    /// any subdirectory of a store. A nested DB.md is a hard store boundary, so
+    /// discovery must stop at the nearest store.
     #[test]
-    fn outermost_store_root_walks_up_past_interior_db_md() {
+    fn nearest_store_root_stops_at_nested_store_boundary() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n# Store\n").unwrap();
 
-        // A nested type-folder that also holds an interior content `DB.md` (the
-        // shadowing trap), plus a deeper subdir to start the walk from.
+        // A nested store plus a deeper subdir to start the walk from.
         let docs = root.join("sources").join("docs");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(
             docs.join("DB.md"),
-            "---\ntype: pdf-source\nsummary: ingested doc named DB.md\n---\n# Doc\n",
+            "---\ntype: db-md\nscope: research\nowner: Nested\n---\n# Nested store\n",
         )
         .unwrap();
 
-        // Starting from the subdirectory that itself carries an interior DB.md,
-        // discovery must still land on the OUTERMOST store, never `sources/docs`.
-        let found = outermost_store_root(&docs).expect("a store must be found above");
+        let found = nearest_store_root(&docs).expect("a store must be found above");
         assert_eq!(
             std::fs::canonicalize(&found).unwrap(),
-            std::fs::canonicalize(root).unwrap(),
-            "interior DB.md must not become the store root"
+            std::fs::canonicalize(&docs).unwrap(),
+            "the nearest store owns paths below its boundary"
         );
 
         // Starting from a plain subdirectory of the store resolves the same root.
         let records = root.join("records");
         std::fs::create_dir_all(&records).unwrap();
         assert_eq!(
-            std::fs::canonicalize(outermost_store_root(&records).unwrap()).unwrap(),
+            std::fs::canonicalize(nearest_store_root(&records).unwrap()).unwrap(),
             std::fs::canonicalize(root).unwrap(),
             "fm set / fm init must work from a subdirectory of the store"
         );
@@ -502,11 +487,11 @@ mod tests {
     /// `locate_store_from_cwd` hint must be actionable for `fm set` / `fm init`
     /// (which take no `--dir`) — not the central generic "pass the store path".
     #[test]
-    fn outermost_store_root_is_none_outside_any_store_and_hint_is_actionable() {
+    fn nearest_store_root_is_none_outside_any_store_and_hint_is_actionable() {
         let dir = tempfile::TempDir::new().unwrap();
         // A bare tempdir with no DB.md at or above it (within the temp tree).
         assert!(
-            outermost_store_root(dir.path()).is_none(),
+            nearest_store_root(dir.path()).is_none(),
             "no DB.md above this dir → no store root"
         );
 

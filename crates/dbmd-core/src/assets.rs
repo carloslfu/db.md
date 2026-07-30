@@ -706,8 +706,11 @@ fn find_untracked(store: &Store, declared: &BTreeSet<String>) -> crate::Result<V
     }
     let mut out = Vec::new();
     for entry in walkdir::WalkDir::new(&sources)
+        .follow_links(true)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e.file_name().to_str().unwrap_or("")))
+        .filter_entry(|e| {
+            !is_hidden(e.file_name().to_str().unwrap_or("")) && store.owns_path(e.path())
+        })
     {
         let entry = match entry {
             Ok(e) => e,

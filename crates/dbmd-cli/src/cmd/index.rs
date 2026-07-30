@@ -256,7 +256,7 @@ fn type_folders_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
         Err(_) => return out,
     };
     for entry in rd.flatten() {
-        if !entry.path().is_dir() {
+        if !entry.path().is_dir() || !store.owns_path(&entry.path()) {
             continue;
         }
         let name = entry.file_name();

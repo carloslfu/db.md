@@ -96,6 +96,8 @@ impl Issue {
 pub mod codes {
     /// path has no `DB.md`; not a db.md store.
     pub const NOT_A_STORE: &str = "NOT_A_STORE";
+    /// a visible descendant directory is itself a db.md store.
+    pub const NESTED_STORE: &str = "NESTED_STORE";
     /// the store's `DB.md` is not `type: db-md`.
     pub const DB_MD_BAD_TYPE: &str = "DB_MD_BAD_TYPE";
     /// the store's `DB.md` frontmatter lacks `scope` or `owner`.
@@ -281,12 +283,12 @@ pub fn validate_working_set(
         working.insert(linker);
     }
 
-    let mut issues = Vec::new();
+    let mut issues = nested_store_issues(store)?;
     for rel in &working {
         let abs = store.root.join(rel);
         // A changed path can be a *deletion* — skip files that no longer exist;
         // the incoming-linker scan above already flagged links into them.
-        if !abs.is_file() {
+        if !abs.is_file() || !store.owns_path(&abs) {
             continue;
         }
         // `None` basename index: the working-set pass does not build the
@@ -300,12 +302,40 @@ pub fn validate_working_set(
 }
 
 fn validate_content_sweep(store: &Store) -> crate::Result<Vec<Issue>> {
-    let mut issues = Vec::new();
+    let mut issues = nested_store_issues(store)?;
     for rel in store.walk()? {
         let abs = store.root.join(&rel);
         check_content_file(store, &rel, &abs, None, &mut issues);
     }
     issues.sort_by(issue_order);
+    Ok(issues)
+}
+
+/// Structural issues that every validation scope reports. Nested stores are
+/// pruned from all parent-store reads, but remain an error because a single
+/// filesystem tree must have one unambiguous owning store at every path.
+fn nested_store_issues(store: &Store) -> crate::Result<Vec<Issue>> {
+    let mut issues = Vec::new();
+    for nested in store.nested_store_roots()? {
+        let marker = nested.join("DB.md");
+        push(
+            &mut issues,
+            Severity::Error,
+            codes::NESTED_STORE,
+            &marker,
+            None,
+            None,
+            format!(
+                "`{}` is a db.md store nested inside this store",
+                nested.display()
+            ),
+            Some(
+                "move the nested store outside this store, or run dbmd from the nested root"
+                    .to_string(),
+            ),
+            vec![],
+        );
+    }
     Ok(issues)
 }
 
@@ -318,14 +348,14 @@ pub fn validate_all(store: &Store) -> crate::Result<Vec<Issue>> {
         return Ok(vec![not_a_store_issue(store)]);
     }
 
-    let mut issues = Vec::new();
+    let mut issues = nested_store_issues(store)?;
 
     // Store-identity file: `DB.md` shape (type / required fields / section
     // headers). A single root file, checked once in the sweep — not a content
     // file (it carries no `summary`), so it is not part of `walk_content_files`.
     check_db_md(store, &mut issues);
 
-    let files = walk_content_files(&store.root);
+    let files = store.walk()?;
 
     // The basename index makes the short-form wiki-link check able to upgrade a
     // bare-basename target to `WIKI_LINK_AMBIGUOUS` when it matches ≥2 files.
@@ -1608,7 +1638,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     // ── Root index.md ──── (only when a type-folder exists to roll up) ──────────
     if !type_folders.is_empty() {
         let root_index = store.root.join("index.md");
-        if !root_index.is_file() {
+        if !root_index.is_file() || !store.owns_path(&root_index) {
             push(
                 issues,
                 Severity::Error,
@@ -1629,7 +1659,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     for layer in &layers_with_type_folders {
         let layer_index_rel = PathBuf::from(layer).join("index.md");
         let abs = store.root.join(&layer_index_rel);
-        if !abs.is_file() {
+        if !abs.is_file() || !store.owns_path(&abs) {
             push(
                 issues,
                 Severity::Error,
@@ -1650,7 +1680,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     for (tf, members) in &type_folders {
         let index_md_rel = tf.join("index.md");
         let index_md_abs = store.root.join(&index_md_rel);
-        let index_md_present = index_md_abs.is_file();
+        let index_md_present = index_md_abs.is_file() && store.owns_path(&index_md_abs);
         if !index_md_present {
             // The whole folder index is absent → a single `INDEX_MISSING` keyed
             // on the FOLDER (not the would-be `index.md` path). When the index is
@@ -1682,7 +1712,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
         // missing is one `INDEX_MISSING`, not also an `INDEX_JSONL_MISSING`.
         let jsonl_rel = tf.join("index.jsonl");
         let jsonl_abs = store.root.join(&jsonl_rel);
-        if !jsonl_abs.is_file() {
+        if !jsonl_abs.is_file() || !store.owns_path(&jsonl_abs) {
             push(
                 issues,
                 Severity::Error,
@@ -1720,7 +1750,8 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     }
     for (layer_dir, members) in &loose_by_layer {
         let jsonl_rel = layer_dir.join("index.jsonl");
-        if !store.root.join(&jsonl_rel).is_file() {
+        let jsonl_abs = store.root.join(&jsonl_rel);
+        if !jsonl_abs.is_file() || !store.owns_path(&jsonl_abs) {
             push(
                 issues,
                 Severity::Error,
@@ -1744,7 +1775,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     }
 
     // ── Orphan index.md: an index file in a folder with no content. ──────────
-    for rel in walk_index_files(&store.root) {
+    for rel in walk_index_files(store) {
         let parent = rel.parent().unwrap_or(Path::new("")).to_path_buf();
         let parent_str = parent.to_string_lossy().to_string();
         let is_canonical = parent_str.is_empty() // root
@@ -2174,6 +2205,7 @@ fn log_files_chronological(store: &Store) -> Vec<PathBuf> {
             .map(|e| e.path())
             .filter(|p| {
                 p.is_file()
+                    && store.owns_path(p)
                     && p.file_name()
                         .and_then(|s| s.to_str())
                         .and_then(|n| n.strip_suffix(".md"))
@@ -2186,7 +2218,8 @@ fn log_files_chronological(store: &Store) -> Vec<PathBuf> {
         files.extend(archives);
     }
     // The active file holds the current month — newest, so it comes last.
-    if store.root.join("log.md").is_file() {
+    let active = store.root.join("log.md");
+    if active.is_file() && store.owns_path(&active) {
         files.push(PathBuf::from("log.md"));
     }
     files
@@ -2202,6 +2235,9 @@ fn check_log_file(
     issues: &mut Vec<Issue>,
 ) {
     let abs = store.root.join(log_rel);
+    if !store.owns_path(&abs) {
+        return;
+    }
     let Ok(text) = std::fs::read_to_string(&abs) else {
         return;
     };
@@ -2273,17 +2309,7 @@ struct Link {
 /// case-insensitive filesystem `db.md` would also match `DB.md`; we require the
 /// exact-cased directory entry to be present.
 fn store_marker_present(store: &Store) -> bool {
-    let want = store.root.join("DB.md");
-    if !want.is_file() {
-        return false;
-    }
-    // Reject a case-folded match (`db.md`) on case-insensitive filesystems.
-    match std::fs::read_dir(&store.root) {
-        Ok(entries) => entries
-            .flatten()
-            .any(|e| e.file_name().to_str() == Some("DB.md")),
-        Err(_) => true, // can't enumerate; trust the is_file() above
-    }
+    Store::is_db_md_store(&store.root)
 }
 
 /// Validate the store's identity file, `DB.md`: its frontmatter `type:` must be
@@ -2299,7 +2325,10 @@ fn store_marker_present(store: &Store) -> bool {
 fn check_db_md(store: &Store, issues: &mut Vec<Issue>) {
     let rel = Path::new("DB.md");
     let abs = store.root.join("DB.md");
-    let Ok(text) = std::fs::read_to_string(&abs) else {
+    let Ok(owned) = crate::store::ensure_path_within_store(&store.root, &abs) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&owned) else {
         return; // marker present but unreadable: nothing more to say.
     };
 
@@ -2671,11 +2700,9 @@ fn is_content_file(rel: &Path) -> bool {
         return false;
     }
     let name = rel.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    // Only the derived catalog twins are meta INSIDE a layer. `DB.md` / `log.md`
-    // are reserved meta only at the store ROOT, which the `first` layer check
-    // above already excludes — so a content file named `log.md` / `DB.md` inside
-    // a layer (e.g. `records/docs/log.md`) is real content, consistent with
-    // `Store::walk`.
+    // The derived catalog twins are never content. A layer-internal `log.md`
+    // remains content; a descendant `DB.md` is unreachable because the store
+    // ownership walker prunes its containing nested-store boundary.
     if matches!(name, "index.md" | "index.jsonl") {
         return false;
     }
@@ -3227,13 +3254,16 @@ fn resolved_target_abs(store: &Store, bare: &str) -> Option<PathBuf> {
     // The literal path, as written (e.g. an `.eml`/`.pdf` source file kept
     // verbatim under `sources/`).
     let literal = store.root.join(bare);
-    if literal.is_file() && disk_case_matches(store, &literal, bare) {
+    if literal.is_file() && store.owns_path(&literal) && disk_case_matches(store, &literal, bare) {
         return Some(literal);
     }
     // The `.md`-appended path (a content page referenced without its extension).
     let with_md_rel = format!("{bare}.md");
     let with_md = store.root.join(&with_md_rel);
-    if with_md.is_file() && disk_case_matches(store, &with_md, &with_md_rel) {
+    if with_md.is_file()
+        && store.owns_path(&with_md)
+        && disk_case_matches(store, &with_md, &with_md_rel)
+    {
         return Some(with_md);
     }
     None
@@ -3310,68 +3340,12 @@ fn loose_layer_dir(rel: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(comps[0]))
 }
 
-/// **SWEEP.** Walk every `.md` content file under `sources/`/`records/`,
-/// returning store-relative paths to be parsed in full. Skips hidden dirs and
-/// the index twin (`index.jsonl`). Used only by `validate_all`; the working-set
-/// incoming-linker scan rides the embedded-ripgrep `Store::find_links_to_any`
-/// (a single presence-only pass), so the loop default never walks-and-*parses*
-/// the whole content tree.
-///
-/// **`log/` is NOT pruned here.** Only the *root-level* `log/` rotation archive
-/// is reserved (`Store::is_in_log_dir` checks only the first path component);
-/// the walk roots are the two layers, so the root archive is already out of
-/// scope. A `log`-named folder *inside* a layer (e.g. `records/log/` — a
-/// decision log) is real content (see `is_content_file`), so pruning every
-/// `name == "log"` made `--all` silently skip those files — reporting fewer
-/// errors than the default working-set scope on the same store.
-fn walk_content_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for layer in ["sources", "records"] {
-        let base = root.join(layer);
-        if !base.is_dir() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(&base)
-            // Follow symlinks, matching the loop-default `md_walker`
-            // (store.rs `follow_links(true)`): a content file that is a symlink
-            // into the store, or that lives in a symlinked-in type-folder, is
-            // checked by `dbmd validate` (the loop default rides `Store::walk` /
-            // `walk_all_md`, both following symlinks). Without this the `--all`
-            // sweep silently SKIPPED such files, so the authoritative superset
-            // reported FEWER issues than the loop scope on the same store —
-            // inverting the `--all`-is-the-superset contract. walkdir's loop
-            // detection drops a symlink cycle (yields an Err that `.flatten()`
-            // discards), so this cannot hang.
-            .follow_links(true)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_str().unwrap_or("");
-                !name.starts_with('.')
-            })
-            .flatten()
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_str().unwrap_or("");
-            if name.ends_with(".md") && name != "index.md" {
-                if let Ok(rel) = entry.path().strip_prefix(root) {
-                    out.push(rel.to_path_buf());
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 /// Every `index.md` under the store (root + layers + type-folders), as
-/// store-relative paths. Used to detect orphan indexes. Like
-/// [`walk_content_files`], a `log`-named folder *inside* a layer is real content
-/// and its `index.md` is not pruned (only the root-level `log/` archive is
-/// reserved, and the walk roots are the two layers, so it is already
-/// out of scope).
-fn walk_index_files(root: &Path) -> Vec<PathBuf> {
+/// store-relative paths. Used to detect orphan indexes. A `log`-named folder
+/// inside a layer is real content; external symlinks and nested stores are
+/// pruned through [`Store::owns_path`].
+fn walk_index_files(store: &Store) -> Vec<PathBuf> {
+    let root = &store.root;
     let mut out = Vec::new();
     if root.join("index.md").is_file() {
         out.push(PathBuf::from("index.md"));
@@ -3396,7 +3370,7 @@ fn walk_index_files(root: &Path) -> Vec<PathBuf> {
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_str().unwrap_or("");
-                !name.starts_with('.')
+                !name.starts_with('.') && store.owns_path(e.path())
             })
             .flatten()
         {
@@ -3569,6 +3543,7 @@ fn log_files_for_working_set(store: &Store) -> Vec<PathBuf> {
             .map(|e| e.path())
             .filter(|p| {
                 p.is_file()
+                    && store.owns_path(p)
                     && p.file_name()
                         .and_then(|s| s.to_str())
                         .and_then(|n| n.strip_suffix(".md"))
@@ -3581,6 +3556,7 @@ fn log_files_for_working_set(store: &Store) -> Vec<PathBuf> {
         archives.sort();
         files.extend(archives);
     }
+    files.retain(|path| path.is_file() && store.owns_path(path));
     files
 }
 
@@ -3901,26 +3877,28 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
 
     // Lenient manifest read: a malformed line is reported, not fatal.
     let mut manifest: BTreeMap<String, assets::AssetRecord> = BTreeMap::new();
-    if let Ok(text) = std::fs::read_to_string(&manifest_abs) {
-        for (i, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<assets::AssetRecord>(line) {
-                Ok(rec) => {
-                    manifest.insert(rec.path.clone(), rec);
+    if store.owns_path(&manifest_abs) {
+        if let Ok(text) = std::fs::read_to_string(&manifest_abs) {
+            for (i, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
                 }
-                Err(e) => push(
-                    issues,
-                    Severity::Error,
-                    codes::ASSET_MANIFEST_MALFORMED,
-                    manifest_rel,
-                    Some((i as u32) + 1),
-                    None,
-                    format!("invalid {} record: {e}", assets::MANIFEST_FILE),
-                    Some("run `dbmd assets scan` to rebuild the manifest".to_string()),
-                    vec![],
-                ),
+                match serde_json::from_str::<assets::AssetRecord>(line) {
+                    Ok(rec) => {
+                        manifest.insert(rec.path.clone(), rec);
+                    }
+                    Err(e) => push(
+                        issues,
+                        Severity::Error,
+                        codes::ASSET_MANIFEST_MALFORMED,
+                        manifest_rel,
+                        Some((i as u32) + 1),
+                        None,
+                        format!("invalid {} record: {e}", assets::MANIFEST_FILE),
+                        Some("run `dbmd assets scan` to rebuild the manifest".to_string()),
+                        vec![],
+                    ),
+                }
             }
         }
     }
@@ -3978,7 +3956,8 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
     // Per-record: wrapper existence + orphan detection.
     for (path, rec) in &manifest {
         for w in &rec.wrappers {
-            if !store.root.join(w).is_file() {
+            let wrapper = store.root.join(w);
+            if !wrapper.is_file() || !store.owns_path(&wrapper) {
                 push(
                     issues,
                     Severity::Error,
@@ -4207,6 +4186,30 @@ mod tests {
         let fx = Fixture::bare();
         let issues = validate_working_set(&fx.store(), None).unwrap();
         assert!(has(&issues, codes::NOT_A_STORE));
+    }
+
+    #[test]
+    fn both_scopes_report_nested_store_without_validating_its_content() {
+        let fx = Fixture::new();
+        fx.write(
+            "records/nested/DB.md",
+            "---\ntype: db-md\nscope: research\nowner: Nested\n---\n",
+        );
+        // Deliberately invalid as a parent-store content file. It belongs to
+        // the nested store and must therefore never produce parent issues.
+        fx.write("records/nested/records/notes/bad.md", "not frontmatter");
+
+        for issues in [
+            validate_working_set(&fx.store(), None).unwrap(),
+            validate_all(&fx.store()).unwrap(),
+        ] {
+            assert_eq!(count(&issues, codes::NESTED_STORE), 1, "{issues:#?}");
+            assert_eq!(
+                find(&issues, codes::NESTED_STORE).file,
+                PathBuf::from("records/nested/DB.md")
+            );
+            assert!(!has(&issues, codes::FM_MISSING_TYPE), "{issues:#?}");
+        }
     }
 
     #[test]

@@ -79,7 +79,7 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
 
     for layer in Layer::all() {
         let layer_root = store.root.join(layer_dir_name(layer));
-        for abs in walk_layer_content_files(&layer_root)? {
+        for abs in walk_layer_content_files(store, &layer_root)? {
             let rel = abs.strip_prefix(&store.root).unwrap_or(&abs).to_path_buf();
             let node_id = strip_md(&rel);
             existing_nodes.insert(node_id.clone());
@@ -116,7 +116,7 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
             }
             if existing_nodes.contains(target) {
                 linked_to.insert(target.clone());
-            } else if target_resolves_on_disk(&store.root, target) {
+            } else if target_resolves_on_disk(store, target) {
                 // A link to an existing non-`.md` source artifact (a `.eml`,
                 // `.pdf`, …) is a live edge, not a broken one — `sources/` holds
                 // such files by design and `graph` resolves them on disk. The
@@ -141,8 +141,7 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
         }
 
         let has_outgoing = file.resolvable_targets().any(|t| {
-            t != &file.node_id
-                && (existing_nodes.contains(t) || target_resolves_on_disk(&store.root, t))
+            t != &file.node_id && (existing_nodes.contains(t) || target_resolves_on_disk(store, t))
         });
         let has_incoming = linked_to.contains(&file.node_id);
         if !has_outgoing && !has_incoming {
@@ -176,12 +175,13 @@ fn layer_dir_name(layer: Layer) -> &'static str {
 /// `log` dirs nested deeper. A directory named `log` nested under a type-folder
 /// (`sources/emails/log/`) is ordinary content and is counted, so stats agrees
 /// with `tree` / `index` / `query` instead of making the subtree invisible.
-fn walk_layer_content_files(layer_root: &Path) -> crate::Result<Vec<PathBuf>> {
+fn walk_layer_content_files(store: &Store, layer_root: &Path) -> crate::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     if !layer_root.is_dir() {
         return Ok(out);
     }
     let walker = walkdir::WalkDir::new(layer_root)
+        .follow_links(true)
         .into_iter()
         .filter_entry(|e| {
             // Skip hidden dirs/files. `depth()` is relative to the layer root
@@ -193,7 +193,7 @@ fn walk_layer_content_files(layer_root: &Path) -> crate::Result<Vec<PathBuf>> {
             if e.file_type().is_dir() && name == "log" && e.depth() == 1 {
                 return false;
             }
-            true
+            store.owns_path(e.path())
         });
     for entry in walker {
         let entry = entry.map_err(|e| {
@@ -456,15 +456,15 @@ fn is_within_store_target(target: &Path) -> bool {
 /// `is_safe_store_relative_path` (which reject `..` before any probe), keeping
 /// the broken-link surface in agreement: an escaping target is counted broken
 /// (validate's `WIKI_LINK_BROKEN`), never silently treated as resolved.
-fn target_resolves_on_disk(store_root: &Path, target: &Path) -> bool {
+fn target_resolves_on_disk(store: &Store, target: &Path) -> bool {
     // Reject any non-`Normal` component (`..`, RootDir, Prefix) up front — never
     // let a wiki-link turn a stats probe into a filesystem escape.
     if !is_within_store_target(target) {
         return false;
     }
     // The target as written points at a real file (e.g. an explicit `.eml`).
-    let literal = store_root.join(target);
-    if literal.is_file() {
+    let literal = store.root.join(target);
+    if literal.is_file() && store.owns_path(&literal) {
         return true;
     }
     // Bare-stem case: look for a sibling `<stem>.<ext>` with a non-`.md`
@@ -478,7 +478,7 @@ fn target_resolves_on_disk(store_root: &Path, target: &Path) -> bool {
         Some(name) => name,
         None => return false,
     };
-    let parent_abs = store_root.join(match target.parent() {
+    let parent_abs = store.root.join(match target.parent() {
         Some(p) => p,
         None => return false,
     });
@@ -488,7 +488,7 @@ fn target_resolves_on_disk(store_root: &Path, target: &Path) -> bool {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || !store.owns_path(&path) {
             continue;
         }
         // Same stem, and an extension that is present and not `.md`.
@@ -1229,7 +1229,7 @@ mod tests {
         // Explicit-extension traversal -> would hit the literal `is_file` branch.
         assert!(
             !target_resolves_on_disk(
-                &store.root,
+                &store,
                 &strip_md(Path::new("sources/../../outside-secret.txt"))
             ),
             "an explicit-extension `..` target escaping the store must not resolve on disk"
@@ -1237,16 +1237,13 @@ mod tests {
         // Bare-stem traversal -> would hit the `read_dir(parent)` branch, where a
         // sibling `outside-secret.eml` (non-`.md`) sits beside the escaped parent.
         assert!(
-            !target_resolves_on_disk(
-                &store.root,
-                &strip_md(Path::new("sources/../../outside-secret"))
-            ),
+            !target_resolves_on_disk(&store, &strip_md(Path::new("sources/../../outside-secret"))),
             "a bare-stem `..` target escaping the store must not resolve on disk"
         );
         // A `..` that stays nominally under a layer prefix is still an escape and
         // is rejected before any probe.
         assert!(
-            !target_resolves_on_disk(&store.root, Path::new("records/../records/secret")),
+            !target_resolves_on_disk(&store, Path::new("records/../records/secret")),
             "any `..` component is rejected before a probe, even one re-entering a layer"
         );
 
@@ -1258,7 +1255,7 @@ mod tests {
             "From: a@b.com\nSubject: x\n\nbody\n",
         );
         assert!(
-            target_resolves_on_disk(&store.root, Path::new("sources/emails/msg")),
+            target_resolves_on_disk(&store, Path::new("sources/emails/msg")),
             "a legitimate in-store bare-stem source link still resolves on disk"
         );
 

@@ -76,35 +76,16 @@ pub fn run(ctx: &Context, args: &FormatArgs) -> CliResult {
     Ok(())
 }
 
-/// Find the db.md store the file belongs to: walk up from the file's parent
-/// directory and open the **outermost** ancestor that carries a `DB.md` marker.
-/// A file outside any store is the stable `NOT_A_STORE` error.
-///
-/// Anchoring to the outermost (shallowest) store — not the first one found — is
-/// what keeps an *interior* content file that merely happens to be named `DB.md`
-/// (e.g. `sources/docs/DB.md`, a store state the spec explicitly blesses as
-/// ordinary content) from hijacking discovery: stopping at the first ancestor
-/// with a `DB.md` would treat `sources/docs/` as the root, parse the content
-/// file as an (empty) config, miss the real store's frozen-page policy, and
-/// compute a wrong store-relative path. Walking all the way to the topmost
-/// `DB.md` skips those interior markers and lands on the true store root.
+/// Find the nearest db.md store owning the file. A descendant `DB.md` starts a
+/// separate store boundary, so an outer store's policy must not govern writes
+/// beneath it. A file outside any store is the stable `NOT_A_STORE` error.
 fn locate_store(file: &Path) -> Result<Store, CliError> {
     let start = file.parent().unwrap_or(Path::new("."));
     // Canonicalize so the walk-up works for a bare relative `file` arg too; fall
     // back to the literal path if canonicalization fails (e.g. file absent — the
     // read below then surfaces the real I/O error).
     let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
-    // Walk the full ancestor chain and remember the *outermost* store root seen,
-    // rather than returning at the first match.
-    let mut outermost: Option<&Path> = None;
-    let mut dir: Option<&Path> = Some(start.as_path());
-    while let Some(d) = dir {
-        if Store::is_db_md_store(d) {
-            outermost = Some(d);
-        }
-        dir = d.parent();
-    }
-    match outermost {
+    match start.ancestors().find(|path| Store::is_db_md_store(path)) {
         Some(root) => Store::open_strict(root).map_err(CliError::from),
         // No ancestor is a store: surface NOT_A_STORE against the file's directory.
         None => Store::open_strict(&start).map_err(CliError::from),
@@ -127,21 +108,16 @@ fn store_relative(store: &Store, file: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// An interior content file named `DB.md` (a store state the spec blesses as
-    /// ordinary content) must NOT hijack store-root discovery. `locate_store`
-    /// must resolve to the real outermost store so its frozen-page policy is
-    /// loaded and the store-relative path is the full `sources/docs/contract.md`,
-    /// not the shadowed `contract.md`.
+    /// A nested DB.md starts a distinct store. Formatting a file below it must
+    /// load the nested policy and compute a nested-store-relative path.
     #[test]
-    fn locate_store_anchors_to_outermost_store_past_interior_db_md() {
+    fn locate_store_stops_at_nearest_store_boundary() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        // Outer store config declares `sources/docs/contract.md` frozen. Uses the
-        // blank-line section spacing the parser's canonical fixtures exercise.
         std::fs::write(
             root.join("DB.md"),
-            "---\ntype: db-md\nscope: company\nowner: T\n---\n\n# Store\n\n## Policies\n\n### Frozen pages\n- sources/docs/contract.md\n",
+            "---\ntype: db-md\nscope: company\nowner: T\n---\n# Outer store\n",
         )
         .unwrap();
 
@@ -153,31 +129,27 @@ mod tests {
             "---\ntype: pdf-source\nsummary: A frozen contract page\n---\n# Contract\n",
         )
         .unwrap();
-        // The interior content file that happens to be named `DB.md` — the
-        // shadowing trap.
+        // The nested store owns the contract and freezes its local path.
         std::fs::write(
             docs.join("DB.md"),
-            "---\ntype: pdf-source\nsummary: An ingested doc named DB.md\n---\n# Doc\n",
+            "---\ntype: db-md\nscope: research\nowner: Nested\n---\n\n# Nested\n\n## Policies\n\n### Frozen pages\n- contract.md\n",
         )
         .unwrap();
 
         let contract = docs.join("contract.md");
         let store = locate_store(&contract).expect("store must resolve");
 
-        // Discovery landed on the outermost store, not `sources/docs/`.
         assert_eq!(
             std::fs::canonicalize(&store.root).unwrap(),
-            std::fs::canonicalize(root).unwrap(),
-            "interior DB.md must not become the store root"
+            std::fs::canonicalize(&docs).unwrap(),
+            "the nearest nested store must own the file"
         );
 
-        // The frozen-page policy is loaded, and the relative path is the full
-        // `sources/docs/contract.md` — so the frozen check fires and refuses.
         let rel = store_relative(&store, &contract);
-        assert_eq!(rel, PathBuf::from("sources/docs/contract.md"));
+        assert_eq!(rel, PathBuf::from("contract.md"));
         assert!(
             store.config.is_frozen(&rel),
-            "outermost store's frozen-page policy must apply to the contract"
+            "the nested store's frozen-page policy must apply"
         );
     }
 }

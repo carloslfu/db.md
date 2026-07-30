@@ -75,7 +75,8 @@ fn load_state(dir: &Path) -> Result<ServeState, String> {
     }
 
     let mut files = Vec::new();
-    collect_files(dir, dir, &mut files)?;
+    let canonical_root = dir.canonicalize().map_err(|e| e.to_string())?;
+    collect_files(dir, &canonical_root, dir, &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(ServeState {
         brain,
@@ -91,6 +92,7 @@ fn load_state(dir: &Path) -> Result<ServeState, String> {
 
 fn collect_files(
     root: &Path,
+    canonical_root: &Path,
     current: &Path,
     out: &mut Vec<(String, String)>,
 ) -> Result<(), String> {
@@ -102,9 +104,21 @@ fn collect_files(
         if name.starts_with('.') {
             continue; // .dbmd (mirror state, pins) and .git never travel
         }
-        if path.is_dir() {
-            collect_files(root, &path, out)?;
-        } else if let Ok(content) = std::fs::read_to_string(&path) {
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "refusing to serve symlinked path {}",
+                path.display()
+            ));
+        }
+        let resolved = path.canonicalize().map_err(|e| e.to_string())?;
+        if !resolved.starts_with(canonical_root) {
+            return Err(format!("path {} escapes the mirror root", path.display()));
+        }
+        if file_type.is_dir() {
+            collect_files(root, canonical_root, &path, out)?;
+        } else if file_type.is_file() {
+            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
             let rel = path
                 .strip_prefix(root)
                 .map_err(|e| e.to_string())?
@@ -277,3 +291,27 @@ pub fn run(ctx: &Context, args: &ServeArgs) -> CliResult {
 // Used via dbmd_core; keep the path alive for grep-ability with the mirror.
 #[allow(unused)]
 type _MirrorDir = PathBuf;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_refuses_symlinked_content() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let secret = external.path().join("secret.md");
+        std::fs::write(&secret, "TOP SECRET").unwrap();
+        symlink(&secret, root.path().join("secret.md")).unwrap();
+
+        let canonical_root = root.path().canonicalize().unwrap();
+        let mut files = Vec::new();
+        let err = collect_files(root.path(), &canonical_root, root.path(), &mut files).unwrap_err();
+        assert!(err.contains("refusing to serve symlinked path"), "{err}");
+        assert!(files.is_empty());
+        assert!(!err.contains("TOP SECRET"));
+    }
+}

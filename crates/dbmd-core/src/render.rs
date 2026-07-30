@@ -84,7 +84,7 @@ pub fn tree(store: &Store, layer: Option<Layer>, type_: Option<&str>) -> Result<
         for entry in std::fs::read_dir(&layer_abs)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
-            if !file_type.is_dir() {
+            if !file_type.is_dir() || !store.owns_path(&entry.path()) {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -99,7 +99,7 @@ pub fn tree(store: &Store, layer: Option<Layer>, type_: Option<&str>) -> Result<
         for type_name in type_dir_names {
             let type_abs = layer_abs.join(&type_name);
             let mut files: Vec<PathBuf> = Vec::new();
-            collect_content_files(&store.root, &type_abs, &mut files)?;
+            collect_content_files(store, &type_abs, &mut files)?;
 
             // `--type` restricts to a single frontmatter `type` (matching every
             // other `--type` flag in the binary), NOT the folder directory
@@ -108,7 +108,7 @@ pub fn tree(store: &Store, layer: Option<Layer>, type_: Option<&str>) -> Result<
             // `--type contact` empty on a canonical store; reading each file's
             // frontmatter `type` is what the flag's help text promises.
             if let Some(want) = type_ {
-                files.retain(|rel| file_type_matches(&store.root, rel, want));
+                files.retain(|rel| file_type_matches(store, rel, want));
             }
 
             if files.is_empty() {
@@ -162,7 +162,7 @@ fn is_content_md(name: &str) -> bool {
 /// through date-shard subdirectories, into `out` as store-relative paths.
 /// Skips hidden dirs and any nested `index.md` meta files.
 fn collect_content_files(
-    store_root: &Path,
+    store: &Store,
     dir: &Path,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), StoreError> {
@@ -170,15 +170,18 @@ fn collect_content_files(
         let entry = entry?;
         let file_type = entry.file_type()?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !store.owns_path(&entry.path()) {
+            continue;
+        }
 
         if file_type.is_dir() {
             if name.starts_with('.') {
                 continue;
             }
-            collect_content_files(store_root, &entry.path(), out)?;
+            collect_content_files(store, &entry.path(), out)?;
         } else if file_type.is_file() && is_content_md(&name) {
             let abs = entry.path();
-            let rel = abs.strip_prefix(store_root).unwrap_or(&abs).to_path_buf();
+            let rel = abs.strip_prefix(&store.root).unwrap_or(&abs).to_path_buf();
             out.push(rel);
         }
     }
@@ -193,8 +196,11 @@ fn collect_content_files(
 /// Self-contained (does not route through the crate's parser, which would error
 /// on malformed frontmatter): split off the leading `---` block and read the
 /// `type` key as a string, mirroring `stats`'s frontmatter-type reader.
-fn file_type_matches(store_root: &Path, rel: &Path, want: &str) -> bool {
-    let abs = store_root.join(rel);
+fn file_type_matches(store: &Store, rel: &Path, want: &str) -> bool {
+    let abs = store.root.join(rel);
+    if !store.owns_path(&abs) {
+        return false;
+    }
     let text = match std::fs::read_to_string(&abs) {
         Ok(t) => t,
         Err(_) => return false,

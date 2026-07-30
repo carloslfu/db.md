@@ -21,10 +21,10 @@ independent source of truth the tool is measured against.
 diffing. The runner should compare as a **set** of issue objects (order
 independent) OR sort the tool output the same way before diffing.
 
-## Coverage — 39 of the SPEC § Validation codes are seeded
+## Coverage — 40 of the SPEC § Validation codes are seeded
 
-The SPEC § Validation table defines **49** codes. This corpus seeds
-**39** of them (the seeding table below has 39 rows) and deliberately
+The SPEC § Validation table defines **51** codes. This corpus seeds
+**40** of them (the seeding table below has 40 rows) and deliberately
 leaves the rest uncovered — the five `ASSET_*` asset-manifest codes,
 `FM_UNREADABLE`, `FM_MISSING_CREATED`, `FM_MISSING_UPDATED`,
 `FM_BAD_META_TYPE` (every seeded records file carries a valid, or
@@ -32,10 +32,10 @@ absent-defaulting-to-`fact`, `meta-type`), and the v0.4 `FM_BAD_ID`
 (every explicit id in this corpus is a legal opaque token — v0.4 keeps
 hand-authored slug ids silent by design, so they must NOT fire it; the
 structural trigger is unit-tested in `dbmd-core`). One of the
-39, `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md
+40, `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md
 line 494) and is grouped under `plan_extensions` in `coverage.json` for
 provenance — it still counts as a seeded SPEC code. `coverage.json`
-therefore records `all_spec_codes_covered: false` and lists those ten
+therefore records `all_spec_codes_covered: false` and lists those eleven
 codes under `uncovered_spec_codes`.
 
 This is enforced, not asserted by hand: the e2e test computes
@@ -43,8 +43,9 @@ SPEC-minus-mapped from the live SPEC table and `coverage.json`, and fails
 CI unless `uncovered_spec_codes` equals that gap exactly (both
 directions) and `all_spec_codes_covered` agrees. So if a future SPEC code
 is added without a seeding fixture — or a fixture is removed — the
-bookkeeping forces CI red. 33 distinct codes fire in the `--all` sweep
-across 56 issue objects (`SCHEMA_SHAPE_MISMATCH` twice — email + date
+bookkeeping forces CI red. 34 distinct codes fire in the `--all` sweep
+across 57 issue objects (`NESTED_STORE` once for the deliberately embedded
+`bad-db-md/` fixture; `SCHEMA_SHAPE_MISMATCH` twice — email + date
 shape; `INDEX_JSONL_STALE` eighteen times — the contacts (×6), expenses
 (×3), invoices (×3), meetings (×2), decisions, notes, processes, and
 clients sidecars each kept a single deliberately-stale projected field;
@@ -58,6 +59,7 @@ separate invocation on the `bad-db-md/` sub-store (`bad-db-md.json`);
 | Code | Severity | Seeded by | Issue site |
 |------|----------|-----------|------------|
 | `NOT_A_STORE` | error | `not-a-store/` (no DB.md) | dir-level — separate invocation |
+| `NESTED_STORE` | error | `bad-db-md/DB.md` | parent-store sweep; the boundary is not traversed |
 | `DB_MD_BAD_TYPE` | error | `bad-db-md/DB.md` (`type: notes`) | `type` line 2 — separate invocation |
 | `DB_MD_MISSING_FIELD` | error | `bad-db-md/DB.md` (no `owner`) | block top line 1 — separate invocation |
 | `DB_MD_UNKNOWN_SECTION` | warning | `bad-db-md/DB.md` (`## Glossary`) | heading line 18 — separate invocation |
@@ -184,18 +186,18 @@ contract with the validator; the validator should implement them.
 9. **`malformed-yaml.md` yields only `FM_MALFORMED_YAML`.** When the
    frontmatter block fails to parse, no field-level checks (type,
    summary, schema, dedup) run on that file — the block is opaque.
-10. **The DB.md-structure codes live in a SEPARATE sub-store, not the
-    main sweep.** A store has exactly one `DB.md`, and the corpus-b root
+10. **The DB.md-structure codes live in a separately validated nested store.**
+    A store has exactly one owned `DB.md`, and the corpus-b root
     `DB.md` must stay valid (a broken one would change the parsed
     `Config` — ignored-types, schemas — and ripple into unrelated
     checks). So the four `DB_MD_*` codes are seeded in `bad-db-md/`, a
     sibling sub-store with its own deliberately-broken `DB.md` (wrong
     `type:`, missing `owner`, an unrecognized `## Glossary` section, and
     a `### expense` schema whose `unique:` key names non-`required`
-    fields), validated by a separate invocation (`bad-db-md.json`). The corpus-b
-    `--all` sweep checks only `<root>/DB.md` (clean) and walks
-    `sources/`/`records/` under the root, so it never descends into
-    `bad-db-md/` — exactly the isolation `not-a-store/` relies on.
+    fields), validated by a separate invocation (`bad-db-md.json`). The parent
+    sweep reports `bad-db-md/DB.md` once as `NESTED_STORE` and does not inspect
+    its config or content. The direct invocation owns that boundary and reports
+    its five `DB_MD_*` issues.
 11. **`DUP_UNIQUE_KEY` is schema-declared, not built in.** Each dup-pair
     fixture collides only because this store's `DB.md ## Schemas` gives its
     type a `unique:` key (`contact: email`, `company: domain`,
@@ -232,13 +234,14 @@ contract with the validator; the validator should implement them.
 
 ## What MUST be true (the invariants, restated)
 
-- `dbmd validate --all --json <store>` emits **exactly** the 56 issues
-  in `validate.json` (33 distinct codes; `SCHEMA_SHAPE_MISMATCH` twice,
+- `dbmd validate --all --json <store>` emits **exactly** the 57 issues
+  in `validate.json` (34 distinct codes; `NESTED_STORE` once,
+  `SCHEMA_SHAPE_MISMATCH` twice,
   `INDEX_JSONL_STALE` eighteen times, `DUP_UNIQUE_KEY` six times) — no
   more (no spurious issues on the deliberately clean link targets and
   clean indexes — and no spurious `meta-type` staleness now that every
   sidecar carries the injected `meta-type: fact`), no fewer.
-- Exit code is **non-zero** (there are 41 errors).
+- Exit code is **non-zero** (there are 42 errors).
 - Every `error` blocks; `warning`/`info` do not change the exit code on
   their own — but here errors dominate, so exit is non-zero regardless.
 - `dbmd validate --all --json <store>/bad-db-md` emits **exactly** the

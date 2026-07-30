@@ -23,6 +23,9 @@
 //!   3. **`EXPECTED/not-a-store.json`** — pointing `validate` at the no-`DB.md`
 //!      sibling surfaces exactly one `NOT_A_STORE` issue and exits non-zero, and
 //!      the `--all` sweep on the store proper does NOT descend into it.
+//!      The separate `bad-db-md/` store is reported only as a `NESTED_STORE`
+//!      boundary by the parent and validated for its own `DB_MD_*` issues when
+//!      invoked directly.
 //!   4. **`EXPECTED/validate.json` is intent-derived, not a snapshot** — its
 //!      `_comment` declares hand-derivation; every code it emits is mapped in the
 //!      committed `EXPECTED/coverage.json`; that coverage map is a subset of the
@@ -546,11 +549,11 @@ fn not_a_store_sibling_is_one_issue_and_outside_the_sweep() {
 // 3b — DB.md structure: the bad-db-md/ sub-store trips the DB_MD_* codes (the
 //      three identity-contract issues plus the two DB_MD_SCHEMA_FIELD
 //      unique-key warnings) in a single SEPARATE invocation, and the corpus-b
-//      root sweep never descends into it.
+//      parent reports only the NESTED_STORE boundary.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn bad_db_md_substore_emits_the_db_md_codes_and_is_outside_the_sweep() {
+fn bad_db_md_substore_is_a_boundary_and_emits_its_own_db_md_codes() {
     let golden: serde_json::Value = read_json(&corpus_b_expected("bad-db-md.json"));
     assert!(
         golden["exit_code_nonzero"].as_bool().unwrap_or(false),
@@ -624,9 +627,9 @@ fn bad_db_md_substore_emits_the_db_md_codes_and_is_outside_the_sweep() {
         );
     }
 
-    // The corpus-b `--all` sweep does NOT descend into the sibling sub-store:
-    // no DB_MD_* code, and no issue whose file path is rooted in `bad-db-md/`.
-    // (The sweep checks only the corpus-b ROOT `DB.md`, which is clean.)
+    // The corpus-b parent sweep does not validate through the nested-store
+    // boundary. It reports exactly the structural NESTED_STORE issue at the
+    // marker, but none of the nested store's own DB_MD_* defects.
     let sweep: serde_json::Value = {
         let out = dbmd()
             .args(["--json", "validate", "--all"])
@@ -644,10 +647,10 @@ fn bad_db_md_substore_emits_the_db_md_codes_and_is_outside_the_sweep() {
             "the corpus-b root sweep's DB.md is clean — no DB_MD_* code, saw {code}"
         );
         let file = issue["file"].as_str().unwrap_or("").replace('\\', "/");
-        assert!(
-            !file.starts_with("bad-db-md"),
-            "the sweep must not descend into the bad-db-md sibling, saw {file:?}"
-        );
+        if file.starts_with("bad-db-md") {
+            assert_eq!(code, "NESTED_STORE");
+            assert_eq!(file, "bad-db-md/DB.md");
+        }
     }
 }
 

@@ -581,6 +581,16 @@ store, not as the store's bare home. An agent sets this up by default; the
 operator opts out explicitly for a throwaway store. Do not move repo-owned data
 out to an external location without the operator's explicit confirmation.
 
+**Stores never nest.** An exact uppercase `DB.md` in any visible descendant
+directory starts a different store and therefore a foreign ownership boundary.
+The parent store's tools MUST NOT read, write, index, search, validate as
+content, or sync anything at or below that boundary. Store discovery from a
+file or working directory uses the nearest ancestor carrying `DB.md`. Running
+`dbmd validate` on the parent reports `NESTED_STORE`; move the nested store
+outside the parent, or operate on it from its own root. This rule keeps sync
+snapshots, indexes, policies, and destructive writes attached to exactly one
+store. Hidden directories remain outside normal store walks.
+
 The file carries identity in frontmatter and optional per-store overrides in
 sections. **Required frontmatter: `type: db-md`, `scope`, and `owner`** — a
 store missing `scope` or `owner` fails `dbmd validate` with
@@ -1222,6 +1232,7 @@ see; grouped by category):
 | Code | Severity | Meaning / remediation |
 |------|----------|-----------------------|
 | `NOT_A_STORE` | error | path has no `DB.md`; not a db.md store |
+| `NESTED_STORE` | error | a visible descendant directory has its own `DB.md`; move that store outside the parent or operate from its own root |
 | `DB_MD_BAD_TYPE` | error | the store's `DB.md` is not `type: db-md` |
 | `DB_MD_MISSING_FIELD` | error | the store's `DB.md` frontmatter lacks `scope` or `owner` |
 | `DB_MD_UNKNOWN_SECTION` | warning | `DB.md` has an `##` section other than `Agent instructions` / `Policies` / `Schemas` / `Folders` |

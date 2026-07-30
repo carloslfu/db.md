@@ -41,10 +41,11 @@ lint:
 # Publishability guard. Packages every crate from its TARBALL (the form
 # `cargo publish` ships) so an include_str!/include_bytes! path that escapes
 # the crate, a path-only dep missing a version, or missing publish metadata
-# fails HERE, not at publish. Mirrors CI (.github/workflows/publish-check.yml).
+# fails HERE, not at publish. The local pre-commit gate packages the current
+# working copy; CI repeats the check from a clean checkout without this flag.
 # Run this before any `cargo publish`.
 publish-check: sync
-	cargo package --workspace --locked
+	cargo package --workspace --locked --allow-dirty
 
 clean:
 	cargo clean

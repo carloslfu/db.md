@@ -1162,7 +1162,7 @@ fn list_archives_desc(store: &Store) -> crate::Result<Vec<PathBuf>> {
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || !store.owns_path(&path) {
             continue;
         }
         let name = match path.file_name().and_then(|s| s.to_str()) {

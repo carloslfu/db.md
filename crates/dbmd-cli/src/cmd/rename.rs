@@ -170,6 +170,15 @@ pub fn run(ctx: &Context, args: &RenameArgs) -> CliResult {
     let mut rewritten = 0usize;
     let mut rewritten_linkers: Vec<PathBuf> = Vec::new();
     let mut skip_warnings: Vec<String> = Vec::new();
+    // The owned backlink scan correctly prunes external aliases before it can
+    // read their targets. Preserve operator visibility by naming the first
+    // ignored alias without claiming its target contained a matching link.
+    if let Some(path) = store.unowned_symlinks().map_err(core_err)?.first() {
+        skip_warnings.push(format!(
+            "ignored unowned symlink {} (its target is outside this store's ownership boundary)",
+            path_to_unix(path)
+        ));
+    }
     for linker_rel in &linkers {
         // ── Layer guard: rename only rewrites CONTENT files ──────────────────
         // `find_links_to` rides `Store::find_links_to_any`, whose scan

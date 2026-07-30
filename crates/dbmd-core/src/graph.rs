@@ -923,7 +923,9 @@ fn walk_content_files(store: &Store) -> Result<Vec<PathBuf>, StoreError> {
         if !dir.is_dir() {
             continue;
         }
-        let walker = WalkBuilder::new(&dir)
+        let store_root = store.root.clone();
+        let mut builder = WalkBuilder::new(&dir);
+        builder
             .hidden(true)
             .git_ignore(true)
             .git_global(false)
@@ -932,7 +934,10 @@ fn walk_content_files(store: &Store) -> Result<Vec<PathBuf>, StoreError> {
             // type folder is walked like any other content (consistent with the
             // store SWEEP walker), rather than silently vanishing from orphans.
             .follow_links(true)
-            .build();
+            .filter_entry(move |entry| {
+                crate::store::ensure_path_within_store(&store_root, entry.path()).is_ok()
+            });
+        let walker = builder.build();
         for result in walker {
             let entry = result.map_err(|e| StoreError::Search {
                 root: store.root.clone(),

@@ -143,7 +143,7 @@ impl Index {
         let rel = normalize_rel(type_folder);
         let abs = store.root.join(&rel);
         let mut records = Vec::new();
-        for file_abs in walk_type_folder_files(&abs) {
+        for file_abs in walk_type_folder_files(store, &abs) {
             let rel_path =
                 rel_to_store(&store.root, &file_abs).expect("walked file is under the store root");
             // Abort the build on a malformed file rather than skip it. A skipped
@@ -179,7 +179,7 @@ impl Index {
         let mut child_counts = BTreeMap::new();
         for tf in type_folders_in_layer(store, layer) {
             let abs = store.root.join(&tf);
-            let n = walk_type_folder_files(&abs).len();
+            let n = walk_type_folder_files(store, &abs).len();
             if n > 0 {
                 child_counts.insert(tf, n);
             }
@@ -209,7 +209,7 @@ impl Index {
         for layer in Layer::all() {
             for tf in type_folders_in_layer(store, layer) {
                 let abs = store.root.join(&tf);
-                let n = walk_type_folder_files(&abs).len();
+                let n = walk_type_folder_files(store, &abs).len();
                 if n > 0 {
                     child_counts.insert(tf, n);
                 }
@@ -624,7 +624,9 @@ impl Index {
                 // file that merely happens to be named index.md.
                 for entry in walkdir::WalkDir::new(&tf_abs)
                     .min_depth(2)
+                    .follow_links(true)
                     .into_iter()
+                    .filter_entry(|entry| store.owns_path(entry.path()))
                     .filter_map(|e| e.ok())
                 {
                     let p = entry.path();
@@ -635,7 +637,7 @@ impl Index {
                 // Empty type-folder → no index at its root either. Same content
                 // guard: an `index.md` here that is actually a user record (the
                 // only file in the folder) is preserved, not deleted.
-                if walk_type_folder_files(&tf_abs).is_empty() {
+                if walk_type_folder_files(store, &tf_abs).is_empty() {
                     let md = tf_abs.join("index.md");
                     if is_deletable_catalog_artifact(&md) {
                         remove_if_exists(&md)?;
@@ -1374,14 +1376,15 @@ fn collect_child_stats(
 
 /// Walk a type-folder's `.md` content files, recursing through date-shards,
 /// excluding the `index.md` artifact itself and any hidden entries.
-fn walk_type_folder_files(folder_abs: &Path) -> Vec<PathBuf> {
+fn walk_type_folder_files(store: &Store, folder_abs: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if !folder_abs.is_dir() {
         return out;
     }
     for entry in walkdir::WalkDir::new(folder_abs)
+        .follow_links(true)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e.file_name()))
+        .filter_entry(|e| !is_hidden(e.file_name()) && store.owns_path(e.path()))
         .filter_map(|e| e.ok())
     {
         if !entry.file_type().is_file() {
@@ -1409,7 +1412,7 @@ fn type_folders_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
         Err(_) => return out,
     };
     for entry in rd.flatten() {
-        if !entry.path().is_dir() {
+        if !entry.path().is_dir() || !store.owns_path(&entry.path()) {
             continue;
         }
         let name = entry.file_name();
@@ -1453,7 +1456,7 @@ fn loose_files_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if !p.is_file() {
+        if !p.is_file() || !store.owns_path(&p) {
             continue;
         }
         if p.extension().and_then(|e| e.to_str()) != Some("md") {

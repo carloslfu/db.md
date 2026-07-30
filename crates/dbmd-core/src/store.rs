@@ -38,13 +38,10 @@ use crate::parser::{parse_db_md, Config, Frontmatter};
 /// curator-maintained catalogs. The store walks skip these so a SWEEP over the
 /// content layers never mistakes a catalog for a record.
 ///
-/// Only `index.md` is excluded by basename, because the content walks traverse
-/// the layer dirs (`sources/`/`records/`) and `index.md` is the only
-/// meta file that appears INSIDE them. The root `DB.md` / `log.md` (and the
-/// `log/` archive) live at the store root, outside every layer, so they are
-/// never reached by these walks — and a content file that merely happens to be
-/// named `DB.md` or `log.md` inside a layer (e.g. `records/docs/DB.md`) is real
-/// content the SPEC does NOT reserve at type-folder depth.
+/// Only `index.md` is excluded by basename. A descendant `DB.md` is not content:
+/// it marks a foreign nested-store boundary, and the walker prunes the entire
+/// directory before reaching that marker. The root `DB.md` / `log.md` (and the
+/// `log/` archive) live outside every layer walk.
 const NON_CONTENT_BASENAMES: [&str; 1] = ["index.md"];
 
 /// The complete machine-twin sidecar that backs every structured read.
@@ -147,6 +144,19 @@ impl Store {
     /// at `path`. On case-sensitive filesystems a lowercase `db.md` must NOT
     /// count (the lowercase name refers to the project/spec, not the marker).
     pub fn is_db_md_store(path: &Path) -> bool {
+        // Fast negative path. Nearly every directory in a large store lacks the
+        // marker; one lstat avoids enumerating a potentially 10k-entry folder
+        // for every containment check. On a case-insensitive filesystem this
+        // probe can also match `db.md`, so a positive still goes through the
+        // exact-name read_dir check below.
+        let probe = path.join("DB.md");
+        let Ok(probe_meta) = std::fs::symlink_metadata(&probe) else {
+            return false;
+        };
+        if probe_meta.is_dir() {
+            return false;
+        }
+
         // Read the directory and match the *stored* filename byte-for-byte.
         // `path.join("DB.md").exists()` would lie on a case-insensitive
         // filesystem (macOS default), where a lowercase `db.md` answers a
@@ -160,11 +170,22 @@ impl Store {
         for entry in entries.flatten() {
             if entry.file_name() == "DB.md" {
                 // A directory literally named `DB.md` is not the marker.
-                match entry.file_type() {
-                    Ok(ft) if ft.is_dir() => return false,
-                    Ok(_) => return true,
-                    Err(_) => return false,
+                let Ok(ft) = entry.file_type() else {
+                    return false;
+                };
+                if ft.is_dir() {
+                    return false;
                 }
+                // A marker symlink is legal only when it resolves inside this
+                // root. Otherwise merely opening a hostile store would read an
+                // arbitrary external file as configuration.
+                let Ok(root) = path.canonicalize() else {
+                    return false;
+                };
+                let Ok(marker) = entry.path().canonicalize() else {
+                    return false;
+                };
+                return marker.is_file() && marker.starts_with(root);
             }
         }
         false
@@ -249,6 +270,107 @@ impl Store {
             return Ok(Vec::new());
         }
         self.walk_content_md(&abs)
+    }
+
+    /// Return visible descendant db.md store roots, stopping at each boundary.
+    ///
+    /// A db.md store cannot own another store. This discovery primitive exists
+    /// for validation: normal walkers prune the boundary and never read through
+    /// it, while `validate` reports the structural error against its `DB.md`.
+    /// Hidden directories stay outside the db.md content model and are skipped.
+    pub fn nested_store_roots(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let canonical_root = self.root.canonicalize()?;
+        let mut out = Vec::new();
+        let mut walker = walkdir::WalkDir::new(&self.root)
+            .follow_links(true)
+            .into_iter();
+
+        while let Some(result) = walker.next() {
+            let entry = match result {
+                Ok(entry) => entry,
+                // A symlink loop is not a nested store. The ordinary store walk
+                // has the same loop protection; skip the broken branch.
+                Err(err) if err.loop_ancestor().is_some() => continue,
+                Err(err) => {
+                    return Err(StoreError::Search {
+                        root: self.root.clone(),
+                        message: err.to_string(),
+                    });
+                }
+            };
+            if entry.depth() == 0 {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if name.starts_with('.') {
+                if entry.path().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+
+            let resolved = match resolve_within(&canonical_root, &self.root, entry.path()) {
+                Ok(path) => path,
+                Err(_) => {
+                    if entry.path().is_dir() {
+                        walker.skip_current_dir();
+                    }
+                    continue;
+                }
+            };
+            if resolved.is_dir() && Store::is_db_md_store(&resolved) {
+                if let Ok(rel) = entry.path().strip_prefix(&self.root) {
+                    out.push(rel.to_path_buf());
+                }
+                walker.skip_current_dir();
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Whether `candidate` resolves to content owned by this store.
+    ///
+    /// Ownership requires both filesystem containment and that the path does
+    /// not cross a descendant store boundary.
+    pub fn owns_path(&self, candidate: &Path) -> bool {
+        ensure_path_within_store(&self.root, candidate).is_ok()
+    }
+
+    /// Visible symlinks whose targets are outside this store's ownership
+    /// boundary. The scan never follows a symlink or reads its target bytes;
+    /// mutating callers use it to surface that ignored content exists instead
+    /// of silently implying the whole visible tree was processed.
+    pub fn unowned_symlinks(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let mut out = Vec::new();
+        let mut walker = walkdir::WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter();
+        while let Some(result) = walker.next() {
+            let entry = result.map_err(|err| StoreError::Search {
+                root: self.root.clone(),
+                message: err.to_string(),
+            })?;
+            if entry.depth() == 0 {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if name.starts_with('.') {
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+            if entry.file_type().is_symlink() && !self.owns_path(entry.path()) {
+                if let Some(rel) = self.rel_path(entry.path()) {
+                    out.push(rel);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// The ≤`n` most-recent files in a type-folder by frontmatter `updated`
@@ -626,6 +748,9 @@ impl Store {
                 continue;
             }
             let path = entry.path();
+            if !self.owns_path(path) {
+                continue;
+            }
             if !has_md_extension(path) {
                 continue;
             }
@@ -654,6 +779,9 @@ impl Store {
                 continue;
             }
             let path = entry.path();
+            if !self.owns_path(path) {
+                continue;
+            }
             if !has_md_extension(path) {
                 continue;
             }
@@ -717,10 +845,12 @@ impl Store {
         }
         let mut out = Vec::new();
         let mut builder = WalkBuilder::new(&walk_root);
+        let store_root = self.root.clone();
         builder
             .standard_filters(false)
             .hidden(true)
-            .follow_links(true);
+            .follow_links(true)
+            .filter_entry(move |entry| ensure_path_within_store(&store_root, entry.path()).is_ok());
         for entry in builder.build() {
             let entry = entry.map_err(|e| StoreError::Search {
                 root: walk_root.clone(),
@@ -730,6 +860,9 @@ impl Store {
                 continue;
             }
             let path = entry.path();
+            if !self.owns_path(path) {
+                continue;
+            }
             if path.file_name().and_then(|n| n.to_str()) != Some(TYPE_INDEX_FILE) {
                 continue;
             }
@@ -747,17 +880,18 @@ impl Store {
     /// A `WalkBuilder` configured for db.md SWEEPs: gitignore/global-ignore are
     /// OFF (a SWEEP must see every file even if the store is a git repo with a
     /// `.gitignore`), but hidden files/dirs are skipped. Symlinks are
-    /// **followed** (`follow_links(true)`) so a symlinked `.md` content file or
-    /// a symlinked type folder (e.g. `records/companies -> /other/disk/...`) is
-    /// walked like any other content rather than silently vanishing; a symlinked
-    /// layer dir was already traversed (the walk root is followed), so following
-    /// symlinks one level deeper just removes that inconsistency.
+    /// **followed** (`follow_links(true)`) so an in-store alias to an in-store
+    /// `.md` file or type folder is walked like ordinary content rather than
+    /// silently vanishing. The ownership filter prunes aliases that escape the
+    /// root or cross a descendant-store boundary.
     fn md_walker(&self, root: &Path) -> WalkBuilder {
         let mut builder = WalkBuilder::new(root);
+        let store_root = self.root.clone();
         builder
             .standard_filters(false)
             .hidden(true)
-            .follow_links(true);
+            .follow_links(true)
+            .filter_entry(move |entry| ensure_path_within_store(&store_root, entry.path()).is_ok());
         builder
     }
 
@@ -821,7 +955,49 @@ pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io:
     // itself carries (the user-supplied `--dir`), which the tail-only lexical
     // check deliberately leaves in place.
     let root = store_root.canonicalize()?;
-    resolve_within(&root, store_root, candidate)
+    let resolved = resolve_within(&root, store_root, candidate)?;
+    reject_nested_store_boundary(&root, &resolved, candidate, store_root)?;
+    Ok(resolved)
+}
+
+/// Reject a path owned by a descendant store. Every directory between the
+/// canonical root and the resolved candidate is checked, including the
+/// candidate itself when it is a directory.
+fn reject_nested_store_boundary(
+    root: &Path,
+    resolved: &Path,
+    candidate: &Path,
+    store_root: &Path,
+) -> std::io::Result<()> {
+    let Ok(rel) = resolved.strip_prefix(root) else {
+        return Err(outside_store_err(candidate, store_root));
+    };
+    if rel != Path::new("DB.md")
+        && resolved.file_name().and_then(|name| name.to_str()) == Some("DB.md")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "path {} would create or address a nested db.md store marker",
+                candidate.display()
+            ),
+        ));
+    }
+    let mut cursor = root.to_path_buf();
+    for component in rel.components() {
+        cursor.push(component.as_os_str());
+        if cursor.is_dir() && Store::is_db_md_store(&cursor) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "path {} crosses nested db.md store boundary {}",
+                    candidate.display(),
+                    cursor.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The lexical half of the containment gate: reject any `..` component in the
@@ -986,17 +1162,19 @@ impl StoreContainment {
                     }
                 };
                 let resolved = canon_parent.join(name);
-                return if resolved.starts_with(&self.root) {
-                    Ok(resolved)
-                } else {
-                    Err(outside_store_err(candidate, &self.store_root))
-                };
+                if !resolved.starts_with(&self.root) {
+                    return Err(outside_store_err(candidate, &self.store_root));
+                }
+                reject_nested_store_boundary(&self.root, &resolved, candidate, &self.store_root)?;
+                return Ok(resolved);
             }
         }
 
         // Slow path — symlink leaf, missing file, no parent: the full peel,
         // against the already-canonical root.
-        resolve_within(&self.root, &self.store_root, candidate)
+        let resolved = resolve_within(&self.root, &self.store_root, candidate)?;
+        reject_nested_store_boundary(&self.root, &resolved, candidate, &self.store_root)?;
+        Ok(resolved)
     }
 }
 
@@ -1872,6 +2050,27 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn is_store_false_when_db_md_symlink_escapes_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let marker = external.path().join("outside.md");
+        fs::write(
+            &marker,
+            "---\ntype: db-md\nscope: personal\nowner: Outside\n---\n",
+        )
+        .unwrap();
+        symlink(&marker, dir.path().join("DB.md")).unwrap();
+
+        assert!(
+            !Store::is_db_md_store(dir.path()),
+            "opening a store must not read an external DB.md symlink"
+        );
+    }
+
     #[test]
     fn open_rejects_non_store_with_path() {
         let dir = tempdir().unwrap();
@@ -1949,19 +2148,25 @@ mod tests {
     }
 
     #[test]
-    fn walk_includes_content_named_log_md_or_db_md_inside_a_layer() {
+    fn walk_includes_log_md_but_prunes_nested_store() {
         let dir = empty_store();
         let root = dir.path();
-        // A content file that merely happens to be named log.md / DB.md INSIDE a
-        // layer is real content — those names are reserved only at the store root.
+        // log.md is reserved only at the store root.
         write(
             root,
             "records/configs/log.md",
             &content_md("2026-05-01T00:00:00Z"),
         );
+        // A descendant DB.md starts a foreign store boundary. Nothing beneath
+        // it belongs to the outer store.
         write(
             root,
             "sources/docs/DB.md",
+            "---\ntype: db-md\nscope: research\nowner: Nested\n---\n",
+        );
+        write(
+            root,
+            "sources/docs/records/notes/secret.md",
             &content_md("2026-05-02T00:00:00Z"),
         );
         // The derived catalog twin is still skipped at any depth.
@@ -1973,12 +2178,74 @@ mod tests {
             "layer-internal log.md is content: {got:?}"
         );
         assert!(
-            got.contains(&"sources/docs/DB.md".to_string()),
-            "layer-internal DB.md is content: {got:?}"
+            !got.iter().any(|path| path.starts_with("sources/docs/")),
+            "nested store content must be pruned: {got:?}"
         );
         assert!(
             !got.iter().any(|p| p.ends_with("index.md")),
             "index.md is still skipped: {got:?}"
+        );
+        assert_eq!(
+            store.nested_store_roots().unwrap(),
+            vec![PathBuf::from("sources/docs")]
+        );
+        assert!(
+            ensure_path_within_store(root, &root.join("sources/docs/records/notes/secret.md"))
+                .is_err(),
+            "outer-store containment must reject a nested-store path"
+        );
+        let nested = Store::open_strict(&root.join("sources/docs")).unwrap();
+        assert!(
+            nested.owns_path(&root.join("sources/docs/records/notes/secret.md")),
+            "the same path is owned when the nested store is opened directly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_never_reads_external_file_or_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = empty_store();
+        let external = tempdir().unwrap();
+        fs::write(
+            external.path().join("secret.md"),
+            content_md("2026-05-03T00:00:00Z"),
+        )
+        .unwrap();
+        fs::create_dir(external.path().join("folder")).unwrap();
+        fs::write(
+            external.path().join("folder").join("deeper.md"),
+            content_md("2026-05-04T00:00:00Z"),
+        )
+        .unwrap();
+
+        fs::create_dir_all(dir.path().join("records/notes")).unwrap();
+        symlink(
+            external.path().join("secret.md"),
+            dir.path().join("records/notes/aliased.md"),
+        )
+        .unwrap();
+        symlink(
+            external.path().join("folder"),
+            dir.path().join("records/external"),
+        )
+        .unwrap();
+
+        let store = open(&dir);
+        assert!(
+            store.walk().unwrap().is_empty(),
+            "external symlink targets must be pruned from every store sweep"
+        );
+        assert!(!store.owns_path(&dir.path().join("records/notes/aliased.md")));
+        assert!(!store.owns_path(&dir.path().join("records/external")));
+        assert_eq!(
+            rels(&store.unowned_symlinks().unwrap()),
+            vec![
+                "records/external".to_string(),
+                "records/notes/aliased.md".to_string(),
+            ],
+            "ignored external aliases remain observable without reading targets"
         );
     }
 

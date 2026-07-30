@@ -332,7 +332,9 @@ fn content_files(store: &Store) -> Result<Vec<PathBuf>, CliError> {
         if !dir.is_dir() {
             continue;
         }
-        let walker = WalkBuilder::new(&dir)
+        let store_root = store.root.clone();
+        let mut builder = WalkBuilder::new(&dir);
+        builder
             // Match the core's `md_walker`: disable EVERY ignore source
             // (`.gitignore`, parent ignores, `.ignore`, `.git/info/exclude`,
             // global gitignore) and keep only the hidden-file skip. A store
@@ -341,7 +343,11 @@ fn content_files(store: &Store) -> Result<Vec<PathBuf>, CliError> {
             // `index` (which use `md_walker`) still see every file.
             .standard_filters(false)
             .hidden(true)
-            .build();
+            .follow_links(true)
+            .filter_entry(move |entry| {
+                dbmd_core::store::ensure_path_within_store(&store_root, entry.path()).is_ok()
+            });
+        let walker = builder.build();
         for entry in walker {
             let entry = entry.map_err(|e| {
                 CliError::new(

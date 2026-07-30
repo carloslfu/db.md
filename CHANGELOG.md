@@ -8,7 +8,21 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.0**.
+  `Cargo.toml`, currently **v0.8.1**.
+
+## [0.8.1] — 2026-07-30
+
+### Fixed
+
+- **Store ownership is now fail-closed.** Walks, indexes, search, stats, graph,
+  asset discovery, validation, and link.md push snapshots prune symlinks that
+  resolve outside the store. `DB.md` and `assets.jsonl` pass through the same
+  containment gate before sync reads them. Mutating rename still warns when a
+  visible alias was ignored, without reading its target.
+- **Nested stores are explicit foreign boundaries.** The nearest `DB.md`
+  ancestor owns a path; parent tools never read, mutate, index, or sync through
+  a descendant store. Both validation scopes report the additive
+  `NESTED_STORE` error so an ambiguous tree cannot pass silently.
 
 ## [0.8.0] — 2026-07-23
 

@@ -1434,11 +1434,17 @@ fn parse_store_pack(bytes: Vec<u8>) -> LinkResult<Vec<(String, Vec<u8>)>> {
 /// derives its own index, and local history stays local). Returns
 /// `(store-relative path, content)` pairs, path-sorted.
 pub fn collect_push_files(store: &Store) -> LinkResult<Vec<(String, String)>> {
+    preflight_push_ownership(store)?;
     let mut out: Vec<(String, String)> = Vec::new();
 
     let read_text = |rel: &str| -> LinkResult<String> {
         let abs = store.root.join(rel);
-        std::fs::read(&abs)
+        // Resolve through the store's ownership gate before reading. This
+        // refuses an external symlink (including a hostile DB.md/assets.jsonl)
+        // and any path crossing a nested-store boundary.
+        let owned =
+            crate::store::ensure_path_within_store(&store.root, &abs).map_err(LinkError::from)?;
+        std::fs::read(&owned)
             .map_err(LinkError::from)
             .and_then(|bytes| {
                 String::from_utf8(bytes).map_err(|_| LinkError::NotUtf8 {
@@ -1465,6 +1471,49 @@ pub fn collect_push_files(store: &Store) -> LinkResult<Vec<(String, String)>> {
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+/// Refuse to build a destructive whole-store snapshot from an ambiguous local
+/// tree. Ordinary read-only walks safely prune foreign paths, but a push that
+/// silently omitted them could delete the hosted copies of those paths.
+fn preflight_push_ownership(store: &Store) -> LinkResult<()> {
+    if let Some(nested) = store.nested_store_roots()?.into_iter().next() {
+        return Err(LinkError::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("cannot push: nested db.md store at {}", nested.display()),
+        )));
+    }
+
+    for layer in crate::store::Layer::all() {
+        let root = store.root.join(layer.dir_name());
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        {
+            let entry = entry.map_err(|err| {
+                LinkError::from(std::io::Error::other(format!(
+                    "cannot inspect push path under {}: {err}",
+                    root.display()
+                )))
+            })?;
+            if entry.file_type().is_symlink()
+                && crate::store::ensure_path_within_store(&store.root, entry.path()).is_err()
+            {
+                return Err(LinkError::from(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "cannot push: {} resolves outside this store or into a nested store",
+                        entry.path().display()
+                    ),
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Push `files` to `brain` as a whole-store snapshot — the hub's push
@@ -2263,6 +2312,44 @@ pub fn head(cfg: &HubConfig, brain: &str) -> LinkResult<Head> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_push_files_refuses_external_symlink_and_nested_store() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("DB.md"),
+            "---\ntype: db-md\nscope: company\nowner: Test\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("records/notes")).unwrap();
+
+        let external = tempfile::tempdir().unwrap();
+        let secret = external.path().join("secret.md");
+        std::fs::write(&secret, "TOP SECRET").unwrap();
+        symlink(&secret, root.path().join("records/notes/secret.md")).unwrap();
+
+        let store = Store::open_strict(root.path()).unwrap();
+        let err = collect_push_files(&store).unwrap_err().to_string();
+        assert!(err.contains("cannot push"), "{err}");
+        assert!(
+            !err.contains("TOP SECRET"),
+            "external bytes must never leak"
+        );
+
+        std::fs::remove_file(root.path().join("records/notes/secret.md")).unwrap();
+        let nested = root.path().join("records/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("DB.md"),
+            "---\ntype: db-md\nscope: research\nowner: Nested\n---\n",
+        )
+        .unwrap();
+        let err = collect_push_files(&store).unwrap_err().to_string();
+        assert!(err.contains("nested db.md store"), "{err}");
+    }
 
     #[test]
     fn signed_feed_item_verifies_identity_hash_and_signature() {

@@ -3,12 +3,22 @@
   "scope": "all",
   "store": "tests/corpora/corpus-b-edges",
   "summary": {
-    "errors": 41,
+    "errors": 42,
     "info": 1,
-    "total": 56,
+    "total": 57,
     "warnings": 14
   },
   "issues": [
+    {
+      "code": "NESTED_STORE",
+      "file": "bad-db-md/DB.md",
+      "key": null,
+      "line": null,
+      "message": "`bad-db-md` is a db.md store nested inside this store",
+      "related": [],
+      "severity": "error",
+      "suggestion": "move the nested store outside this store, or run dbmd from the nested root"
+    },
     {
       "code": "LOG_BAD_TIMESTAMP",
       "file": "log.md",
