@@ -18,6 +18,10 @@ Two things version independently:
   actually published `dbmd-core` (0.8.2). The 0.8.5 release preflight correctly
   refused to package against the unpublished 0.8.3 floor left by the two prior
   fail-closed release attempts, so 0.8.5 published no artifacts.
+- The publishability gate now packages both crates without registry-dependent
+  verification, extracts the exact tarballs, and compiles the CLI against the
+  same-release core. Clean CI no longer substitutes an older registry core
+  while proving a new release.
 
 ## [0.8.5] — 2026-07-30
 

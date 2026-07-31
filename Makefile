@@ -39,13 +39,14 @@ lint:
 	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Publishability guard. Packages every crate from its TARBALL (the form
-# `cargo publish` ships) so an include_str!/include_bytes! path that escapes
-# the crate, a path-only dep missing a version, or missing publish metadata
-# fails HERE, not at publish. The local pre-commit gate packages the current
-# working copy; CI repeats the check from a clean checkout without this flag.
+# `cargo publish` ships), then compiles the extracted CLI against the extracted
+# core from the same source. This catches escaping include paths, path-only
+# dependencies, missing metadata, and unpublished-workspace dependency skew.
+# The local pre-commit gate permits the current working copy; CI repeats the
+# check from a clean checkout without this flag.
 # Run this before any `cargo publish`.
 publish-check: sync
-	cargo package --workspace --locked --allow-dirty
+	DBMD_PUBLISH_ALLOW_DIRTY=1 scripts/check-publishability.sh
 
 clean:
 	cargo clean

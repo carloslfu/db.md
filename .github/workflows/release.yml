@@ -138,7 +138,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Publishability
-        run: cargo package --workspace --locked
+        run: make publish-check
 
       - name: cargo-deny (advisories + licenses + bans)
         uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902
@@ -494,10 +494,10 @@ jobs:
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
-      # Same packaging guard as publish-check.yml: build each crate from its
-      # tarball before any upload, so a packaging bug fails here, not midway.
-      - name: Verify publishability (cargo package --workspace)
-        run: cargo package --workspace --locked
+      # Same packaging guard as publish-check.yml: compile the exact extracted
+      # same-release tarballs together before any upload.
+      - name: Verify same-release tarball publishability
+        run: make publish-check
       # Trusted Publishing: exchange GitHub OIDC for a short-lived crates.io
       # token at runtime. No token is stored in the repo or in CI.
       - name: Authenticate to crates.io via OIDC (Trusted Publishing, no token)
