@@ -191,6 +191,13 @@ jobs:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
         run: sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"
 
+      - name: Diagnose rejected Darwin toolchain
+        if: ${{ failure() && !matrix.use_cross }}
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: sh scripts/diagnose-darwin-toolchain.sh "$DEVELOPER_DIR"
+
       # cross (Docker-based) handles both musl targets in reviewed immutable
       # images, avoiding mutable apt repositories and host sysroots.
       - name: Install cross (linux)

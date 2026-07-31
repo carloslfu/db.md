@@ -20,6 +20,7 @@ publishability="$repo_root/scripts/check-publishability.sh"
 cross_config="$repo_root/Cross.toml"
 linkmd_source="$repo_root/crates/dbmd-core/src/linkmd.rs"
 darwin_verifier="$repo_root/scripts/verify-darwin-toolchain.sh"
+darwin_diagnostics="$repo_root/scripts/diagnose-darwin-toolchain.sh"
 
 fail() {
     printf 'release security test: %s\n' "$*" >&2
@@ -44,6 +45,7 @@ reject_fixed() {
 bash -n "$controller"
 sh -n "$crates_publisher"
 sh -n "$publishability"
+sh -n "$darwin_diagnostics"
 sh "$repo_root/scripts/test-release-state.sh"
 sh "$repo_root/scripts/test-crates-release-state.sh"
 
@@ -96,6 +98,11 @@ require_fixed '/Applications/Xcode_26.6.app/Contents/Developer' "$workflow"
 require_fixed '/Applications/Xcode_26.6.app/Contents/Developer' "$test_workflow"
 require_fixed 'sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"' "$workflow"
 require_fixed 'sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"' "$test_workflow"
+require_fixed 'sh scripts/diagnose-darwin-toolchain.sh "$DEVELOPER_DIR"' "$workflow"
+require_fixed 'sh scripts/diagnose-darwin-toolchain.sh "$DEVELOPER_DIR"' "$test_workflow"
+require_fixed 'codesign --remove-signature "$arm64_file"' "$darwin_diagnostics"
+require_fixed "find . -type f" "$darwin_diagnostics"
+require_fixed "-name '*.tbd'" "$darwin_diagnostics"
 require_fixed 'Build shipped release target twice' "$test_workflow"
 require_fixed 'cmp "$first" "$second"' "$test_workflow"
 require_fixed 'CARGO_TARGET_DIR="$target_dir"' "$test_workflow"
