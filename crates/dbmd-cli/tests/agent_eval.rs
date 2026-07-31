@@ -108,8 +108,16 @@ fn build_release_dbmd() -> PathBuf {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
+    // Keep the eval's optimized artifact graph separate from the workspace's
+    // ordinary `target/release` graph. Hosted CI restores that graph through a
+    // compiler cache before running the tests; re-linking a different source
+    // revision in place has twice produced incomplete LTO inputs (notably
+    // missing `encoding_rs` symbols). A dedicated Cargo target directory keeps
+    // this executable reproducible while preserving Cargo's own current-source
+    // freshness checks and the once-per-process memoization above.
+    let target_dir = repo_root.join("target").join("agent-eval-release");
     let exe = if cfg!(windows) { "dbmd.exe" } else { "dbmd" };
-    let bin = repo_root.join("target").join("release").join(exe);
+    let bin = target_dir.join("release").join(exe);
 
     // Build the CLI in release. `--release` is mandatory (the eval drives the
     // optimized artifact). Inherit stdio so a build failure is visible in the
@@ -117,7 +125,8 @@ fn build_release_dbmd() -> PathBuf {
     // rebuilds when any input changed, giving rebuild-if-stale semantics
     // without a hand-rolled (and provably wrong) freshness check.
     let status = StdCommand::new(env!("CARGO"))
-        .args(["build", "--release", "-p", "dbmd-cli"])
+        .args(["build", "--release", "-p", "dbmd-cli", "--target-dir"])
+        .arg(&target_dir)
         .current_dir(&repo_root)
         .status()
         .expect("spawn `cargo build --release -p dbmd-cli`");

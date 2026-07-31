@@ -8,7 +8,17 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.4**.
+  `Cargo.toml`, currently **v0.8.5**.
+
+## [0.8.5] — 2026-07-30
+
+### Fixed
+
+- The agent-eval release build now uses a dedicated Cargo target directory.
+  The protected 0.8.4 preflight proved that serializing callers was necessary
+  but insufficient: the restored shared release graph could still feed an
+  incomplete cached LTO input to the nested build. The gate again failed closed
+  and published no artifacts.
 
 ## [0.8.4] — 2026-07-30
 
