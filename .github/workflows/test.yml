@@ -25,8 +25,16 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           key: msrv-1.88
-      - name: Check declared MSRV
+      - name: Type-check at declared MSRV
         run: cargo check --workspace --locked
+      # `cargo check` cannot catch optimizer/linker regressions. This exact
+      # release-profile link is the repository's executable MSRV contract: its
+      # minimum compiler must produce the optimized artifact our release
+      # controller and agent-eval harness exercise.
+      - name: Build and run release profile at declared MSRV
+        run: |
+          cargo build --workspace --release --locked
+          ./target/release/dbmd --version
 
   test:
     runs-on: ubuntu-24.04

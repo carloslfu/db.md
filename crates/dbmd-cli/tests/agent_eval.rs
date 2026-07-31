@@ -85,10 +85,10 @@ fn build_release_dbmd() -> Result<ReleaseBinary, String> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    // Hosted CI restores `target/` through a compiler cache. A named directory
-    // below that root can therefore inherit incomplete LTO inputs from a killed
-    // prior link. A fresh temp target cannot inherit that graph; retaining its
-    // TempDir owner keeps the finished binary alive for the whole test process.
+    // The eval must never consume a release artifact from another source
+    // revision or another test process. A fresh process-owned target gives
+    // Cargo a clean graph; retaining its TempDir owner keeps the finished
+    // binary alive for the whole test process.
     let target_owner = tempfile::Builder::new()
         .prefix("dbmd-agent-eval-release-")
         .tempdir()

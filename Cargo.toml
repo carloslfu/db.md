@@ -94,6 +94,12 @@ insta = "1"
 assert_cmd = "2"
 
 [profile.release]
-lto = true
+# Rust 1.88's fat-LTO linker drops the externally referenced `encoding_rs`
+# encoding statics on x86_64 Linux once calamine and grep-searcher are linked
+# into the same binary. That makes an otherwise clean MSRV release build fail
+# with undefined UTF_8/UTF_16LE/UTF_16BE symbols. Thin LTO keeps cross-crate
+# optimization while producing a valid release binary on every supported
+# toolchain. The MSRV workflow links this exact profile to guard the boundary.
+lto = "thin"
 codegen-units = 1
 strip = true

@@ -31,18 +31,20 @@ Two things version independently:
   fence around `latest` prevent overlapping older releases from moving either
   mutable channel backward.
 - Agent evals now build one optimized binary per test process in a fresh target
-  outside the restored workspace cache. Parallel evals share that immutable
-  artifact, so a stale incomplete LTO graph cannot poison the clean CI run.
+  and parallel evals share that immutable artifact. Clean Linux reproduction
+  proved the remaining link failure was not cache poisoning: Rust 1.88 fat LTO
+  dropped externally referenced `encoding_rs` statics. Release builds now use
+  Thin LTO, and CI links the complete release profile on the declared MSRV
+  instead of treating `cargo check` as sufficient proof.
 
 ## [0.8.5] — 2026-07-30
 
 ### Fixed
 
 - The agent-eval release build now uses a dedicated Cargo target directory.
-  The protected 0.8.4 preflight proved that serializing callers was necessary
-  but insufficient: the restored shared release graph could still feed an
-  incomplete cached LTO input to the nested build. The gate again failed closed
-  and published no artifacts.
+  This ruled out reuse of the restored workspace graph, but the protected gate
+  still failed closed and published no artifacts. The later clean reproduction
+  identified the Rust 1.88 fat-LTO failure recorded under 0.8.6.
 
 ## [0.8.4] — 2026-07-30
 
@@ -50,10 +52,10 @@ Two things version independently:
 
 - The agent-eval harness now serializes its nested optimized builds. A
   dedicated helper regression could previously race the suite's first
-  release-binary build under Rust's parallel test runner, sending two
-  whole-program LTO links into the same target directory. The protected 0.8.3
-  release preflight caught the resulting incomplete link and published no
-  artifacts.
+  release-binary build under Rust's parallel test runner. Serialization removed
+  that ambiguity, but the protected gate still failed closed and published no
+  artifacts; the later clean reproduction identified the distinct Rust 1.88
+  fat-LTO failure recorded under 0.8.6.
 
 ## [0.8.3] — 2026-07-30
 
