@@ -2557,7 +2557,19 @@ fn install_stage_at(
     } else {
         libc::RENAME_NOREPLACE
     };
-    let result = unsafe { libc::renameat2(parent, stage.as_ptr(), parent, dest.as_ptr(), flags) };
+    // `libc::renameat2` is not exported for the musl targets we ship. Invoke
+    // the kernel ABI directly, as `fsx::renameat_noreplace` does, so the same
+    // atomic exchange/no-replace boundary compiles for glibc and musl.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent,
+            stage.as_ptr(),
+            parent,
+            dest.as_ptr(),
+            flags,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -5619,6 +5631,51 @@ mod tests {
     use super::*;
 
     const TEST_BRAIN_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_snapshot_install_is_atomic_for_create_and_exchange() {
+        use std::os::fd::AsRawFd as _;
+
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let parent = std::fs::File::open(sandbox.path()).unwrap();
+        let stage = std::ffi::CString::new("stage").unwrap();
+        let destination = std::ffi::CString::new("brain").unwrap();
+
+        std::fs::create_dir(sandbox.path().join("stage")).unwrap();
+        std::fs::write(sandbox.path().join("stage/value"), b"created").unwrap();
+        install_stage_at(
+            parent.as_raw_fd(),
+            stage.as_c_str(),
+            destination.as_c_str(),
+            false,
+        )
+        .unwrap();
+        assert!(!sandbox.path().join("stage").exists());
+        assert_eq!(
+            std::fs::read(sandbox.path().join("brain/value")).unwrap(),
+            b"created"
+        );
+
+        std::fs::create_dir(sandbox.path().join("stage")).unwrap();
+        std::fs::write(sandbox.path().join("stage/value"), b"replacement").unwrap();
+        install_stage_at(
+            parent.as_raw_fd(),
+            stage.as_c_str(),
+            destination.as_c_str(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(sandbox.path().join("brain/value")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(sandbox.path().join("stage/value")).unwrap(),
+            b"created",
+            "RENAME_EXCHANGE must leave the predecessor at the unique stage name"
+        );
+    }
 
     struct SignedRemoteFixture {
         card: String,

@@ -18,6 +18,7 @@ crates_controller_lib="$repo_root/scripts/crates-release-lib.sh"
 crates_publisher="$repo_root/scripts/publish-crates.sh"
 publishability="$repo_root/scripts/check-publishability.sh"
 cross_config="$repo_root/Cross.toml"
+linkmd_source="$repo_root/crates/dbmd-core/src/linkmd.rs"
 
 fail() {
     printf 'release security test: %s\n' "$*" >&2
@@ -66,6 +67,20 @@ require_fixed \
 require_fixed 'use_cross: true' "$workflow"
 reject_fixed 'apt-get install' "$workflow"
 reject_fixed 'musl-tools' "$workflow"
+
+# Every main commit must build the two exact static Linux artifacts that ship.
+# The release-only v0.8.7 cross build caught a musl API mismatch after tagging;
+# this gate prevents a tag from being the first musl compilation.
+require_fixed 'name: release target (${{ matrix.rust_target }})' "$test_workflow"
+require_fixed 'x86_64-unknown-linux-musl' "$test_workflow"
+require_fixed 'aarch64-unknown-linux-musl' "$test_workflow"
+require_fixed \
+    'cross build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli' \
+    "$test_workflow"
+require_fixed 'tool: cross@0.2.5' "$test_workflow"
+require_fixed 'libc::syscall(' "$linkmd_source"
+require_fixed 'libc::SYS_renameat2' "$linkmd_source"
+reject_fixed 'libc::renameat2(' "$linkmd_source"
 
 # Version-specific dtolnay action commits encode the toolchain in action.yml;
 # a `toolchain:` input is ignored and creates a false claim about the compiler.

@@ -40,6 +40,48 @@ jobs:
           CARGO_TARGET_DIR="${RUNNER_TEMP}/dbmd-clippy-msrv" \
             cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  release-targets:
+    name: release target (${{ matrix.rust_target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        rust_target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          key: release-${{ matrix.rust_target }}
+      - name: Install cross
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853
+        with:
+          tool: cross@0.2.5
+      - name: Verify immutable cross image pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.rust_target }}" in
+            aarch64-unknown-linux-musl)
+              expected='ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4'
+              ;;
+            x86_64-unknown-linux-musl)
+              expected='ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99'
+              ;;
+            *) exit 1 ;;
+          esac
+          grep -A1 -F "[target.${{ matrix.rust_target }}]" Cross.toml |
+            grep -Fqx "image = \"$expected\"" || {
+            echo "::error::cross image is not pinned to the reviewed OCI digest" >&2
+            exit 1
+          }
+      - name: Build shipped release target
+        run: cross build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
+
   test:
     runs-on: ubuntu-24.04
     steps:

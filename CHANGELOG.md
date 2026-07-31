@@ -8,7 +8,19 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.7**.
+  `Cargo.toml`, currently **v0.8.8**.
+
+## [0.8.8] — 2026-07-30
+
+### Fixed
+
+- Linux atomic snapshot installation now invokes the `renameat2` kernel ABI
+  through `libc::syscall`, matching the existing secure filesystem primitive.
+  This preserves exchange/no-replace semantics on both glibc and musl.
+- Main CI now builds the release binary for both shipped musl targets in the
+  same digest-pinned `cross` images used by the protected release. The v0.8.7
+  tag failed closed before publication when its release-only musl builds
+  exposed this portability defect.
 
 ## [0.8.7] — 2026-07-30
 
