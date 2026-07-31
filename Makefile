@@ -42,8 +42,9 @@ lint:
 # `cargo publish` ships), then compiles the extracted CLI against the extracted
 # core from the same source. This catches escaping include paths, path-only
 # dependencies, missing metadata, and unpublished-workspace dependency skew.
-# The local pre-commit gate permits the current working copy; CI repeats the
-# check from a clean checkout without this flag.
+# The local pre-commit gate permits the current working copy. CI calls `sync`
+# and the script directly without this flag, so a generated tracked-file change
+# fails the clean-checkout proof.
 # Run this before any `cargo publish`.
 publish-check: sync
 	DBMD_PUBLISH_ALLOW_DIRTY=1 scripts/check-publishability.sh

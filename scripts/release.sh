@@ -10,8 +10,11 @@
 
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=scripts/release-lib.sh
-source "$(cd -- "$(dirname -- "$0")" && pwd)/release-lib.sh"
+source "$script_dir/release-lib.sh"
+# shellcheck source=scripts/crates-release-lib.sh
+source "$script_dir/crates-release-lib.sh"
 
 SOURCE_REPO="${DBMD_SOURCE_REPO:-carloslfu/db.md}"
 TAP_REPO="${DBMD_TAP_REPO:-carloslfu/homebrew-tap}"
@@ -48,6 +51,56 @@ cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 test "$cargo_version" = "$version" ||
     die "Cargo.toml version $cargo_version does not match requested $version"
 gh auth status >/dev/null
+
+require_controller_current() {
+    channel="$1"
+    remote_main_sha="$(
+        git ls-remote origin refs/heads/main |
+            awk 'NR == 1 { print $1 }'
+    )"
+    test -n "$remote_main_sha" ||
+        die "cannot establish origin/main before $channel"
+    test "$remote_main_sha" = "$source_sha" ||
+        die "stale release controller cannot mutate $channel: origin/main is $remote_main_sha"
+}
+
+require_commit_sha() {
+    value="$1"
+    label="$2"
+    printf '%s\n' "$value" |
+        grep -Eq '^[0-9a-f]{40}$' ||
+        die "$label is not a full Git commit SHA"
+}
+
+compare_release_versions() {
+    current_version="$1"
+    candidate_version="$2"
+    gh api \
+        "repos/${SOURCE_REPO}/compare/v${current_version}...v${candidate_version}" \
+        --jq .status
+}
+
+require_monotonic_channel() {
+    current_version="$1"
+    channel="$2"
+    printf '%s\n' "$current_version" |
+        grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' ||
+        die "$channel exposes an invalid version: $current_version"
+    comparison_status="$(compare_release_versions "$current_version" "$version")"
+    transition="$(
+        release_channel_transition \
+            "$current_version" "$version" "$comparison_status"
+    )"
+    case "$transition" in
+        exact | advance) return 0 ;;
+        stale)
+            die "stale release controller cannot regress $channel from $current_version to $version"
+            ;;
+        *)
+            die "$channel version $current_version is not a trunk ancestor of $version"
+            ;;
+    esac
+}
 
 release_tmp="$(mktemp -d "${TMPDIR:-/tmp}/dbmd-release.XXXXXXXX")"
 chmod 700 "$release_tmp"
@@ -358,7 +411,8 @@ compare_final_target linux-aarch64-musl aarch64-unknown-linux-musl
 printf 'Independent rebuild matched all four immutable release binaries byte-for-byte.\n'
 
 # Verify crates.io converged to the exact local package bytes, not merely the
-# requested version label.
+# requested version label. A yanked version is not a converged public release,
+# even when its immutable tarball checksum is exact.
 (
     cd "$release_source"
     CARGO_TARGET_DIR="$release_tmp/package-target" \
@@ -367,19 +421,34 @@ printf 'Independent rebuild matched all four immutable release binaries byte-for
 for crate_name in dbmd-core dbmd-cli; do
     local_crate="$release_tmp/package-target/package/${crate_name}-${version}.crate"
     local_checksum="$(shasum -a 256 "$local_crate" | awk '{print $1}')"
-    published_checksum="$(
-        curl -fsS \
-            -H 'User-Agent: db.md release controller' \
-            "https://crates.io/api/v1/crates/${crate_name}/${version}" |
-            jq -r .version.checksum
+    crate_response="$release_tmp/${crate_name}-version.json"
+    curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --proto '=https' \
+        --proto-redir '=https' \
+        -H 'User-Agent: db.md release controller' \
+        --output "$crate_response" \
+        "https://crates.io/api/v1/crates/${crate_name}/${version}"
+    crate_state="$(
+        crates_version_state "$crate_response" "$local_checksum" "$version"
     )"
-    test "$published_checksum" = "$local_checksum" ||
-        die "crates.io checksum mismatch for ${crate_name} ${version}"
+    case "$crate_state" in
+        exact) ;;
+        yanked) die "crates.io ${crate_name} ${version} is yanked" ;;
+        mismatch) die "crates.io checksum mismatch for ${crate_name} ${version}" ;;
+        wrong-version) die "crates.io response did not bind ${crate_name} ${version}" ;;
+        *) die "crates.io returned malformed state for ${crate_name} ${version}" ;;
+    esac
 done
 
 # Render and update the tap with the caller's existing GitHub authorization.
-# The blob SHA is an optimistic concurrency token; exact bytes make retries a
-# no-op. The returned commit must be a direct child of the head we reviewed.
+# The current formula's release tag must be an ancestor of this source, and
+# origin/main must still name this controller's source. The blob SHA is then an
+# optimistic concurrency token: an overlapping newer controller either makes
+# this one fail before the write or invalidates its compare-and-swap.
 formula="$release_tmp/dbmd.rb"
 "$release_source/HomebrewFormula/render.sh" \
     "$version" "$verify_dir/SHA256SUMS" > "$formula"
@@ -393,6 +462,11 @@ tap_blob_sha="$(printf '%s' "$tap_content" | jq -r .sha)"
 printf '%s' "$tap_content" | jq -r .content |
     tr -d '\n' |
     openssl base64 -d -A > "$release_tmp/current-dbmd.rb"
+current_tap_version="$(
+    release_formula_version "$release_tmp/current-dbmd.rb"
+)" || die "tap formula does not contain exactly one version declaration"
+require_monotonic_channel "$current_tap_version" Homebrew
+require_controller_current Homebrew
 
 if ! cmp -s "$formula" "$release_tmp/current-dbmd.rb"; then
     formula_base64="$(
@@ -421,14 +495,151 @@ if ! cmp -s "$formula" "$release_tmp/current-dbmd.rb"; then
         die "tap main advanced after formula update; rerun to verify convergence"
 fi
 
-gh api "repos/${TAP_REPO}/contents/Formula/dbmd.rb?ref=main" --jq .content |
+# Bind the exact formula proof to one immutable tap commit. Reading `main` and
+# sampling its head later is not equivalent: a newer controller can advance in
+# that gap and let this stale controller mistake the newer head for its fence.
+verified_tap_head="$(
+    gh api "repos/${TAP_REPO}/git/ref/heads/main" --jq .object.sha
+)"
+require_commit_sha "$verified_tap_head" "verified tap head"
+gh api \
+    "repos/${TAP_REPO}/contents/Formula/dbmd.rb?ref=${verified_tap_head}" \
+    --jq .content |
     tr -d '\n' |
     openssl base64 -d -A > "$release_tmp/final-dbmd.rb"
 cmp "$formula" "$release_tmp/final-dbmd.rb" ||
     die "tap formula does not exactly match the immutable release"
 
-# Latest is the final convergence signal. Every permanent channel is already
-# exact, so an interrupted rerun reaches this step idempotently.
+repair_latest_forward() {
+    repair_head="$1"
+    for _ in $(seq 1 10); do
+        require_commit_sha "$repair_head" "latest repair tap head"
+        repair_formula="$release_tmp/raced-dbmd-${repair_head}.rb"
+        gh api \
+            "repos/${TAP_REPO}/contents/Formula/dbmd.rb?ref=${repair_head}" \
+            --jq .content |
+            tr -d '\n' |
+            openssl base64 -d -A > "$repair_formula"
+        raced_tap_version="$(
+            release_formula_version "$repair_formula"
+        )" || die "tap advanced concurrently to an ambiguous formula"
+        raced_status="$(compare_release_versions "$version" "$raced_tap_version")"
+        raced_transition="$(
+            release_channel_transition \
+                "$version" "$raced_tap_version" "$raced_status"
+        )"
+        fence_action="$(
+            release_latest_fence_action \
+                "$verified_tap_head" "$repair_head" "$raced_transition"
+        )"
+        test "$fence_action" = repair-forward ||
+            die "tap changed concurrently without advancing from $version"
+
+        repair_tag="v${raced_tap_version}"
+        repair_release_json="$(
+            gh api "repos/${SOURCE_REPO}/releases/tags/${repair_tag}"
+        )"
+        test "$(printf '%s' "$repair_release_json" | jq -r .tag_name)" = "$repair_tag" ||
+            die "newer tap release does not bind $repair_tag"
+        test "$(printf '%s' "$repair_release_json" | jq -r .immutable)" = true ||
+            die "newer tap release $repair_tag is not immutable"
+        test "$(printf '%s' "$repair_release_json" | jq -r .draft)" = false ||
+            die "newer tap release $repair_tag is still a draft"
+        repair_source_sha="$(
+            gh api "repos/${SOURCE_REPO}/commits/${repair_tag}" --jq .sha
+        )"
+        require_commit_sha "$repair_source_sha" "newer tap tag $repair_tag"
+
+        repair_actual_assets="$(
+            printf '%s' "$repair_release_json" |
+                jq -r '.assets[].name' |
+                LC_ALL=C sort
+        )"
+        repair_expected_assets="$(
+            printf '%s\n' \
+                SHA256SUMS \
+                "dbmd-${raced_tap_version}-darwin-aarch64.tar.gz" \
+                "dbmd-${raced_tap_version}-darwin-x86_64.tar.gz" \
+                "dbmd-${raced_tap_version}-linux-aarch64-musl.tar.gz" \
+                "dbmd-${raced_tap_version}-linux-x86_64-musl.tar.gz" |
+                LC_ALL=C sort
+        )"
+        test "$repair_actual_assets" = "$repair_expected_assets" ||
+            die "newer tap release $repair_tag has an unexpected asset set"
+
+        repair_dir="$release_tmp/latest-repair-${repair_head}"
+        mkdir -p "$repair_dir"
+        gh release download "$repair_tag" \
+            --repo "$SOURCE_REPO" --dir "$repair_dir"
+        (
+            cd "$repair_dir"
+            shasum -a 256 -c SHA256SUMS
+            for repair_tarball in dbmd-*.tar.gz; do
+                gh attestation verify "$repair_tarball" \
+                    --repo "$SOURCE_REPO" \
+                    --signer-workflow "${SOURCE_REPO}/.github/workflows/${RELEASE_WORKFLOW}" \
+                    --source-digest "$repair_source_sha" \
+                    --source-ref "refs/tags/${repair_tag}" \
+                    --deny-self-hosted-runners >/dev/null
+            done
+        )
+        repair_expected_formula="$repair_dir/expected-dbmd.rb"
+        "$release_source/HomebrewFormula/render.sh" \
+            "$raced_tap_version" "$repair_dir/SHA256SUMS" \
+            > "$repair_expected_formula"
+        cmp "$repair_expected_formula" "$repair_formula" ||
+            die "newer tap formula does not match its immutable release assets"
+
+        gh release edit "$repair_tag" --repo "$SOURCE_REPO" --latest
+        repair_head_after="$(
+            gh api "repos/${TAP_REPO}/git/ref/heads/main" --jq .object.sha
+        )"
+        if [ "$repair_head_after" = "$repair_head" ]; then
+            test "$(
+                gh api "repos/${SOURCE_REPO}/releases/latest" --jq .tag_name
+            )" = "$repair_tag" ||
+                die "latest did not converge to newer tap release $repair_tag"
+            die "tap advanced concurrently; latest was repaired to $repair_tag"
+        fi
+        repair_head="$repair_head_after"
+    done
+    die "tap did not hold still while repairing latest forward"
+}
+
+# Latest is the final convergence signal. Refuse an already-newer latest tag,
+# require origin/main to remain frozen at this source immediately before the
+# mutation, and require the live tap head to equal the commit whose exact
+# formula was proved above. If a newer controller advances the tap during the
+# edit, verify its tag, immutable assets, attestations, and exact formula before
+# repairing latest forward and failing this stale controller.
+latest_tag="$(
+    gh api "repos/${SOURCE_REPO}/releases/latest" --jq .tag_name
+)"
+case "$latest_tag" in
+    v*) latest_version="${latest_tag#v}" ;;
+    *) die "latest release exposes an invalid tag: $latest_tag" ;;
+esac
+require_monotonic_channel "$latest_version" latest
+require_controller_current latest
+tap_head_before_latest="$(
+    gh api "repos/${TAP_REPO}/git/ref/heads/main" --jq .object.sha
+)"
+require_commit_sha "$tap_head_before_latest" "live tap head before latest"
+test "$(
+    release_latest_preflight_action \
+        "$verified_tap_head" "$tap_head_before_latest"
+)" = proceed ||
+    die "tap advanced after the candidate formula proof; refusing stale latest mutation"
 gh release edit "$tag" --repo "$SOURCE_REPO" --latest
+tap_head_after_latest="$(
+    gh api "repos/${TAP_REPO}/git/ref/heads/main" --jq .object.sha
+)"
+require_commit_sha "$tap_head_after_latest" "live tap head after latest"
+if [ "$tap_head_after_latest" != "$tap_head_before_latest" ]; then
+    repair_latest_forward "$tap_head_after_latest"
+fi
+test "$(
+    gh api "repos/${SOURCE_REPO}/releases/latest" --jq .tag_name
+)" = "$tag" || die "latest did not converge to $tag"
 printf 'Release %s converged: independent rebuild, crates.io, immutable assets, attestations, Homebrew, latest.\n' \
     "$tag"

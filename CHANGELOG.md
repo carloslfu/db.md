@@ -14,14 +14,25 @@ Two things version independently:
 
 ### Fixed
 
-- The CLI's compatible registry dependency floor again names the latest
-  actually published `dbmd-core` (0.8.2). The 0.8.5 release preflight correctly
-  refused to package against the unpublished 0.8.3 floor left by the two prior
-  fail-closed release attempts, so 0.8.5 published no artifacts.
+- The CLI now requires the exact same-release `dbmd-core`. The 0.8.5 preflight
+  correctly refused to package against the unpublished 0.8.3 floor left by the
+  two prior fail-closed release attempts, so 0.8.5 published no artifacts.
 - The publishability gate now packages both crates without registry-dependent
   verification, extracts the exact tarballs, and compiles the CLI against the
-  same-release core. Clean CI no longer substitutes an older registry core
-  while proving a new release.
+  exact same-release core required by its public manifest. Clean CI no longer
+  substitutes an older registry core while proving a new release.
+- Crate publication now converges `dbmd-core` by exact crates.io checksum and
+  non-yanked state before it packages the untouched registry-bound CLI. It
+  applies the same authoritative check to the CLI before the GitHub release can
+  become public, including exact fail-closed resume behavior. The trusted local
+  controller independently repeats both checksum and yank-state verification.
+- Release promotion now rejects stale controllers by source ancestry and a
+  fresh `origin/main` check. Homebrew's optimistic blob update and a tap-head
+  fence around `latest` prevent overlapping older releases from moving either
+  mutable channel backward.
+- Agent evals now build one optimized binary per test process in a fresh target
+  outside the restored workspace cache. Parallel evals share that immutable
+  artifact, so a stale incomplete LTO graph cannot poison the clean CI run.
 
 ## [0.8.5] — 2026-07-30
 

@@ -17,6 +17,84 @@ release_resume_action() {
     printf '%s\n' invalid
 }
 
+# Classify a candidate release relative to a version already serving a mutable
+# distribution channel. `comparison_status` is GitHub's compare status for
+# `v<current>...v<candidate>`: `ahead` means the candidate descends from the
+# current channel source on trunk.
+release_channel_transition() {
+    current_version="$1"
+    candidate_version="$2"
+    comparison_status="$3"
+
+    if [ "$current_version" = "$candidate_version" ]; then
+        if [ "$comparison_status" = identical ]; then
+            printf '%s\n' exact
+        else
+            printf '%s\n' invalid
+        fi
+        return 0
+    fi
+
+    case "$comparison_status" in
+        ahead) printf '%s\n' advance ;;
+        behind) printf '%s\n' stale ;;
+        *) printf '%s\n' invalid ;;
+    esac
+}
+
+# Extract the one exact version declaration from a rendered Homebrew formula.
+# Ambiguous or malformed input is rejected instead of letting a stale
+# controller choose whichever line happened to match first.
+release_formula_version() {
+    formula_file="$1"
+    awk '
+        /^[[:space:]]*version "[^"]+"[[:space:]]*$/ {
+            value = $0
+            sub(/^[[:space:]]*version "/, "", value)
+            sub(/"[[:space:]]*$/, "", value)
+            versions[++count] = value
+        }
+        END {
+            if (count != 1) {
+                exit 1
+            }
+            print versions[1]
+        }
+    ' "$formula_file"
+}
+
+# Decide what to do after a `latest` edit using the Homebrew head as its
+# ordering fence. An unchanged head proves the exact formula reviewed before
+# the edit is still current. If the head changed, only a strict descendant may
+# be repaired forward; every other race fails without choosing a tag.
+release_latest_fence_action() {
+    tap_head_before="$1"
+    tap_head_after="$2"
+    raced_transition="$3"
+
+    if [ "$tap_head_before" = "$tap_head_after" ]; then
+        printf '%s\n' stable
+    elif [ "$raced_transition" = advance ]; then
+        printf '%s\n' repair-forward
+    else
+        printf '%s\n' invalid
+    fi
+}
+
+# Bind a final-channel mutation to the exact tap commit whose formula was
+# inspected. Sampling a new head after that inspection is unsafe: a newer
+# controller may already have advanced the tap in the gap.
+release_latest_preflight_action() {
+    verified_tap_head="$1"
+    live_tap_head="$2"
+
+    if [ "$verified_tap_head" = "$live_tap_head" ]; then
+        printf '%s\n' proceed
+    else
+        printf '%s\n' stale
+    fi
+}
+
 compare_immutable_target() {
     rebuilt_binary="$1"
     tarball="$2"

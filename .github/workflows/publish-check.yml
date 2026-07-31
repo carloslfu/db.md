@@ -45,4 +45,6 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
 
       - name: Package and compile the exact same-release tarballs
-        run: make publish-check
+        run: |
+          make sync
+          scripts/check-publishability.sh

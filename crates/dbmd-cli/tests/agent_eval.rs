@@ -46,7 +46,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use common::{copy_store_to_temp, corpora_dir, corpus_a, corpus_b};
 
@@ -59,150 +59,106 @@ use common::{copy_store_to_temp, corpora_dir, corpus_a, corpus_b};
 // builds debug) or a repeated local run where a release binary already exists.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Absolute path to a **freshly-built** `target/release/dbmd`.
-///
-/// `CARGO_MANIFEST_DIR` is `<repo>/crates/dbmd-cli`; the workspace target dir is
-/// `<repo>/target`. The brief is explicit that the eval drives the *optimized
-/// release* artifact (not the debug bin `assert_cmd`/`cargo_bin` would pick, and
-/// not via a new build-driver dependency like `escargot`), so we invoke `cargo
-/// build --release -p dbmd-cli` ourselves and hand back the artifact path.
-///
-/// **The build is unconditional, by design.** It is NOT guarded on
-/// `bin.is_file()`. A stale release binary left over from an earlier commit is a
-/// soundness hazard: this whole file (the flagship byte-for-byte golden plus
-/// every supporting eval) would otherwise run against pre-edit code and report
-/// green while a regression ships — the failure mode is silent, not loud. Cargo
-/// is the staleness oracle: when the binary is genuinely up to date the build is
-/// a sub-second no-op; when any source under the dependency graph changed, cargo
-/// rebuilds before we return the path. Skipping the build "because a binary
-/// already exists" is exactly the bug this guards against — do not re-add an
-/// `if !bin.is_file()` short-circuit.
-///
-/// The build runs **once per test process**, memoized in a `OnceLock`: the first
-/// of the file's tests to reach here triggers the (rebuild-if-stale) build, all
-/// others observe the completed result. That keeps the guarantee — every test
-/// drives a binary built from the current tree — while a parallel `cargo test`
-/// run does not fire seven redundant, lock-contending `cargo build` no-ops.
-fn release_dbmd() -> PathBuf {
-    static DBMD: OnceLock<PathBuf> = OnceLock::new();
-    DBMD.get_or_init(build_release_dbmd).clone()
+/// A freshly-built release binary held alive for this test process.
+struct ReleaseBinary {
+    _target_owner: tempfile::TempDir,
+    path: PathBuf,
 }
 
-/// Run `cargo build --release -p dbmd-cli` unconditionally and return the
-/// artifact path, asserting the build succeeded and the on-disk binary is
-/// current with the sources cargo just saw. Called once via [`release_dbmd`].
-fn build_release_dbmd() -> PathBuf {
-    // `release_dbmd()` memoizes the common path, but the dedicated regression
-    // below deliberately invokes this helper directly. Rust's test harness may
-    // run that regression at the same time as another test initializes the
-    // `OnceLock`, which used to launch two release builds into the same target
-    // directory. Cargo coordinates most shared work, but the concurrent
-    // whole-program LTO links can still observe/replace the same final
-    // artifacts. Serialize the complete nested build boundary, not just the
-    // memoized caller.
-    static BUILD_LOCK: Mutex<()> = Mutex::new(());
-    let _build_guard = BUILD_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+/// Absolute path to a freshly built optimized `dbmd`.
+///
+/// The build runs once per test process. `OnceLock` serializes the first caller,
+/// then every parallel eval consumes the same completed artifact. The `Result`
+/// is memoized too, so a failed link is reported once instead of making every
+/// waiting test retry it.
+fn release_dbmd() -> PathBuf {
+    static DBMD: OnceLock<Result<ReleaseBinary, String>> = OnceLock::new();
+    match DBMD.get_or_init(build_release_dbmd) {
+        Ok(release) => release.path.clone(),
+        Err(error) => panic!("{error}"),
+    }
+}
 
+/// Build the optimized CLI once in a process-owned target directory that can
+/// never come from the workspace compiler cache.
+fn build_release_dbmd() -> Result<ReleaseBinary, String> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    // Keep the eval's optimized artifact graph separate from the workspace's
-    // ordinary `target/release` graph. Hosted CI restores that graph through a
-    // compiler cache before running the tests; re-linking a different source
-    // revision in place has twice produced incomplete LTO inputs (notably
-    // missing `encoding_rs` symbols). A dedicated Cargo target directory keeps
-    // this executable reproducible while preserving Cargo's own current-source
-    // freshness checks and the once-per-process memoization above.
-    let target_dir = repo_root.join("target").join("agent-eval-release");
+    // Hosted CI restores `target/` through a compiler cache. A named directory
+    // below that root can therefore inherit incomplete LTO inputs from a killed
+    // prior link. A fresh temp target cannot inherit that graph; retaining its
+    // TempDir owner keeps the finished binary alive for the whole test process.
+    let target_owner = tempfile::Builder::new()
+        .prefix("dbmd-agent-eval-release-")
+        .tempdir()
+        .map_err(|error| format!("create isolated agent-eval target: {error}"))?;
+    let target_dir = target_owner.path().join("target");
     let exe = if cfg!(windows) { "dbmd.exe" } else { "dbmd" };
     let bin = target_dir.join("release").join(exe);
 
-    // Build the CLI in release. `--release` is mandatory (the eval drives the
-    // optimized artifact). Inherit stdio so a build failure is visible in the
-    // test log rather than swallowed. Cargo no-ops when truly up to date and
-    // rebuilds when any input changed, giving rebuild-if-stale semantics
-    // without a hand-rolled (and provably wrong) freshness check.
     let status = StdCommand::new(env!("CARGO"))
         .args(["build", "--release", "-p", "dbmd-cli", "--target-dir"])
         .arg(&target_dir)
         .current_dir(&repo_root)
         .status()
-        .expect("spawn `cargo build --release -p dbmd-cli`");
-    assert!(
-        status.success(),
-        "`cargo build --release -p dbmd-cli` failed — the agent eval drives \
-         the release binary at {}",
-        bin.display()
-    );
-
-    // The build reported success, so the artifact must now exist and — because
-    // cargo is the staleness oracle — is current with the sources cargo just
-    // saw: if anything in the dependency graph changed cargo rebuilt before
-    // returning, and if not the binary was already up to date. Either way we are
-    // driving code built from the *current* tree, never a stale leftover from an
-    // earlier commit. We assert presence (the loud form of "build produced the
-    // artifact"); we do NOT assert anything about the mtime moving forward — on
-    // macOS/APFS `cargo` uplifts a cached `target/release/deps/` artifact while
-    // *preserving its mtime*, so the uplifted binary's mtime legitimately moves
-    // BACKWARDS relative to a previously-linked one. A monotonic-mtime assertion
-    // is therefore false here and flakes intermittently; cargo's own up-to-date
-    // tracking is the correct (and sufficient) freshness guarantee.
-    let _ = std::fs::metadata(&bin).unwrap_or_else(|e| {
-        panic!(
+        .map_err(|error| format!("spawn `cargo build --release -p dbmd-cli`: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "`cargo build --release -p dbmd-cli` failed; the agent eval drives \
+             the release binary at {}",
+            bin.display()
+        ));
+    }
+    std::fs::metadata(&bin).map_err(|error| {
+        format!(
             "release binary absent after a successful `cargo build --release`: \
-             {} ({e})",
+             {} ({error})",
             bin.display()
         )
-    });
+    })?;
 
-    bin
+    Ok(ReleaseBinary {
+        _target_owner: target_owner,
+        path: bin,
+    })
 }
 
-/// Regression: the release-binary build helper must hand back an existing,
-/// executable artifact and must NOT flake on the artifact's mtime.
+/// Regression: every caller receives one stable immutable release binary.
 ///
-/// `build_release_dbmd` used to assert the binary's mtime never moved backwards
-/// across a build. That invariant is false: on macOS/APFS `cargo` uplifts a
-/// cached `target/release/deps/` artifact while preserving its mtime, so the
-/// on-disk binary's mtime legitimately moves backwards relative to a previously
-/// linked one, and the assertion failed intermittently. Driving the helper
-/// twice (the second call is a no-op rebuild — the regime that exposes the
-/// non-monotonic mtime) must succeed both times and return the same path; the
-/// only guarantees we keep are existence + executability, which cargo's own
-/// up-to-date tracking backs.
+/// Calling the accessor twice must neither rebuild nor replace the artifact.
+/// Its path, bytes, length, and mtime remain identical.
 #[test]
 fn release_dbmd_build_helper_is_mtime_flake_free() {
-    let first = build_release_dbmd();
+    let first = release_dbmd();
     assert!(
         first.is_file(),
-        "build_release_dbmd must return an existing artifact: {}",
+        "release_dbmd must return an existing artifact: {}",
         first.display()
     );
+    let first_bytes = std::fs::read(&first).expect("read first release binary");
+    let first_metadata = std::fs::metadata(&first).expect("stat first release binary");
 
-    // A second build (now guaranteed up to date — possibly served via an APFS
-    // mtime-preserving uplift) must still succeed and return the same path,
-    // never panicking on a non-monotonic mtime.
-    let second = build_release_dbmd();
+    let second = release_dbmd();
+    let second_bytes = std::fs::read(&second).expect("read second release binary");
+    let second_metadata = std::fs::metadata(&second).expect("stat second release binary");
+    assert_eq!(first, second, "release_dbmd must return one stable path");
+    assert_eq!(first_bytes, second_bytes, "release binary bytes changed");
     assert_eq!(
-        first, second,
-        "build_release_dbmd must return a stable artifact path across calls"
+        first_metadata.len(),
+        second_metadata.len(),
+        "release binary length changed"
     );
-    assert!(
-        second.is_file(),
-        "the artifact must still exist after a no-op rebuild: {}",
-        second.display()
+    assert_eq!(
+        first_metadata.modified().ok(),
+        second_metadata.modified().ok(),
+        "release binary mtime changed"
     );
 
-    // The artifact is executable (Unix: at least one exec bit set).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&second)
-            .expect("metadata for the release binary")
-            .permissions()
-            .mode();
+        let mode = second_metadata.permissions().mode();
         assert!(
             mode & 0o111 != 0,
             "the release binary must be executable; mode = {mode:o}"
