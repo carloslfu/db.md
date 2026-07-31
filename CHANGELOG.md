@@ -8,7 +8,18 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.3**.
+  `Cargo.toml`, currently **v0.8.4**.
+
+## [0.8.4] — 2026-07-30
+
+### Fixed
+
+- The agent-eval harness now serializes its nested optimized builds. A
+  dedicated helper regression could previously race the suite's first
+  release-binary build under Rust's parallel test runner, sending two
+  whole-program LTO links into the same target directory. The protected 0.8.3
+  release preflight caught the resulting incomplete link and published no
+  artifacts.
 
 ## [0.8.3] — 2026-07-30
 

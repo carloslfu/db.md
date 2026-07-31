@@ -46,7 +46,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use common::{copy_store_to_temp, corpora_dir, corpus_a, corpus_b};
 
@@ -92,6 +92,19 @@ fn release_dbmd() -> PathBuf {
 /// artifact path, asserting the build succeeded and the on-disk binary is
 /// current with the sources cargo just saw. Called once via [`release_dbmd`].
 fn build_release_dbmd() -> PathBuf {
+    // `release_dbmd()` memoizes the common path, but the dedicated regression
+    // below deliberately invokes this helper directly. Rust's test harness may
+    // run that regression at the same time as another test initializes the
+    // `OnceLock`, which used to launch two release builds into the same target
+    // directory. Cargo coordinates most shared work, but the concurrent
+    // whole-program LTO links can still observe/replace the same final
+    // artifacts. Serialize the complete nested build boundary, not just the
+    // memoized caller.
+    static BUILD_LOCK: Mutex<()> = Mutex::new(());
+    let _build_guard = BUILD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
