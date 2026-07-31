@@ -8,7 +8,16 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.5**.
+  `Cargo.toml`, currently **v0.8.6**.
+
+## [0.8.6] — 2026-07-30
+
+### Fixed
+
+- The CLI's compatible registry dependency floor again names the latest
+  actually published `dbmd-core` (0.8.2). The 0.8.5 release preflight correctly
+  refused to package against the unpublished 0.8.3 floor left by the two prior
+  fail-closed release attempts, so 0.8.5 published no artifacts.
 
 ## [0.8.5] — 2026-07-30
 
