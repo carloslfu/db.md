@@ -8,7 +8,21 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.8**.
+  `Cargo.toml`, currently **v0.8.9**.
+
+## [0.8.9] — 2026-07-30
+
+### Fixed
+
+- Independent release rebuilds now use one Cargo target directory per platform.
+  This prevents host build scripts compiled in one digest-pinned `cross` image
+  from being reused under another image with an older glibc. The v0.8.8
+  controller failed closed before approval when this contamination was
+  detected.
+- A controller that fails or is interrupted leaves protected publication
+  pending for an independently rebuilt successor. GitHub does not expose a
+  compare-and-swap rejection scoped to one rerun attempt, so cleanup never
+  risks rejecting another controller's approval gate.
 
 ## [0.8.8] — 2026-07-30
 

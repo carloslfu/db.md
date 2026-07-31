@@ -36,6 +36,21 @@ release_artifact_state() {
     printf '%s\n' invalid
 }
 
+# A workflow run id and environment id survive GitHub reruns. Approval is safe
+# only if the exact attempt and pending-deployment record reviewed before the
+# independent rebuild are still current at the point of use.
+release_approval_state_matches() {
+    captured_attempt="$1"
+    current_attempt="$2"
+    captured_pending="$3"
+    current_pending="$4"
+
+    [ -n "$captured_attempt" ] &&
+        [ "$captured_attempt" = "$current_attempt" ] &&
+        [ -n "$captured_pending" ] &&
+        [ "$captured_pending" = "$current_pending" ]
+}
+
 # Classify a candidate release relative to a version already serving a mutable
 # distribution channel. `comparison_status` is GitHub's compare status for
 # `v<current>...v<candidate>`: `ahead` means the candidate descends from the

@@ -105,7 +105,10 @@ require_monotonic_channel() {
 release_tmp="$(mktemp -d "${TMPDIR:-/tmp}/dbmd-release.XXXXXXXX")"
 chmod 700 "$release_tmp"
 cleanup() {
+    cleanup_status=$?
+    trap - EXIT
     rm -rf "$release_tmp"
+    exit "$cleanup_status"
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
@@ -257,12 +260,13 @@ rebuild_and_compare() {
             x86_64-apple-darwin aarch64-apple-darwin >/dev/null
 
         for rust_target in x86_64-apple-darwin aarch64-apple-darwin; do
-            CARGO_TARGET_DIR="$rebuilt_dir" \
+            target_dir="$rebuilt_dir/$rust_target"
+            CARGO_TARGET_DIR="$target_dir" \
             MACOSX_DEPLOYMENT_TARGET=11.0 \
             RUSTFLAGS='-C link-arg=-Wl,-no_uuid' \
                 cargo "+${RUST_TOOLCHAIN}" build \
                     --release --locked --target "$rust_target" -p dbmd-cli
-            binary="$rebuilt_dir/$rust_target/release/dbmd"
+            binary="$target_dir/$rust_target/release/dbmd"
             xcrun vtool -set-build-version macos 11.0 11.0 \
                 -replace -output "${binary}.normalized" "$binary"
             mv "${binary}.normalized" "$binary"
@@ -270,7 +274,8 @@ rebuild_and_compare() {
         done
 
         for rust_target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            CARGO_TARGET_DIR="$rebuilt_dir" \
+            target_dir="$rebuilt_dir/$rust_target"
+            CARGO_TARGET_DIR="$target_dir" \
             RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" \
                 cross build --release --locked --target "$rust_target" -p dbmd-cli
         done
@@ -282,7 +287,7 @@ rebuild_and_compare() {
         artifact_dir="$ci_dir/$target_name"
         tarball="$artifact_dir/dbmd-${version}-${target_name}.tar.gz"
         compare_immutable_target \
-            "$rebuilt_dir/$rust_target/release/dbmd" \
+            "$rebuilt_dir/$rust_target/$rust_target/release/dbmd" \
             "$tarball" "$version" "$target_name" \
             "$release_source/NOTICE" \
             "$release_source/THIRD_PARTY_NOTICES" \
@@ -317,11 +322,27 @@ esac
 # This comparison is unconditional. A fresh pending approval, a manually
 # approved run, a completed/resumed run, and a rerun all pass through the same
 # independent four-target rebuild before any permanent-channel convergence.
-rebuild_and_compare
+can_approve=""
 if [ -n "$pending_record" ]; then
     IFS="$(printf '\t')" read -r environment_id can_approve <<EOF
 $pending_record
 EOF
+fi
+rebuild_and_compare
+if [ -n "$pending_record" ]; then
+    current_run_attempt="$(
+        gh api "repos/${SOURCE_REPO}/actions/runs/${run_id}" --jq .run_attempt
+    )"
+    current_pending_record="$(
+        gh api \
+            "repos/${SOURCE_REPO}/actions/runs/${run_id}/pending_deployments" \
+            --jq ".[] | select(.environment.name == \"${RELEASE_ENV}\") |
+                  [.environment.id, .current_user_can_approve] | @tsv"
+    )"
+    release_approval_state_matches \
+        "$run_attempt" "$current_run_attempt" \
+        "$pending_record" "$current_pending_record" ||
+        die "release approval state changed during independent rebuild"
     test "$can_approve" = true ||
         die "current gh identity cannot approve $RELEASE_ENV"
     jq -n \
@@ -408,7 +429,7 @@ compare_final_target() {
     target_name="$1"
     rust_target="$2"
     compare_immutable_target \
-        "$rebuilt_dir/$rust_target/release/dbmd" \
+        "$rebuilt_dir/$rust_target/$rust_target/release/dbmd" \
         "$verify_dir/dbmd-${version}-${target_name}.tar.gz" \
         "$version" "$target_name" \
         "$release_source/NOTICE" \

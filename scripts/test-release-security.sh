@@ -163,8 +163,17 @@ require_fixed 'compare_target darwin-x86_64 x86_64-apple-darwin' "$controller"
 require_fixed 'compare_target darwin-aarch64 aarch64-apple-darwin' "$controller"
 require_fixed 'compare_target linux-x86_64-musl x86_64-unknown-linux-musl' "$controller"
 require_fixed 'compare_target linux-aarch64-musl aarch64-unknown-linux-musl' "$controller"
+require_fixed 'target_dir="$rebuilt_dir/$rust_target"' "$controller"
+require_fixed 'CARGO_TARGET_DIR="$target_dir"' "$controller"
+require_fixed '"$rebuilt_dir/$rust_target/$rust_target/release/dbmd"' "$controller"
+[ "$(grep -Fc '"$rebuilt_dir/$rust_target/$rust_target/release/dbmd"' "$controller")" -eq 2 ] ||
+    fail "both CI-artifact and immutable-release comparisons must use the isolated rebuild path"
+reject_fixed 'CARGO_TARGET_DIR="$rebuilt_dir"' "$controller"
 require_fixed 'pending_deployments' "$controller"
 require_fixed 'state: "approved"' "$controller"
+reject_fixed 'state: "rejected"' "$controller"
+reject_fixed 'release_pending_cleanup_action' "$controller"
+require_fixed 'release_approval_state_matches' "$controller"
 require_fixed '--signer-workflow "${SOURCE_REPO}/.github/workflows/${RELEASE_WORKFLOW}"' "$controller"
 require_fixed '--source-digest "$source_sha"' "$controller"
 require_fixed '--source-ref "refs/tags/${tag}"' "$controller"
@@ -173,16 +182,25 @@ require_fixed '--deny-self-hosted-runners' "$controller"
 compare_line="$(grep -n 'rebuild_and_compare$' "$controller" | head -n 1 | cut -d: -f1)"
 artifact_state_line="$(grep -n 'release_artifact_state ' "$controller" | head -n 1 | cut -d: -f1)"
 approve_line="$(grep -n 'state: "approved"' "$controller" | head -n 1 | cut -d: -f1)"
+approval_revalidate_line="$(
+    grep -n 'release_approval_state_matches' "$controller" |
+        head -n 1 |
+        cut -d: -f1
+)"
 [ -n "$artifact_state_line" ] && [ -n "$compare_line" ] &&
     [ "$artifact_state_line" -lt "$compare_line" ] ||
     fail "failed workflow state must be rejected before artifact download"
 [ -n "$compare_line" ] && [ -n "$approve_line" ] &&
     [ "$compare_line" -lt "$approve_line" ] ||
     fail "publishing approval is not ordered after independent rebuild comparison"
+[ -n "$approval_revalidate_line" ] &&
+    [ "$compare_line" -lt "$approval_revalidate_line" ] &&
+    [ "$approval_revalidate_line" -lt "$approve_line" ] ||
+    fail "approval state must be revalidated after rebuild and before approval"
 
 # The rebuild call is outside the pending-approval branch, so fresh,
 # manually-approved, completed/resumed, and rerun states cannot bypass it.
-pending_branch_line="$(grep -n '^if \[ -n "\$pending_record" \]; then$' "$controller" | head -n 1 | cut -d: -f1)"
+pending_branch_line="$(grep -n '^if \[ -n "\$pending_record" \]; then$' "$controller" | tail -n 1 | cut -d: -f1)"
 [ -n "$compare_line" ] && [ -n "$pending_branch_line" ] &&
     [ "$compare_line" -lt "$pending_branch_line" ] ||
     fail "independent rebuild must run before every approval/resume state branch"

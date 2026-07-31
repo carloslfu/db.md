@@ -32,6 +32,24 @@ test "$(release_artifact_state '' completed failure)" = failed ||
 test "$(release_artifact_state '' in_progress '')" = invalid ||
     fail "running release without pending approval must not download artifacts"
 
+test_approval_state_matches() {
+    release_approval_state_matches "$@"
+}
+test_approval_state_matches 2 2 '123	true' '123	true' ||
+    fail "exact approval state must remain usable"
+if test_approval_state_matches 2 3 '123	true' '123	true'; then
+    fail "a replacement rerun attempt must invalidate approval"
+fi
+if test_approval_state_matches 2 2 '123	true' '456	true'; then
+    fail "a replacement pending environment must invalidate approval"
+fi
+if test_approval_state_matches 2 2 '123	true' '123	false'; then
+    fail "lost approval capability must invalidate approval"
+fi
+if test_approval_state_matches 2 2 '123	true' ''; then
+    fail "a disappeared pending deployment must invalidate approval"
+fi
+
 # GitHub compare is queried as current-channel tag -> candidate tag. A
 # descendant may advance the channel; a candidate behind the served tag is the
 # stale-controller exploit and must fail closed.
