@@ -19,6 +19,7 @@ crates_publisher="$repo_root/scripts/publish-crates.sh"
 publishability="$repo_root/scripts/check-publishability.sh"
 cross_config="$repo_root/Cross.toml"
 linkmd_source="$repo_root/crates/dbmd-core/src/linkmd.rs"
+darwin_verifier="$repo_root/scripts/verify-darwin-toolchain.sh"
 
 fail() {
     printf 'release security test: %s\n' "$*" >&2
@@ -81,6 +82,47 @@ require_fixed 'tool: cross@0.2.5' "$test_workflow"
 require_fixed 'libc::syscall(' "$linkmd_source"
 require_fixed 'libc::SYS_renameat2' "$linkmd_source"
 reject_fixed 'libc::renameat2(' "$linkmd_source"
+
+# Darwin CI and the trusted controller must link with the exact same Apple
+# toolchain. Normalizing LC_BUILD_VERSION alone cannot erase SDK stub and
+# linker differences from the executable.
+require_fixed 'os: macos-26' "$workflow"
+[ "$(grep -Fc 'os: macos-26' "$workflow")" -eq 2 ] ||
+    fail "both Darwin release targets must use macos-26"
+require_fixed 'release-darwin-targets:' "$test_workflow"
+require_fixed 'x86_64-apple-darwin' "$test_workflow"
+require_fixed 'aarch64-apple-darwin' "$test_workflow"
+require_fixed '/Applications/Xcode_26.6.app/Contents/Developer' "$workflow"
+require_fixed '/Applications/Xcode_26.6.app/Contents/Developer' "$test_workflow"
+require_fixed 'sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"' "$workflow"
+require_fixed 'sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"' "$test_workflow"
+require_fixed 'Build shipped release target twice' "$test_workflow"
+require_fixed 'cmp "$first" "$second"' "$test_workflow"
+require_fixed 'CARGO_TARGET_DIR="$target_dir"' "$test_workflow"
+require_fixed 'DBMD_RELEASE_DARWIN_DEVELOPER_DIR:-$(xcode-select -p)' "$controller"
+require_fixed 'sh scripts/verify-darwin-toolchain.sh "$DARWIN_DEVELOPER_DIR"' "$controller"
+require_fixed 'Xcode 26.6\nBuild version 17F113' "$darwin_verifier"
+require_fixed 'xcrun --sdk macosx --show-sdk-version)" = 26.5' "$darwin_verifier"
+require_fixed '7def90dd8829726686213a747fc5bff1583df933dae5edc55d755479e0bfe00a' "$darwin_verifier"
+require_fixed '5897b275efd93b201b6df5832dd541262b3f20f290859ba78f2200a6a66ef38b' "$darwin_verifier"
+require_fixed 'c87bf9bb62dc6a3c5d7faf5c5f8dabc94aba865161a3e08b9f1871150e938fe6' "$darwin_verifier"
+require_fixed 'e49ffad64ad1cee722540fc5ecb00a230fd8071680682c60d9c851029d20e814' "$darwin_verifier"
+require_fixed '229eb9d8027953d2aee0590f983eed587d52bdd1ebc21114a62ce693f77b03f1' "$darwin_verifier"
+require_fixed 'f8d005f09381389167f9e0aeaa169bc9e7dff162ef22ca2fd8e98df7ff1acafe' "$darwin_verifier"
+require_fixed '20cfce043f11a083e2eb6111efe3579919a8082fa4cc912a7bd839af2010ec57' "$darwin_verifier"
+require_fixed 'f18a90790d05e826fbaad1892be4fe32270fd24cb73ac131049a55c7866a6d8e' "$darwin_verifier"
+require_fixed 'find . -type f -print0' "$darwin_verifier"
+require_fixed 'LC_ALL=C sort -z' "$darwin_verifier"
+require_fixed 'xargs -0 shasum -a 256' "$darwin_verifier"
+require_fixed '5600799d9ea652e4f6b1a1158d730344388ffa7e3bba32f532beb5011ebcf129' "$darwin_verifier"
+reject_fixed 'os: macos-15-intel' "$workflow"
+reject_fixed 'os: macos-14' "$workflow"
+
+build_job="$(
+    sed -n '/^  build:$/,/^  [a-zA-Z0-9_-]*:$/p' "$workflow"
+)"
+printf '%s\n' "$build_job" | grep -Fq 'Swatinem/rust-cache' &&
+    fail "official release builders must start from fresh target directories"
 
 # Version-specific dtolnay action commits encode the toolchain in action.yml;
 # a `toolchain:` input is ignored and creates a false claim about the compiler.

@@ -158,12 +158,12 @@ jobs:
         include:
           - target_name: darwin-x86_64
             rust_target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-26
             use_cross: false
             rustflags: '-C link-arg=-Wl,-no_uuid'
           - target_name: darwin-aarch64
             rust_target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-26
             use_cross: false
             rustflags: '-C link-arg=-Wl,-no_uuid'
           - target_name: linux-x86_64-musl
@@ -184,9 +184,12 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
-        with:
-          key: ${{ matrix.target_name }}
+      - name: Verify pinned Darwin toolchain
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"
 
       # cross (Docker-based) handles both musl targets in reviewed immutable
       # images, avoiding mutable apt repositories and host sysroots.
@@ -219,6 +222,7 @@ jobs:
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
         env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
           MACOSX_DEPLOYMENT_TARGET: '11.0'
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
@@ -230,6 +234,8 @@ jobs:
       - name: Normalize Darwin build metadata for reproducibility
         if: startsWith(matrix.target_name, 'darwin-')
         shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
         run: |
           set -euo pipefail
           binary="target/${{ matrix.rust_target }}/release/${BINARY}"

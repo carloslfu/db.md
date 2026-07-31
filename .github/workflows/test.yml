@@ -82,6 +82,50 @@ jobs:
       - name: Build shipped release target
         run: cross build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
 
+  release-darwin-targets:
+    name: release target (${{ matrix.rust_target }})
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: x86_64-apple-darwin
+            expected_arch: x86_64
+          - rust_target: aarch64-apple-darwin
+            expected_arch: arm64
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4
+        with:
+          targets: ${{ matrix.rust_target }}
+      - name: Verify pinned Darwin toolchain
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"
+      - name: Build shipped release target twice
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+          RUSTFLAGS: '-C link-arg=-Wl,-no_uuid'
+        run: |
+          set -euo pipefail
+          for build in first second; do
+            target_dir="${RUNNER_TEMP}/dbmd-darwin-${{ matrix.rust_target }}-${build}"
+            CARGO_TARGET_DIR="$target_dir" \
+              cargo build --release --locked \
+                --target ${{ matrix.rust_target }} -p dbmd-cli
+            binary="$target_dir/${{ matrix.rust_target }}/release/dbmd"
+            xcrun vtool -set-build-version macos 11.0 11.0 \
+              -replace -output "${binary}.normalized" "$binary"
+            mv "${binary}.normalized" "$binary"
+            chmod +x "$binary"
+          done
+          first="${RUNNER_TEMP}/dbmd-darwin-${{ matrix.rust_target }}-first/${{ matrix.rust_target }}/release/dbmd"
+          second="${RUNNER_TEMP}/dbmd-darwin-${{ matrix.rust_target }}-second/${{ matrix.rust_target }}/release/dbmd"
+          cmp "$first" "$second"
+          test "$(lipo -archs "$first")" = "${{ matrix.expected_arch }}"
+
   test:
     runs-on: ubuntu-24.04
     steps:

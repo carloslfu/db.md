@@ -21,13 +21,16 @@ TAP_REPO="${DBMD_TAP_REPO:-carloslfu/homebrew-tap}"
 RELEASE_WORKFLOW="${DBMD_RELEASE_WORKFLOW:-release.yml}"
 RELEASE_ENV="${DBMD_RELEASE_ENV:-release-publishing}"
 RUST_TOOLCHAIN="${DBMD_RELEASE_RUST_TOOLCHAIN:-1.88.0}"
+DARWIN_DEVELOPER_DIR="$(
+    printf '%s\n' "${DBMD_RELEASE_DARWIN_DEVELOPER_DIR:-$(xcode-select -p)}"
+)"
 
 die() {
     printf 'release: %s\n' "$*" >&2
     exit 1
 }
 
-for command_name in git gh jq shasum cargo rustup cross tar xcrun cmp curl openssl; do
+for command_name in git gh jq shasum cargo rustup cross tar xcode-select xcodebuild xcrun cmp curl find sort xargs openssl; do
     command -v "$command_name" >/dev/null 2>&1 ||
         die "required command not found: $command_name"
 done
@@ -255,6 +258,7 @@ rebuild_and_compare() {
 
     (
         cd "$release_source"
+        sh scripts/verify-darwin-toolchain.sh "$DARWIN_DEVELOPER_DIR"
         rustup target add \
             --toolchain "$RUST_TOOLCHAIN" \
             x86_64-apple-darwin aarch64-apple-darwin >/dev/null
@@ -262,12 +266,14 @@ rebuild_and_compare() {
         for rust_target in x86_64-apple-darwin aarch64-apple-darwin; do
             target_dir="$rebuilt_dir/$rust_target"
             CARGO_TARGET_DIR="$target_dir" \
+            DEVELOPER_DIR="$DARWIN_DEVELOPER_DIR" \
             MACOSX_DEPLOYMENT_TARGET=11.0 \
             RUSTFLAGS='-C link-arg=-Wl,-no_uuid' \
                 cargo "+${RUST_TOOLCHAIN}" build \
                     --release --locked --target "$rust_target" -p dbmd-cli
             binary="$target_dir/$rust_target/release/dbmd"
-            xcrun vtool -set-build-version macos 11.0 11.0 \
+            DEVELOPER_DIR="$DARWIN_DEVELOPER_DIR" \
+                xcrun vtool -set-build-version macos 11.0 11.0 \
                 -replace -output "${binary}.normalized" "$binary"
             mv "${binary}.normalized" "$binary"
             chmod +x "$binary"
