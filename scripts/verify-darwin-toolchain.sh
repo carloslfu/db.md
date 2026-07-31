@@ -29,15 +29,17 @@ export DEVELOPER_DIR
 }
 
 sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+mismatch_count=0
 
 verify_sha256() {
     file="$1"
     expected="$2"
     actual="$(shasum -a 256 "$file" | awk '{print $1}')"
-    [ "$actual" = "$expected" ] || {
-        printf 'darwin toolchain verifier: digest mismatch for %s\n' "$file" >&2
-        exit 1
-    }
+    if [ "$actual" != "$expected" ]; then
+        printf 'darwin toolchain verifier: digest mismatch for %s (expected %s, actual %s)\n' \
+            "$file" "$expected" "$actual" >&2
+        mismatch_count=$((mismatch_count + 1))
+    fi
 }
 
 verify_sha256 \
@@ -75,9 +77,17 @@ sdk_manifest="$(
         shasum -a 256 |
         awk '{print $1}'
 )"
-[ "$sdk_manifest" = 5600799d9ea652e4f6b1a1158d730344388ffa7e3bba32f532beb5011ebcf129 ] || {
-    printf 'darwin toolchain verifier: full SDK manifest mismatch\n' >&2
+expected_sdk_manifest=5600799d9ea652e4f6b1a1158d730344388ffa7e3bba32f532beb5011ebcf129
+if [ "$sdk_manifest" != "$expected_sdk_manifest" ]; then
+    printf 'darwin toolchain verifier: full SDK manifest mismatch (expected %s, actual %s)\n' \
+        "$expected_sdk_manifest" "$sdk_manifest" >&2
+    mismatch_count=$((mismatch_count + 1))
+fi
+
+if [ "$mismatch_count" -ne 0 ]; then
+    printf 'darwin toolchain verifier: rejected %s mismatched release input(s)\n' \
+        "$mismatch_count" >&2
     exit 1
-}
+fi
 
 printf 'Darwin release toolchain verified.\n'

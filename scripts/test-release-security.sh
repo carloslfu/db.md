@@ -115,8 +115,74 @@ require_fixed 'find . -type f -print0' "$darwin_verifier"
 require_fixed 'LC_ALL=C sort -z' "$darwin_verifier"
 require_fixed 'xargs -0 shasum -a 256' "$darwin_verifier"
 require_fixed '5600799d9ea652e4f6b1a1158d730344388ffa7e3bba32f532beb5011ebcf129' "$darwin_verifier"
+require_fixed 'expected %s, actual %s' "$darwin_verifier"
+require_fixed 'rejected %s mismatched release input(s)' "$darwin_verifier"
 reject_fixed 'os: macos-15-intel' "$workflow"
 reject_fixed 'os: macos-14' "$workflow"
+
+# A mismatched toolchain remains fail-closed while reporting every public
+# fingerprint needed to diagnose runner-image drift. The diagnostic must not
+# stop at the first mismatch, which previously hid whether the linker and SDK
+# were also different.
+darwin_mock="$(mktemp -d)"
+cleanup_darwin_mock() {
+    rm -rf -- "$darwin_mock"
+}
+trap cleanup_darwin_mock EXIT HUP INT TERM
+mkdir -p \
+    "$darwin_mock/bin" \
+    "$darwin_mock/sdk/usr/lib" \
+    "$darwin_mock/sdk/System/Library/Frameworks/CoreFoundation.framework"
+for tool in clang ld vtool ar ranlib; do
+    printf 'mismatched-%s\n' "$tool" >"$darwin_mock/$tool"
+done
+printf 'mismatched SDK settings\n' >"$darwin_mock/sdk/SDKSettings.json"
+printf 'mismatched libSystem\n' >"$darwin_mock/sdk/usr/lib/libSystem.tbd"
+printf 'mismatched CoreFoundation\n' \
+    >"$darwin_mock/sdk/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd"
+cat >"$darwin_mock/bin/uname" <<'EOF'
+#!/bin/sh
+printf 'arm64\n'
+EOF
+cat >"$darwin_mock/bin/xcodebuild" <<'EOF'
+#!/bin/sh
+printf 'Xcode 26.6\nBuild version 17F113\n'
+EOF
+cat >"$darwin_mock/bin/xcrun" <<'EOF'
+#!/bin/sh
+case "$*" in
+    "--sdk macosx --show-sdk-version")
+        printf '26.5\n'
+        ;;
+    "--sdk macosx --show-sdk-path")
+        printf '%s\n' "$DBMD_DARWIN_MOCK_ROOT/sdk"
+        ;;
+    "-f clang"|"-f ld"|"-f vtool"|"-f ar"|"-f ranlib")
+        printf '%s/%s\n' "$DBMD_DARWIN_MOCK_ROOT" "$2"
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF
+chmod 700 \
+    "$darwin_mock/bin/uname" \
+    "$darwin_mock/bin/xcodebuild" \
+    "$darwin_mock/bin/xcrun"
+darwin_diagnostic="$darwin_mock/diagnostic"
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/stdout" 2>"$darwin_diagnostic"; then
+    fail "mismatched Darwin release inputs were accepted"
+fi
+[ "$(grep -c 'digest mismatch for ' "$darwin_diagnostic")" -eq 8 ] ||
+    fail "Darwin verifier did not report all eight file mismatches"
+require_fixed 'full SDK manifest mismatch (expected ' "$darwin_diagnostic"
+require_fixed 'rejected 9 mismatched release input(s)' "$darwin_diagnostic"
+reject_fixed 'Darwin release toolchain verified.' "$darwin_mock/stdout"
+cleanup_darwin_mock
+trap - EXIT HUP INT TERM
 
 build_job="$(
     sed -n '/^  build:$/,/^  [a-zA-Z0-9_-]*:$/p' "$workflow"
