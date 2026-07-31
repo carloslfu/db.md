@@ -775,7 +775,7 @@ fn archive_dir(store: &Store) -> PathBuf {
 
 /// The `log/<YYYY-MM>.md` archive path for a given month.
 fn archive_path(store: &Store, year: i32, month: u32) -> PathBuf {
-    archive_dir(store).join(format!("{:04}-{:02}.md", year, month))
+    archive_dir(store).join(format!("{year:04}-{month:02}.md"))
 }
 
 /// The crash-recovery marker for an in-progress rotation.

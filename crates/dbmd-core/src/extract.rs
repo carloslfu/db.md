@@ -1104,8 +1104,7 @@ fn extract_epub(bytes: &[u8]) -> Result<Extracted> {
                 return Err(ExtractError::Parse {
                     format: "epub",
                     message: format!(
-                        "extracted text exceeds the {} byte cap",
-                        MAX_EXTRACT_OUTPUT_BYTES
+                        "extracted text exceeds the {MAX_EXTRACT_OUTPUT_BYTES} byte cap"
                     ),
                 });
             }
@@ -2987,11 +2986,10 @@ xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">\
 xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
 xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\">\
 <office:body><office:spreadsheet><table:table table:name=\"S\">\
-<table:table-row table:number-rows-repeated=\"{}\">\
+<table:table-row table:number-rows-repeated=\"{MAX_SPREADSHEET_CELLS}\">\
 <table:table-cell table:number-columns-repeated=\"2\"/>\
 </table:table-row></table:table></office:spreadsheet></office:body>\
-</office:document-content>",
-            MAX_SPREADSHEET_CELLS
+</office:document-content>"
         );
         write_ods_with_content(&hostile, &content);
         let error = extract(&hostile)
