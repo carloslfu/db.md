@@ -36,11 +36,17 @@
 //! CLI surfaces with a stable code, never a panic.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Compressed/input bytes accepted by any in-process document adapter. The
+/// individual ZIP-entry and extracted-output limits remain independent. A
+/// source larger than this must be handled by an externally sandboxed importer,
+/// not parsed in the toolkit process.
+const MAX_DOCUMENT_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The result of extracting one document: the plain text plus a small,
 /// format-tagged metadata map.
@@ -49,7 +55,7 @@ use serde::Serialize;
 /// plain mode the CLI prints [`Extracted::text`] and discards the metadata.
 /// Metadata is intentionally minimal and best-effort — extraction never *fails*
 /// for want of a title; it just omits the key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extracted {
     /// The extracted plain text (UTF-8), normalized to `\n` line endings with
     /// trailing whitespace trimmed per line and a single trailing newline. For
@@ -98,7 +104,7 @@ impl Extracted {
 /// A metadata value: a string (title, format tag, sheet name list joined) or a
 /// non-negative count (pages, sheets). Serializes to a bare JSON string or
 /// number — no wrapper object — so `{text, metadata}` stays flat and readable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MetaValue {
     /// A textual value (e.g. document title, the `format` tag).
@@ -226,13 +232,32 @@ pub fn extract(path: &Path) -> Result<Extracted> {
             .to_string();
         ExtractError::UnsupportedFormat(ext)
     })?;
+    let bytes =
+        crate::fsx::read_bounded_nofollow(path, MAX_DOCUMENT_INPUT_BYTES).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                ExtractError::Parse {
+                    format: format.tag(),
+                    message: format!(
+                        "input must be one regular file within the {} MiB extraction cap: {error}",
+                        MAX_DOCUMENT_INPUT_BYTES / (1024 * 1024)
+                    ),
+                }
+            } else {
+                ExtractError::Io(error)
+            }
+        })?;
 
     match format {
-        Format::Pdf => extract_pdf(path),
-        Format::Docx => extract_docx(path),
-        Format::Spreadsheet => extract_spreadsheet(path),
-        Format::Epub => extract_epub(path),
-        Format::Html => extract_html(path),
+        Format::Pdf => extract_pdf(&bytes),
+        Format::Docx => extract_docx(&bytes),
+        Format::Spreadsheet => extract_spreadsheet(
+            &bytes,
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ods")),
+        ),
+        Format::Epub => extract_epub(&bytes),
+        Format::Html => extract_html(&bytes),
     }
 }
 
@@ -306,12 +331,8 @@ pub fn normalize_text(raw: &str) -> String {
 /// wrapped in [`std::panic::catch_unwind`]: an internal abort is contained and
 /// surfaced as [`ExtractError::Parse`], upholding this module's "never panics"
 /// contract on untrusted `sources/` input.
-fn extract_pdf(path: &Path) -> Result<Extracted> {
-    // Read the bytes ourselves so a missing/unreadable file is a clean
-    // `ExtractError::Io` (via `?`) before we hand anything to the PDF parser.
-    let bytes = std::fs::read(path)?;
-
-    let text = match guard_pdf_panic(|| pdf_extract::extract_text_from_mem(&bytes))? {
+fn extract_pdf(bytes: &[u8]) -> Result<Extracted> {
+    let text = match guard_pdf_panic(|| pdf_extract::extract_text_from_mem(bytes))? {
         Ok(t) => t,
         Err(e) => return Err(classify_pdf_error(e)),
     };
@@ -322,7 +343,7 @@ fn extract_pdf(path: &Path) -> Result<Extracted> {
     // failure OR an internal panic here is non-fatal — the text already
     // succeeded — so a contained panic (outer `Err`) and a load failure (inner
     // `Err`) are both silently skipped.
-    if let Ok(Ok(doc)) = guard_pdf_panic(|| pdf_extract::Document::load_mem(&bytes)) {
+    if let Ok(Ok(doc)) = guard_pdf_panic(|| pdf_extract::Document::load_mem(bytes)) {
         out.put_num("pages", doc.get_pages().len() as u64);
     }
 
@@ -370,11 +391,11 @@ fn classify_pdf_error(err: pdf_extract::OutputError) -> ExtractError {
 /// line-broken content keeps its shape; everything else is structural and
 /// ignored. This is the same minimal-but-faithful path `docx-rs` takes for text
 /// extraction, without pulling in a second XML/zip stack.
-fn extract_docx(path: &Path) -> Result<Extracted> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = open_zip(file, "docx")?;
+fn extract_docx(bytes: &[u8]) -> Result<Extracted> {
+    let mut archive = open_zip(Cursor::new(bytes), "docx")?;
+    let mut budget = ExtractionBudget::default();
 
-    let xml = read_zip_entry(&mut archive, "word/document.xml", "docx")?;
+    let xml = read_zip_entry(&mut archive, "word/document.xml", "docx", &mut budget)?;
     let text = wordprocessing_text(&xml, "docx")?;
 
     Ok(Extracted::new(text, Format::Docx))
@@ -533,9 +554,9 @@ fn resolve_entity_ref(reference: &quick_xml::events::BytesRef<'_>) -> String {
 /// `catch_unwind` cannot contain it). `sources/` is untrusted input, so we
 /// bound the read the same way docx/epub do: refuse before the allocation.
 ///
-/// 50M cells is ~1.2 GB worst-case dense (`Data` ≈ 24 bytes) — far above any
-/// real spreadsheet's used range, far below the weaponizable extreme.
-const MAX_SPREADSHEET_CELLS: u64 = 50_000_000;
+/// Two million cells is still a large working sheet while bounding calamine's
+/// dense `Vec<Data>` to roughly tens of MiB instead of the previous ~1.2 GiB.
+const MAX_SPREADSHEET_CELLS: u64 = 2_000_000;
 
 /// Extract every sheet of a spreadsheet via `calamine`, rendering each row as
 /// tab-separated cells, one row per line, sheets in workbook order separated by
@@ -551,8 +572,8 @@ const MAX_SPREADSHEET_CELLS: u64 = 50_000_000;
 /// [`ExtractError::Parse`] refusal rather than letting an attacker-supplied
 /// sheet OOM/abort the process — upholding the module's "never panics on
 /// untrusted `sources/` input" contract for the spreadsheet adapter.
-fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
-    use calamine::{open_workbook_auto, Reader};
+fn extract_spreadsheet(bytes: &[u8], is_ods: bool) -> Result<Extracted> {
+    use calamine::{open_workbook_auto_from_rs, Reader};
 
     // ODS has no sparse-iterator pre-scan (see `spreadsheet_dense_cells`), so the
     // xlsx-family fail-fast on a truncated/unclosed `content.xml` does not protect
@@ -566,18 +587,15 @@ fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
     // format-bounded and the xlsx-family is pre-scanned). A truncated/unclosed
     // document fails fast here with a typed Parse refusal — the same shape the
     // xlsx pre-scan produces on a truncated sheet.
-    let is_ods = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("ods"));
     if is_ods {
-        ods_content_xml_well_formed(path)?;
+        ods_content_xml_well_formed(bytes)?;
     }
 
-    let mut workbook = open_workbook_auto(path).map_err(|e| ExtractError::Parse {
-        format: "spreadsheet",
-        message: e.to_string(),
-    })?;
+    let mut workbook =
+        open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| ExtractError::Parse {
+            format: "spreadsheet",
+            message: e.to_string(),
+        })?;
 
     let sheet_names = workbook.sheet_names().to_vec();
     let mut text = String::new();
@@ -613,6 +631,15 @@ fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
             let cells: Vec<String> = row.iter().map(render_cell).collect();
             text.push_str(&cells.join("\t"));
             text.push('\n');
+            if text.len() > MAX_EXTRACT_OUTPUT_BYTES {
+                return Err(ExtractError::Parse {
+                    format: "spreadsheet",
+                    message: format!(
+                        "extracted text exceeds the {MAX_EXTRACT_OUTPUT_BYTES} byte cap \
+                         (malformed or hostile spreadsheet)"
+                    ),
+                });
+            }
         }
     }
 
@@ -645,17 +672,32 @@ fn extract_spreadsheet(path: &Path) -> Result<Extracted> {
 /// hang. A well-formed `content.xml` passes through untouched, so valid `.ods`
 /// extraction is unchanged. Peak memory stays bounded by the zip-entry cap; the
 /// scan never densely materializes anything.
-fn ods_content_xml_well_formed(path: &Path) -> Result<()> {
+fn ods_content_xml_well_formed(bytes: &[u8]) -> Result<()> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
-    let file = std::fs::File::open(path)?;
-    let mut archive = open_zip(file, "spreadsheet")?;
-    let xml = read_zip_entry(&mut archive, "content.xml", "spreadsheet")?;
+    let mut archive = open_zip(Cursor::new(bytes), "spreadsheet")?;
+    let mut budget = ExtractionBudget::default();
+    let xml = read_zip_entry(&mut archive, "content.xml", "spreadsheet", &mut budget)?;
 
     let mut reader = Reader::from_str(&xml);
     let mut depth: i64 = 0;
+    let mut events = 0usize;
+    let mut in_row = false;
+    let mut row_cells = 0u64;
+    let mut row_repeat = 1u64;
+    let mut logical_rows = 0u64;
+    let mut declared_cells = 0u64;
     loop {
+        events += 1;
+        if events > MAX_XML_EVENTS {
+            return Err(ExtractError::Parse {
+                format: "spreadsheet",
+                message: format!(
+                    "ODS content.xml exceeds the {MAX_XML_EVENTS}-event parser budget"
+                ),
+            });
+        }
         match reader.read_event() {
             // Any structural malformation (including the unclosed `<table:table>`
             // at EOF, which quick-xml reports as "Unexpected end of xml") is a
@@ -666,8 +708,98 @@ fn ods_content_xml_well_formed(path: &Path) -> Result<()> {
                     message: format!("malformed ODS content.xml: {e}"),
                 });
             }
-            Ok(Event::Start(_)) => depth += 1,
-            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Start(element)) => {
+                depth += 1;
+                match local_name(element.name().as_ref()) {
+                    b"table-row" => {
+                        in_row = true;
+                        row_cells = 0;
+                        row_repeat = ods_repeat(&element, b"number-rows-repeated")?;
+                        logical_rows = logical_rows.checked_add(row_repeat).ok_or_else(|| {
+                            ExtractError::Parse {
+                                format: "spreadsheet",
+                                message: "ODS repeated-row count overflow".to_string(),
+                            }
+                        })?;
+                        if logical_rows > MAX_SPREADSHEET_CELLS {
+                            return Err(ExtractError::Parse {
+                                format: "spreadsheet",
+                                message: format!(
+                                    "ODS declares {logical_rows} logical rows, over the \
+                                     {MAX_SPREADSHEET_CELLS}-row structural cap"
+                                ),
+                            });
+                        }
+                    }
+                    b"table-cell" | b"covered-table-cell" if in_row => {
+                        row_cells = row_cells
+                            .checked_add(ods_repeat(&element, b"number-columns-repeated")?)
+                            .ok_or_else(|| ExtractError::Parse {
+                                format: "spreadsheet",
+                                message: "ODS repeated-column count overflow".to_string(),
+                            })?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(element)) => match local_name(element.name().as_ref()) {
+                b"table-row" => {
+                    let repeated = ods_repeat(&element, b"number-rows-repeated")?;
+                    logical_rows =
+                        logical_rows
+                            .checked_add(repeated)
+                            .ok_or_else(|| ExtractError::Parse {
+                                format: "spreadsheet",
+                                message: "ODS repeated-row count overflow".to_string(),
+                            })?;
+                    if logical_rows > MAX_SPREADSHEET_CELLS {
+                        return Err(ExtractError::Parse {
+                            format: "spreadsheet",
+                            message: format!(
+                                "ODS declares {logical_rows} logical rows, over the \
+                                 {MAX_SPREADSHEET_CELLS}-row structural cap"
+                            ),
+                        });
+                    }
+                }
+                b"table-cell" | b"covered-table-cell" if in_row => {
+                    row_cells = row_cells
+                        .checked_add(ods_repeat(&element, b"number-columns-repeated")?)
+                        .ok_or_else(|| ExtractError::Parse {
+                            format: "spreadsheet",
+                            message: "ODS repeated-column count overflow".to_string(),
+                        })?;
+                }
+                _ => {}
+            },
+            Ok(Event::End(element)) => {
+                depth -= 1;
+                if local_name(element.name().as_ref()) == b"table-row" && in_row {
+                    let expanded =
+                        row_cells
+                            .checked_mul(row_repeat)
+                            .ok_or_else(|| ExtractError::Parse {
+                                format: "spreadsheet",
+                                message: "ODS repeated-cell grid overflow".to_string(),
+                            })?;
+                    declared_cells = declared_cells.checked_add(expanded).ok_or_else(|| {
+                        ExtractError::Parse {
+                            format: "spreadsheet",
+                            message: "ODS declared-cell count overflow".to_string(),
+                        }
+                    })?;
+                    if declared_cells > MAX_SPREADSHEET_CELLS {
+                        return Err(ExtractError::Parse {
+                            format: "spreadsheet",
+                            message: format!(
+                                "ODS declares {declared_cells} expanded cells, over the \
+                                 {MAX_SPREADSHEET_CELLS}-cell cap"
+                            ),
+                        });
+                    }
+                    in_row = false;
+                }
+            }
             Ok(Event::Eof) => break,
             _ => {}
         }
@@ -687,6 +819,29 @@ fn ods_content_xml_well_formed(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ods_repeat(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Result<u64> {
+    let Some(raw) = attr_value(element, key) else {
+        return Ok(1);
+    };
+    let repeat = raw.parse::<u64>().map_err(|_| ExtractError::Parse {
+        format: "spreadsheet",
+        message: format!(
+            "ODS attribute {} has an invalid repeat count",
+            String::from_utf8_lossy(key)
+        ),
+    })?;
+    if repeat == 0 {
+        return Err(ExtractError::Parse {
+            format: "spreadsheet",
+            message: format!(
+                "ODS attribute {} must be at least 1",
+                String::from_utf8_lossy(key)
+            ),
+        });
+    }
+    Ok(repeat)
+}
+
 /// Compute the would-be dense cell count (`rows × cols`) of one sheet WITHOUT
 /// the dense allocation, by streaming the sheet's sparse cells and tracking the
 /// MIN/MAX non-empty position — exactly the bounds `Range::from_sparse` uses.
@@ -699,10 +854,13 @@ fn ods_content_xml_well_formed(path: &Path) -> Result<()> {
 /// exposes a sparse iterator on the auto-detected reader; those fall through to
 /// the normal materialization path. A row/col delta is saturated into `u64` so
 /// the multiply cannot overflow.
-fn spreadsheet_dense_cells(
-    workbook: &mut calamine::Sheets<std::io::BufReader<std::fs::File>>,
+fn spreadsheet_dense_cells<RS>(
+    workbook: &mut calamine::Sheets<RS>,
     name: &str,
-) -> Result<Option<u64>> {
+) -> Result<Option<u64>>
+where
+    RS: std::io::Read + std::io::Seek + Clone,
+{
     use calamine::{DataRef, Sheets};
 
     // Stream cells, tracking the non-empty MIN/MAX extent that `from_sparse`
@@ -852,6 +1010,8 @@ fn render_excel_datetime(dt: &calamine::ExcelDateTime) -> String {
 /// few-KB file can declare millions; this bounds the read loop. Far above any
 /// real book (which has well under a few hundred reading-order items).
 const MAX_EPUB_SPINE_ITEMS: usize = 10_000;
+const MAX_EPUB_MANIFEST_ITEMS: usize = 20_000;
+const MAX_XML_EVENTS: usize = 1_000_000;
 
 /// Hard cap on accumulated extracted-text bytes, shared by every adapter that
 /// concatenates or materializes a large string from untrusted `sources/` input:
@@ -875,16 +1035,16 @@ const MAX_EXTRACT_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// capped — so a tiny crafted `.epub` can neither peg a core nor balloon memory.
 ///
 /// Metadata carries `title` (the OPF `dc:title`) and `chapters` (spine length).
-fn extract_epub(path: &Path) -> Result<Extracted> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = open_zip(file, "epub")?;
+fn extract_epub(bytes: &[u8]) -> Result<Extracted> {
+    let mut archive = open_zip(Cursor::new(bytes), "epub")?;
+    let mut budget = ExtractionBudget::default();
 
     // 1. container.xml → OPF path.
-    let container = read_zip_entry(&mut archive, "META-INF/container.xml", "epub")?;
+    let container = read_zip_entry(&mut archive, "META-INF/container.xml", "epub", &mut budget)?;
     let opf_path = epub_opf_path(&container)?;
 
     // 2. OPF → base dir, manifest, spine, title.
-    let opf = read_zip_entry(&mut archive, &opf_path, "epub")?;
+    let opf = read_zip_entry(&mut archive, &opf_path, "epub", &mut budget)?;
     let parsed = parse_opf(&opf)?;
     let base = opf_base_dir(&opf_path);
 
@@ -921,7 +1081,8 @@ fn extract_epub(path: &Path) -> Result<Extracted> {
             Some(cached) => cached.clone(),
             None => {
                 // A missing spine target is skipped (best-effort), not fatal.
-                let Ok(chapter_xhtml) = read_zip_entry(&mut archive, &entry, "epub") else {
+                let Ok(chapter_xhtml) = read_zip_entry(&mut archive, &entry, "epub", &mut budget)
+                else {
                     continue;
                 };
                 let t = html_to_text(chapter_xhtml.as_bytes())?;
@@ -1020,18 +1181,43 @@ fn parse_opf(opf_xml: &str) -> Result<OpfParsed> {
     // title does not truncate it.
     let mut in_title = false;
     let mut title_buf = String::new();
+    let mut events = 0usize;
 
     loop {
+        events += 1;
+        if events > MAX_XML_EVENTS {
+            return Err(ExtractError::Parse {
+                format: "epub",
+                message: format!("OPF exceeds the {MAX_XML_EVENTS}-event parser budget"),
+            });
+        }
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
                 b"item" => {
                     if let (Some(id), Some(href)) = (attr_value(&e, b"id"), attr_value(&e, b"href"))
                     {
+                        if !manifest.contains_key(&id) && manifest.len() >= MAX_EPUB_MANIFEST_ITEMS
+                        {
+                            return Err(ExtractError::Parse {
+                                format: "epub",
+                                message: format!(
+                                    "manifest exceeds the {MAX_EPUB_MANIFEST_ITEMS}-item cap"
+                                ),
+                            });
+                        }
                         manifest.insert(id, href);
                     }
                 }
                 b"itemref" => {
                     if let Some(idref) = attr_value(&e, b"idref") {
+                        if spine.len() >= MAX_EPUB_SPINE_ITEMS {
+                            return Err(ExtractError::Parse {
+                                format: "epub",
+                                message: format!(
+                                    "spine exceeds the {MAX_EPUB_SPINE_ITEMS}-item cap"
+                                ),
+                            });
+                        }
                         spine.push(idref);
                     }
                 }
@@ -1048,11 +1234,28 @@ fn parse_opf(opf_xml: &str) -> Result<OpfParsed> {
                 b"item" => {
                     if let (Some(id), Some(href)) = (attr_value(&e, b"id"), attr_value(&e, b"href"))
                     {
+                        if !manifest.contains_key(&id) && manifest.len() >= MAX_EPUB_MANIFEST_ITEMS
+                        {
+                            return Err(ExtractError::Parse {
+                                format: "epub",
+                                message: format!(
+                                    "manifest exceeds the {MAX_EPUB_MANIFEST_ITEMS}-item cap"
+                                ),
+                            });
+                        }
                         manifest.insert(id, href);
                     }
                 }
                 b"itemref" => {
                     if let Some(idref) = attr_value(&e, b"idref") {
+                        if spine.len() >= MAX_EPUB_SPINE_ITEMS {
+                            return Err(ExtractError::Parse {
+                                format: "epub",
+                                message: format!(
+                                    "spine exceeds the {MAX_EPUB_SPINE_ITEMS}-item cap"
+                                ),
+                            });
+                        }
                         spine.push(idref);
                     }
                 }
@@ -1070,6 +1273,12 @@ fn parse_opf(opf_xml: &str) -> Result<OpfParsed> {
             Ok(Event::Text(t)) => {
                 if in_title {
                     title_buf.push_str(&String::from_utf8_lossy(&t.into_inner()));
+                    if title_buf.len() > 1024 * 1024 {
+                        return Err(ExtractError::Parse {
+                            format: "epub",
+                            message: "OPF title exceeds the 1 MiB metadata cap".to_string(),
+                        });
+                    }
                 }
             }
             // An entity (`&amp;`) or numeric ref inside the title resolves into
@@ -1180,9 +1389,8 @@ fn normalize_zip_path(path: &str) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Extract plain text from an `.html` file.
-fn extract_html(path: &Path) -> Result<Extracted> {
-    let bytes = std::fs::read(path)?;
-    let text = html_to_text(&bytes)?;
+fn extract_html(bytes: &[u8]) -> Result<Extracted> {
+    let text = html_to_text(bytes)?;
     Ok(Extracted::new(text, Format::Html))
 }
 
@@ -1324,54 +1532,38 @@ const HTML_VOID_ELEMENTS: &[&str] = &[
 /// are ignored, and a `<` not followed by a tag-ish character is treated as
 /// literal text rather than a tag open (so `a < b` in prose does not inflate it).
 fn html_block_nesting_exceeds(html: &[u8], limit: usize) -> Option<usize> {
-    let mut depth: usize = 0;
+    let mut stack: Vec<&[u8]> = Vec::with_capacity(limit.min(256));
     let mut i = 0usize;
-    let n = html.len();
-    while i < n {
-        if html[i] != b'<' {
-            i += 1;
+    while let Some(tag) = next_html_tag(html, &mut i) {
+        if tag.closing {
+            // An unmatched closing tag must not lower the security counter.
+            // HTML5 ignores or repairs many mismatches; blindly decrementing on
+            // any `</x>` let an attacker interleave bogus closes to hide a
+            // deeply nested tree from this guard.
+            if stack
+                .last()
+                .is_some_and(|open| open.eq_ignore_ascii_case(tag.name))
+            {
+                stack.pop();
+            }
             continue;
         }
-        // Look at the byte after `<` to classify the tag.
-        let Some(&c) = html.get(i + 1) else { break };
-        if c == b'!' || c == b'?' {
-            // Comment, doctype, CDATA, or processing instruction — skip to `>`.
-            i = memchr_gt(html, i + 1);
-            continue;
-        }
-        if c == b'/' {
-            depth = depth.saturating_sub(1);
-            i = memchr_gt(html, i + 1);
-            continue;
-        }
-        if !c.is_ascii_alphabetic() {
-            // A stray `<` in text (`a < b`) — not a tag open.
-            i += 1;
-            continue;
-        }
-        // Find the tag's end `>` and whether it self-closes (`... />`).
-        // `memchr_gt` returns the index ONE PAST the `>`, so the `>` byte is at
-        // `end - 1` and the self-closing `/` (`<div/>`, `<div />`) is at `end - 2`.
-        // (Reading `end - 1` here always saw the `>`, so the check was dead and
-        // every self-closing NON-void element was miscounted as an open tag —
-        // tripping the depth cap on a flat, valid document.)
-        let end = memchr_gt(html, i + 1);
-        let self_closing = end >= 2 && html.get(end - 2) == Some(&b'/');
-        // Extract the tag name (letters/digits after `<`).
-        let name_end = (i + 1..end.min(n))
-            .find(|&j| !html[j].is_ascii_alphanumeric())
-            .unwrap_or(end.min(n));
-        let name = html[i + 1..name_end].to_ascii_lowercase();
-        let is_void = std::str::from_utf8(&name)
-            .map(|s| HTML_VOID_ELEMENTS.contains(&s))
+        let is_void = std::str::from_utf8(tag.name)
+            .map(|name| {
+                HTML_VOID_ELEMENTS
+                    .iter()
+                    .any(|void| name.eq_ignore_ascii_case(void))
+            })
             .unwrap_or(false);
-        if !self_closing && !is_void {
-            depth += 1;
-            if depth > limit {
-                return Some(depth);
+        if !tag.self_closing && !is_void {
+            stack.push(tag.name);
+            if stack.len() > limit {
+                return Some(stack.len());
+            }
+            if skip_raw_text_element(html, &mut i, tag.name) {
+                stack.pop();
             }
         }
-        i = end;
     }
     None
 }
@@ -1409,40 +1601,16 @@ fn html_table_amplification(
     let mut total: usize = 0;
     let mut row_cells: usize = 0;
     let mut i = 0usize;
-    let n = html.len();
-    while i < n {
-        if html[i] != b'<' {
-            i += 1;
+    while let Some(tag) = next_html_tag(html, &mut i) {
+        if tag.closing {
             continue;
         }
-        let Some(&c) = html.get(i + 1) else { break };
-        if c == b'!' || c == b'?' {
-            // Comment, doctype, CDATA, or processing instruction — skip to `>`.
-            i = memchr_gt(html, i + 1);
-            continue;
-        }
-        if c == b'/' {
-            // Closing tag — not a new cell.
-            i = memchr_gt(html, i + 1);
-            continue;
-        }
-        if !c.is_ascii_alphabetic() {
-            // A stray `<` in text (`a < b`) — not a tag open.
-            i += 1;
-            continue;
-        }
-        let end = memchr_gt(html, i + 1);
-        // Tag name = the run of letters/digits right after `<`.
-        let name_end = (i + 1..end.min(n))
-            .find(|&j| !html[j].is_ascii_alphanumeric())
-            .unwrap_or(end.min(n));
-        let name = html[i + 1..name_end].to_ascii_lowercase();
-        if name == b"tr" {
+        if tag.name.eq_ignore_ascii_case(b"tr") {
             // A new row resets the per-row width tally. (A `<td>` outside any row
             // still counts toward both totals; resetting only on `<tr>` is the
             // conservative choice — it can never under-count a real row's width.)
             row_cells = 0;
-        } else if name == b"td" || name == b"th" {
+        } else if tag.name.eq_ignore_ascii_case(b"td") || tag.name.eq_ignore_ascii_case(b"th") {
             total += 1;
             row_cells += 1;
             if row_cells > row_limit {
@@ -1452,22 +1620,137 @@ fn html_table_amplification(
                 return Some(TableBomb::TooManyCells(total));
             }
         }
-        i = end;
+        let _ = skip_raw_text_element(html, &mut i, tag.name);
     }
     None
 }
 
-/// Index just past the next `>` at or after `from` (or `len` if none). Small
-/// helper so [`html_block_nesting_exceeds`] always makes forward progress.
-fn memchr_gt(hay: &[u8], from: usize) -> usize {
-    let mut j = from;
-    while j < hay.len() {
-        if hay[j] == b'>' {
-            return j + 1;
+#[derive(Clone, Copy)]
+struct HtmlTag<'a> {
+    name: &'a [u8],
+    closing: bool,
+    self_closing: bool,
+}
+
+/// Return the next real tag using an allocation-free lexical pass that honors
+/// quoted attributes and full comment/CDATA bodies. The previous `first '>'`
+/// scanner could be desynchronized by `data=\"></tr>\"` or `<!-- > ... -->`,
+/// letting hostile table/depth markup reach html2text uncounted.
+fn next_html_tag<'a>(html: &'a [u8], cursor: &mut usize) -> Option<HtmlTag<'a>> {
+    while *cursor < html.len() {
+        let start = html[*cursor..].iter().position(|byte| *byte == b'<')? + *cursor;
+        if html[start..].starts_with(b"<!--") {
+            *cursor = find_bytes(html, start + 4, b"-->").unwrap_or(html.len());
+            if *cursor < html.len() {
+                *cursor += 3;
+            }
+            continue;
         }
-        j += 1;
+        if html[start..].starts_with(b"<![CDATA[") {
+            *cursor = find_bytes(html, start + 9, b"]]>").unwrap_or(html.len());
+            if *cursor < html.len() {
+                *cursor += 3;
+            }
+            continue;
+        }
+
+        let mut pos = start + 1;
+        let closing = html.get(pos) == Some(&b'/');
+        if closing {
+            pos += 1;
+        }
+        while html.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if !html.get(pos).is_some_and(u8::is_ascii_alphabetic) {
+            // Declaration, processing instruction, or literal `<`: skip its
+            // quote-aware terminator, then keep looking.
+            *cursor = html_tag_end(html, pos).unwrap_or(html.len());
+            continue;
+        }
+        let name_start = pos;
+        while html
+            .get(pos)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-'))
+        {
+            pos += 1;
+        }
+        let end = html_tag_end(html, pos)?;
+        let mut before_end = end.saturating_sub(1);
+        while before_end > start && html[before_end - 1].is_ascii_whitespace() {
+            before_end -= 1;
+        }
+        let self_closing = before_end > start && html[before_end - 1] == b'/';
+        *cursor = end;
+        return Some(HtmlTag {
+            name: &html[name_start..pos],
+            closing,
+            self_closing,
+        });
     }
-    hay.len()
+    None
+}
+
+fn html_tag_end(html: &[u8], from: usize) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    let mut pos = from;
+    while pos < html.len() {
+        match (quote, html[pos]) {
+            (Some(active), byte) if byte == active => quote = None,
+            (None, byte @ (b'\'' | b'"')) => quote = Some(byte),
+            (None, b'>') => return Some(pos + 1),
+            _ => {}
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| from + offset)
+}
+
+/// HTML raw-text/RCDATA elements do not tokenize `<tr>`/`<td>` strings in their
+/// contents as markup. Skip directly to the matching closing tag so script or
+/// style text cannot reset the row counter and bypass the table guard.
+fn skip_raw_text_element(html: &[u8], cursor: &mut usize, name: &[u8]) -> bool {
+    if ![b"script".as_slice(), b"style", b"textarea", b"title"]
+        .iter()
+        .any(|raw| name.eq_ignore_ascii_case(raw))
+    {
+        return false;
+    }
+    let mut pos = *cursor;
+    while let Some(relative) = html[pos..].iter().position(|byte| *byte == b'<') {
+        let start = pos + relative;
+        let mut probe = start + 1;
+        if html.get(probe) != Some(&b'/') {
+            pos = start + 1;
+            continue;
+        }
+        probe += 1;
+        while html.get(probe).is_some_and(u8::is_ascii_whitespace) {
+            probe += 1;
+        }
+        let end_name = probe.saturating_add(name.len());
+        if html
+            .get(probe..end_name)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+            && html
+                .get(end_name)
+                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'>' | b'/'))
+        {
+            *cursor = html_tag_end(html, end_name).unwrap_or(html.len());
+            return true;
+        }
+        pos = start + 1;
+    }
+    *cursor = html.len();
+    true
 }
 
 /// A `html2text` decorator that flattens HTML to plain text WITHOUT emitting the
@@ -1618,20 +1901,175 @@ fn unwrap_brackets(line: &str) -> String {
 /// Open a zip archive from a reader, mapping any failure to a typed
 /// [`ExtractError::Parse`] tagged with the calling format.
 fn open_zip<R: Read + std::io::Seek>(
-    reader: R,
+    mut reader: R,
     format: &'static str,
 ) -> Result<zip::ZipArchive<R>> {
+    preflight_zip_directory(&mut reader, format)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| ExtractError::Parse {
+            format,
+            message: format!("rewinding zip container after preflight: {e}"),
+        })?;
     zip::ZipArchive::new(reader).map_err(|e| ExtractError::Parse {
         format,
         message: format!("not a valid zip container: {e}"),
     })
 }
 
+/// Document ZIPs are small structured containers, not general-purpose backup
+/// archives. Bound the attacker-controlled central directory before `zip`
+/// materializes one entry record per member. Per-entry inflation caps alone do
+/// not help a file with millions of empty members: parsing its central directory
+/// can exhaust memory before any named document member is opened.
+const MAX_ZIP_ENTRIES: u16 = 20_000;
+const MAX_ZIP_CENTRAL_DIRECTORY_BYTES: u32 = 32 * 1024 * 1024;
+
+/// Parse the classic EOCD from the bounded tail of a ZIP and reject oversized,
+/// multi-disk, inconsistent, or ZIP64 containers before `ZipArchive::new`.
+///
+/// ZIP64 is deliberately refused for in-process document adapters. The complete
+/// compressed document is already capped at 128 MiB and legitimate DOCX/XLSX/
+/// ODS/EPUB files do not need 65k entries or 4-GiB offsets; a ZIP64 sentinel
+/// here is therefore hostile/corrupt for this surface.
+fn preflight_zip_directory<R: Read + Seek>(reader: &mut R, format: &'static str) -> Result<()> {
+    const EOCD_LEN: usize = 22;
+    const MAX_COMMENT: usize = u16::MAX as usize;
+
+    let file_len = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| ExtractError::Parse {
+            format,
+            message: format!("sizing zip container: {e}"),
+        })?;
+    let tail_len = usize::try_from(file_len.min((EOCD_LEN + MAX_COMMENT) as u64))
+        .expect("bounded ZIP tail fits usize");
+    if tail_len < EOCD_LEN {
+        return Err(ExtractError::Parse {
+            format,
+            message: "not a valid zip container: missing end-of-central-directory".to_string(),
+        });
+    }
+    reader
+        .seek(SeekFrom::Start(file_len - tail_len as u64))
+        .map_err(|e| ExtractError::Parse {
+            format,
+            message: format!("seeking to zip directory tail: {e}"),
+        })?;
+    let mut tail = vec![0u8; tail_len];
+    reader
+        .read_exact(&mut tail)
+        .map_err(|e| ExtractError::Parse {
+            format,
+            message: format!("reading zip directory tail: {e}"),
+        })?;
+
+    let eocd = (0..=tail_len - EOCD_LEN).rev().find(|&offset| {
+        tail[offset..].starts_with(b"PK\x05\x06")
+            && offset
+                + EOCD_LEN
+                + usize::from(u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]))
+                == tail_len
+    });
+    let Some(offset) = eocd else {
+        return Err(ExtractError::Parse {
+            format,
+            message: "not a valid zip container: missing end-of-central-directory".to_string(),
+        });
+    };
+    let u16_at = |position: usize| u16::from_le_bytes([tail[position], tail[position + 1]]);
+    let u32_at = |position: usize| {
+        u32::from_le_bytes([
+            tail[position],
+            tail[position + 1],
+            tail[position + 2],
+            tail[position + 3],
+        ])
+    };
+    let disk = u16_at(offset + 4);
+    let central_disk = u16_at(offset + 6);
+    let entries_on_disk = u16_at(offset + 8);
+    let entries = u16_at(offset + 10);
+    let central_size = u32_at(offset + 12);
+    let central_offset = u32_at(offset + 16);
+
+    if disk != 0 || central_disk != 0 || entries_on_disk != entries {
+        return Err(ExtractError::Parse {
+            format,
+            message: "multi-disk zip containers are not accepted".to_string(),
+        });
+    }
+    if entries == u16::MAX || central_size == u32::MAX || central_offset == u32::MAX {
+        return Err(ExtractError::Parse {
+            format,
+            message: "ZIP64 document containers are not accepted".to_string(),
+        });
+    }
+    if entries > MAX_ZIP_ENTRIES {
+        return Err(ExtractError::Parse {
+            format,
+            message: format!(
+                "zip central directory declares {entries} entries, over the {MAX_ZIP_ENTRIES}-entry cap"
+            ),
+        });
+    }
+    if central_size > MAX_ZIP_CENTRAL_DIRECTORY_BYTES {
+        return Err(ExtractError::Parse {
+            format,
+            message: format!(
+                "zip central directory declares {central_size} bytes, over the \
+                 {MAX_ZIP_CENTRAL_DIRECTORY_BYTES}-byte cap"
+            ),
+        });
+    }
+    let eocd_absolute = file_len - tail_len as u64 + offset as u64;
+    let central_end = u64::from(central_offset)
+        .checked_add(u64::from(central_size))
+        .ok_or_else(|| ExtractError::Parse {
+            format,
+            message: "zip central-directory bounds overflow".to_string(),
+        })?;
+    if central_end > eocd_absolute {
+        return Err(ExtractError::Parse {
+            format,
+            message: "zip central directory extends beyond its end record".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Cap on a single decompressed zip entry. docx/epub members are XML text — a
 /// member that inflates past this ceiling is a decompression bomb or corruption,
 /// not real evidence. `sources/` is untrusted input, so bound the read rather
 /// than let `read_to_end` follow a hostile DEFLATE stream until OOM.
-const MAX_ZIP_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ZIP_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_ZIP_INFLATED_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct ExtractionBudget {
+    inflated_bytes: u64,
+}
+
+impl ExtractionBudget {
+    fn charge_inflated(&mut self, bytes: u64, format: &'static str) -> Result<()> {
+        self.inflated_bytes =
+            self.inflated_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| ExtractError::Parse {
+                    format,
+                    message: "aggregate inflated-byte budget overflow".to_string(),
+                })?;
+        if self.inflated_bytes > MAX_ZIP_INFLATED_BYTES {
+            return Err(ExtractError::Parse {
+                format,
+                message: format!(
+                    "document inflates to over the {MAX_ZIP_INFLATED_BYTES}-byte aggregate cap"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Read a single zip entry to a UTF-8 string, bounded by [`MAX_ZIP_ENTRY_BYTES`]
 /// so a zip-bomb member cannot exhaust memory. A missing entry, an over-cap
@@ -1642,6 +2080,7 @@ fn read_zip_entry<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
     format: &'static str,
+    budget: &mut ExtractionBudget,
 ) -> Result<String> {
     let entry = archive.by_name(name).map_err(|e| ExtractError::Parse {
         format,
@@ -1657,6 +2096,7 @@ fn read_zip_entry<R: Read + std::io::Seek>(
             ),
         });
     }
+    budget.charge_inflated(declared, format)?;
     // ...and bound the actual decompressed read so a lying header (a bomb that
     // understates its uncompressed size) still cannot allocate past the cap.
     let mut bytes = Vec::new();
@@ -1675,6 +2115,12 @@ fn read_zip_entry<R: Read + std::io::Seek>(
             ),
         });
     }
+    // A lying header may declare fewer bytes than the stream produces. Charge
+    // the delta after the bounded read so the aggregate cap follows actual
+    // inflation without double-counting the declared portion.
+    if bytes.len() as u64 > declared {
+        budget.charge_inflated(bytes.len() as u64 - declared, format)?;
+    }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -1683,13 +2129,10 @@ fn read_zip_entry<R: Read + std::io::Seek>(
 fn attr_value(elem: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     elem.attributes().flatten().find_map(|attr| {
         if local_name(attr.key.as_ref()) == key {
-            // `unescape_value` returns an XML-unescaped `Cow<str>` — exactly the
-            // owned attribute text we want. It is soft-deprecated in quick-xml
-            // 0.40 in favor of `normalized_value(XmlVersion)`, whose extra
-            // version arg and byte-Cow return buy us nothing here; the simple
-            // form is correct for the UTF-8 OOXML/OPF attributes we read.
-            #[allow(deprecated)]
-            attr.unescape_value().ok().map(|cow| cow.into_owned())
+            let encoded = std::str::from_utf8(attr.value.as_ref()).ok()?;
+            quick_xml::escape::unescape(encoded)
+                .ok()
+                .map(|cow| cow.into_owned())
         } else {
             None
         }
@@ -1700,6 +2143,90 @@ fn attr_value(elem: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<St
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn extract_refuses_oversized_sparse_input_before_adapter_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hostile.pdf");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_DOCUMENT_INPUT_BYTES + 1).unwrap();
+
+        let err = extract(&path).unwrap_err();
+        assert!(
+            matches!(err, ExtractError::Parse { format: "pdf", .. }),
+            "oversized document must fail at the metadata gate: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_refuses_symlink_input_instead_of_reopening_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.pdf");
+        std::fs::write(&secret, b"not actually a pdf; still private").unwrap();
+        let selected = dir.path().join("selected.pdf");
+        symlink(&secret, &selected).unwrap();
+
+        let error = extract(&selected).expect_err("document input symlinks must fail closed");
+        assert!(matches!(error, ExtractError::Io(_)), "got {error:?}");
+    }
+
+    fn classic_eocd(entries: u16, central_size: u32, central_offset: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(22);
+        bytes.extend_from_slice(b"PK\x05\x06");
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // central directory disk
+        bytes.extend_from_slice(&entries.to_le_bytes());
+        bytes.extend_from_slice(&entries.to_le_bytes());
+        bytes.extend_from_slice(&central_size.to_le_bytes());
+        bytes.extend_from_slice(&central_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        bytes
+    }
+
+    #[test]
+    fn zip_preflight_accepts_a_bounded_classic_directory() {
+        let mut archive = Cursor::new(classic_eocd(0, 0, 0));
+        preflight_zip_directory(&mut archive, "docx").unwrap();
+    }
+
+    #[test]
+    fn zip_preflight_rejects_entry_count_before_zip_allocates_records() {
+        let mut archive = Cursor::new(classic_eocd(MAX_ZIP_ENTRIES + 1, 0, 0));
+        let error = preflight_zip_directory(&mut archive, "docx")
+            .expect_err("hostile central-directory count must be refused");
+        assert!(
+            matches!(error, ExtractError::Parse { format: "docx", ref message }
+                if message.contains("entry cap")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn zip_preflight_rejects_declared_central_directory_size_before_allocation() {
+        let mut archive = Cursor::new(classic_eocd(1, MAX_ZIP_CENTRAL_DIRECTORY_BYTES + 1, 0));
+        let error = preflight_zip_directory(&mut archive, "epub")
+            .expect_err("hostile central-directory size must be refused");
+        assert!(
+            matches!(error, ExtractError::Parse { format: "epub", ref message }
+                if message.contains("byte cap")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn zip_preflight_rejects_zip64_sentinels() {
+        let mut archive = Cursor::new(classic_eocd(u16::MAX, u32::MAX, u32::MAX));
+        let error = preflight_zip_directory(&mut archive, "spreadsheet")
+            .expect_err("ZIP64 documents are outside the bounded adapter contract");
+        assert!(
+            matches!(error, ExtractError::Parse { format: "spreadsheet", ref message }
+                if message.contains("ZIP64")),
+            "got {error:?}"
+        );
+    }
 
     /// Absolute path to a corpus-c-formats fixture under `sources/docs/`.
     fn fixture(name: &str) -> PathBuf {
@@ -1865,6 +2392,45 @@ mod tests {
         assert!(
             html_table_amplification(b"<p>plain prose, a < b</p>", 0, 0).is_none(),
             "no table cells means the scanner never fires"
+        );
+    }
+
+    #[test]
+    fn html_guards_cannot_be_desynchronized_by_quoted_gt_or_comment_markup() {
+        // `>` and a fake closing row inside an attribute are data, not tokens.
+        // The old first-`>` scanner ended the `<td ...>` early and then treated
+        // `</tr>` inside the quoted value as markup, resetting/undercounting the
+        // real row that follows.
+        let quoted = br#"<table><tr><td data="></tr>">a</td><td>b</td><td>c</td></tr></table>"#;
+        assert!(matches!(
+            html_table_amplification(quoted, 2, 100),
+            Some(TableBomb::RowTooWide(3))
+        ));
+
+        // A `>` does not terminate an HTML comment; fake tags after it remain
+        // commented out until `-->`.
+        let commented = b"<table><tr><!-- > <tr><td>fake</td> --><td>a</td><td>b</td></tr></table>";
+        assert!(matches!(
+            html_table_amplification(commented, 1, 100),
+            Some(TableBomb::RowTooWide(2))
+        ));
+
+        // Raw script text is not parsed as table markup by HTML5. It therefore
+        // cannot inject fake `<tr>` resets between real cells.
+        let script =
+            b"<table><tr><td>a</td><script>\"<tr><td>fake</td>\"</script><td>b</td></tr></table>";
+        assert!(matches!(
+            html_table_amplification(script, 1, 100),
+            Some(TableBomb::RowTooWide(2))
+        ));
+
+        // Bogus closing tags must not lower the nesting counter.
+        let mut depth_bypass = String::new();
+        for _ in 0..=MAX_HTML_NESTING_DEPTH {
+            depth_bypass.push_str("<div></bogus>");
+        }
+        assert!(
+            html_block_nesting_exceeds(depth_bypass.as_bytes(), MAX_HTML_NESTING_DEPTH).is_some()
         );
     }
 
@@ -2408,6 +2974,32 @@ xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">\
             got.text.contains("Alpha") && got.text.contains("Beta"),
             "a valid .ods must still extract its cell text, got {:?}",
             got.text
+        );
+    }
+
+    #[test]
+    fn ods_repeat_attributes_are_bounded_before_calamine_allocates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hostile = tmp.path().join("repeat-bomb.ods");
+        let content = format!(
+            "<?xml version=\"1.0\"?>\
+<office:document-content \
+xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\">\
+<office:body><office:spreadsheet><table:table table:name=\"S\">\
+<table:table-row table:number-rows-repeated=\"{}\">\
+<table:table-cell table:number-columns-repeated=\"2\"/>\
+</table:table-row></table:table></office:spreadsheet></office:body>\
+</office:document-content>",
+            MAX_SPREADSHEET_CELLS
+        );
+        write_ods_with_content(&hostile, &content);
+        let error = extract(&hostile)
+            .expect_err("expanded ODS cells must be refused before dense materialization");
+        assert!(
+            matches!(&error, ExtractError::Parse { format, message }
+                if *format == "spreadsheet" && message.contains("expanded cells")),
+            "got {error:?}"
         );
     }
 

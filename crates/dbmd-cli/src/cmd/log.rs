@@ -31,6 +31,7 @@ use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
 use crate::cli::{LogArgs, LogCommand, LogSinceArgs, LogTailArgs};
 use crate::context::{ColorChoice, Context};
 use crate::error::{CliError, CliResult, ExitCode};
+use crate::sanitize::sanitize_single_line;
 
 use dbmd_core::{Log, LogEntry, LogKind, Store};
 
@@ -97,6 +98,7 @@ fn run_append_inner(ctx: &Context, tokens: &[String]) -> CliResult {
     // inside an external subcommand), so the append form always operates on the
     // current directory — the documented convention for the loop-side `log`.
     let store = open_store(".")?;
+    let _transaction = store.transaction()?;
 
     // `-` is the store-wide sentinel: no object slot in the header.
     let object = if parsed.object == "-" {
@@ -218,9 +220,9 @@ fn emit_append_error_and_exit(ctx: &Context, err: &CliError) -> ! {
     if ctx.json {
         eprintln!("{}", err.to_json());
     } else {
-        eprintln!("dbmd: {}", err.message);
+        eprintln!("dbmd: {}", sanitize_single_line(&err.message));
         if let Some(hint) = &err.hint {
-            eprintln!("  hint: {hint}");
+            eprintln!("  hint: {}", sanitize_single_line(hint));
         }
     }
     std::process::exit(err.exit.code());

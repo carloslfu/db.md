@@ -35,7 +35,6 @@ use std::path::{Path, PathBuf};
 use grep::regex::RegexMatcher;
 use grep::searcher::sinks::Lossy;
 use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
-use ignore::WalkBuilder;
 
 use dbmd_core::{Layer, Query, Store};
 
@@ -94,14 +93,11 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
     // ── Free-text scan over only the candidate set's bodies ──────────────────
     let mut matches: Vec<Match> = Vec::new();
     let mut searcher = build_searcher();
-    // The symlink-stable half of the containment gate (part 2 below), hoisted:
-    // the store root is canonicalized once and parent-dir resolutions are
-    // memoized across the loop (`StoreContainment`) instead of two full
-    // realpath chains per candidate — at a 10k-file scan set that overhead
-    // tripled the whole search. `None` (the root itself failed to canonicalize
-    // — deleted mid-search) makes every candidate skip, exactly as every
-    // per-candidate gate call would have failed.
-    let mut containment = dbmd_core::store::StoreContainment::new(&store.root).ok();
+    // Reuse one reader rooted at the directory descriptor selected by
+    // `Store::open_strict`. Its parent-capability cache keeps a 10k-file scan at
+    // one no-follow open per file, while refusing symlinks and nested stores
+    // without reopening/canonicalizing the mutable store pathname.
+    let mut reader = store.regular_reader().map_err(CliError::from)?;
     'outer: for rel in &candidates {
         // Containment gate, part 1 — structural. A candidate path may have come
         // verbatim from a type-folder `index.jsonl` sidecar, which is an
@@ -118,23 +114,35 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
         if !is_content_file(rel) {
             continue 'outer;
         }
-        let abs = store.abs_path(rel);
-        // Containment gate, part 2 — symlink-stable. Even a layer-prefixed path
-        // can escape via a `..` component or a symlink in its parent chain
-        // (`records/contacts/../../outside/secret`, or `records` itself a
-        // symlink out of the store). Resolve every candidate through the single
-        // within-store containment helper before opening it; a path that
-        // resolves outside the store root is silently skipped, exactly like a
-        // stale/missing candidate below — a poisoned entry yields no results,
-        // never an out-of-store read.
-        let abs = match containment.as_mut().map(|c| c.resolve(&abs)) {
-            Some(Ok(resolved)) => resolved,
-            _ => continue 'outer,
+        // Containment gate, part 2 — handle-relative and no-follow. Structural
+        // validation above rejects traversal spellings; this open enforces the
+        // boundary against symlink races and nested-store paths at the actual
+        // I/O edge.
+        let file = match reader.open(rel) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::InvalidData
+                        | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue 'outer;
+            }
+            Err(error) => {
+                return Err(CliError::new(
+                    ExitCode::Runtime,
+                    "SEARCH_FAILED",
+                    format!("secure open of {} failed: {error}", rel.display()),
+                ));
+            }
         };
         let rel_str = path_to_str(rel);
-        let scan = searcher.search_path(
+        let scan = searcher.search_file(
             &matcher,
-            &abs,
+            &file,
             // `Lossy`, not `UTF8`: the matched line is decoded with U+FFFD
             // substitution rather than erroring on the first invalid byte, so a
             // single non-UTF-8 byte on a matched line can't abort the whole
@@ -170,7 +178,7 @@ fn collect_matches(store: &Store, args: &SearchArgs) -> Result<Vec<Match>, CliEr
             return Err(CliError::new(
                 ExitCode::Runtime,
                 "SEARCH_FAILED",
-                format!("ripgrep scan of {} failed: {e}", abs.display()),
+                format!("ripgrep scan of {} failed: {e}", rel.display()),
             ));
         }
         if let Some(limit) = args.limit {
@@ -236,7 +244,7 @@ fn resolve_candidates(
     // read the candidate files' timestamps here — only over the candidates, so
     // still O(candidates), never a whole-store parse.
     if windows.is_active() && args.r#type.is_none() && args.r#where.is_empty() {
-        resolved.retain(|rel| windows.matches(read_file_timestamps(&store.abs_path(rel))));
+        resolved.retain(|rel| windows.matches(read_file_timestamps(store, rel)));
     }
 
     Ok(resolved)
@@ -320,54 +328,18 @@ fn resolve_link_targets(store: &Store, targets: &[PathBuf]) -> BTreeSet<PathBuf>
 
 /// Every content `.md` file under the two layers, as store-relative paths.
 ///
-/// The no-filter candidate set. Uses the `ignore` walker (the ripgrep directory
-/// engine) over the layer roots only, so root meta files (`DB.md`, `log.md`,
-/// `log/`) are structurally out of reach; per-folder `index.md` sidecars and
-/// the `index.jsonl` twins are filtered out. A path-only walk — never a
+/// The no-filter candidate set. Uses the store's descriptor-relative walker
+/// over the two content layers, so symlinks/nested stores are pruned and root
+/// meta files are structurally out of reach. This is a path-only walk, never a
 /// frontmatter parse of the store.
 fn content_files(store: &Store) -> Result<Vec<PathBuf>, CliError> {
-    let mut out = BTreeSet::new();
-    for layer in Layer::all() {
-        let dir = store.root.join(layer.dir_name());
-        if !dir.is_dir() {
-            continue;
-        }
-        let store_root = store.root.clone();
-        let mut builder = WalkBuilder::new(&dir);
-        builder
-            // Match the core's `md_walker`: disable EVERY ignore source
-            // (`.gitignore`, parent ignores, `.ignore`, `.git/info/exclude`,
-            // global gitignore) and keep only the hidden-file skip. A store
-            // nested inside a repo whose `.gitignore` matches `*.md` must not
-            // silently hide content files from `search` when `validate` /
-            // `index` (which use `md_walker`) still see every file.
-            .standard_filters(false)
-            .hidden(true)
-            .follow_links(true)
-            .filter_entry(move |entry| {
-                dbmd_core::store::ensure_path_within_store(&store_root, entry.path()).is_ok()
-            });
-        let walker = builder.build();
-        for entry in walker {
-            let entry = entry.map_err(|e| {
-                CliError::new(
-                    ExitCode::Runtime,
-                    "SEARCH_FAILED",
-                    format!("walk failed under {}: {e}", dir.display()),
-                )
-            })?;
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let abs = entry.into_path();
-            if let Some(rel) = store.rel_path(&abs) {
-                if is_content_file(&rel) {
-                    out.insert(rel);
-                }
-            }
-        }
-    }
-    Ok(out.into_iter().collect())
+    store.walk().map_err(|error| {
+        CliError::new(
+            ExitCode::Runtime,
+            "SEARCH_FAILED",
+            format!("secure store walk failed: {error}"),
+        )
+    })
 }
 
 // ── Time windows ─────────────────────────────────────────────────────────────
@@ -550,13 +522,17 @@ fn bad_timestamp(flag: &str, raw: &str) -> CliError {
 /// becomes a whole-store parse. A missing file / frontmatter / field yields
 /// `None`, which a window filter then excludes.
 fn read_file_timestamps(
-    abs: &Path,
+    store: &Store,
+    rel: &Path,
 ) -> (
     Option<chrono::DateTime<chrono::FixedOffset>>,
     Option<chrono::DateTime<chrono::FixedOffset>>,
 ) {
-    let text = match std::fs::read_to_string(abs) {
-        Ok(t) => t,
+    let text = match store.read_bounded(rel, dbmd_core::parser::MAX_DBMD_FILE_BYTES) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return (None, None),
+        },
         Err(_) => return (None, None),
     };
     let yaml = match frontmatter_block(&text) {
@@ -624,14 +600,12 @@ fn yaml_scalar_string(value: &serde_norway::Value) -> Option<String> {
 /// `.md` file on disk, trying the path as written and then with `.md` appended.
 /// Returns the store-relative path of whichever exists, else `None`.
 fn resolve_content_file(store: &Store, rel: &Path) -> Option<PathBuf> {
-    let as_written = store.abs_path(rel);
-    if as_written.is_file() {
-        return store.rel_path(&as_written).filter(|r| is_content_file(r));
+    if store.regular_file_exists(rel).ok()? && is_content_file(rel) {
+        return Some(rel.to_path_buf());
     }
     let with_md = PathBuf::from(format!("{}.md", path_to_str(rel)));
-    let abs = store.abs_path(&with_md);
-    if abs.is_file() {
-        return store.rel_path(&abs).filter(|r| is_content_file(r));
+    if store.regular_file_exists(&with_md).ok()? && is_content_file(&with_md) {
+        return Some(with_md);
     }
     None
 }
@@ -1200,13 +1174,15 @@ mod tests {
         // the strict `strip_prefix("---\n")` returned None -> (None, None), so the
         // all-content time-window filter silently dropped a real, indexed file.
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
         let f = tmp.path().join("n.md");
         std::fs::write(
             &f,
             "--- \ntype: note\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-02T00:00:00Z\n--- \nbody\n",
         )
         .unwrap();
-        let (created, updated) = read_file_timestamps(&f);
+        let store = Store::open_strict(tmp.path()).unwrap();
+        let (created, updated) = read_file_timestamps(&store, Path::new("n.md"));
         assert!(
             created.is_some(),
             "created must parse despite a trailing-ws fence"
@@ -1291,5 +1267,54 @@ mod tests {
             mapped_other.is_err(),
             "a non-pipe write error stays an error"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_reads_opened_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        std::fs::create_dir_all(root.join("records/notes")).unwrap();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        std::fs::write(
+            root.join("records/notes/owned.md"),
+            "---\ntype: note\nsummary: owned\ncreated: 2026-07-01T00:00:00Z\nupdated: 2026-07-30T00:00:00Z\n---\nowned needle\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let detached = sandbox.path().join("detached");
+        std::fs::rename(&root, &detached).unwrap();
+
+        let replacement = sandbox.path().join("replacement");
+        std::fs::create_dir_all(replacement.join("records/notes")).unwrap();
+        std::fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        std::fs::write(
+            replacement.join("records/notes/secret.md"),
+            "---\ntype: note\nsummary: replacement\ncreated: 2026-07-01T00:00:00Z\nupdated: 2026-07-30T00:00:00Z\n---\nreplacement needle\n",
+        )
+        .unwrap();
+        symlink(&replacement, &root).unwrap();
+
+        let args = SearchArgs {
+            query: "needle".to_string(),
+            r#type: None,
+            r#in: None,
+            r#where: Vec::new(),
+            linked_from: None,
+            linked_to: None,
+            updated_after: Some("2026-07-15".to_string()),
+            updated_before: None,
+            created_after: None,
+            created_before: None,
+            limit: None,
+            dir: root.to_string_lossy().into_owned(),
+        };
+        let matches = collect_matches(&store, &args).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].file, "records/notes/owned.md");
+        assert!(matches[0].text.contains("owned needle"));
+        assert!(!matches[0].text.contains("replacement"));
     }
 }

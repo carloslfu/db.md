@@ -10,7 +10,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 # MSRV 1.88: forced by the `pdf-extract 0.12` security update (RUSTSEC-2026-0187),
 # whose `lopdf 0.42` uses stable let-chains (Rust 1.88+). Verified as the exact
@@ -49,10 +49,11 @@ thiserror = "2"
 # module). MIT/Apache-2.0, zero AI/LLM; already present in Cargo.lock
 # (transitive), so promoting it to a direct dep adds no new crate to the tree.
 sha2 = "0.10"
+libc = "0.2"
 # Document text extraction (dbmd extract). All MIT — recorded in THIRD_PARTY_NOTICES.
 # Zero AI/LLM, zero embeddings: these are deterministic format decoders.
 pdf-extract = "0.12"      # PDF text layer (MIT); 0.12 pulls lopdf >=0.42 (RUSTSEC-2026-0187 fix)
-calamine = "0.35"         # XLSX/ODS spreadsheet reader (MIT)
+calamine = "0.36.1"       # XLSX/ODS spreadsheet reader (MIT; quick-xml >=0.41)
 html2text = "0.17"        # HTML → plain text (MIT)
 quick-xml = "0.41"        # docx/epub OOXML + XHTML parse (MIT); 0.41 fixes RUSTSEC-2026-0194/0195
 # `zip` with only the DEFLATE backend: docx/xlsx/epub containers use STORED +
@@ -66,6 +67,10 @@ quick-xml = "0.41"        # docx/epub OOXML + XHTML parse (MIT); 0.41 fixes RUST
 # so zip 8.x's 1.88 requirement is no longer the blocker; bumping it is a
 # separate, unneeded change.)
 zip = { version = "7.2", default-features = false, features = ["deflate"] }
+# Canonical link.md snapshot packs are raw STORED ZIP32. CRC-32 is written
+# explicitly into both headers so client and hub generate byte-identical packs
+# without a streaming data descriptor or compressor-version dependency.
+crc32fast = "1.5"
 # HTTP client for the link.md client verbs (dbmd-core's `linkmd` module,
 # feature `link`, default-on; a format-only library consumer opts out with
 # default-features = false). Blocking, rustls-based TLS (no OpenSSL, no system

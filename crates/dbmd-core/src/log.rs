@@ -16,7 +16,7 @@
 //! signalling a probable rewrite.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +34,17 @@ const LOG_FRONTMATTER: &str = "---\ntype: log\n---\n\n# Curator log\n";
 
 /// Block size for the backward (reverse-from-EOF) reader.
 const REVERSE_BLOCK: usize = 8 * 1024;
+
+/// Bound one active/monthly curator log before allocating it. Logs are primary
+/// text data but not an asset transport; a larger file is hostile/corrupt and
+/// must be repaired or sharded before an in-process parse.
+const MAX_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn read_log_file(store: &Store, path: &Path) -> std::io::Result<String> {
+    let bytes = store.read_bounded(path, MAX_LOG_FILE_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
 
 /// A recognized `log.md` entry kind. Custom kinds are valid in the format
 /// (`dbmd validate` warns on unrecognized via `LOG_UNKNOWN_KIND`); this enum
@@ -200,15 +211,15 @@ impl Log {
         // the plain-append paths). A lock failure is non-fatal: we proceed
         // unlocked rather than refuse to log (best-effort, same posture as the
         // pre-fix behaviour on platforms without advisory locks).
-        let _lock = AppendLock::acquire(&active);
+        let _lock = AppendLock::acquire(store, &active)?;
 
         // Read the active file's current contents (if any). The "current month"
         // is the month of the entry being appended (the newest in the timeline);
         // every existing entry from a strictly-earlier month rolls to archives.
         let current_ym = entry.year_month();
 
-        if active.exists() {
-            let content = fs::read_to_string(&active)?;
+        if store.regular_file_exists(&active)? {
+            let content = read_log_file(store, &active)?;
             let (header, entries) = parse_active(&content);
 
             // Partition existing entries into prior-month (roll out) and
@@ -231,17 +242,17 @@ impl Log {
             // append uses the right mode; the marker only changes what a LATER
             // retry sees.
             let marker = rotation_marker_path(store);
-            let recovering = marker.exists();
+            let recovering = store.regular_file_exists(&marker)?;
 
             if !by_month.is_empty() {
                 // Roll each prior month into its archive (atomic per-file),
                 // appending to any existing archive for that month.
                 let dir = archive_dir(store);
-                fs::create_dir_all(&dir)?;
+                store.create_dir_all(&dir)?;
                 // Mark the rotation in-flight so a crash before the active trim
                 // is recoverable as a re-roll (deduped), not re-appended.
                 if !recovering {
-                    fs::write(&marker, b"")?;
+                    store.write_atomic(&marker, b"")?;
                 }
 
                 // Scope the crash-recovery dedup correctly. The marker only tells
@@ -270,7 +281,7 @@ impl Log {
 
                 for ((y, m), month_entries) in &by_month {
                     let path = archive_path(store, *y, *m);
-                    append_to_archive(&path, month_entries, recovering_reroll)?;
+                    append_to_archive(store, &path, month_entries, recovering_reroll)?;
                 }
 
                 // Rewrite the active file to the kept (current-month) entries
@@ -281,9 +292,9 @@ impl Log {
                 }
                 body.push_str(&entry.render());
                 let full = compose_active(&header, &body);
-                crate::fsx::write_atomic(&active, full.as_bytes())?;
+                store.write_atomic(&active, full.as_bytes())?;
                 // Rotation committed (active trimmed): clear the in-flight marker.
-                let _ = fs::remove_file(&marker);
+                let _ = store.remove_file(&marker);
                 return Ok(());
             }
 
@@ -291,7 +302,7 @@ impl Log {
             // the active file but never deleted the marker), clear it so the next
             // real rotation is treated as fresh, not stuck in recovery mode.
             if recovering {
-                let _ = fs::remove_file(&marker);
+                let _ = store.remove_file(&marker);
             }
             // Plain atomic append of the rendered entry.
             let mut full = content;
@@ -299,16 +310,13 @@ impl Log {
                 full.push('\n');
             }
             full.push_str(&entry.render());
-            crate::fsx::write_atomic(&active, full.as_bytes())?;
+            store.write_atomic(&active, full.as_bytes())?;
             Ok(())
         } else {
             // Fresh log: frontmatter + the single entry.
-            if let Some(parent) = active.parent() {
-                fs::create_dir_all(parent)?;
-            }
             let body = entry.render();
             let full = compose_active(LOG_FRONTMATTER, &body);
-            crate::fsx::write_atomic(&active, full.as_bytes())?;
+            store.write_atomic(&active, full.as_bytes())?;
             Ok(())
         }
     }
@@ -361,7 +369,7 @@ impl Log {
         // — and suppress matching archive entries below — ONLY while the marker
         // is present. Even then it suppresses only an ARCHIVE entry that matches
         // an ACTIVE one, never active-vs-active or archive-vs-archive.
-        let recovering = rotation_marker_path(store).exists();
+        let recovering = store.regular_file_exists(&rotation_marker_path(store))?;
         let mut active_seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
         // Active file: scan fully (current-month-bounded by rotation). Record
@@ -369,8 +377,8 @@ impl Log {
         // marker is present); consider every entry regardless — a same-minute
         // duplicate WITHIN the active file is two distinct appends.
         let active = active_log_path(store);
-        if active.exists() {
-            reverse_collect(&active, |e| {
+        if store.regular_file_exists(&active)? {
+            reverse_collect(store, &active, |e| {
                 if recovering {
                     active_seen.insert(entry_key(&e));
                 }
@@ -393,7 +401,7 @@ impl Log {
                     break;
                 }
             }
-            reverse_collect(&archive, |e| {
+            reverse_collect(store, &archive, |e| {
                 // Suppress only a crash-retry active↔archive overlap, and only
                 // when recovering (marker present). `active_seen` is empty
                 // otherwise, so this never suppresses in normal operation — a
@@ -448,7 +456,7 @@ impl Log {
         // identities — and suppress matching archive entries below — ONLY while
         // recovering; even then it suppresses an ARCHIVE entry against an ACTIVE
         // one, never active-vs-active or archive-vs-archive.
-        let recovering = rotation_marker_path(store).exists();
+        let recovering = store.regular_file_exists(&rotation_marker_path(store))?;
         let mut active_seen: std::collections::HashSet<EntryKey> = std::collections::HashSet::new();
 
         // Active file: scan fully, no early stop (out-of-order safe). Collect
@@ -456,8 +464,8 @@ impl Log {
         // is two distinct appends), recording identities for overlap detection
         // only while recovering (the marker is present).
         let active = active_log_path(store);
-        if active.exists() {
-            reverse_collect(&active, |e| {
+        if store.regular_file_exists(&active)? {
+            reverse_collect(store, &active, |e| {
                 if e.timestamp > time {
                     if recovering {
                         active_seen.insert(entry_key(&e));
@@ -490,7 +498,7 @@ impl Log {
             }
             // Scan this archive fully — within a month, entries may still be
             // out of order, so no within-file early stop.
-            reverse_collect(&archive, |e| {
+            reverse_collect(store, &archive, |e| {
                 // Suppress only a crash-retry active↔archive overlap, and only
                 // when recovering (marker present). `active_seen` is empty
                 // otherwise, so a distinct same-(minute,kind,object,note) archive
@@ -513,8 +521,8 @@ impl Log {
         let mut found: Option<DateTime<FixedOffset>> = None;
 
         let active = active_log_path(store);
-        if active.exists() {
-            reverse_collect(&active, |e| {
+        if store.regular_file_exists(&active)? {
+            reverse_collect(store, &active, |e| {
                 if e.kind == LogKind::Validate {
                     found = Some(e.timestamp);
                     true
@@ -526,7 +534,7 @@ impl Log {
 
         if found.is_none() {
             for archive in list_archives_desc(store)? {
-                reverse_collect(&archive, |e| {
+                reverse_collect(store, &archive, |e| {
                     if e.kind == LogKind::Validate {
                         found = Some(e.timestamp);
                         true
@@ -725,8 +733,7 @@ impl PartialOrd for WindowItem {
 /// lock degrades to the pre-fix last-writer-wins, never to incorrectness of a
 /// single writer.
 struct AppendLock {
-    #[cfg(unix)]
-    file: Option<File>,
+    _file: File,
 }
 
 impl AppendLock {
@@ -734,73 +741,14 @@ impl AppendLock {
     /// `active`. Best-effort: any failure to open or lock the lock file yields
     /// an unlocked guard (we log rather than refuse to log). Blocks until the
     /// lock is granted when another appender holds it.
-    fn acquire(active: &Path) -> AppendLock {
-        #[cfg(unix)]
-        {
-            let file = Self::open_and_lock(active);
-            AppendLock { file }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = active;
-            AppendLock {}
-        }
-    }
-
-    #[cfg(unix)]
-    fn open_and_lock(active: &Path) -> Option<File> {
-        use std::os::unix::io::AsRawFd;
-
-        // The lock file lives beside the active log; ensure its parent exists
-        // (the fresh-log path may run before `log.md`'s directory is created).
-        if let Some(parent) = active.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let lock_path = lock_path_for(active);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .ok()?;
-
-        // Blocking exclusive advisory lock. `flock` is in libc, which every Rust
-        // binary links, so the bare `extern "C"` declaration needs no crate dep.
-        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
-        if rc != 0 {
-            // Could not lock (e.g. a filesystem without flock support): proceed
-            // unlocked rather than fail the append.
-            return None;
-        }
-        Some(file)
+    fn acquire(store: &Store, active: &Path) -> crate::Result<AppendLock> {
+        Ok(AppendLock {
+            _file: store.lock_file(&lock_path_for(active))?,
+        })
     }
 }
-
-#[cfg(unix)]
-impl Drop for AppendLock {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        if let Some(file) = &self.file {
-            // Release explicitly; the fd close on drop would also release it.
-            unsafe { flock(file.as_raw_fd(), LOCK_UN) };
-        }
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-/// `flock` operation: exclusive lock (`LOCK_EX`), blocking.
-#[cfg(unix)]
-const LOCK_EX: std::os::raw::c_int = 2;
-/// `flock` operation: unlock (`LOCK_UN`).
-#[cfg(unix)]
-const LOCK_UN: std::os::raw::c_int = 8;
 
 /// The advisory-lock sibling path for an active log file (`<name>.lock`).
-#[cfg(unix)]
 fn lock_path_for(active: &Path) -> PathBuf {
     let mut name = active
         .file_name()
@@ -815,12 +763,14 @@ fn lock_path_for(active: &Path) -> PathBuf {
 
 /// The active `log.md` path under the store root.
 fn active_log_path(store: &Store) -> PathBuf {
-    store.root.join("log.md")
+    let _ = store;
+    PathBuf::from("log.md")
 }
 
 /// The `log/` archive directory under the store root.
 fn archive_dir(store: &Store) -> PathBuf {
-    store.root.join("log")
+    let _ = store;
+    PathBuf::from("log")
 }
 
 /// The `log/<YYYY-MM>.md` archive path for a given month.
@@ -1026,9 +976,14 @@ fn compose_active(header: &str, body: &str) -> String {
 /// SAME physical entries adds nothing. On a fresh rotation (`false`) every entry
 /// is genuinely new to the archive and is appended unconditionally, so a
 /// distinct same-minute repeat survives.
-fn append_to_archive(path: &Path, entries: &[LogEntry], recovering: bool) -> crate::Result<()> {
-    if path.exists() {
-        let existing = fs::read_to_string(path)?;
+fn append_to_archive(
+    store: &Store,
+    path: &Path,
+    entries: &[LogEntry],
+    recovering: bool,
+) -> crate::Result<()> {
+    if store.regular_file_exists(path)? {
+        let existing = read_log_file(store, path)?;
 
         let mut body = String::new();
         if recovering {
@@ -1070,17 +1025,14 @@ fn append_to_archive(path: &Path, entries: &[LogEntry], recovering: bool) -> cra
             full.push('\n');
         }
         full.push_str(&body);
-        crate::fsx::write_atomic(path, full.as_bytes())?;
+        store.write_atomic(path, full.as_bytes())?;
     } else {
         let mut body = String::new();
         for e in entries {
             body.push_str(&e.render());
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let full = compose_active(LOG_FRONTMATTER, &body);
-        crate::fsx::write_atomic(path, full.as_bytes())?;
+        store.write_atomic(path, full.as_bytes())?;
     }
     Ok(())
 }
@@ -1110,12 +1062,12 @@ fn batch_is_archived(
 ) -> crate::Result<bool> {
     for ((y, m), month_entries) in by_month {
         let path = archive_path(store, *y, *m);
-        if !path.exists() {
+        if !store.regular_file_exists(&path)? {
             // No archive for this month: nothing was rolled here yet, so the
             // batch cannot be a completed re-roll.
             return Ok(false);
         }
-        let (_header, archived) = parse_active(&fs::read_to_string(&path)?);
+        let (_header, archived) = parse_active(&read_log_file(store, &path)?);
         let mut available: std::collections::HashMap<EntryKey, usize> =
             std::collections::HashMap::new();
         for e in &archived {
@@ -1155,24 +1107,19 @@ fn entry_key(e: &LogEntry) -> EntryKey {
 /// Every `log/<YYYY-MM>.md` archive, sorted **newest month first**.
 fn list_archives_desc(store: &Store) -> crate::Result<Vec<PathBuf>> {
     let dir = archive_dir(store);
-    if !dir.is_dir() {
+    if !store.directory_exists(&dir).unwrap_or(false) {
         return Ok(Vec::new());
     }
     let mut months: Vec<(String, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || !store.owns_path(&path) {
-            continue;
-        }
-        let name = match path.file_name().and_then(|s| s.to_str()) {
+    for name in store.regular_file_names(&dir)? {
+        let name = match name.to_str() {
             Some(n) => n,
             None => continue,
         };
         // Match `YYYY-MM.md`.
         if let Some(stem) = name.strip_suffix(".md") {
             if is_year_month(stem) {
-                months.push((stem.to_string(), path.clone()));
+                months.push((stem.to_string(), dir.join(name)));
             }
         }
     }
@@ -1223,12 +1170,19 @@ fn is_year_month(s: &str) -> bool {
 /// to `take`. `take` returns `true` to stop early (enough collected). The file
 /// is read backward in blocks; only the tail region needed to satisfy `take`
 /// is read — the whole file is read only if `take` never returns `true`.
-fn reverse_collect<F>(path: &Path, mut take: F) -> crate::Result<()>
+fn reverse_collect<F>(store: &Store, path: &Path, mut take: F) -> crate::Result<()>
 where
     F: FnMut(LogEntry) -> bool,
 {
-    let mut file = File::open(path)?;
+    let mut file = store.open_regular(path)?;
     let len = file.metadata()?.len();
+    if len > MAX_LOG_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "log file exceeds the bounded parser limit",
+        )
+        .into());
+    }
     if len == 0 {
         return Ok(());
     }
@@ -1488,11 +1442,14 @@ mod tests {
     fn temp_store() -> (TempDir, Store) {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("DB.md"), "---\ntype: db-md\n---\n").expect("write DB.md");
-        let store = Store {
-            root: dir.path().to_path_buf(),
-            config: Config::default(),
-        };
+        let store = Store::from_root_and_config(dir.path(), Config::default()).unwrap();
         (dir, store)
+    }
+
+    /// Resolve a store-relative helper path for the few test fixtures that
+    /// intentionally bypass `Store` and author an on-disk crash state directly.
+    fn test_abs(store: &Store, relative: impl AsRef<Path>) -> PathBuf {
+        store.root.join(relative)
     }
 
     /// Regression (adversarial review): a hand-created / externally-produced
@@ -1817,7 +1774,7 @@ mod tests {
             "apr-early",
         );
         let dir = store.root.join("log");
-        fs::create_dir_all(&dir).unwrap();
+        store.create_dir_all(&dir).unwrap();
         let mut arch = String::from(LOG_FRONTMATTER);
         arch.push('\n');
         arch.push_str(&apr_late.render());
@@ -2501,17 +2458,17 @@ Second.
         let month = [apr1.clone(), apr2.clone()];
 
         // First roll: a FRESH rotation (no in-progress marker) appends both.
-        fs::create_dir_all(&dir).unwrap();
-        append_to_archive(&arch, &month, false).unwrap();
+        fs::create_dir_all(test_abs(&store, &dir)).unwrap();
+        append_to_archive(&store, &arch, &month, false).unwrap();
 
         // The retries are crash-RECOVERIES (the in-progress-rotation marker is
         // present), so they dedup the re-rolled identical entries to a no-op.
         // Pre-fix this blindly concatenated, doubling every entry; do it twice to
         // prove the amplification a real retry loop would cause is suppressed.
-        append_to_archive(&arch, &month, true).unwrap();
-        append_to_archive(&arch, &month, true).unwrap();
+        append_to_archive(&store, &arch, &month, true).unwrap();
+        append_to_archive(&store, &arch, &month, true).unwrap();
 
-        let archived = fs::read_to_string(&arch).unwrap();
+        let archived = store.read_text_bounded(&arch, u64::MAX).unwrap();
         // Each entry header must appear EXACTLY once despite the re-rolls.
         assert_eq!(
             count_occurrences(&archived, "## [2026-04-10 09:00] ingest | apr-a"),
@@ -2550,13 +2507,13 @@ Second.
 
         // Snapshot the active file holding both April entries (this is what is
         // still on disk if the post-rotation active rewrite never lands).
-        let active_path = active_log_path(&store);
+        let active_path = test_abs(&store, active_log_path(&store));
         let pre_rotation_active = fs::read_to_string(&active_path).unwrap();
 
         // A May append rotates April out and trims the active file.
         let may = entry(2026, 5, 2, 8, 0, LogKind::Update, Some("may-a"), "may one");
         Log::append(&store, &may).unwrap();
-        let arch = archive_path(&store, 2026, 4);
+        let arch = test_abs(&store, archive_path(&store, 2026, 4));
         assert!(arch.exists(), "April should have rotated to its archive");
 
         // Simulate the crash/error: the active rewrite never persisted, so the
@@ -2566,7 +2523,7 @@ Second.
         // deleted only AFTER the active trim commits. Restore it so the retry is
         // recognized as a crash-recovery re-roll (deduped), not a fresh rotation
         // (which would correctly append a genuinely-distinct repeat).
-        fs::write(rotation_marker_path(&store), b"").unwrap();
+        fs::write(test_abs(&store, rotation_marker_path(&store)), b"").unwrap();
 
         // The agent retries the append. Re-partitioning sees April as prior
         // months again and re-rolls them — which must NOT duplicate the archive.
@@ -2607,14 +2564,14 @@ Second.
     fn regression_stale_marker_does_not_drop_distinct_same_minute_on_fresh_roll() {
         let (_d, store) = temp_store();
         let dir = archive_dir(&store);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(test_abs(&store, &dir)).unwrap();
 
         // Pre-existing, independently-authored January archive entry.
         let jan = entry(2026, 1, 15, 9, 0, LogKind::Create, Some("dup"), "body");
         let mut arch = String::from(LOG_FRONTMATTER);
         arch.push('\n');
         arch.push_str(&jan.render());
-        fs::write(archive_path(&store, 2026, 1), arch).unwrap();
+        fs::write(test_abs(&store, archive_path(&store, 2026, 1)), arch).unwrap();
 
         // Active file: a February entry plus a SECOND, distinct, byte-identical
         // January `dup` (backdated, physically alongside February).
@@ -2623,7 +2580,7 @@ Second.
 
         // A stale rotation marker lingers (crash stranded it; not gitignored, so
         // it can ride into a clone).
-        fs::write(rotation_marker_path(&store), b"").unwrap();
+        fs::write(test_abs(&store, rotation_marker_path(&store)), b"").unwrap();
 
         // A March append rotates January AND February out as a FRESH roll.
         let mar = entry(2026, 3, 1, 0, 0, LogKind::Create, Some("mar"), "mar");
@@ -2631,14 +2588,14 @@ Second.
 
         // The genuinely-distinct January `dup` must survive: BOTH copies in the
         // archive, the entry never lost.
-        let jan_arch = fs::read_to_string(archive_path(&store, 2026, 1)).unwrap();
+        let jan_arch = fs::read_to_string(test_abs(&store, archive_path(&store, 2026, 1))).unwrap();
         assert_eq!(
             count_occurrences(&jan_arch, "## [2026-01-15 09:00] create | dup"),
             2,
             "stale marker dropped a distinct same-minute January entry; got:\n{jan_arch}"
         );
         // February rolled to its own (newly created) archive exactly once.
-        let feb_arch = fs::read_to_string(archive_path(&store, 2026, 2)).unwrap();
+        let feb_arch = fs::read_to_string(test_abs(&store, archive_path(&store, 2026, 2))).unwrap();
         assert_eq!(
             count_occurrences(&feb_arch, "## [2026-02-05 09:00] create | feb"),
             1,
@@ -2646,7 +2603,7 @@ Second.
         );
         // The marker is cleared after the committed rotation.
         assert!(
-            !rotation_marker_path(&store).exists(),
+            !test_abs(&store, rotation_marker_path(&store)).exists(),
             "rotation marker must be cleared after a committed rotation"
         );
         // The reader agrees: both January `dup`s are visible (no marker now).
@@ -2669,7 +2626,7 @@ Second.
     fn regression_true_crash_retry_still_dedups_when_whole_batch_already_archived() {
         let (_d, store) = temp_store();
         let dir = archive_dir(&store);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(test_abs(&store, &dir)).unwrap();
 
         let apr1 = entry(2026, 4, 10, 9, 0, LogKind::Ingest, Some("apr-a"), "apr one");
         let apr2 = entry(2026, 4, 20, 9, 0, LogKind::Create, Some("apr-b"), "apr two");
@@ -2680,13 +2637,13 @@ Second.
         arch.push('\n');
         arch.push_str(&apr1.render());
         arch.push_str(&apr2.render());
-        fs::write(archive_path(&store, 2026, 4), arch).unwrap();
+        fs::write(test_abs(&store, archive_path(&store, 2026, 4)), arch).unwrap();
 
         // The active file still holds the SAME April entries (trim never landed).
         write_raw_log(&store, &[apr1.clone(), apr2.clone()]);
 
         // The crash left the in-progress-rotation marker behind.
-        fs::write(rotation_marker_path(&store), b"").unwrap();
+        fs::write(test_abs(&store, rotation_marker_path(&store)), b"").unwrap();
 
         // The agent retries with a May append: April is re-rolled. Because the
         // whole April batch is already in the archive, this is a true re-roll and
@@ -2694,7 +2651,7 @@ Second.
         let may = entry(2026, 5, 2, 8, 0, LogKind::Update, Some("may"), "may one");
         Log::append(&store, &may).unwrap();
 
-        let archived = fs::read_to_string(archive_path(&store, 2026, 4)).unwrap();
+        let archived = fs::read_to_string(test_abs(&store, archive_path(&store, 2026, 4))).unwrap();
         assert_eq!(
             count_occurrences(&archived, "## [2026-04-10 09:00] ingest | apr-a"),
             1,
@@ -2737,7 +2694,7 @@ Second.
         )
         .unwrap();
 
-        let archived = fs::read_to_string(archive_path(&store, 2026, 4)).unwrap();
+        let archived = fs::read_to_string(test_abs(&store, archive_path(&store, 2026, 4))).unwrap();
         assert_eq!(
             count_occurrences(&archived, "## [2026-04-10 09:00] ingest | x"),
             2,
@@ -2810,7 +2767,7 @@ Second.
         // backdated append of identical fields lands in the active log.md after a
         // later-month rotation completed (so NO marker lingers).
         let dir = archive_dir(&store);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(test_abs(&store, &dir)).unwrap();
         let dup = entry(
             2026,
             5,
@@ -2824,7 +2781,7 @@ Second.
         let mut arch = String::from(LOG_FRONTMATTER);
         arch.push('\n');
         arch.push_str(&dup.render());
-        fs::write(archive_path(&store, 2026, 5), arch).unwrap();
+        fs::write(test_abs(&store, archive_path(&store, 2026, 5)), arch).unwrap();
 
         // Active file: a current-month (June) entry plus the SECOND distinct copy
         // of the May-dated event (backdated, so physically alongside June).
@@ -2843,7 +2800,7 @@ Second.
         // No rotation marker => normal operation => trust the disk: BOTH distinct
         // copies of the May event must be reported by since and tail.
         assert!(
-            !rotation_marker_path(&store).exists(),
+            !test_abs(&store, rotation_marker_path(&store)).exists(),
             "precondition: no rotation marker (normal operation)"
         );
 
@@ -2877,7 +2834,7 @@ Second.
         // in BOTH the archive (write committed) and the active file (trim never
         // landed), and the in-flight marker is still on disk.
         let dir = archive_dir(&store);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(test_abs(&store, &dir)).unwrap();
         let rolled = entry(
             2026,
             5,
@@ -2891,7 +2848,7 @@ Second.
         let mut arch = String::from(LOG_FRONTMATTER);
         arch.push('\n');
         arch.push_str(&rolled.render());
-        fs::write(archive_path(&store, 2026, 5), arch).unwrap();
+        fs::write(test_abs(&store, archive_path(&store, 2026, 5)), arch).unwrap();
 
         // Active file still holds the un-trimmed May entry plus a current-month
         // (June) entry — the pre-trim shape a crash leaves behind.
@@ -2908,9 +2865,9 @@ Second.
         write_raw_log(&store, &[jun, rolled.clone()]);
 
         // The crash leaves the in-progress-rotation marker behind.
-        fs::write(rotation_marker_path(&store), b"").unwrap();
+        fs::write(test_abs(&store, rotation_marker_path(&store)), b"").unwrap();
         assert!(
-            rotation_marker_path(&store).exists(),
+            test_abs(&store, rotation_marker_path(&store)).exists(),
             "precondition: rotation marker present (crash mid-rotation)"
         );
 
@@ -2944,7 +2901,7 @@ Second.
     #[test]
     fn regression_rotation_preserves_lines_before_first_valid_header() {
         let (_d, store) = temp_store();
-        let active = active_log_path(&store);
+        let active = test_abs(&store, active_log_path(&store));
         let content = "---\ntype: log\n---\n\n## [orphan from a merge] stray text\n## [2026-04-10 09:00] ingest | x\nbody line\n";
         fs::write(&active, content).unwrap();
 
@@ -2956,7 +2913,8 @@ Second.
         .unwrap();
 
         let active_after = fs::read_to_string(&active).unwrap();
-        let arch_after = fs::read_to_string(archive_path(&store, 2026, 4)).unwrap_or_default();
+        let arch_after =
+            fs::read_to_string(test_abs(&store, archive_path(&store, 2026, 4))).unwrap_or_default();
         assert!(
             active_after.contains("orphan from a merge") || arch_after.contains("orphan from a merge"),
             "the pre-first-valid-header line was erased by rotation;\nactive:\n{active_after}\narchive:\n{arch_after}"
@@ -3052,11 +3010,11 @@ Second.
             "april late",
         );
         let dir = archive_dir(&store);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(test_abs(&store, &dir)).unwrap();
         let mut arch = String::from(LOG_FRONTMATTER);
         arch.push('\n');
         arch.push_str(&apr.render());
-        fs::write(archive_path(&store, 2026, 4), arch).unwrap();
+        fs::write(test_abs(&store, archive_path(&store, 2026, 4)), arch).unwrap();
 
         // Active file: a clean May entry, so an archive scan is actually needed.
         let may = entry(2026, 5, 5, 8, 0, LogKind::Update, Some("may-a"), "may one");
@@ -3391,15 +3349,15 @@ Second.
         write_raw_log(&store, &[apr_a.clone(), apr_b.clone()]);
         // The committed step-1 archive holds the same two entries.
         let dir = archive_dir(&store);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(test_abs(&store, &dir)).unwrap();
         let mut arch = String::from(LOG_FRONTMATTER);
         arch.push('\n');
         arch.push_str(&apr_a.render());
         arch.push_str(&apr_b.render());
-        fs::write(archive_path(&store, 2026, 4), arch).unwrap();
+        fs::write(test_abs(&store, archive_path(&store, 2026, 4)), arch).unwrap();
         // The crash leaves the in-progress-rotation marker on disk; this is what
         // authorizes the read-side overlap dedup.
-        fs::write(rotation_marker_path(&store), b"").unwrap();
+        fs::write(test_abs(&store, rotation_marker_path(&store)), b"").unwrap();
 
         // `since` must return each April entry exactly once.
         let since = Log::since(&store, ts(2026, 4, 1, 0, 0)).unwrap();
@@ -3415,6 +3373,45 @@ Second.
             tail,
             vec![apr_a, apr_b],
             "tail must dedup the doubly-present entries; got {tail:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_stays_on_opened_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let detached = sandbox.path().join("detached");
+        fs::rename(&root, &detached).unwrap();
+
+        let replacement = sandbox.path().join("replacement");
+        fs::create_dir_all(&replacement).unwrap();
+        fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(replacement.join("log.md"), "replacement log sentinel\n").unwrap();
+        symlink(&replacement, &root).unwrap();
+
+        let owned = entry(
+            2026,
+            7,
+            30,
+            12,
+            0,
+            LogKind::Create,
+            Some("owned"),
+            "owned event",
+        );
+        Log::append(&store, &owned).unwrap();
+        assert!(fs::read_to_string(detached.join("log.md"))
+            .unwrap()
+            .contains("owned event"));
+        assert_eq!(
+            fs::read_to_string(replacement.join("log.md")).unwrap(),
+            "replacement log sentinel\n"
         );
     }
 }

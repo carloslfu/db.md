@@ -186,6 +186,7 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::NoHub => CliError::new(ExitCode::Runtime, "NO_HUB", message),
             L::NoCredential => CliError::new(ExitCode::Runtime, "NO_CREDENTIAL", message),
             L::BadKey => CliError::new(ExitCode::Runtime, "BAD_CREDENTIAL", message),
+            L::UnboundCredential => CliError::new(ExitCode::Runtime, "UNBOUND_CREDENTIAL", message),
             L::UnsafeHub { .. } => CliError::new(ExitCode::Runtime, "HUB_NOT_HTTPS", message),
             L::Transport { .. } => CliError::new(ExitCode::Runtime, "HUB_UNREACHABLE", message),
             L::Http { code, .. } => {
@@ -196,7 +197,9 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
                 }
             }
             L::NotJson { .. } => CliError::new(ExitCode::Runtime, "HUB_NOT_JSON", message),
-            L::ResponseTooLarge => CliError::new(ExitCode::Runtime, "RESPONSE_TOO_LARGE", message),
+            L::ResponseTooLarge { .. } => {
+                CliError::new(ExitCode::Runtime, "RESPONSE_TOO_LARGE", message)
+            }
             L::BadAddress { .. } => CliError::new(ExitCode::Runtime, "BAD_ADDRESS", message)
                 .with_hint(
                     "addresses are `@brain`, `@brain/<record-id>`, or `@brain/<store-path>.md`",
@@ -211,6 +214,9 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::NotUtf8 { .. } => CliError::new(ExitCode::Runtime, "NOT_UTF8", message),
             L::InvalidPack { .. } => CliError::new(ExitCode::Runtime, "INVALID_PACK", message),
             L::InvalidFeed { .. } => CliError::new(ExitCode::Runtime, "INVALID_FEED", message),
+            L::UnsupportedPlatform { .. } => {
+                CliError::new(ExitCode::Runtime, "UNSUPPORTED_PLATFORM", message)
+            }
             L::BadAgentKey { .. } => CliError::new(ExitCode::Runtime, "BAD_AGENT_KEY", message)
                 .with_hint("mint a key with `dbmd key generate --out <file>`"),
             L::Io(_) => CliError::new(ExitCode::Runtime, "IO_ERROR", message),

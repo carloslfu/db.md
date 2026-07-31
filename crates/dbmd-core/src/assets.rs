@@ -35,8 +35,7 @@ use serde_norway::Value;
 use sha2::{Digest, Sha256};
 
 use crate::parser;
-use crate::store::{self, Store};
-use crate::write_atomic;
+use crate::store::Store;
 
 /// The manifest file name at the store root.
 pub const MANIFEST_FILE: &str = "assets.jsonl";
@@ -139,11 +138,13 @@ pub struct VerifyReport {
 /// error. A malformed line is an `InvalidData` error (the CLI surfaces it;
 /// [`crate::validate`] flags it leniently as `ASSET_MANIFEST_MALFORMED`).
 pub fn read_manifest(store: &Store) -> crate::Result<Vec<AssetRecord>> {
-    let abs = store.root.join(MANIFEST_FILE);
-    if !abs.exists() {
-        return Ok(Vec::new());
-    }
-    let text = std::fs::read_to_string(&abs)?;
+    let text = match store
+        .read_text_bounded(Path::new(MANIFEST_FILE), crate::parser::MAX_DBMD_FILE_BYTES)
+    {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
     let mut by_path: BTreeMap<String, AssetRecord> = BTreeMap::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -181,18 +182,21 @@ fn serialize_manifest(records: &[AssetRecord]) -> String {
     out
 }
 
-/// Write the manifest atomically (temp + fsync + rename, via [`write_atomic`]),
-/// records sorted by path ascending. An empty record set removes the file.
+/// Write the manifest atomically (temp + fsync + rename through the store's
+/// held root capability), records sorted by path ascending. An empty record set
+/// removes the file.
 pub fn write_manifest(store: &Store, records: &[AssetRecord]) -> crate::Result<()> {
-    let abs = store.root.join(MANIFEST_FILE);
+    let abs = Path::new(MANIFEST_FILE);
     let out = serialize_manifest(records);
     if out.is_empty() {
-        if abs.exists() {
-            std::fs::remove_file(&abs)?;
+        match store.remove_file(abs) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         return Ok(());
     }
-    write_atomic(&abs, out.as_bytes())?;
+    store.write_atomic(abs, out.as_bytes())?;
     Ok(())
 }
 
@@ -225,9 +229,16 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
     let mut warnings: Vec<String> = Vec::new();
 
     for rel in store.walk()? {
-        let abs = store.abs_path(&rel);
-        let (fm, _body) = match parser::read_file(&abs) {
-            Ok(v) => v,
+        let text = match store.read_text_bounded(&rel, parser::MAX_DBMD_FILE_BYTES) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let parsed = match parser::split_frontmatter(&text, &rel) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        let fm = match parser::Frontmatter::parse(&parsed.frontmatter_yaml, &rel) {
+            Ok(frontmatter) => frontmatter,
             Err(_) => continue, // unparseable / not a content file: skip
         };
         let wrapper = rel_to_string(&rel);
@@ -264,7 +275,7 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
         let wrappers: Vec<String> = wrappers.iter().cloned().collect();
 
         // Belt-and-suspenders containment check before any disk read.
-        let abs = match store::ensure_path_within_store(&store.root, &store.root.join(path)) {
+        let abs = match store.capability_relative(Path::new(path)) {
             Ok(p) => p,
             Err(_) => {
                 warnings.push(format!("{path}: escapes the store root; skipped"));
@@ -272,37 +283,43 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
             }
         };
 
-        if abs.is_dir() {
-            warnings.push(format!("{path}: is a directory, not a file; skipped"));
-            continue;
-        }
-        if abs.is_file() {
-            let (sha256, bytes) = sha256_file(&abs)?;
-            records.push(AssetRecord {
-                path: path.clone(),
-                sha256,
-                bytes,
-                media_type: media_type_for(path),
-                wrappers,
-                required,
-            });
-            hashed += 1;
-        } else if let Some(prev) = existing_by_path.get(path) {
-            // Evicted: bytes gone locally but previously cataloged. Preserve the
-            // committed hash/size (we cannot re-hash what is not here).
-            records.push(AssetRecord {
-                path: path.clone(),
-                sha256: prev.sha256.clone(),
-                bytes: prev.bytes,
-                media_type: media_type_for(path),
-                wrappers,
-                required,
-            });
-            preserved += 1;
-        } else {
-            warnings.push(format!(
-                "{path}: declared but absent and never cataloged; cannot hash (skipped)"
-            ));
+        match store.open_regular(abs) {
+            Ok(file) => {
+                let (sha256, bytes) = sha256_file(file)?;
+                records.push(AssetRecord {
+                    path: path.clone(),
+                    sha256,
+                    bytes,
+                    media_type: media_type_for(path),
+                    wrappers,
+                    required,
+                });
+                hashed += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(prev) = existing_by_path.get(path) {
+                    // Evicted: bytes gone locally but previously cataloged. Preserve the
+                    // committed hash/size (we cannot re-hash what is not here).
+                    records.push(AssetRecord {
+                        path: path.clone(),
+                        sha256: prev.sha256.clone(),
+                        bytes: prev.bytes,
+                        media_type: media_type_for(path),
+                        wrappers,
+                        required,
+                    });
+                    preserved += 1;
+                } else {
+                    warnings.push(format!(
+                        "{path}: declared but absent and never cataloged; cannot hash (skipped)"
+                    ));
+                }
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "{path}: is not a readable regular in-store file: {error}"
+                ));
+            }
         }
     }
     records.sort_by(|a, b| a.path.cmp(&b.path));
@@ -330,8 +347,13 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
     let mut wrote = false;
     if !dry_run {
         let canonical = serialize_manifest(&records);
-        let abs = store.root.join(MANIFEST_FILE);
-        let on_disk = std::fs::read(&abs).unwrap_or_default();
+        let on_disk = match store
+            .read_bounded(Path::new(MANIFEST_FILE), crate::parser::MAX_DBMD_FILE_BYTES)
+        {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
         if on_disk != canonical.as_bytes() {
             write_manifest(store, &records)?;
             wrote = true;
@@ -371,7 +393,7 @@ pub fn verify(store: &Store, include_optional: bool, quick: bool) -> crate::Resu
             continue;
         }
         checked += 1;
-        let abs = match store::ensure_path_within_store(&store.root, &store.root.join(&rec.path)) {
+        let abs = match store.capability_relative(Path::new(&rec.path)) {
             Ok(p) => p,
             Err(_) => {
                 // A manifest path that escapes the store is not restorable here.
@@ -379,17 +401,24 @@ pub fn verify(store: &Store, include_optional: bool, quick: bool) -> crate::Resu
                 continue;
             }
         };
-        if !abs.is_file() {
-            missing.push(rec.path.clone());
-            continue;
-        }
+        let file = match store.open_regular(abs) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(rec.path.clone());
+                continue;
+            }
+            Err(_) => {
+                corrupt.push(rec.path.clone());
+                continue;
+            }
+        };
         if quick {
-            let len = std::fs::metadata(&abs)?.len();
+            let len = file.metadata()?.len();
             if len != rec.bytes {
                 corrupt.push(rec.path.clone());
             }
         } else {
-            let (sha, bytes) = sha256_file(&abs)?;
+            let (sha, bytes) = sha256_file(file)?;
             if sha != rec.sha256 || bytes != rec.bytes {
                 corrupt.push(rec.path.clone());
             }
@@ -438,9 +467,7 @@ pub fn status(store: &Store) -> crate::Result<StatusReport> {
         // bytes) while `verify` reported it `corrupt` — two read commands on the
         // same store disagreeing, plus a path-existence oracle outside the store.
         // An escaping record is treated as not-present (missing), matching verify.
-        let is_present = store::ensure_path_within_store(&store.root, &store.root.join(&rec.path))
-            .map(|p| p.is_file())
-            .unwrap_or(false);
+        let is_present = store.open_regular(Path::new(&rec.path)).is_ok();
         let state = if is_present {
             present += 1;
             "present"
@@ -495,7 +522,7 @@ pub fn status(store: &Store) -> crate::Result<StatusReport> {
 pub fn paths(store: &Store) -> crate::Result<Vec<String>> {
     Ok(read_manifest(store)?
         .into_iter()
-        .filter(|r| store::ensure_path_within_store(&store.root, &store.root.join(&r.path)).is_ok())
+        .filter(|r| store.capability_relative(Path::new(&r.path)).is_ok())
         .map(|r| r.path)
         .collect())
 }
@@ -627,8 +654,7 @@ fn rel_to_string(p: &Path) -> String {
 
 /// Stream the file through SHA-256 (constant memory) and return
 /// `(lowercase-hex digest, byte length)`.
-fn sha256_file(abs: &Path) -> std::io::Result<(String, u64)> {
-    let mut f = std::fs::File::open(abs)?;
+fn sha256_file(mut f: std::fs::File) -> std::io::Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
     let mut total: u64 = 0;
@@ -700,43 +726,27 @@ fn media_type_for(path: &str) -> String {
 /// un-wrappered-drop worklist). Walks the raw filesystem (so it sees files an
 /// ignore mechanism would hide), skips `index.*` sidecars and hidden entries.
 fn find_untracked(store: &Store, declared: &BTreeSet<String>) -> crate::Result<Vec<String>> {
-    let sources = store.root.join("sources");
-    if !sources.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
-    for entry in walkdir::WalkDir::new(&sources)
-        .follow_links(true)
-        .into_iter()
-        .filter_entry(|e| {
-            !is_hidden(e.file_name().to_str().unwrap_or("")) && store.owns_path(e.path())
-        })
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+    let paths = match store.walk_regular_files(Path::new("sources")) {
+        Ok(paths) => paths,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error.into()),
+    };
+    for path in paths {
+        let name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => continue,
         };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_str().unwrap_or("");
         if is_markdown(name) || name == "index.jsonl" {
             continue;
         }
-        let rel = match entry.path().strip_prefix(&store.root) {
-            Ok(r) => rel_to_string(r),
-            Err(_) => continue,
-        };
+        let rel = rel_to_string(&path);
         if !declared.contains(&rel) {
             out.push(rel);
         }
     }
     out.sort();
     Ok(out)
-}
-
-fn is_hidden(name: &str) -> bool {
-    name.starts_with('.') && name != "." && name != ".."
 }
 
 #[cfg(test)]
@@ -795,10 +805,7 @@ mod tests {
 \"media_type\":\"application/octet-stream\",\"wrappers\":[\"records/w.md\"],\"required\":true}\n",
         )
         .unwrap();
-        let store = Store {
-            root: root.to_path_buf(),
-            config: crate::parser::Config::default(),
-        };
+        let store = Store::from_root_and_config(root, crate::parser::Config::default()).unwrap();
 
         // status: must not panic; totals saturate at u64::MAX (both assets are
         // missing from disk, so bytes_missing accumulates them too).
@@ -832,12 +839,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("sources/a.pdf"), b"PDFBYTES").unwrap();
-        let store = Store {
-            root: root.to_path_buf(),
-            config: crate::parser::Config::default(),
-        };
+        let store = Store::from_root_and_config(root, crate::parser::Config::default()).unwrap();
         let report = scan(&store, false, false).unwrap();
-        assert!(report.wrote, "first scan writes the manifest");
+        assert!(
+            report.wrote,
+            "first scan writes the manifest; report: {report:?}"
+        );
         let canonical = std::fs::read_to_string(root.join(MANIFEST_FILE)).unwrap();
         (tmp, store, canonical)
     }
@@ -923,10 +930,7 @@ mod tests {
 \"media_type\":\"text/plain\",\"wrappers\":[\"sources/legit.pdf.md\"],\"required\":false}\n",
         )
         .unwrap();
-        let store = Store {
-            root: root.to_path_buf(),
-            config: crate::parser::Config::default(),
-        };
+        let store = Store::from_root_and_config(root, crate::parser::Config::default()).unwrap();
 
         let out = paths(&store).expect("paths is non-failing on a poisoned manifest");
         assert_eq!(
@@ -967,5 +971,36 @@ mod tests {
             canonical,
             "a no-op rescan must leave the manifest byte-identical"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_membership_reads_opened_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        std::fs::write(
+            root.join(MANIFEST_FILE),
+            "{\"path\":\"sources/owned.pdf\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"bytes\":1,\"media_type\":\"application/pdf\",\"wrappers\":[],\"required\":true}\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let detached = sandbox.path().join("detached");
+        std::fs::rename(&root, &detached).unwrap();
+
+        let replacement = sandbox.path().join("replacement");
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        std::fs::write(
+            replacement.join(MANIFEST_FILE),
+            "{\"path\":\"sources/replacement-secret.pdf\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"bytes\":1,\"media_type\":\"application/pdf\",\"wrappers\":[],\"required\":true}\n",
+        )
+        .unwrap();
+        symlink(&replacement, &root).unwrap();
+
+        assert_eq!(paths(&store).unwrap(), vec!["sources/owned.pdf"]);
     }
 }

@@ -53,12 +53,41 @@ pub fn sanitize(s: &str) -> String {
                 }
                 None => {}
             }
-        } else if !c.is_control() || c == '\n' || c == '\t' {
+        } else if !is_directional_control(c) && (!c.is_control() || c == '\n' || c == '\t') {
             out.push(c);
         }
         // Any other control char (C0, DEL, C1) is dropped.
     }
     out
+}
+
+/// Sanitize one terminal field that must not create another visual line or
+/// column. Newlines and tabs are rendered visibly; ANSI, C0/C1, and Unicode
+/// bidi controls are removed by [`sanitize`].
+pub fn sanitize_single_line(s: &str) -> String {
+    let cleaned = sanitize(s);
+    let mut out = String::with_capacity(cleaned.len());
+    for c in cleaned.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u{2028}"),
+            '\u{2029}' => out.push_str("\\u{2029}"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn is_directional_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 #[cfg(test)]
@@ -82,5 +111,13 @@ mod tests {
         assert_eq!(sanitize("a\nb\tc"), "a\nb\tc");
         assert_eq!(sanitize("café → ok"), "café → ok");
         assert_eq!(sanitize(""), "");
+    }
+
+    #[test]
+    fn single_line_neutralizes_line_column_and_bidi_spoofing() {
+        assert_eq!(
+            sanitize_single_line("file\nfake error\tkey\u{202e}txt\u{2028}tail"),
+            "file\\nfake error\\tkeytxt\\u{2028}tail"
+        );
     }
 }

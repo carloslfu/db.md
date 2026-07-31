@@ -22,6 +22,7 @@ use dbmd_core::{Config, Issue, Severity, Store};
 use crate::cli::ValidateArgs;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
+use crate::sanitize::sanitize_single_line;
 
 /// Run `dbmd validate`.
 pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
@@ -34,10 +35,7 @@ pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
     let store = if Store::is_db_md_store(root) {
         Store::open(root).map_err(|e| CliError::from(dbmd_core::Error::from(e)))?
     } else {
-        Store {
-            root: root.to_path_buf(),
-            config: Config::default(),
-        }
+        Store::from_root_and_config(root, Config::default()).map_err(CliError::from)?
     };
 
     let scope = if args.all { "all" } else { "working-set" };
@@ -131,19 +129,19 @@ fn text_report(counts: &Counts, issues: &[Issue]) -> String {
         out.push_str(&format!(
             "{} {} {}",
             severity_word(issue.severity),
-            issue.code,
-            issue.file.display()
+            sanitize_single_line(issue.code),
+            sanitize_single_line(&issue.file.to_string_lossy())
         ));
         if let Some(line) = issue.line {
             out.push_str(&format!(":{line}"));
         }
         if let Some(key) = &issue.key {
-            out.push_str(&format!(" [{key}]"));
+            out.push_str(&format!(" [{}]", sanitize_single_line(key)));
         }
-        out.push_str(&format!(" — {}", issue.message));
+        out.push_str(&format!(" — {}", sanitize_single_line(&issue.message)));
         out.push('\n');
         if let Some(suggestion) = &issue.suggestion {
-            out.push_str(&format!("    hint: {suggestion}\n"));
+            out.push_str(&format!("    hint: {}\n", sanitize_single_line(suggestion)));
         }
     }
     out.push_str(&format!(
@@ -212,5 +210,37 @@ fn severity_word(severity: Severity) -> &'static str {
         Severity::Error => "error",
         Severity::Warning => "warning",
         Severity::Info => "info",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_report_neutralizes_malicious_issue_fields_but_json_is_exact() {
+        let issue = Issue {
+            severity: Severity::Error,
+            code: "TEST",
+            file: PathBuf::from("records/bad\nfake\u{1b}[31m.md"),
+            line: Some(7),
+            key: Some("summary\tspoof\u{202e}".to_string()),
+            message: "first\nerror: forged\u{1b}]0;owned\u{7}".to_string(),
+            suggestion: Some("fix\tit\nnow".to_string()),
+            related: Vec::new(),
+        };
+        let counts = Counts::of(std::slice::from_ref(&issue));
+        let human = text_report(&counts, std::slice::from_ref(&issue));
+        assert!(!human.contains('\u{1b}'));
+        assert!(!human.contains('\u{202e}'));
+        assert!(human.contains(r"records/bad\nfake.md:7"));
+        assert!(human.contains(r"[summary\tspoof]"));
+        assert!(human.contains(r"first\nerror: forged"));
+        assert!(human.contains(r"hint: fix\tit\nnow"));
+
+        let json = issue_json(&issue);
+        assert_eq!(json["file"], "records/bad\nfake\u{1b}[31m.md");
+        assert_eq!(json["key"], "summary\tspoof\u{202e}");
+        assert_eq!(json["message"], "first\nerror: forged\u{1b}]0;owned\u{7}");
     }
 }

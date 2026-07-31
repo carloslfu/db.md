@@ -36,6 +36,11 @@ pub fn run(ctx: &Context, args: &IndexArgs) -> CliResult {
 /// together with `--dry-run` print what would be written without writing.
 pub fn run_rebuild(ctx: &Context, args: &IndexRebuildArgs) -> CliResult {
     let store = open_store(&args.dir)?;
+    let _transaction = if args.dry_run {
+        None
+    } else {
+        Some(store.transaction().map_err(CliError::from)?)
+    };
 
     if args.layer.is_some() && args.folder.is_some() {
         return Err(CliError::new(
@@ -94,9 +99,7 @@ pub fn run_show(ctx: &Context, args: &IndexShowArgs) -> CliResult {
         Some(p) => require_show_scope(&store, p)?.join("index.md"),
         None => PathBuf::from("index.md"),
     };
-    let index_md = store.root.join(&index_rel);
-
-    match std::fs::read_to_string(&index_md) {
+    match store.read_text_bounded(&index_rel, dbmd_core::parser::MAX_DBMD_FILE_BYTES) {
         Ok(contents) => {
             if ctx.json {
                 let obj = serde_json::json!({
@@ -249,17 +252,12 @@ fn rebuild_layer(store: &Store, layer: Layer) -> Result<(), dbmd_core::Error> {
 /// the core sweep enumeration so a dry-run preview lists the same folders a
 /// rebuild writes.
 fn type_folders_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
-    let layer_dir = store.root.join(layer.dir_name());
     let mut out = Vec::new();
-    let rd = match std::fs::read_dir(&layer_dir) {
-        Ok(rd) => rd,
+    let names = match store.directory_names(Path::new(layer.dir_name())) {
+        Ok(names) => names,
         Err(_) => return out,
     };
-    for entry in rd.flatten() {
-        if !entry.path().is_dir() || !store.owns_path(&entry.path()) {
-            continue;
-        }
-        let name = entry.file_name();
+    for name in names {
         let Some(name) = name.to_str() else { continue };
         if name.starts_with('.') || name == "log" {
             continue;

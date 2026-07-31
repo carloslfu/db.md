@@ -217,11 +217,27 @@ pub enum Command {
     /// sending a bearer (nothing reusable on the wire).
     Key(KeyArgs),
 
+    /// Internal installer primitive: copy a verified dbmd binary into a held,
+    /// no-follow destination directory and atomically replace its regular leaf.
+    #[command(name = "__install-verified", hide = true)]
+    InstallVerified(InstallVerifiedArgs),
+
     // ── Agent bootstrap ──────────────────────────────────────────────────────
     /// Print the bundled canonical SPEC.md (compiled in at build time). The
     /// installation point: `dbmd spec` loads the standard into an agent's
     /// system prompt.
     Spec(SpecArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InstallVerifiedArgs {
+    /// Verified binary extracted from the authenticated release archive.
+    #[arg(value_name = "SOURCE")]
+    pub source: String,
+
+    /// Destination directory to create/open without following symlinks.
+    #[arg(value_name = "INSTALL_DIR")]
+    pub install_dir: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -931,7 +947,9 @@ pub struct AssetsPathsArgs {
 // env var beats the `hub = <URL>` line in the store-local `.dbmd/config`;
 // there is NO default hub (the toolkit is neutral — a hub is whatever you
 // point it at). The credential is the `DBMD_HUB_KEY` env var, never a file in
-// the store. Non-HTTPS hubs are refused (loopback exempt).
+// the store. Store-selected hubs require an exact
+// `DBMD_HUB_CREDENTIAL_ORIGIN` binding before they receive ambient
+// credentials. Non-HTTPS hubs are refused (loopback exempt).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `dbmd resolve <ADDRESS>` — `@brain` card or `@brain/<id>` record.
@@ -1169,9 +1187,10 @@ pub enum KeyCommand {
     Generate(KeyGenerateArgs),
 
     /// Rotate a self-custodied brain's key (link.md §9.1): mint a fresh
-    /// keypair, sign the rotation statement with the OLD key, send it to the
-    /// hub, and write the new secret to `--out` only after the hub accepts.
-    /// History keeps verifying — the old identity moves into `previous`.
+    /// keypair and durably write it to `--out` BEFORE asking the hub to commit
+    /// its public half, then sign with the OLD key and re-verify the committed
+    /// feed. An existing `--out` is reused after an ambiguous failure. History
+    /// keeps verifying; retain the old key as recovery material.
     Rotate(KeyRotateArgs),
 }
 
@@ -1203,9 +1222,19 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub dir: String,
 
+    /// Trusted Ed25519 anchor printed by `dbmd mirror`. This must come from the
+    /// operator or another trusted checkpoint, not from files inside the mirror.
+    #[arg(long, value_name = "ED25519:MULTIKEY")]
+    pub pin: String,
+
     /// The address to bind. Loopback by default; port 0 picks a free port.
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
     pub addr: String,
+
+    /// Permit binding outside loopback. This exposes the full mirrored store
+    /// without authentication; use only behind an authenticated reverse proxy.
+    #[arg(long)]
+    pub unsafe_public: bool,
 }
 
 /// `dbmd key rotate <BRAIN> --key-file <OLD> --out <NEW>`.
@@ -1219,7 +1248,8 @@ pub struct KeyRotateArgs {
     #[arg(long, value_name = "FILE")]
     pub key_file: String,
 
-    /// Where to write the NEW private key file (0600, never overwriting).
+    /// Durable home for the NEW private key (0600). It is created before the
+    /// hub mutation and reused unchanged for safe retry/reconciliation.
     #[arg(long, value_name = "FILE")]
     pub out: String,
 }

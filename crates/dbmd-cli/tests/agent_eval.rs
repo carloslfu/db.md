@@ -1130,11 +1130,17 @@ fn assert_store_matches_golden(store: &Path) {
         let in_records = first == "records";
         // Source CONTENT files are inputs; only the source INDEX files are golden.
         let is_source_index = first == "sources" && is_index_or_log;
+        // Advisory index locks are persistent hidden coordination inodes, not
+        // authored store data. Unlinking them on unlock would be incorrect:
+        // another writer could then lock a new inode while the old one remains
+        // held. Keep the golden strict for every other records file.
+        let is_internal_index_lock =
+            rel.file_name().and_then(|name| name.to_str()) == Some(".index.lock");
         let golden_governed = in_records
             || is_source_index
             || (rel == Path::new("index.md"))
             || (rel == Path::new("log.md"));
-        if golden_governed {
+        if golden_governed && !is_internal_index_lock {
             assert!(
                 golden_rels.contains(&rel),
                 "the store produced {} which the golden does not pin — \

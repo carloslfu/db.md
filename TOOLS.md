@@ -142,17 +142,19 @@ address *shape*); these are client capabilities, never store
 requirements. No hub is baked in: the hub URL comes from `--hub`, the
 `DBMD_HUB_URL` env var, or a `hub = <URL>` line in the store-local
 `.dbmd/config` (precedence in that order); the credential is the
-`DBMD_HUB_KEY` env var, never a file in the store. Non-HTTPS hubs are
-refused (loopback exempt). Zero AI, zero telemetry: network I/O happens
-only when a verb is explicitly invoked.
+`DBMD_HUB_KEY` env var, never a file in the store. When a store-local config
+selects the hub, an ambient bearer, agent key, or brain key is used only if
+`DBMD_HUB_CREDENTIAL_ORIGIN` exactly binds it to that origin. Identity pins and
+monotonic feed checkpoints live in the user's global dbmd state directory,
+never under the store. Non-HTTPS hubs are refused (loopback exempt). Zero AI,
+zero telemetry: network I/O happens only when a verb is explicitly invoked.
 
 - `dbmd resolve @brain[/<id>]` — a bare `@brain` returns the brain card
   (metadata + index stats); `@brain/<record-id>` (the reserved address
   shape; a `@brain/<store-path>.md` form also works) returns the full
   record, frontmatter + body
 - `dbmd sync @brain [--out DIR]` — pull the granted slice as plain
-  files (never deletes local files; divergence is reported) and rebuild
-  the local index catalog; `--push` sends the local store as a
+  files (never deletes local files; divergence is reported); `--push` sends the local store as a
   whole-store snapshot (content `.md` + `DB.md` + `assets.jsonl`;
   derived catalogs and local history stay local)
 - `dbmd grant issue|list|revoke` — the capability model, owner-side:

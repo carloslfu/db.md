@@ -16,6 +16,12 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, FixedOffset};
 use serde_norway::{Mapping, Value};
 
+/// One db.md text file is bounded before allocation/YAML parsing. Interactive
+/// records are intentionally small; a larger blob belongs in the asset layer.
+/// This prevents a hostile path or imported store from making every read,
+/// validate, or format operation allocate an unbounded string.
+pub const MAX_DBMD_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The two canonical layer folder names. A path is "content" / a wiki-link is
 /// "full-path" only when it resolves under one of these.
 const LAYER_DIRS: [&str; 2] = ["sources", "records"];
@@ -1230,7 +1236,18 @@ pub fn split_frontmatter(text: &str, file: &Path) -> Result<ParsedFile, ParseErr
 /// Read a file from disk and parse it into typed [`Frontmatter`] plus the
 /// verbatim body string.
 pub fn read_file(path: &Path) -> Result<(Frontmatter, String), ParseError> {
-    let text = std::fs::read_to_string(path)?;
+    let bytes = crate::fsx::read_bounded_nofollow(path, MAX_DBMD_FILE_BYTES).map_err(|error| {
+        ParseError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "could not read a bounded regular db.md file ({} MiB cap): {error}",
+                MAX_DBMD_FILE_BYTES / (1024 * 1024)
+            ),
+        ))
+    })?;
+    let text = String::from_utf8(bytes).map_err(|error| {
+        ParseError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
     let parsed = split_frontmatter(&text, path)?;
     let fm = Frontmatter::parse(&parsed.frontmatter_yaml, path)?;
     Ok((fm, parsed.body))
@@ -1266,7 +1283,9 @@ pub fn write_file_new(
     Ok(())
 }
 
-fn render_file(frontmatter: &Frontmatter, body: &str) -> String {
+/// Render canonical file bytes without performing I/O. Transactional callers
+/// use this to stage the exact bytes that [`write_file`] would commit.
+pub fn render_file(frontmatter: &Frontmatter, body: &str) -> String {
     let yaml = frontmatter.to_yaml();
     // `to_yaml` already terminates each block with a newline. Compose the file
     // as: opening fence, frontmatter YAML, closing fence, then body verbatim.
@@ -2565,6 +2584,20 @@ fn extract_type_list_bullet(bullet: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_file_refuses_oversized_sparse_input_before_allocating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hostile.md");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_DBMD_FILE_BYTES + 1).unwrap();
+
+        let err = read_file(&path).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData),
+            "oversized file must fail at the metadata gate: {err:?}"
+        );
+    }
     use std::path::Path;
     use tempfile::tempdir;
 

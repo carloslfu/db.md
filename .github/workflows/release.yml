@@ -3,24 +3,25 @@
 # Cross-compile + release pipeline for the single `dbmd` binary
 # (plan: db-md-rust-toolkit.md, Block 8).
 #
-# Four targets, built on runners that match the target arch where possible
-# (no QEMU for the host-arch builds) and via `cross` (Docker) for the one
-# cross-arch case:
+# Four targets, built on native Darwin runners or in digest-pinned `cross`
+# containers for Linux:
 #
 #   darwin-x86_64        x86_64-apple-darwin          macos-13   (Intel runner, native)
 #   darwin-aarch64       aarch64-apple-darwin         macos-14   (Apple Silicon, native)
-#   linux-x86_64-musl    x86_64-unknown-linux-musl    ubuntu     (native + musl-tools)
+#   linux-x86_64-musl    x86_64-unknown-linux-musl    ubuntu     (cross / Docker)
 #   linux-aarch64-musl   aarch64-unknown-linux-musl   ubuntu     (cross / Docker)
 #
 # Per-target output is a tarball `dbmd-<version>-<target>.tar.gz` containing
 # the `dbmd` binary + NOTICE + THIRD_PARTY_NOTICES + LICENSE. A single
 # `SHA256SUMS` manifest covers every tarball (standard `sha256sum -c` format).
 #
-# The `publish` job then creates a GitHub Release on this repo
-# (carloslfu/db.md) carrying every tarball + SHA256SUMS as immutable assets,
-# with a signed SLSA build-provenance attestation. The install script
-# (scripts/install.sh) and Homebrew tap download from those release assets;
-# crates.io is published separately by the `publish-crates` job.
+# CI first builds four retained workflow artifacts. The job that creates the
+# draft release is held behind the protected `release-publishing` environment
+# until the local release controller independently rebuilds and byte-compares
+# all four targets. After approval CI stages and attests the draft, publishes
+# crates.io, then publishes the immutable, non-latest GitHub release. The
+# controller verifies both channels, updates Homebrew through the optimistic
+# GitHub Contents API, and sets `latest` only after full convergence.
 #
 # IMPORTANT (CI-gated, cannot run on a single dev host): cross-platform
 # execution is exercised only by CI runners. The macOS/musl/aarch64 builds and
@@ -52,7 +53,7 @@ env:
 jobs:
   # ── Resolve the version once, so every job agrees on it ──────────────────
   version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
@@ -90,13 +91,36 @@ jobs:
   preflight:
     needs: version
     name: release preflight
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          # The release tag must be proven to descend from the protected main
+          # branch. A shallow tag checkout cannot establish that ancestry.
+          fetch-depth: 0
+
+      - name: Require the release tag to be on protected main
+        if: ${{ github.ref_type == 'tag' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          tagged="$(git rev-parse "${GITHUB_REF}^{commit}")"
+          test "$tagged" = "$GITHUB_SHA" || {
+            echo "::error::trigger SHA $GITHUB_SHA is not the commit named by $GITHUB_REF" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$tagged" origin/main || {
+            echo "::error::release tag $GITHUB_REF_NAME is not reachable from protected main" >&2
+            exit 1
+          }
+          echo "release source: $GITHUB_REF_NAME -> $tagged (ancestor of origin/main)"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
@@ -133,52 +157,84 @@ jobs:
             rust_target: x86_64-apple-darwin
             os: macos-15-intel
             use_cross: false
+            rustflags: '-C link-arg=-Wl,-no_uuid'
           - target_name: darwin-aarch64
             rust_target: aarch64-apple-darwin
             os: macos-14
             use_cross: false
+            rustflags: '-C link-arg=-Wl,-no_uuid'
           - target_name: linux-x86_64-musl
             rust_target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            use_cross: false
+            os: ubuntu-24.04
+            use_cross: true
+            rustflags: ''
           - target_name: linux-aarch64-musl
             rust_target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: true
+            rustflags: ''
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: 1.88.0
           targets: ${{ matrix.rust_target }}
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           key: ${{ matrix.target_name }}
 
-      # musl on the native x86_64 runner needs the musl gcc wrapper + headers.
-      - name: Install musl tools (linux x86_64)
-        if: matrix.target_name == 'linux-x86_64-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      # cross (Docker-based) handles the aarch64-musl sysroot/linker cleanly,
-      # so we never hand-wire a cross GCC. Pinned to a release tag.
-      - name: Install cross (linux aarch64)
+      # cross (Docker-based) handles both musl targets in reviewed immutable
+      # images, avoiding mutable apt repositories and host sysroots.
+      - name: Install cross (linux)
         if: matrix.use_cross
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853
         with:
           tool: cross@0.2.5
 
+      - name: Verify immutable cross image pin (linux)
+        if: matrix.use_cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.rust_target }}" in
+            aarch64-unknown-linux-musl)
+              expected='ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4'
+              ;;
+            x86_64-unknown-linux-musl)
+              expected='ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99'
+              ;;
+            *) exit 1 ;;
+          esac
+          grep -A1 -F "[target.${{ matrix.rust_target }}]" Cross.toml |
+            grep -Fqx "image = \"$expected\"" || {
+            echo "::error::cross image is not pinned to the reviewed OCI digest" >&2
+            exit 1
+          }
+
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
 
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
+
+      - name: Normalize Darwin build metadata for reproducibility
+        if: startsWith(matrix.target_name, 'darwin-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.rust_target }}/release/${BINARY}"
+          xcrun vtool -set-build-version macos 11.0 11.0 \
+            -replace -output "${binary}.normalized" "$binary"
+          mv "${binary}.normalized" "$binary"
+          chmod +x "$binary"
 
       # Assemble the per-target tarball: binary + the three legal files.
       # Tarball name: dbmd-<version>-<target>.tar.gz
@@ -257,8 +313,9 @@ jobs:
   # ── Collect tarballs, build the manifest, create the GitHub Release ─────
   publish:
     needs: [version, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.ref_type == 'tag' }}
+    environment: release-publishing
     permissions:
       contents: write       # create the GitHub Release + upload assets
       id-token: write        # OIDC, for the build-provenance attestation
@@ -306,19 +363,46 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "dir=$rel" >> "$GITHUB_OUTPUT"
 
-      # GitHub Release on carloslfu/db.md with every tarball + the manifest.
-      # softprops/gh-release is the standard immutable-asset path; assets get
-      # stable download URLs the install script's GitHub fallback reads.
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e
-        with:
-          tag_name: v${{ needs.version.outputs.version }}
-          name: dbmd v${{ needs.version.outputs.version }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz
-            release/${{ needs.version.outputs.version }}/SHA256SUMS
+      # Immutable Releases lock assets when a release becomes public. Keep the
+      # release draft-only while assets and attestations are assembled, then
+      # publish exactly once after every preceding gate succeeds.
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+               --json isDraft --jq '.isDraft' >is-draft 2>/dev/null; then
+            if [ "$(cat is-draft)" != "true" ]; then
+              echo "::error::release $tag already exists and is not a draft" >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --verify-tag \
+              --title "dbmd $tag" \
+              --generate-notes
+          fi
+
+      - name: Upload every release asset to the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release/"$VERSION"/dbmd-*.tar.gz release/"$VERSION"/SHA256SUMS)
+          if [ "${#assets[@]}" -ne 5 ]; then
+            echo "::error::expected four tarballs and SHA256SUMS, found ${#assets[@]} assets" >&2
+            exit 1
+          fi
+          gh release upload "v${VERSION}" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
       # Signed SLSA provenance. Anyone can verify a downloaded tarball was
       # built by this CI from this source:
@@ -346,11 +430,55 @@ jobs:
         with:
           subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
 
+      - name: Verify staged draft assets and attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq .isDraft)" = true || {
+            echo "::error::release $tag must remain a draft until crates publish" >&2
+            exit 1
+          }
+          actual="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+              --jq '.assets[].name' |
+              LC_ALL=C sort
+          )"
+          expected="$(
+            printf '%s\n' \
+              SHA256SUMS \
+              "dbmd-${VERSION}-darwin-aarch64.tar.gz" \
+              "dbmd-${VERSION}-darwin-x86_64.tar.gz" \
+              "dbmd-${VERSION}-linux-aarch64-musl.tar.gz" \
+              "dbmd-${VERSION}-linux-x86_64-musl.tar.gz" |
+              LC_ALL=C sort
+          )"
+          test "$actual" = "$expected" || {
+            echo "::error::draft release has an unexpected asset set" >&2
+            printf 'actual:\n%s\n' "$actual" >&2
+            exit 1
+          }
+          (
+            cd "release/${VERSION}"
+            shasum -a 256 -c SHA256SUMS
+            for tarball in dbmd-*.tar.gz; do
+              gh attestation verify "$tarball" \
+                --repo "$GITHUB_REPOSITORY" >/dev/null
+            done
+          )
+
   # ── Publish the crates to crates.io (Trusted Publishing, no stored token) ─
   publish-crates:
     name: Publish to crates.io
     needs: [version, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.ref_type == 'tag' }}
     # The `crates-io` environment binds Trusted Publishing: crates.io only
     # accepts an OIDC publish from a job running in this environment. If the
@@ -363,6 +491,8 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
       # Same packaging guard as publish-check.yml: build each crate from its
       # tarball before any upload, so a packaging bug fails here, not midway.
@@ -392,74 +522,39 @@ jobs:
           publish_if_new dbmd-core   # dependency first; cargo waits for the index
           publish_if_new dbmd-cli
 
-  # ── Update the Homebrew tap formula (no-op without HOMEBREW_TAP_DEPLOY_KEY) ─
-  # Renders HomebrewFormula/dbmd.rb.template with this release's version +
-  # the per-target sha256s from the published SHA256SUMS, then pushes
-  # Formula/dbmd.rb to github.com/carloslfu/homebrew-tap so
-  # `brew install carloslfu/tap/dbmd` tracks the latest release with no
-  # hand-render. Needs `publish` (reads the release's SHA256SUMS).
-  #
-  # Auth: an SSH **deploy key** scoped to the tap repo only (write), stored as
-  # the HOMEBREW_TAP_DEPLOY_KEY secret. Least-privilege by design — unlike a
-  # broad PAT, a leak can only touch the tap, and there is no long-lived
-  # account token in CI. Skips cleanly on forks or when the secret is unset
-  # (the formula is then maintained by hand: HomebrewFormula/render.sh
-  # <version> <SHA256SUMS> > Formula/dbmd.rb).
-  homebrew:
-    name: Update Homebrew tap
-    needs: [version, publish]
-    runs-on: ubuntu-latest
-    if: ${{ github.ref_type == 'tag' && !github.event.repository.fork }}
+  # Publish only after both permanent crates have converged. This release is
+  # intentionally not promoted to `latest`; the local controller does that only
+  # after it independently verifies the four binaries and updates Homebrew.
+  publish-release:
+    name: Publish immutable GitHub release
+    needs: [version, publish-crates]
+    runs-on: ubuntu-24.04
+    if: ${{ github.ref_type == 'tag' }}
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-
-      - name: Check tap deploy key
-        id: tok
-        run: |
-          if [ -z "${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "HOMEBREW_TAP_DEPLOY_KEY unset — skipping tap update"
-          fi
-
-      - name: Download SHA256SUMS from the release
-        if: steps.tok.outputs.skip != 'true'
+      - name: Publish draft without latest promotion
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release download "v${{ needs.version.outputs.version }}" \
-            --repo "${{ github.repository }}" \
-            --pattern 'SHA256SUMS' --dir .
-
-      - name: Render formula
-        if: steps.tok.outputs.skip != 'true'
-        run: |
-          chmod +x HomebrewFormula/render.sh
-          HomebrewFormula/render.sh "${{ needs.version.outputs.version }}" SHA256SUMS > dbmd.rb
-          echo "--- rendered formula ---"
-          cat dbmd.rb
-
-      - name: Push formula to the tap (SSH deploy key)
-        if: steps.tok.outputs.skip != 'true'
-        env:
-          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
-          chmod 600 ~/.ssh/tap_key
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
-          git clone git@github.com:carloslfu/homebrew-tap.git tap-repo
-          mkdir -p tap-repo/Formula
-          cp dbmd.rb tap-repo/Formula/dbmd.rb
-          cd tap-repo
-          git config user.name  "dbmd-release-bot"
-          git config user.email "dbmd-release-bot@users.noreply.github.com"
-          git add Formula/dbmd.rb
-          if git diff --cached --quiet; then
-            echo "no formula changes"
-            exit 0
-          fi
-          git commit -m "dbmd: update to v${{ needs.version.outputs.version }}"
-          git push origin HEAD
-          rm -f ~/.ssh/tap_key
+          tag="v${VERSION}"
+          release_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .id
+          )"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false -f make_latest=false >/dev/null
+          for _ in $(seq 1 10); do
+            immutable="$(
+              gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .immutable
+            )"
+            [ "$immutable" = true ] && exit 0
+            sleep 1
+          done
+          echo "::error::published release $tag did not become immutable" >&2
+          exit 1

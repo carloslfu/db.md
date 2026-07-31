@@ -22,7 +22,7 @@ use dbmd_core::linkmd::{self, LinkError};
 use crate::cli::SubscribeArgs;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
-use crate::sanitize::sanitize;
+use crate::sanitize::sanitize_single_line;
 
 /// Run `dbmd subscribe`.
 pub fn run(ctx: &Context, args: &SubscribeArgs) -> CliResult {
@@ -59,7 +59,11 @@ pub fn run(ctx: &Context, args: &SubscribeArgs) -> CliResult {
             }
             // A hub blip must not kill a follower; a real HTTP answer must.
             Err(LinkError::Transport { hub, message }) => {
-                eprintln!("dbmd: subscribe: hub unreachable at {hub} ({message}); retrying");
+                eprintln!(
+                    "dbmd: subscribe: hub unreachable at {} ({}); retrying",
+                    sanitize_single_line(&hub),
+                    sanitize_single_line(&message)
+                );
             }
             Err(e) => return Err(e.into()),
         }
@@ -76,11 +80,15 @@ fn emit(ctx: &Context, head: &linkmd::Head, prev: u64) {
         // Compact, one object per line: this is a stream, not a document.
         println!("{v}");
     } else if head.seq == prev {
-        println!("{} at feed seq {}", sanitize(&head.brain), head.seq);
+        println!(
+            "{} at feed seq {}",
+            sanitize_single_line(&head.brain),
+            head.seq
+        );
     } else {
         println!(
             "{} advanced: feed seq {} -> {}",
-            sanitize(&head.brain),
+            sanitize_single_line(&head.brain),
             prev,
             head.seq
         );

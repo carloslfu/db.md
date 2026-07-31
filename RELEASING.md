@@ -5,46 +5,54 @@ Written so an agent or a human can run it cold.
 
 ## TL;DR
 
-Bump the version, push `main`, push a `vX.Y.Z` tag. The tag triggers CI,
-which builds all platforms and publishes to crates.io via Trusted Publishing
-(OIDC, no token), then creates the GitHub release. In the intended
-solo-maintainer setup, there is no manual approval step.
+Bump the version and push `main`, then run the release controller. It creates
+or resumes the exact tag/run, independently rebuilds all four release targets
+and byte-compares their binaries before approving publication, then converges
+crates.io, the immutable GitHub release, Homebrew, and finally `latest`.
 
 ```sh
 # 1. bump version (see "Files to bump" below), then:
 git add -A && git commit -m "release: X.Y.Z — <one line>"
 git push origin main          # runs CI checks only — does NOT publish
 
-# 2. tag it — THIS is the publish trigger
-git tag vX.Y.Z
-git push origin vX.Y.Z
+# 2. authorize and cut the release
+scripts/release.sh X.Y.Z
 ```
 
-Then watch the run and verify (see "Verify" below).
+Do not push the tag by hand. Direct tag pushes can build, but the protected
+`release-publishing` environment keeps publication waiting until the local
+controller has reviewed the independent rebuild.
 
 ## What is automatic vs. manual
 
 | Step | Who |
 |---|---|
 | Version bump + changelog | **you / agent** (before tagging) |
-| Build 4 platforms, GitHub release, SHA256SUMS, provenance attestation | CI (`release.yml`, on tag) |
+| Build 4 platforms, draft assets, SHA256SUMS, provenance attestation | CI (`release.yml`, on tag) |
+| Independently rebuild and byte-compare all 4 binaries | local controller, before environment approval |
 | Publish `dbmd-core` then `dbmd-cli` to crates.io via OIDC | CI (`publish-crates` job, on tag) |
-| Bump the Homebrew tap formula (`carloslfu/homebrew-tap`) | CI (`homebrew` job, on tag) when `HOMEBREW_TAP_DEPLOY_KEY` is configured; otherwise it skips cleanly |
-| Approval click | None in the intended solo-maintainer setup; adding required reviewers to the `crates-io` environment turns this into a GitHub approval gate |
+| Publish immutable GitHub release (not latest yet) | CI, only after both crates converge |
+| Bump the Homebrew tap formula (`carloslfu/homebrew-tap`) | local controller via optimistic GitHub Contents API |
+| Promote GitHub release to latest | local controller, final convergence step |
+| Release authorization | protected-environment approval by the authenticated local controller |
 
 Pushing to `main` never publishes. Only a `vX.Y.Z` tag does.
 
-**Homebrew tap:** the `homebrew` job renders `HomebrewFormula/dbmd.rb.template`
-(via `HomebrewFormula/render.sh <version> SHA256SUMS`) and pushes
-`Formula/dbmd.rb` to `carloslfu/homebrew-tap`. It authenticates with an SSH
-**deploy key** scoped to the tap repo only (write), stored as the
-`HOMEBREW_TAP_DEPLOY_KEY` secret on this repo — least-privilege, no broad
-account token in CI. If that secret is absent the job **skips cleanly** and the
-formula can be bumped by hand: `HomebrewFormula/render.sh X.Y.Z SHA256SUMS >
-Formula/dbmd.rb` (download `SHA256SUMS` from the release first), then commit to
-the tap. To rotate: generate a new ed25519 pair, replace the tap's deploy key
-(tap repo → Settings → Deploy keys) and the `HOMEBREW_TAP_DEPLOY_KEY` secret on
-this repo.
+**Homebrew tap:** CI has no tap credential and no Homebrew publishing job. The
+controller renders `HomebrewFormula/dbmd.rb.template` only after the immutable
+release and exact crates.io checksums verify, then updates `Formula/dbmd.rb`
+using the maintainer's existing `gh` session. The current blob SHA is the
+optimistic concurrency token. The returned commit must descend directly from
+the reviewed tap head, tap `main` must equal that commit, and its bytes are read
+back exactly. A killed controller leaves no deploy key or environment secret.
+
+The controller also asserts GitHub release immutability before it creates the
+tag. Before approval it downloads the four CI artifacts, rebuilds both Darwin
+targets with normalized Mach-O build metadata and both musl targets in
+digest-pinned `cross` images, and byte-compares each binary plus legal files.
+After CI completes it verifies the tag-to-SHA binding, exact five-asset set,
+SHA256 manifest, every provenance attestation, exact local-vs-crates.io package
+checksums, and the resulting tap formula.
 
 ## Files to bump (must all agree on the version)
 
@@ -74,10 +82,11 @@ you tag. CI runs the same check (`publish-check.yml`) on every push.
 ## Verify after the tag
 
 ```sh
-gh run list --workflow=release.yml --limit 1      # find the run
-gh run watch <run-id>                             # all jobs should go green
 gh release view vX.Y.Z                            # 4 tarballs + SHA256SUMS attached
 ```
+
+`scripts/release.sh` does not return success until the workflow and the
+post-release verification are green.
 
 Then confirm on the web (crates.io rate-limits scripted curl — use a browser):
 
@@ -101,13 +110,18 @@ the version and contents right before tagging. There is no un-publish.
   Environments). It binds the OIDC trust — crates.io only accepts a publish
   from a job running in that environment. The intended solo-maintainer setup has
   no required reviewers, so publishing is hands-off.
-- **To re-add a manual approval gate** (e.g. if more maintainers join): repo →
-  Settings → Environments → `crates-io` → add yourself/others as Required
-  reviewers. The publish job will then wait for a one-click approval per release.
+- The **`release-publishing` environment** has the authenticated maintainer as
+  required reviewer. The controller idempotently reconciles that policy and
+  approves the exact pending deployment only after independent rebuild
+  verification. There is no `DBMD_RELEASE_AUTH`, Homebrew secret, or deploy key
+  to leak.
 
 ## If a release half-fails
 
-The `publish-crates` job is **idempotent** — it skips any version already on
-crates.io. So if `dbmd-core` published but `dbmd-cli` failed (e.g. a transient
-index lag), just re-run the failed job (`gh run rerun <run-id> --failed`) or
-re-push the tag; it won't double-publish core.
+Run `scripts/release.sh X.Y.Z` again. The controller accepts an existing tag
+only when it names the exact reviewed `main` commit. It finds the bound
+workflow, reruns failed jobs when necessary, re-verifies the four rebuilds
+before a new approval, treats already-published crates as idempotent only after
+exact checksum comparison, treats an already matching tap formula as a no-op,
+and promotes `latest` only after every channel has converged. Never cut a patch
+version merely to recover a transient channel failure.

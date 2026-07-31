@@ -10,11 +10,11 @@
 //! move, leaving the store half-renamed: file gone from `<old>`, some linkers
 //! dangling at `[[old]]`, both folder indexes stale.
 //!
-//! The fix reorders the operation — every linker is rewritten while the file
-//! still sits at `<old>`, and the move happens LAST, only once every rewrite
-//! committed — and skips a non-UTF8 linker (with a warning) instead of hard
-//! aborting. These tests reconstruct the exact triggers and assert the corrected
-//! behavior; each WOULD FAIL against the pre-fix code.
+//! The fix prepares every byte first and commits through a durable forward-
+//! recovery journal. Invalid UTF-8 outside a wiki-link is preserved exactly
+//! while the live target is rewritten at the byte level, so no linker is
+//! skipped and left dangling. These tests reconstruct the exact triggers and
+//! assert the corrected behavior; each WOULD FAIL against the pre-fix code.
 //!
 //! Driven end-to-end through the compiled `dbmd` binary against throwaway temp
 //! stores (the same shape as `tests/writers.rs`), never touching the committed
@@ -122,14 +122,14 @@ impl Output {
 ///   - the rename SUCCEEDS (exit 0) instead of aborting,
 ///   - the file actually moved to `<new>` and is gone from `<old>`,
 ///   - the clean linker WAS rewritten to `[[new]]`,
-///   - the non-UTF8 linker is skipped (its bytes survive untouched) and its
-///     skip is surfaced as a non-fatal warning.
+///   - the non-UTF8 linker's target is rewritten while its invalid prose byte is
+///     preserved exactly.
 ///
 /// Pre-fix this test fails two ways at once: the command exits non-zero (the
 /// `?` propagates `InvalidData`), and even the move-then-abort path leaves the
 /// store inconsistent — neither of which can happen now.
 #[test]
-fn regression_rename_skips_non_utf8_linker_and_completes_consistently() {
+fn regression_rename_rewrites_non_utf8_linker_without_byte_loss() {
     let store = Store::new();
     store.seed(
         "records/contacts/sarah.md",
@@ -166,9 +166,7 @@ fn regression_rename_skips_non_utf8_linker_and_completes_consistently() {
         out.stderr
     );
 
-    // The file actually moved — no half-state where it is gone but linkers
-    // dangle. (Pre-fix the move happened too, but the loop then aborted; here
-    // the move is the LAST step and only runs because every rewrite committed.)
+    // The file actually moved with no final dangling linker.
     assert!(
         !store.abs("records/contacts/sarah.md").exists(),
         "source must be moved away from <old>"
@@ -189,40 +187,32 @@ fn regression_rename_skips_non_utf8_linker_and_completes_consistently() {
         "clean linker must no longer reference the old path; got: {clean}"
     );
 
-    // The non-UTF8 linker is skipped: its bytes are untouched (still the old
-    // link + the stray byte) and the skip is reported as a non-fatal warning.
+    // The non-UTF8 linker is retargeted without decoding/re-encoding unrelated
+    // bytes. The lone Latin-1 byte remains exact.
     let bad_after = std::fs::read(store.abs("sources/import/dropped.md")).unwrap();
-    assert_eq!(
-        bad_after, bad,
-        "the skipped non-UTF8 linker must be left byte-for-byte unchanged"
-    );
+    let mut expected_bad = Vec::new();
+    expected_bad.extend_from_slice(b"---\ntype: source\nsummary: s\n---\n");
+    expected_bad.extend_from_slice(b"Ref [[records/contacts/sarah-chen]] here. caf");
+    expected_bad.push(0xE9);
+    expected_bad.push(b'\n');
     assert!(
-        out.stderr.contains("non-UTF8") && out.stderr.contains("sources/import/dropped.md"),
-        "a skipped non-UTF8 linker must surface a warning naming it; stderr: {}",
-        out.stderr
+        bad_after == expected_bad,
+        "only the wiki-link target may change in non-UTF8 content"
     );
 
-    // The reported rewrite count covers ONLY the linker that actually changed
-    // (the clean one), not the skipped non-UTF8 file.
+    // Both authored linkers changed.
     let v = out.stdout_json();
-    assert_eq!(
-        v["links_rewritten"], 1,
-        "only the clean linker counts as rewritten"
-    );
+    assert_eq!(v["links_rewritten"], 2);
 }
 
-/// Finding #6 — the ordering invariant in isolation: the file move is the LAST
-/// mutation, so when a linker rewrite would otherwise be a problem the source
-/// file is never stranded. This test pins the *positive* guarantee that the
-/// fix's reordering provides: with a non-UTF8 linker present, the OTHER linkers
-/// are still correctly rewritten AND the move still happens — i.e. one bad
-/// externally-dropped source cannot corrupt a rename of an unrelated record.
+/// Finding #6 — a non-UTF8 linker encountered before another linker cannot
+/// abort preparation. Both are retargeted before the journal is claimed.
 ///
 /// Pre-fix, the very first non-UTF8 linker encountered in BTreeSet order
 /// (`sources/a-import.md` sorts before `sources/z-late.md`) would abort the
 /// loop, so the `sources/z-late.md` linker that sorts AFTER it would be left
-/// dangling at `[[old]]` while the file had already moved. Post-fix every clean
-/// linker is rewritten regardless of where the bad one falls in iteration order.
+/// dangling at `[[old]]` while the file had already moved. Post-fix both linkers
+/// are rewritten regardless of their iteration order.
 #[test]
 fn regression_rename_non_utf8_linker_does_not_strand_later_linkers() {
     let store = Store::new();
@@ -264,18 +254,26 @@ fn regression_rename_non_utf8_linker_does_not_strand_later_linkers() {
         late.contains("[[records/contacts/sarah-chen|Sarah]]"),
         "a clean linker sorting after a non-UTF8 linker must still be rewritten; got: {late}"
     );
+    let bad_after = std::fs::read(store.abs("sources/a-import.md")).unwrap();
+    assert!(
+        bad_after
+            .windows(b"[[records/contacts/sarah-chen]]".len())
+            .any(|window| window == b"[[records/contacts/sarah-chen]]"),
+        "the earlier non-UTF8 linker must also be retargeted"
+    );
+    assert!(
+        bad_after.contains(&0xFF),
+        "the invalid byte must be preserved"
+    );
 
     // And the move completed.
     assert!(!store.abs("records/contacts/sarah.md").exists());
     assert!(store.abs("records/contacts/sarah-chen.md").exists());
 }
 
-/// Finding #6 — the self-link case must keep working after the reorder. A file
-/// that links to ITSELF is in `find_links_to`'s result; the fix rewrites it
-/// in place at `<old>` (the move hasn't happened yet) and then the deferred
-/// move carries the rewritten file to `<new>`. Final state: the file at `<new>`
-/// with a `[[new]]` self-link. This guards against the reorder regressing the
-/// self-link path (e.g. trying to rewrite at the post-move path before the move).
+/// Finding #6 — the self-link is part of the staged source itself. Final state:
+/// the file at `<new>` carries a `[[new]]` self-link, and no intermediate commit
+/// step can publish a new source with the old self-target.
 #[test]
 fn regression_rename_rewrites_self_link_through_the_deferred_move() {
     let store = Store::new();

@@ -151,8 +151,7 @@ pub fn walk_rels(store: &Store) -> crate::Result<Vec<PathBuf>> {
 /// the lenient-degrade contract is the module's, identical under
 /// [`compute`] and per-file use.
 pub fn emit_file(store: &Store, rel: &Path) -> crate::Result<EmittedFile> {
-    let abs = store.abs_path(rel);
-    let bytes = std::fs::read(&abs)?;
+    let bytes = store.read_bounded(rel, crate::parser::MAX_DBMD_FILE_BYTES)?;
     let sha256 = sha256_hex(&bytes);
 
     // Decode lossily: `sources/` is preserved verbatim per the SPEC and can
@@ -165,7 +164,7 @@ pub fn emit_file(store: &Store, rel: &Path) -> crate::Result<EmittedFile> {
     // tolerance identical to every write surface). A file with no block — or
     // an unterminated one — is still a complete dump member: empty
     // frontmatter, the whole text as body.
-    let (yaml, body) = match split_frontmatter(&text, &abs) {
+    let (yaml, body) = match split_frontmatter(&text, rel) {
         Ok(parsed) => (parsed.frontmatter_yaml, parsed.body),
         Err(_) => (String::new(), text.clone().into_owned()),
     };

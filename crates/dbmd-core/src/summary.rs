@@ -412,7 +412,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path().to_path_buf();
         fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").expect("write DB.md");
-        let store = Store { root, config };
+        let store = Store::from_root_and_config(&root, config).unwrap();
         (tmp, store)
     }
 

@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::cli::ResolveArgs;
 use crate::context::Context;
 use crate::error::CliResult;
-use crate::sanitize::sanitize;
+use crate::sanitize::{sanitize, sanitize_single_line};
 
 /// Run `dbmd resolve`.
 pub fn run(ctx: &Context, args: &ResolveArgs) -> CliResult {
@@ -80,7 +80,7 @@ pub fn run(ctx: &Context, args: &ResolveArgs) -> CliResult {
 fn print_field(v: &Value, key: &str, label: &str) {
     if let Some(s) = v.get(key).and_then(Value::as_str) {
         if !s.is_empty() {
-            println!("{label}: {}", sanitize(s));
+            println!("{label}: {}", sanitize_single_line(s));
         }
     }
 }

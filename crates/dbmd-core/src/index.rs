@@ -16,17 +16,10 @@
 //!
 //! # Implementation notes (deviations the reader should know)
 //!
-//! - **Self-contained, by design.** This module does its own shard-aware folder
-//!   walk, its own minimal frontmatter read, and its own atomic write, using
-//!   only `store.root` (a public field) and the `serde_norway` / `serde_json` /
-//!   `chrono` / `walkdir` crates rather than routing through the sibling
-//!   `store`/`parser` helpers ([`Store::walk_type_folder`],
-//!   [`Store::recent_in_type_folder`], [`parser::read_file`], …). The index has
-//!   to stamp a *deterministic* `updated:` and emit a *canonical, compacted*
-//!   `index.jsonl` (see the two notes below); keeping the read/walk/write local
-//!   is what makes the byte-identity invariant a true byte comparison, free of
-//!   any incidental formatting the shared readers might introduce. The public
-//!   signatures in `lib.rs` are untouched.
+//! - **Deterministic but capability-relative.** The module owns its canonical
+//!   rendering and compaction rules, while every walk/read/write is routed
+//!   through the already-opened [`Store`] capability. This preserves the byte
+//!   identity invariant without reopening a mutable root pathname.
 //! - **Deterministic `updated:` on the index files themselves.** An index's own
 //!   `updated` frontmatter is derived as the max `updated` over the files it
 //!   catalogs (max over children for root/layer) — NOT wall-clock-now. This is
@@ -50,8 +43,7 @@
 //!   SPEC example that wrote `scope: folder`.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write as _;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, SecondsFormat};
@@ -141,11 +133,8 @@ impl Index {
     /// validate-detectable issue (the index never invents summaries).
     pub fn build_type_folder(store: &Store, type_folder: &Path) -> crate::Result<Index> {
         let rel = normalize_rel(type_folder);
-        let abs = store.root.join(&rel);
         let mut records = Vec::new();
-        for file_abs in walk_type_folder_files(store, &abs) {
-            let rel_path =
-                rel_to_store(&store.root, &file_abs).expect("walked file is under the store root");
+        for rel_path in walk_type_folder_files(store, &rel) {
             // Abort the build on a malformed file rather than skip it. A skipped
             // file would still be a content member the validator requires to be
             // catalogued (`validate::walk_content_files` enumerates by filename,
@@ -157,7 +146,7 @@ impl Index {
             // canonical sidecars (`min_depth(2)`), so an aborted rebuild leaves
             // the existing catalogs intact and the operator a clear error naming
             // the file to fix — never a destroyed or silently-wrong index.
-            records.push(record_from_file(&file_abs, rel_path)?);
+            records.push(record_from_store(store, &rel_path, rel_path.clone())?);
         }
         sort_records(&mut records);
         Ok(Index {
@@ -178,21 +167,18 @@ impl Index {
     pub fn build_layer(store: &Store, layer: Layer) -> crate::Result<Index> {
         let mut child_counts = BTreeMap::new();
         for tf in type_folders_in_layer(store, layer) {
-            let abs = store.root.join(&tf);
-            let n = walk_type_folder_files(store, &abs).len();
+            let n = walk_type_folder_files(store, &tf).len();
             if n > 0 {
                 child_counts.insert(tf, n);
             }
         }
         let mut records = Vec::new();
-        for file_abs in loose_files_in_layer(store, layer) {
-            let rel_path =
-                rel_to_store(&store.root, &file_abs).expect("walked file is under the store root");
+        for rel_path in loose_files_in_layer(store, layer) {
             // Abort on a malformed loose file rather than skip it, mirroring
             // `build_type_folder`: a skipped file is still a content member the
             // validator requires to be catalogued, so dropping it would leave a
             // permanently-invalid index. The loud `?` names the file to fix.
-            records.push(record_from_file(&file_abs, rel_path)?);
+            records.push(record_from_store(store, &rel_path, rel_path.clone())?);
         }
         sort_records(&mut records);
         Ok(Index {
@@ -208,8 +194,7 @@ impl Index {
         let mut child_counts = BTreeMap::new();
         for layer in Layer::all() {
             for tf in type_folders_in_layer(store, layer) {
-                let abs = store.root.join(&tf);
-                let n = walk_type_folder_files(store, &abs).len();
+                let n = walk_type_folder_files(store, &tf).len();
                 if n > 0 {
                     child_counts.insert(tf, n);
                 }
@@ -365,15 +350,14 @@ impl Index {
         if let Some(layer) = loose_layer_of(&file_rel) {
             return apply_loose_change(store, layer, &file_rel, false);
         }
-        let file_abs = store.root.join(&file_rel);
         let folder = type_folder_of(&file_rel)
             .ok_or_else(|| bad_index(&file_rel, "file is not inside a layer/type-folder"))?;
-        let record = record_from_file(&file_abs, file_rel.clone())?;
+        let record = record_from_store(store, &file_rel, file_rel.clone())?;
 
         // Serialize the sidecar read-modify-write so concurrent sanctioned
         // writes to this folder don't clobber each other's rows (lost update).
-        let _lock = FolderLock::acquire(&store.root.join(&folder));
-        let mut records = read_jsonl_records(&store.root.join(&folder).join("index.jsonl"))?;
+        let _lock = FolderLock::acquire(store, &folder)?;
+        let mut records = read_jsonl_records(store, &folder.join("index.jsonl"))?;
         records.retain(|r| r.path != record.path);
         records.push(record);
         sort_records(&mut records);
@@ -413,16 +397,15 @@ impl Index {
         // Serialize the sidecar read-modify-write(s). For a cross-folder rename,
         // lock BOTH folders, always in sorted order, so two renames touching the
         // same pair can't deadlock. Held for the whole operation via RAII.
-        let _locks = lock_folders(store, &old_folder, &new_folder);
+        let _locks = lock_folders(store, &old_folder, &new_folder)?;
 
         // Drop from the old folder.
-        let mut old_records =
-            read_jsonl_records(&store.root.join(&old_folder).join("index.jsonl"))?;
+        let mut old_records = read_jsonl_records(store, &old_folder.join("index.jsonl"))?;
         old_records.retain(|r| r.path != old_rel);
 
         if old_folder == new_folder {
             // Same folder: re-read the (now-renamed) file and upsert.
-            let record = record_from_file(&store.root.join(&new_rel), new_rel.clone())?;
+            let record = record_from_store(store, &new_rel, new_rel.clone())?;
             old_records.retain(|r| r.path != record.path);
             old_records.push(record);
             sort_records(&mut old_records);
@@ -436,9 +419,8 @@ impl Index {
         sort_records(&mut old_records);
         write_type_folder_artifacts(store, &old_folder, &old_records)?;
 
-        let record = record_from_file(&store.root.join(&new_rel), new_rel.clone())?;
-        let mut new_records =
-            read_jsonl_records(&store.root.join(&new_folder).join("index.jsonl"))?;
+        let record = record_from_store(store, &new_rel, new_rel.clone())?;
+        let mut new_records = read_jsonl_records(store, &new_folder.join("index.jsonl"))?;
         new_records.retain(|r| r.path != record.path);
         new_records.push(record);
         sort_records(&mut new_records);
@@ -467,8 +449,8 @@ impl Index {
         let folder = type_folder_of(&file_rel)
             .ok_or_else(|| bad_index(&file_rel, "file is not inside a layer/type-folder"))?;
         // Serialize the sidecar read-modify-write (see `on_write`).
-        let _lock = FolderLock::acquire(&store.root.join(&folder));
-        let mut records = read_jsonl_records(&store.root.join(&folder).join("index.jsonl"))?;
+        let _lock = FolderLock::acquire(store, &folder)?;
+        let mut records = read_jsonl_records(store, &folder.join("index.jsonl"))?;
         let before = records.len();
         records.retain(|r| r.path != file_rel);
         if records.len() == before {
@@ -495,11 +477,12 @@ impl Index {
                 write_type_folder_artifacts(store, &tf, &idx.records)?;
             }
             let layer_idx = Index::build_layer(store, layer)?;
-            let layer_index_md = store.root.join(layer_dir_name(layer)).join("index.md");
+            let layer_index_md = PathBuf::from(layer_dir_name(layer)).join("index.md");
             if layer_idx.child_counts.is_empty() {
-                remove_if_exists(&layer_index_md)?;
+                remove_if_exists(store, &layer_index_md)?;
             } else {
                 write_atomic(
+                    store,
                     &layer_index_md,
                     render_layer_md_with_store(store, &layer_idx),
                 )?;
@@ -510,11 +493,15 @@ impl Index {
             write_layer_jsonl(store, layer, &layer_idx.records)?;
         }
         let root_idx = Index::build_root(store)?;
-        let root_index_md = store.root.join("index.md");
+        let root_index_md = PathBuf::from("index.md");
         if root_idx.child_counts.is_empty() {
-            remove_if_exists(&root_index_md)?;
+            remove_if_exists(store, &root_index_md)?;
         } else {
-            write_atomic(&root_index_md, render_root_md_with_store(store, &root_idx))?;
+            write_atomic(
+                store,
+                &root_index_md,
+                render_root_md_with_store(store, &root_idx),
+            )?;
         }
         Ok(())
     }
@@ -536,29 +523,29 @@ impl Index {
             IndexLevel::TypeFolder(folder) => {
                 let idx = Index::build_type_folder(store, folder)?;
                 if idx.records.is_empty() {
-                    remove_if_exists(&store.root.join(folder).join("index.md"))?;
-                    remove_if_exists(&store.root.join(folder).join("index.jsonl"))?;
+                    remove_if_exists(store, &folder.join("index.md"))?;
+                    remove_if_exists(store, &folder.join("index.jsonl"))?;
                 } else {
                     write_type_folder_artifacts(store, folder, &idx.records)?;
                 }
             }
             IndexLevel::Layer(layer) => {
                 let idx = Index::build_layer(store, *layer)?;
-                let p = store.root.join(layer_dir_name(*layer)).join("index.md");
+                let p = PathBuf::from(layer_dir_name(*layer)).join("index.md");
                 if idx.child_counts.is_empty() {
-                    remove_if_exists(&p)?;
+                    remove_if_exists(store, &p)?;
                 } else {
-                    write_atomic(&p, render_layer_md_with_store(store, &idx))?;
+                    write_atomic(store, &p, render_layer_md_with_store(store, &idx))?;
                 }
                 write_layer_jsonl(store, *layer, &idx.records)?;
             }
             IndexLevel::Root => {
                 let idx = Index::build_root(store)?;
-                let p = store.root.join("index.md");
+                let p = PathBuf::from("index.md");
                 if idx.child_counts.is_empty() {
-                    remove_if_exists(&p)?;
+                    remove_if_exists(store, &p)?;
                 } else {
-                    write_atomic(&p, render_root_md_with_store(store, &idx))?;
+                    write_atomic(store, &p, render_root_md_with_store(store, &idx))?;
                 }
             }
         }
@@ -613,36 +600,31 @@ impl Index {
     ///   filename alone silently deleted such records on the next rebuild.
     pub fn cleanup(store: &Store) -> crate::Result<()> {
         for layer in Layer::all() {
-            let layer_dir = store.root.join(layer_dir_name(layer));
-            if !layer_dir.is_dir() {
+            let layer_dir = PathBuf::from(layer_dir_name(layer));
+            if !store.directory_exists(&layer_dir).unwrap_or(false) {
                 continue;
             }
             for tf in type_folders_in_layer(store, layer) {
-                let tf_abs = store.root.join(&tf);
                 // Any generated index inside a shard (below the type-folder
                 // root) is non-canonical: delete it. Never touch a user content
                 // file that merely happens to be named index.md.
-                for entry in walkdir::WalkDir::new(&tf_abs)
-                    .min_depth(2)
-                    .follow_links(true)
-                    .into_iter()
-                    .filter_entry(|entry| store.owns_path(entry.path()))
-                    .filter_map(|e| e.ok())
-                {
-                    let p = entry.path();
-                    if is_index_artifact(p) && is_deletable_catalog_artifact(p) {
-                        remove_if_exists(p)?;
+                for p in store.walk_regular_files(&tf)? {
+                    if p.components().count() >= tf.components().count() + 2
+                        && is_index_artifact(&p)
+                        && is_deletable_catalog_artifact(store, &p)
+                    {
+                        remove_if_exists(store, &p)?;
                     }
                 }
                 // Empty type-folder → no index at its root either. Same content
                 // guard: an `index.md` here that is actually a user record (the
                 // only file in the folder) is preserved, not deleted.
-                if walk_type_folder_files(store, &tf_abs).is_empty() {
-                    let md = tf_abs.join("index.md");
-                    if is_deletable_catalog_artifact(&md) {
-                        remove_if_exists(&md)?;
+                if walk_type_folder_files(store, &tf).is_empty() {
+                    let md = tf.join("index.md");
+                    if is_deletable_catalog_artifact(store, &md) {
+                        remove_if_exists(store, &md)?;
                     }
-                    remove_if_exists(&tf_abs.join("index.jsonl"))?;
+                    remove_if_exists(store, &tf.join("index.jsonl"))?;
                 }
             }
         }
@@ -662,12 +644,11 @@ fn write_type_folder_artifacts(
     folder: &Path,
     records: &[IndexRecord],
 ) -> crate::Result<()> {
-    let folder_abs = store.root.join(folder);
-    let md_path = folder_abs.join("index.md");
-    let jsonl_path = folder_abs.join("index.jsonl");
+    let md_path = folder.join("index.md");
+    let jsonl_path = folder.join("index.jsonl");
     if records.is_empty() {
-        remove_if_exists(&md_path)?;
-        remove_if_exists(&jsonl_path)?;
+        remove_if_exists(store, &md_path)?;
+        remove_if_exists(store, &jsonl_path)?;
         return Ok(());
     }
     let idx = Index {
@@ -675,8 +656,8 @@ fn write_type_folder_artifacts(
         records: records.to_vec(),
         child_counts: BTreeMap::new(),
     };
-    write_atomic(&md_path, idx.to_markdown())?;
-    write_atomic(&jsonl_path, idx.to_jsonl())?;
+    write_atomic(store, &md_path, idx.to_markdown())?;
+    write_atomic(store, &jsonl_path, idx.to_jsonl())?;
     Ok(())
 }
 
@@ -725,7 +706,7 @@ fn update_parents(store: &Store, folder: &Path) -> crate::Result<()> {
     // order is always type-folder(s) → root, and nothing acquires the root lock
     // before a type-folder lock, so this cannot deadlock with the per-folder
     // locks held by the caller.
-    let _root_lock = FolderLock::acquire(&store.root);
+    let _root_lock = FolderLock::acquire(store, Path::new(""))?;
     let stats = collect_child_stats(store, &Layer::all())?;
 
     let layer = folder
@@ -734,24 +715,26 @@ fn update_parents(store: &Store, folder: &Path) -> crate::Result<()> {
         .and_then(|c| c.as_os_str().to_str())
         .and_then(layer_from_dir_name);
     if let Some(layer) = layer {
-        let p = store.root.join(layer_dir_name(layer)).join("index.md");
+        let p = PathBuf::from(layer_dir_name(layer)).join("index.md");
         if layer_has_children(&stats, layer) {
             write_atomic(
+                store,
                 &p,
                 render_layer_md_from_stats(layer, &stats, &store.config.folders),
             )?;
         } else {
-            remove_if_exists(&p)?;
+            remove_if_exists(store, &p)?;
         }
     }
-    let rp = store.root.join("index.md");
+    let rp = PathBuf::from("index.md");
     if stats.values().any(|s| s.count > 0) {
         write_atomic(
+            store,
             &rp,
             render_root_md_from_stats(&stats, &store.config.folders),
         )?;
     } else {
-        remove_if_exists(&rp)?;
+        remove_if_exists(store, &rp)?;
     }
     Ok(())
 }
@@ -869,7 +852,7 @@ fn render_layer_md_with_store(store: &Store, idx: &Index) -> String {
     let mut max_upd: Option<DateTime<FixedOffset>> = None;
     let mut entries = String::new();
     for (tf, n) in &idx.child_counts {
-        let recs = read_jsonl_records(&store.root.join(tf).join("index.jsonl")).unwrap_or_default();
+        let recs = read_jsonl_records(store, &tf.join("index.jsonl")).unwrap_or_default();
         let newest = recs.first();
         if let Some(u) = newest.and_then(|r| r.updated) {
             max_upd = Some(match max_upd {
@@ -902,7 +885,7 @@ fn render_layer_md_with_store(store: &Store, idx: &Index) -> String {
 fn render_root_md_with_store(store: &Store, idx: &Index) -> String {
     let mut max_upd: Option<DateTime<FixedOffset>> = None;
     for tf in idx.child_counts.keys() {
-        let recs = read_jsonl_records(&store.root.join(tf).join("index.jsonl")).unwrap_or_default();
+        let recs = read_jsonl_records(store, &tf.join("index.jsonl")).unwrap_or_default();
         if let Some(u) = recs.first().and_then(|r| r.updated) {
             max_upd = Some(match max_upd {
                 Some(cur) if cur >= u => cur,
@@ -987,26 +970,24 @@ fn sort_records(records: &mut [IndexRecord]) {
 }
 
 impl IndexRecord {
-    /// Build the [`IndexRecord`] a freshly-rebuilt `index.jsonl` *should* hold
-    /// for the file at `abs` (catalogued under store-relative `rel`).
-    ///
-    /// This is the single canonical projection from frontmatter → sidecar
-    /// record: [`Index::build_type_folder`] uses the same path to write the
-    /// jsonl, so the validator can rebuild the expected record here and compare
-    /// it field-for-field against the committed line — covering **every**
-    /// queryable/dedup field the query path reads (`summary`, `type`, `tags`,
-    /// `links`, `created`, `updated`, and every type-specific `fields` entry
-    /// like `email` / `domain` / `company` / `amount` / `vendor`) without the
-    /// validator hand-rolling (and drifting from) the projection per field.
-    pub(crate) fn expected_from_file(abs: &Path, rel: PathBuf) -> crate::Result<IndexRecord> {
-        record_from_file(abs, rel)
+    /// Build the [`IndexRecord`] a freshly-rebuilt `index.jsonl` should hold
+    /// from a file read through the store's retained capability.
+    pub(crate) fn expected_from_store(
+        store: &Store,
+        path: &Path,
+        rel: PathBuf,
+    ) -> crate::Result<IndexRecord> {
+        record_from_store(store, path, rel)
     }
 }
 
-/// Build an [`IndexRecord`] from a file on disk. Missing `summary` →
-/// [`MISSING_SUMMARY`] placeholder (the index never invents a summary).
-fn record_from_file(abs: &Path, rel: PathBuf) -> crate::Result<IndexRecord> {
-    let mut meta = read_frontmatter(abs)?;
+fn record_from_store(store: &Store, path: &Path, rel: PathBuf) -> crate::Result<IndexRecord> {
+    let bytes = store.read_bounded(path, crate::parser::MAX_DBMD_FILE_BYTES)?;
+    let meta = read_frontmatter_bytes(&bytes, path)?;
+    record_from_meta(meta, rel)
+}
+
+fn record_from_meta(mut meta: FileMeta, rel: PathBuf) -> crate::Result<IndexRecord> {
     // Records carry an effective `meta-type` in the catalog: the declared value
     // (already spilled into `fields` by `read_frontmatter`), or the default
     // `fact` when absent — so `--where meta-type=fact` sees un-annotated records.
@@ -1052,15 +1033,14 @@ struct FileMeta {
 /// file, taking a whole `rebuild_all` / write-through down with it). The
 /// frontmatter itself is expected to be UTF-8; if it isn't, `U+FFFD` markers
 /// surface in the parsed values rather than a hard abort.
-fn read_frontmatter(abs: &Path) -> crate::Result<FileMeta> {
-    let bytes = fs::read(abs)?;
-    let yaml = extract_frontmatter_block_lossy(&bytes).unwrap_or_default();
+fn read_frontmatter_bytes(bytes: &[u8], display_path: &Path) -> crate::Result<FileMeta> {
+    let yaml = extract_frontmatter_block_lossy(bytes).unwrap_or_default();
     let map: serde_norway::Mapping = if yaml.trim().is_empty() {
         serde_norway::Mapping::new()
     } else {
         serde_norway::from_str(&yaml).map_err(|e| {
             crate::Error::Store(crate::store::StoreError::BadTypeIndex {
-                path: abs.to_path_buf(),
+                path: display_path.to_path_buf(),
                 message: format!("frontmatter YAML: {e}"),
             })
         })?
@@ -1257,8 +1237,8 @@ fn max_updated<'a>(
 /// Read a type-folder's `index.jsonl` into records, applying last-write-wins by
 /// `path` over any un-compacted lines (so a half-compacted jsonl still reads
 /// cleanly). Missing file → empty set. Returns records in canonical order.
-fn read_jsonl_records(jsonl: &Path) -> crate::Result<Vec<IndexRecord>> {
-    let text = match fs::read_to_string(jsonl) {
+fn read_jsonl_records(store: &Store, jsonl: &Path) -> crate::Result<Vec<IndexRecord>> {
+    let text = match store.read_text_bounded(jsonl, crate::parser::MAX_DBMD_FILE_BYTES) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
@@ -1303,8 +1283,8 @@ struct FolderStat {
 /// byte-identical to [`read_jsonl_records`]`.len()` and `newest` to its
 /// `.first()`, so a rollup built from these stats matches the from-scratch
 /// builders byte-for-byte.
-fn read_folder_stat(jsonl: &Path) -> crate::Result<FolderStat> {
-    let text = match fs::read_to_string(jsonl) {
+fn read_folder_stat(store: &Store, jsonl: &Path) -> crate::Result<FolderStat> {
+    let text = match store.read_text_bounded(jsonl, crate::parser::MAX_DBMD_FILE_BYTES) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FolderStat::default()),
         Err(e) => return Err(e.into()),
@@ -1365,7 +1345,7 @@ fn collect_child_stats(
     let mut stats = BTreeMap::new();
     for &layer in layers {
         for tf in type_folders_in_layer(store, layer) {
-            let stat = read_folder_stat(&store.root.join(&tf).join("index.jsonl"))?;
+            let stat = read_folder_stat(store, &tf.join("index.jsonl"))?;
             if stat.count > 0 {
                 stats.insert(tf, stat);
             }
@@ -1376,51 +1356,24 @@ fn collect_child_stats(
 
 /// Walk a type-folder's `.md` content files, recursing through date-shards,
 /// excluding the `index.md` artifact itself and any hidden entries.
-fn walk_type_folder_files(store: &Store, folder_abs: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if !folder_abs.is_dir() {
-        return out;
-    }
-    for entry in walkdir::WalkDir::new(folder_abs)
-        .follow_links(true)
-        .into_iter()
-        .filter_entry(|e| !is_hidden(e.file_name()) && store.owns_path(e.path()))
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        if p.file_name().and_then(|n| n.to_str()) == Some("index.md") {
-            continue;
-        }
-        out.push(p.to_path_buf());
-    }
-    out
+fn walk_type_folder_files(store: &Store, folder: &Path) -> Vec<PathBuf> {
+    store.walk_type_folder(folder).unwrap_or_default()
 }
 
 /// The immediate type-folders under a layer (one directory level below the
 /// layer dir), as store-relative paths. Hidden dirs and `log/` are skipped.
 fn type_folders_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
-    let layer_dir = store.root.join(layer_dir_name(layer));
     let mut out = Vec::new();
-    let rd = match fs::read_dir(&layer_dir) {
-        Ok(rd) => rd,
+    let names = match store.directory_names(Path::new(layer_dir_name(layer))) {
+        Ok(names) => names,
         Err(_) => return out,
     };
-    for entry in rd.flatten() {
-        if !entry.path().is_dir() || !store.owns_path(&entry.path()) {
-            continue;
-        }
-        let name = entry.file_name();
+    for name in names {
         let name = match name.to_str() {
             Some(n) => n,
             None => continue,
         };
-        if is_hidden(entry.file_name().as_os_str()) || name == "log" {
+        if is_hidden(std::ffi::OsStr::new(name)) || name == "log" {
             continue;
         }
         out.push(PathBuf::from(layer_dir_name(layer)).join(name));
@@ -1448,21 +1401,17 @@ fn loose_layer_of(file_rel: &Path) -> Option<Layer> {
 /// excluding `index.md` and any subdirectory (type-folders are walked
 /// separately). Non-recursive: only the layer's immediate children.
 fn loose_files_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
-    let layer_dir = store.root.join(layer_dir_name(layer));
     let mut out = Vec::new();
-    let rd = match fs::read_dir(&layer_dir) {
-        Ok(rd) => rd,
+    let names = match store.regular_file_names(Path::new(layer_dir_name(layer))) {
+        Ok(names) => names,
         Err(_) => return out,
     };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if !p.is_file() || !store.owns_path(&p) {
-            continue;
-        }
+    for name in names {
+        let p = PathBuf::from(layer_dir_name(layer)).join(&name);
         if p.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        if is_index_artifact(&p) || is_hidden(entry.file_name().as_os_str()) {
+        if is_index_artifact(&p) || is_hidden(&name) {
             continue;
         }
         out.push(p);
@@ -1475,9 +1424,9 @@ fn loose_files_in_layer(store: &Store, layer: Layer) -> Vec<PathBuf> {
 /// both write-through (`on_write`/`on_remove`/`on_rename`) and the sweeps
 /// (`rebuild_all`/`write_level`) go through, so their output is byte-identical.
 fn write_layer_jsonl(store: &Store, layer: Layer, records: &[IndexRecord]) -> crate::Result<()> {
-    let path = store.root.join(layer_dir_name(layer)).join("index.jsonl");
+    let path = PathBuf::from(layer_dir_name(layer)).join("index.jsonl");
     if records.is_empty() {
-        remove_if_exists(&path)?;
+        remove_if_exists(store, &path)?;
         return Ok(());
     }
     let idx = Index {
@@ -1485,7 +1434,7 @@ fn write_layer_jsonl(store: &Store, layer: Layer, records: &[IndexRecord]) -> cr
         records: records.to_vec(),
         child_counts: BTreeMap::new(),
     };
-    write_atomic(&path, idx.to_jsonl())
+    write_atomic(store, &path, idx.to_jsonl())
 }
 
 /// Upsert (`removing` = false) or remove (`removing` = true) a loose file's row
@@ -1498,16 +1447,13 @@ fn apply_loose_change(
     file_rel: &Path,
     removing: bool,
 ) -> crate::Result<()> {
-    let layer_dir = store.root.join(layer_dir_name(layer));
-    let _lock = FolderLock::acquire(&layer_dir);
+    let layer_dir = PathBuf::from(layer_dir_name(layer));
+    let _lock = FolderLock::acquire(store, &layer_dir)?;
     let jsonl = layer_dir.join("index.jsonl");
-    let mut records = read_jsonl_records(&jsonl)?;
+    let mut records = read_jsonl_records(store, &jsonl)?;
     records.retain(|r| r.path != file_rel);
     if !removing {
-        records.push(record_from_file(
-            &store.root.join(file_rel),
-            file_rel.to_path_buf(),
-        )?);
+        records.push(record_from_store(store, file_rel, file_rel.to_path_buf())?);
     }
     sort_records(&mut records);
     write_layer_jsonl(store, layer, &records)
@@ -1522,11 +1468,6 @@ fn type_folder_of(file_rel: &Path) -> Option<PathBuf> {
     layer_from_dir_name(layer)?;
     let type_seg = comps.next()?.as_os_str().to_str()?;
     Some(PathBuf::from(layer).join(type_seg))
-}
-
-/// Convert an absolute path under `root` to a store-relative path.
-fn rel_to_store(root: &Path, abs: &Path) -> Option<PathBuf> {
-    abs.strip_prefix(root).ok().map(|p| p.to_path_buf())
 }
 
 /// Normalize a possibly-absolute or `./`-prefixed path to a clean
@@ -1557,10 +1498,14 @@ fn is_index_artifact(p: &Path) -> bool {
 ///   (`email`, `note`, …) and must be preserved (deleting it is silent,
 ///   unrecoverable data loss). A leftover with no/garbage frontmatter (e.g. a
 ///   bare `stale\n`) is treated as a deletable stale artifact.
-fn is_deletable_catalog_artifact(p: &Path) -> bool {
+fn is_deletable_catalog_artifact(store: &Store, p: &Path) -> bool {
     match p.file_name().and_then(|n| n.to_str()) {
         Some("index.jsonl") => true,
-        Some("index.md") => match read_frontmatter(p) {
+        Some("index.md") => match store
+            .read_bounded(p, crate::parser::MAX_DBMD_FILE_BYTES)
+            .map_err(crate::Error::from)
+            .and_then(|bytes| read_frontmatter_bytes(&bytes, p))
+        {
             // Real content file (non-`index` type) → preserve, never delete.
             Ok(meta) => meta.type_.as_deref().is_none_or(|t| t == "index"),
             // Unreadable / no frontmatter → a stale or garbage artifact, deletable.
@@ -1705,20 +1650,17 @@ fn folder_entry(tf_unix: &str, display: &str, count: usize, description: Option<
 /// write-through path, so a per-write `fsync` would be cost without benefit — a
 /// crash-lost catalog write is recovered by a rebuild, not data loss. (Primary
 /// data — content records, `log.md` — uses the durable `crate::fsx` path.)
-fn write_atomic(path: &Path, contents: String) -> crate::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.flush()?;
-    tmp.persist(path)?;
+fn write_atomic(store: &Store, path: &Path, contents: String) -> crate::Result<()> {
+    // Derived artifacts deliberately skip fsync, but they do not get a weaker
+    // path-security boundary: the core primitive opens every ancestor relative
+    // to held directory descriptors with no-follow semantics, then renames the
+    // sibling temp through that same descriptor.
+    store.write_atomic_nondurable(path, contents.as_bytes())?;
     Ok(())
 }
 
-fn remove_if_exists(path: &Path) -> crate::Result<()> {
-    match fs::remove_file(path) {
+fn remove_if_exists(store: &Store, path: &Path) -> crate::Result<()> {
+    match store.remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -1744,16 +1686,15 @@ fn bad_index(path: &Path, msg: &str) -> crate::Error {
 /// the per-folder RMW (the content file is already serialized by `create_new`),
 /// so concurrent sanctioned writes each see the other's row.
 ///
-/// Implementation: a hidden `<type-folder>/.index.lock` acquired via `create_new`
-/// (the same O_EXCL primitive `cmd/write.rs` uses), bounded-spin with a small
-/// sleep, and stale-lock breaking by mtime age so a crashed writer can't wedge
-/// the folder forever. The dotfile name keeps it out of the content walk
-/// (`walk_type_folder_files` skips hidden) and out of `cleanup`
-/// (`is_index_artifact` only matches `index.md`/`index.jsonl`). RAII: the lock is
-/// released (file removed) on drop, including on the error paths.
+/// Implementation: a hidden persistent `<type-folder>/.index.lock`, opened
+/// through the store's retained directory capability and protected with an
+/// advisory exclusive `flock`. The dotfile name keeps it out of the content
+/// walk (`walk_type_folder_files` skips hidden) and out of `cleanup`
+/// (`is_index_artifact` only matches `index.md`/`index.jsonl`). RAII releases
+/// the kernel lock on drop; retaining the empty lock inode is intentional,
+/// because unlinking it would let a concurrent writer lock a different inode.
 struct FolderLock {
-    path: PathBuf,
-    held: bool,
+    _file: File,
 }
 
 impl FolderLock {
@@ -1779,55 +1720,12 @@ impl FolderLock {
     /// longer than `STALE_AFTER` could be mistaken for a crash and broken. That
     /// needs a pathological store (an `update_parents` rollup exceeding the
     /// window — itself the flagged `O(total)` hot-path cost). The complete fix is
-    /// a holder heartbeat that refreshes the lockfile mtime during long ops; not
-    /// done inline to keep this change surgical. Only a genuine non-contention
-    /// error (e.g. a permission failure creating the lockfile) degrades to
-    /// proceeding unlocked — never contention.
-    fn acquire(folder_abs: &Path) -> Self {
-        use std::time::{Duration, SystemTime};
-        const SPIN: Duration = Duration::from_millis(10);
-        const STALE_AFTER: Duration = Duration::from_secs(30);
-
-        let path = folder_abs.join(".index.lock");
-        // Ensure the folder exists so the lockfile create can succeed.
-        let _ = fs::create_dir_all(folder_abs);
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return FolderLock { path, held: true },
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Break a stale lock left by a crashed writer; otherwise wait
-                    // for the live holder to release. NEVER proceed unlocked here.
-                    let stale = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| SystemTime::now().duration_since(t).ok())
-                        .map(|age| age > STALE_AFTER)
-                        .unwrap_or(false);
-                    if stale {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    std::thread::sleep(SPIN);
-                }
-                // A non-contention error (permissions, read-only fs): we cannot
-                // lock here at all, so proceed unlocked rather than fail a
-                // sanctioned write — the prior best-effort behavior, but ONLY for
-                // hard errors, never for contention.
-                Err(_) => return FolderLock { path, held: false },
-            }
-        }
-    }
-}
-
-impl Drop for FolderLock {
-    fn drop(&mut self) {
-        if self.held {
-            let _ = fs::remove_file(&self.path);
-        }
+    /// The kernel releases the lock if the process exits, so crashes cannot
+    /// leave a stale logical lock behind.
+    fn acquire(store: &Store, folder: &Path) -> crate::Result<Self> {
+        Ok(Self {
+            _file: store.lock_file(&folder.join(".index.lock"))?,
+        })
     }
 }
 
@@ -1836,82 +1734,15 @@ impl Drop for FolderLock {
 /// locks are always acquired in sorted order so a pair of concurrent renames
 /// touching the same two folders can't deadlock by grabbing them in opposite
 /// orders. Returns the guard(s); drop releases them.
-fn lock_folders(store: &Store, a: &Path, b: &Path) -> Vec<FolderLock> {
+fn lock_folders(store: &Store, a: &Path, b: &Path) -> crate::Result<Vec<FolderLock>> {
     if a == b {
-        return vec![FolderLock::acquire(&store.root.join(a))];
+        return Ok(vec![FolderLock::acquire(store, a)?]);
     }
     let (first, second) = if a < b { (a, b) } else { (b, a) };
-    vec![
-        FolderLock::acquire(&store.root.join(first)),
-        FolderLock::acquire(&store.root.join(second)),
-    ]
-}
-
-// A tiny atomic-write helper. `tempfile` is a dev-dependency for tests; for
-// the library path we hand-roll a temp-file-then-rename so writes are atomic
-// without pulling `tempfile` into the non-dev dependency set. The file handle
-// is held in an `Option` so `persist` can take it out without fighting the
-// `Drop` impl (which only cleans up an un-persisted temp file).
-struct AtomicTemp {
-    file: Option<fs::File>,
-    path: PathBuf,
-    persisted: bool,
-}
-
-impl AtomicTemp {
-    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.file.as_mut().expect("temp file open").write_all(bytes)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.as_mut().expect("temp file open").flush()
-    }
-    fn persist(mut self, dest: &Path) -> std::io::Result<()> {
-        if let Some(f) = self.file.take() {
-            f.sync_all().ok();
-            // `f` dropped here, closing the handle before the rename.
-        }
-        fs::rename(&self.path, dest)?;
-        self.persisted = true;
-        Ok(())
-    }
-}
-
-impl Drop for AtomicTemp {
-    fn drop(&mut self) {
-        // Best-effort cleanup if not persisted (an error path bailed out).
-        if !self.persisted {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn tempfile_in(dir: &Path) -> std::io::Result<AtomicTemp> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    // Monotonic-ish unique suffix; the dir is the destination dir so rename is
-    // same-filesystem and therefore atomic.
-    let counter = next_temp_counter();
-    let name = format!(".dbmd-index-{pid}-{nanos}-{counter}.tmp");
-    let path = dir.join(name);
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    Ok(AtomicTemp {
-        file: Some(file),
-        path,
-        persisted: false,
-    })
-}
-
-fn next_temp_counter() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static C: AtomicU64 = AtomicU64::new(0);
-    C.fetch_add(1, Ordering::Relaxed)
+    Ok(vec![
+        FolderLock::acquire(store, first)?,
+        FolderLock::acquire(store, second)?,
+    ])
 }
 
 #[cfg(test)]
@@ -1928,10 +1759,8 @@ mod tests {
     fn mk_store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("DB.md"), "# test store\n").unwrap();
-        let store = Store {
-            root: dir.path().to_path_buf(),
-            config: crate::parser::Config::default(),
-        };
+        let store =
+            Store::from_root_and_config(dir.path(), crate::parser::Config::default()).unwrap();
         (dir, store)
     }
 
@@ -1975,14 +1804,10 @@ mod tests {
     /// bytes — the surface the byte-identity invariant compares.
     fn snapshot_artifacts(store: &Store) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        for entry in walkdir::WalkDir::new(&store.root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let p = entry.path();
-            if is_index_artifact(p) {
-                let rel = path_to_unix(&rel_to_store(&store.root, p).unwrap());
-                out.insert(rel, fs::read_to_string(p).unwrap());
+        for rel in store.walk_regular_files(Path::new("")).unwrap() {
+            if is_index_artifact(&rel) {
+                let key = path_to_unix(&rel);
+                out.insert(key, store.read_text_bounded(&rel, u64::MAX).unwrap());
             }
         }
         out
@@ -3351,8 +3176,9 @@ mod tests {
             "type: contact\nupdated: 2026-05-01T00:00:00Z\nsummary: 2026",
             "\nbody\n",
         );
-        let rec = record_from_file(
-            &store.root.join("records/contacts/a.md"),
+        let rec = record_from_store(
+            &store,
+            Path::new("records/contacts/a.md"),
             PathBuf::from("records/contacts/a.md"),
         )
         .unwrap();
@@ -3376,8 +3202,9 @@ mod tests {
             "type: true\nupdated: 2026-05-02T00:00:00Z\nsummary: hi",
             "\nbody\n",
         );
-        let rec_b = record_from_file(
-            &store.root.join("records/contacts/b.md"),
+        let rec_b = record_from_store(
+            &store,
+            Path::new("records/contacts/b.md"),
             PathBuf::from("records/contacts/b.md"),
         )
         .unwrap();
@@ -3405,7 +3232,7 @@ mod tests {
         bytes.extend_from_slice(b" meeting notes\n");
         fs::write(&abs, bytes).unwrap();
 
-        let rec = record_from_file(&abs, PathBuf::from(rel))
+        let rec = record_from_store(&store, Path::new(rel), PathBuf::from(rel))
             .expect("non-UTF-8 body must not abort the frontmatter read");
         assert_eq!(rec.summary, "An imported email");
         assert_eq!(rec.type_, "email");
@@ -3799,5 +3626,48 @@ mod tests {
                 "rollup artifact {k} diverged from rebuild after concurrent writes"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_stays_on_opened_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        fs::create_dir_all(root.join("records/notes")).unwrap();
+        fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(
+            root.join("records/notes/owned.md"),
+            "---\ntype: note\nsummary: owned summary\n---\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let detached = sandbox.path().join("detached");
+        fs::rename(&root, &detached).unwrap();
+
+        let replacement = sandbox.path().join("replacement");
+        fs::create_dir_all(replacement.join("records/notes")).unwrap();
+        fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(
+            replacement.join("records/notes/replacement.md"),
+            "---\ntype: note\nsummary: replacement secret\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            replacement.join("records/notes/index.jsonl"),
+            "replacement index sentinel\n",
+        )
+        .unwrap();
+        symlink(&replacement, &root).unwrap();
+
+        Index::rebuild_all(&store).unwrap();
+        let index = fs::read_to_string(detached.join("records/notes/index.jsonl")).unwrap();
+        assert!(index.contains("owned summary"));
+        assert!(!index.contains("replacement secret"));
+        assert_eq!(
+            fs::read_to_string(replacement.join("records/notes/index.jsonl")).unwrap(),
+            "replacement index sentinel\n"
+        );
     }
 }

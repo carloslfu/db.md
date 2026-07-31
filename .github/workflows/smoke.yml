@@ -50,12 +50,19 @@ jobs:
   fetch-artifacts:
     # Only proceed if the release run actually succeeded (workflow_run fires on
     # failure too).
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      source_sha: ${{ steps.ver.outputs.source_sha }}
+      source_tag: ${{ steps.ver.outputs.source_tag }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          # Automatic smoke must inspect the exact source commit that produced
+          # the successful release run, not whatever main contains now.
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
 
       # Assemble the local mirror tree from the GitHub Release assets for the
       # requested (or latest) version. On a workflow_run trigger the version is
@@ -68,14 +75,65 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          ver="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
-          if [ -z "$ver" ]; then
-            ver="$(gh release view --json tagName -q .tagName | sed 's/^v//')"
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            test "${{ github.event.workflow_run.event }}" = "push" || {
+              echo "::error::automatic smoke only accepts a tag-push release run" >&2
+              exit 1
+            }
+            source_sha="${{ github.event.workflow_run.head_sha }}"
+            test -n "$source_sha" || {
+              echo "::error::triggering release run has no head SHA" >&2
+              exit 1
+            }
+            mapfile -t tags < <(git tag --points-at "$source_sha" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$')
+            test "${#tags[@]}" -eq 1 || {
+              echo "::error::expected exactly one SemVer release tag at $source_sha, found ${#tags[@]}" >&2
+              printf '  %s\n' "${tags[@]}" >&2
+              exit 1
+            }
+            tag="${tags[0]}"
+            test "$(git rev-list -n1 "$tag")" = "$source_sha" || {
+              echo "::error::$tag does not resolve to triggering SHA $source_sha" >&2
+              exit 1
+            }
+            ver="${tag#v}"
+          else
+            ver="${{ inputs.version }}"
+            if [ -z "$ver" ]; then
+              echo "::error::manual smoke requires an explicit version" >&2
+              exit 1
+            fi
+            printf '%s\n' "$ver" |
+              grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' || {
+                echo "::error::manual smoke version is not strict SemVer" >&2
+                exit 1
+              }
+            tag="v${ver}"
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            source_sha="$(git rev-list -n1 "$tag")"
           fi
+          cargo_ver="$(git show "${source_sha}:Cargo.toml" | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/')"
+          test "$cargo_ver" = "$ver" || {
+            echo "::error::$tag version $ver does not match Cargo.toml $cargo_ver at $source_sha" >&2
+            exit 1
+          }
+          printf '%s\n' "$source_sha" > mirror-source-sha.txt
+          printf '%s\n' "$tag" > mirror-source-tag.txt
           # install.sh fetches from "$DBMD_BASE_URL/v$version/…" (the real
           # GitHub Releases layout), so the mirror tree must carry the v.
           mkdir -p "mirror/v${ver}"
-          gh release download "v${ver}" --dir "mirror/v${ver}" --pattern 'dbmd-*.tar.gz' --pattern 'SHA256SUMS'
+          release_tag="$(gh release view "$tag" --json tagName --jq .tagName)"
+          test "$release_tag" = "$tag" || {
+            echo "::error::release resolved to $release_tag instead of exact tag $tag" >&2
+            exit 1
+          }
+          gh release download "$tag" --dir "mirror/v${ver}" \
+            --pattern 'dbmd-*.tar.gz' --pattern 'SHA256SUMS'
+          (
+            cd "mirror/v${ver}"
+            test "$(find . -maxdepth 1 -name 'dbmd-*.tar.gz' -type f | wc -l | tr -d ' ')" = 4
+            sha256sum -c SHA256SUMS
+          )
           cp scripts/install.sh "mirror/v${ver}/install.sh"
           printf '%s\n' "$ver" > mirror/latest.txt
 
@@ -85,17 +143,31 @@ jobs:
         run: |
           set -euo pipefail
           ver="$(tr -d '[:space:]' < mirror/latest.txt)"
+          source_sha="$(tr -d '[:space:]' < mirror-source-sha.txt)"
+          source_tag="$(tr -d '[:space:]' < mirror-source-tag.txt)"
           test -n "$ver" || { echo "::error::empty mirror/latest.txt" >&2; exit 1; }
+          test -n "$source_sha" || { echo "::error::empty source SHA" >&2; exit 1; }
+          test "$source_tag" = "v$ver" || {
+            echo "::error::source tag $source_tag does not bind version $ver" >&2
+            exit 1
+          }
           test -d "mirror/v${ver}" || { echo "::error::mirror/v${ver} missing" >&2; exit 1; }
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
-          echo "Smoke-testing version: $ver"
+          {
+            echo "version=$ver"
+            echo "source_sha=$source_sha"
+            echo "source_tag=$source_tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "Smoke-testing $source_tag from exact source $source_sha"
           ls -la "mirror/v${ver}"
 
       - name: Re-upload mirror for the matrix jobs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: smoke-mirror
-          path: mirror/
+          path: |
+            mirror/
+            mirror-source-sha.txt
+            mirror-source-tag.txt
           if-no-files-found: error
           retention-days: 1
 
@@ -115,21 +187,35 @@ jobs:
             os: macos-14
             runnable: true
           - target_name: linux-x86_64-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             runnable: true
           # aarch64-musl can't execute on the x86_64 ubuntu runner: integrity
           # check only (no binary execution). Honest about the cross-exec limit.
           - target_name: linux-aarch64-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             runnable: false
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.fetch-artifacts.outputs.source_sha }}
+          fetch-depth: 1
 
       - name: Download smoke mirror
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: smoke-mirror
-          path: mirror
+          path: smoke-payload
+
+      - name: Verify smoke payload binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.fetch-artifacts.outputs.source_sha }}"
+          test "$(tr -d '[:space:]' < smoke-payload/mirror-source-sha.txt)" = \
+            "${{ needs.fetch-artifacts.outputs.source_sha }}"
+          test "$(tr -d '[:space:]' < smoke-payload/mirror-source-tag.txt)" = \
+            "${{ needs.fetch-artifacts.outputs.source_tag }}"
+          mv smoke-payload/mirror mirror
 
       # Serve the mirror tree over localhost so install.sh fetches exactly the
       # artifacts the release produced. Python3 ships on all GitHub runners.
@@ -157,6 +243,9 @@ jobs:
         shell: bash
         env:
           DBMD_BASE_URL: http://127.0.0.1:8099
+          # This controlled localhost mirror intentionally co-locates artifact
+          # and checksum. Normal installers require the independent digest.
+          DBMD_ALLOW_SAME_ORIGIN_CHECKSUM: "1"
           DBMD_INSTALL_DIR: ${{ runner.temp }}/dbmd-bin
           DBMD_VERSION: ${{ needs.fetch-artifacts.outputs.version }}
         run: |

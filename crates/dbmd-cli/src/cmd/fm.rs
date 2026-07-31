@@ -18,7 +18,7 @@ use serde_norway::Value as YamlValue;
 
 use crate::cli::{FmArgs, FmCommand, FmGetArgs, FmInitArgs, FmSetArgs};
 use crate::cmd::log::into_cli;
-use crate::cmd::write::{apply_schema_defaults, path_escapes_store_error, require_store_relative};
+use crate::cmd::write::{apply_schema_defaults, require_store_relative};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -68,21 +68,13 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     let (key, value) = split_assignment(&args.assignment)?;
 
     let store = locate_store_from_cwd()?;
+    let _transaction = store.transaction().map_err(CliError::from)?;
     let rel = require_store_relative(&store, &args.file)?;
-    let file = store.abs_path(&rel);
-
-    // Containment: `fm set` rewrites the file in place; `require_store_relative`
-    // is lexical and follows symlinks, so a `<file>` reached through an in-store
-    // symlink to a directory outside the store would be written OUTSIDE the root.
-    // Same resolved-path guard `dbmd write`/`rename`/`link` apply.
-    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &file) {
-        return Err(path_escapes_store_error(&rel.to_string_lossy(), &e));
-    }
 
     // Frozen-page policy: refuse before any mutation.
     enforce_not_frozen(&store, &rel)?;
 
-    let (mut fm, body) = into_cli(parser::read_file(&file))?;
+    let (mut fm, body) = into_cli(store.read_file(&rel))?;
     into_cli(fm.set(key, value))?;
     // Auto-maintain `updated`: any edit to an existing content file re-stamps
     // `updated` to now (SPEC: `updated` is auto-maintained), so the type-folder
@@ -90,7 +82,7 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     // An explicit `fm set updated=…` already set the field via `fm.set` above;
     // don't clobber that operator-chosen value with `now`.
     bump_updated_unless_explicit(&mut fm, key);
-    into_cli(parser::write_file(&file, &fm, &body))?;
+    into_cli(store.write_file(&rel, &fm, &body))?;
 
     // Write-through: re-derive the record from the now-updated file and re-sort
     // the type-folder index. Non-fatal if it can't run (the file is the source
@@ -123,18 +115,12 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
 /// write-through. Refuses on a `DB.md` frozen page before mutating.
 pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
     let store = locate_store_from_cwd()?;
+    let _transaction = store.transaction().map_err(CliError::from)?;
     let rel = require_store_relative(&store, &args.file)?;
-    let file = store.abs_path(&rel);
-
-    // Containment: `fm init` writes the (possibly seeded) file in place — guard
-    // against a symlinked-out `<file>` the same way `fm set`/`write`/`rename` do.
-    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &file) {
-        return Err(path_escapes_store_error(&rel.to_string_lossy(), &e));
-    }
 
     enforce_not_frozen(&store, &rel)?;
 
-    let (mut fm, body) = read_or_seed_raw_body(&file)?;
+    let (mut fm, body) = read_or_seed_raw_body(&store, &rel)?;
 
     // Type: an explicit frontmatter `type` wins; otherwise infer from the
     // type-folder path segment. A file with neither is an error (init can't
@@ -187,7 +173,7 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
         fm.summary = Some(composed);
     }
 
-    into_cli(parser::write_file(&file, &fm, &body))?;
+    into_cli(store.write_file(&rel, &fm, &body))?;
     let index_ok = Index::on_write(&store, &rel).is_ok();
 
     if ctx.json {
@@ -211,8 +197,11 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
 
 // ── Shared glue ──────────────────────────────────────────────────────────────
 
-fn read_or_seed_raw_body(file: &Path) -> Result<(parser::Frontmatter, String), CliError> {
-    match parser::read_file(file) {
+fn read_or_seed_raw_body(
+    store: &Store,
+    file: &Path,
+) -> Result<(parser::Frontmatter, String), CliError> {
+    match store.read_file(file) {
         Ok(parsed) => Ok(parsed),
         Err(dbmd_core::ParseError::MissingFrontmatter { .. }) => {
             // `MissingFrontmatter` covers TWO distinct shapes: a truly
@@ -224,7 +213,14 @@ fn read_or_seed_raw_body(file: &Path) -> Result<(parser::Frontmatter, String), C
             // by re-reading the raw text and inspecting the opening line the way
             // `split_frontmatter` does; refuse the unterminated-fence case with
             // a clear `FM_MALFORMED` error instead of corrupting its shape.
-            let body = std::fs::read_to_string(file).map_err(CliError::from)?;
+            let body = store
+                .read_bounded(file, dbmd_core::parser::MAX_DBMD_FILE_BYTES)
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })
+                })
+                .map_err(CliError::from)?;
             if opens_frontmatter_fence(&body) {
                 return Err(malformed_frontmatter_error(file));
             }

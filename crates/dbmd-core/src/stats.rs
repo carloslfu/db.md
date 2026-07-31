@@ -78,14 +78,26 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
     let mut facts: Vec<FileFacts> = Vec::new();
 
     for layer in Layer::all() {
-        let layer_root = store.root.join(layer_dir_name(layer));
-        for abs in walk_layer_content_files(store, &layer_root)? {
-            let rel = abs.strip_prefix(&store.root).unwrap_or(&abs).to_path_buf();
+        for rel in store.walk_layer(layer)? {
+            if rel
+                .components()
+                .nth(1)
+                .is_some_and(|component| component.as_os_str() == "log")
+            {
+                continue;
+            }
             let node_id = strip_md(&rel);
             existing_nodes.insert(node_id.clone());
 
-            let size_bytes = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
-            let text = std::fs::read_to_string(&abs).unwrap_or_default();
+            let opened = store.open_regular(&rel).ok();
+            let size_bytes = opened
+                .as_ref()
+                .and_then(|file| file.metadata().ok())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let text = store
+                .read_text_bounded(&rel, crate::parser::MAX_DBMD_FILE_BYTES)
+                .unwrap_or_default();
             let type_ = parse_type(&text);
             let raw_targets = extract_link_targets(&text, &link_re);
 
@@ -152,70 +164,6 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
     stats.top_types = top_types(&stats.type_distribution, TOP_TYPES_LIMIT);
 
     Ok(stats)
-}
-
-/// On-disk folder name for a layer. Local copy so `stats` doesn't couple to
-/// [`Layer::dir_name`].
-fn layer_dir_name(layer: Layer) -> &'static str {
-    match layer {
-        Layer::Sources => "sources",
-        Layer::Records => "records",
-    }
-}
-
-/// Recursively collect the `.md` **content** files under one layer root,
-/// skipping hidden entries (`.git`, dotfiles), the layer's immediate `log/`
-/// archive directory, and the `index.md` catalog meta files. Returns absolute
-/// paths. A missing layer root yields an empty list (a store need not have
-/// both layers).
-///
-/// Only an immediate child of the layer named `log` (`sources/log/`) is the
-/// rotation-archive directory and skipped — matching `render::tree`, which
-/// skips `log` only as an immediate layer child, and the indexer, which indexes
-/// `log` dirs nested deeper. A directory named `log` nested under a type-folder
-/// (`sources/emails/log/`) is ordinary content and is counted, so stats agrees
-/// with `tree` / `index` / `query` instead of making the subtree invisible.
-fn walk_layer_content_files(store: &Store, layer_root: &Path) -> crate::Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    if !layer_root.is_dir() {
-        return Ok(out);
-    }
-    let walker = walkdir::WalkDir::new(layer_root)
-        .follow_links(true)
-        .into_iter()
-        .filter_entry(|e| {
-            // Skip hidden dirs/files. `depth()` is relative to the layer root
-            // (root = 0), so the layer's immediate `log/` archive is depth 1.
-            let name = e.file_name().to_string_lossy();
-            if name.starts_with('.') {
-                return false;
-            }
-            if e.file_type().is_dir() && name == "log" && e.depth() == 1 {
-                return false;
-            }
-            store.owns_path(e.path())
-        });
-    for entry in walker {
-        let entry = entry.map_err(|e| {
-            crate::Error::Io(
-                e.into_io_error()
-                    .unwrap_or_else(|| std::io::Error::other("walk error")),
-            )
-        })?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy();
-        // Content files are `.md`; `index.md` is a meta catalog file, not
-        // content, and `index.jsonl` / other sidecars aren't `.md` at all.
-        if !name.ends_with(".md") || name == "index.md" {
-            continue;
-        }
-        out.push(path.to_path_buf());
-    }
-    out.sort();
-    Ok(out)
 }
 
 /// The wiki-link matcher: `[[target]]` or `[[target|display]]`. Captures the
@@ -463,8 +411,7 @@ fn target_resolves_on_disk(store: &Store, target: &Path) -> bool {
         return false;
     }
     // The target as written points at a real file (e.g. an explicit `.eml`).
-    let literal = store.root.join(target);
-    if literal.is_file() && store.owns_path(&literal) {
+    if store.open_regular(target).is_ok() {
         return true;
     }
     // Bare-stem case: look for a sibling `<stem>.<ext>` with a non-`.md`
@@ -478,19 +425,16 @@ fn target_resolves_on_disk(store: &Store, target: &Path) -> bool {
         Some(name) => name,
         None => return false,
     };
-    let parent_abs = store.root.join(match target.parent() {
+    let parent = match target.parent() {
         Some(p) => p,
         None => return false,
-    });
-    let entries = match std::fs::read_dir(&parent_abs) {
+    };
+    let entries = match store.regular_file_names(parent) {
         Ok(e) => e,
         Err(_) => return false,
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || !store.owns_path(&path) {
-            continue;
-        }
+    for name in entries {
+        let path = Path::new(&name);
         // Same stem, and an extension that is present and not `.md`.
         if path.file_stem() == Some(stem) {
             match path.extension().and_then(|e| e.to_str()) {
@@ -553,10 +497,7 @@ mod tests {
     fn temp_store() -> (TempDir, Store) {
         let dir = TempDir::new().expect("tempdir");
         fs::write(dir.path().join("DB.md"), "---\ntype: db-md\n---\n").expect("write DB.md");
-        let store = Store {
-            root: dir.path().to_path_buf(),
-            config: Config::default(),
-        };
+        let store = Store::from_root_and_config(dir.path(), Config::default()).unwrap();
         (dir, store)
     }
 
@@ -572,10 +513,7 @@ mod tests {
         let root = dir.path().join("store");
         fs::create_dir_all(&root).expect("create store root");
         fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").expect("write DB.md");
-        let store = Store {
-            root,
-            config: Config::default(),
-        };
+        let store = Store::from_root_and_config(&root, Config::default()).unwrap();
         (dir, store)
     }
 

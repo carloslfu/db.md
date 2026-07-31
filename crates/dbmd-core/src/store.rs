@@ -25,14 +25,15 @@
 //! caller-influenced path passes through before it is read or traversed.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use chrono::{DateTime, Datelike, FixedOffset};
-use ignore::WalkBuilder;
 
 use crate::index::IndexRecord;
 use crate::parser::{parse_db_md, Config, Frontmatter};
+use chrono::{DateTime, Datelike, FixedOffset};
 
 /// Basenames that are never content files: the config marker and the two
 /// curator-maintained catalogs. The store walks skip these so a SWEEP over the
@@ -135,8 +136,53 @@ impl Layer {
 pub struct Store {
     /// The store root (the directory containing `DB.md`).
     pub root: PathBuf,
+    /// Absolute lexical spelling frozen when the root capability is opened.
+    /// This is used only to translate absolute CLI arguments into relative
+    /// capability keys; no filesystem operation reopens it.
+    root_locator: PathBuf,
     /// The parsed `DB.md` config (agent instructions, policies, schemas).
     pub config: Config,
+    /// The directory inode selected when the store was opened. Every
+    /// store-relative read starts from this held descriptor, never from
+    /// `root`'s mutable pathname.
+    root_capability: Arc<File>,
+    /// Reused no-follow parent directory capabilities. Interactive operations
+    /// probe many files in the same type/shard folders; caching those held
+    /// parents preserves capability safety without retraversing and rescanning
+    /// every ancestor for every link or validation check.
+    reader: Arc<Mutex<crate::fsx::BoundedDirReader>>,
+}
+
+/// Cached descriptor-relative regular-file reader for one [`Store`].
+///
+/// Sweep callers should create one reader and reuse it across every candidate:
+/// parent directory capabilities are cached, so each file costs one no-follow
+/// `openat` rather than a repeated pathname canonicalization or ancestor walk.
+/// The reader refuses symlink components, non-regular leaves, and descendant
+/// db.md store boundaries.
+pub struct StoreReader {
+    reader: crate::fsx::BoundedDirReader,
+}
+
+impl StoreReader {
+    /// Open one regular store-relative file through the retained root.
+    pub fn open(&mut self, path: &Path) -> std::io::Result<File> {
+        self.reader.open(path)
+    }
+}
+
+/// Exclusive cooperative mutation gate for one opened store. The lock is tied
+/// to the held root inode, not the mutable pathname in [`Store::root`].
+pub struct StoreTransaction {
+    _lock: File,
+}
+
+fn absolute_store_locator(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 impl Store {
@@ -144,69 +190,43 @@ impl Store {
     /// at `path`. On case-sensitive filesystems a lowercase `db.md` must NOT
     /// count (the lowercase name refers to the project/spec, not the marker).
     pub fn is_db_md_store(path: &Path) -> bool {
-        // Fast negative path. Nearly every directory in a large store lacks the
-        // marker; one lstat avoids enumerating a potentially 10k-entry folder
-        // for every containment check. On a case-insensitive filesystem this
-        // probe can also match `db.md`, so a positive still goes through the
-        // exact-name read_dir check below.
-        let probe = path.join("DB.md");
-        let Ok(probe_meta) = std::fs::symlink_metadata(&probe) else {
+        let Ok(root) = crate::fsx::open_directory_nofollow(path) else {
             return false;
         };
-        if probe_meta.is_dir() {
-            return false;
-        }
-
-        // Read the directory and match the *stored* filename byte-for-byte.
-        // `path.join("DB.md").exists()` would lie on a case-insensitive
-        // filesystem (macOS default), where a lowercase `db.md` answers a
-        // `DB.md` probe. `read_dir` returns the real on-disk name, so the
-        // exact-match check is correct on both case-sensitive (Linux) and
-        // case-insensitive filesystems.
-        let entries = match std::fs::read_dir(path) {
-            Ok(entries) => entries,
-            Err(_) => return false,
-        };
-        for entry in entries.flatten() {
-            if entry.file_name() == "DB.md" {
-                // A directory literally named `DB.md` is not the marker.
-                let Ok(ft) = entry.file_type() else {
-                    return false;
-                };
-                if ft.is_dir() {
-                    return false;
-                }
-                // A marker symlink is legal only when it resolves inside this
-                // root. Otherwise merely opening a hostile store would read an
-                // arbitrary external file as configuration.
-                let Ok(root) = path.canonicalize() else {
-                    return false;
-                };
-                let Ok(marker) = entry.path().canonicalize() else {
-                    return false;
-                };
-                return marker.is_file() && marker.starts_with(root);
-            }
-        }
-        false
+        crate::fsx::directory_contains_exact_regular(&root, "DB.md".as_ref()).unwrap_or(false)
     }
 
     /// Open `path` as a db.md store and require `DB.md` to be readable and
     /// parseable. Normal commands should enter through this strict gate so a
     /// damaged config cannot silently disable schema or policy rules.
     pub fn open_strict(path: &Path) -> crate::Result<Store> {
-        if !Store::is_db_md_store(path) {
+        let root_capability = match crate::fsx::open_directory_nofollow(path) {
+            Ok(root) => root,
+            Err(_) => {
+                return Err(NotAStore {
+                    path: path.to_path_buf(),
+                }
+                .into())
+            }
+        };
+        if !crate::fsx::directory_contains_exact_regular(&root_capability, "DB.md".as_ref())? {
             return Err(NotAStore {
                 path: path.to_path_buf(),
             }
             .into());
         }
         let db_md = path.join("DB.md");
-        let text = std::fs::read_to_string(&db_md)?;
+        let mut reader = crate::fsx::BoundedDirReader::from_root(&root_capability)?;
+        let bytes = reader.read(Path::new("DB.md"), crate::parser::MAX_DBMD_FILE_BYTES)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let config = parse_db_md(&text, &db_md)?;
         Ok(Store {
             root: path.to_path_buf(),
+            root_locator: absolute_store_locator(path)?,
             config,
+            root_capability: Arc::new(root_capability),
+            reader: Arc::new(Mutex::new(reader)),
         })
     }
 
@@ -216,7 +236,12 @@ impl Store {
     /// directory as a store so `dbmd validate` can report the config error as an
     /// issue. Normal CLI commands should use [`Store::open_strict`] instead.
     pub fn open(path: &Path) -> Result<Store, NotAStore> {
-        if !Store::is_db_md_store(path) {
+        let root_capability = crate::fsx::open_directory_nofollow(path).map_err(|_| NotAStore {
+            path: path.to_path_buf(),
+        })?;
+        if !crate::fsx::directory_contains_exact_regular(&root_capability, "DB.md".as_ref())
+            .unwrap_or(false)
+        {
             return Err(NotAStore {
                 path: path.to_path_buf(),
             });
@@ -226,14 +251,296 @@ impl Store {
         // the store openable with default config rather than masquerading as
         // NOT_A_STORE — the marker is present, so this *is* a store; a damaged
         // DB.md is `dbmd validate`'s job to report, not `open`'s.
-        let config = match std::fs::read_to_string(&db_md) {
-            Ok(text) => parse_db_md(&text, &db_md).unwrap_or_default(),
+        let mut reader = crate::fsx::BoundedDirReader::from_root(&root_capability)
+            .expect("held root descriptor can be cloned");
+        let config = match reader.read(Path::new("DB.md"), crate::parser::MAX_DBMD_FILE_BYTES) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .ok()
+                .and_then(|text| parse_db_md(&text, &db_md).ok())
+                .unwrap_or_default(),
             Err(_) => Config::default(),
         };
         Ok(Store {
             root: path.to_path_buf(),
+            root_locator: absolute_store_locator(path).map_err(|_| NotAStore {
+                path: path.to_path_buf(),
+            })?,
             config,
+            root_capability: Arc::new(root_capability),
+            reader: Arc::new(Mutex::new(reader)),
         })
+    }
+
+    /// Construct a held-root store view with an explicitly supplied config.
+    ///
+    /// Validation uses this for a directory that may intentionally lack
+    /// `DB.md`, so the validation engine can report `NOT_A_STORE` as a normal
+    /// issue. Tests use it to isolate code from config parsing. The directory
+    /// itself must exist and is still opened with the same no-follow capability
+    /// as a normal store.
+    pub fn from_root_and_config(path: &Path, config: Config) -> std::io::Result<Store> {
+        let root_capability = crate::fsx::open_directory_nofollow(path)?;
+        let reader = crate::fsx::BoundedDirReader::from_root(&root_capability)?;
+        Ok(Store {
+            root: path.to_path_buf(),
+            root_locator: absolute_store_locator(path)?,
+            config,
+            root_capability: Arc::new(root_capability),
+            reader: Arc::new(Mutex::new(reader)),
+        })
+    }
+
+    fn cached_reader(&self) -> std::io::Result<MutexGuard<'_, crate::fsx::BoundedDirReader>> {
+        self.reader
+            .lock()
+            .map_err(|_| std::io::Error::other("store reader lock was poisoned"))
+    }
+
+    /// Open a regular store-relative file from the descriptor retained by this
+    /// `Store`. Absolute inputs are accepted only when they are lexically under
+    /// `self.root`; `..`, absolute escapes, symlink leaves and symlink ancestors
+    /// are rejected by the descriptor traversal.
+    pub fn open_regular(&self, path: &Path) -> std::io::Result<File> {
+        let relative = self.capability_relative(path)?;
+        self.cached_reader()?.open(relative)
+    }
+
+    /// Create a cached descriptor-relative reader for a multi-file sweep.
+    pub fn regular_reader(&self) -> std::io::Result<StoreReader> {
+        Ok(StoreReader {
+            reader: crate::fsx::BoundedDirReader::from_root(&self.root_capability)?,
+        })
+    }
+
+    /// Bounded counterpart to [`Store::open_regular`].
+    pub fn read_bounded(&self, path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+        let relative = self.capability_relative(path)?;
+        self.cached_reader()?.read(relative, max_bytes)
+    }
+
+    /// Bounded UTF-8 read from the held store root.
+    pub fn read_text_bounded(&self, path: &Path, max_bytes: u64) -> std::io::Result<String> {
+        String::from_utf8(self.read_bounded(path, max_bytes)?)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Atomically replace a regular file beneath the held store root.
+    pub fn write_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::write_atomic_beneath(&self.root_capability, relative, bytes, false, true)
+    }
+
+    /// Atomically create a new regular file beneath the held store root.
+    pub fn write_atomic_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::write_atomic_beneath(&self.root_capability, relative, bytes, true, true)
+    }
+
+    /// Atomically replace a derived/rebuildable file beneath the held store
+    /// root without forcing it to stable storage.
+    pub fn write_atomic_nondurable(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::write_atomic_nondurable_beneath(&self.root_capability, relative, bytes)
+    }
+
+    /// Parse one db.md file through the retained root capability.
+    pub fn read_file(
+        &self,
+        path: &Path,
+    ) -> Result<(crate::parser::Frontmatter, String), crate::parser::ParseError> {
+        let bytes = self
+            .read_bounded(path, crate::parser::MAX_DBMD_FILE_BYTES)
+            .map_err(crate::parser::ParseError::Io)?;
+        let text = String::from_utf8(bytes).map_err(|error| {
+            crate::parser::ParseError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            ))
+        })?;
+        let parsed = crate::parser::split_frontmatter(&text, path)?;
+        let frontmatter = crate::parser::Frontmatter::parse(&parsed.frontmatter_yaml, path)?;
+        Ok((frontmatter, parsed.body))
+    }
+
+    /// Canonically render and atomically replace one db.md file through the
+    /// retained root capability.
+    pub fn write_file(
+        &self,
+        path: &Path,
+        frontmatter: &crate::parser::Frontmatter,
+        body: &str,
+    ) -> Result<(), crate::parser::ParseError> {
+        let contents = crate::parser::render_file(frontmatter, body);
+        self.write_atomic(path, contents.as_bytes())?;
+        Ok(())
+    }
+
+    /// Canonically render and atomically create one db.md file through the
+    /// retained root capability.
+    pub fn write_file_new(
+        &self,
+        path: &Path,
+        frontmatter: &crate::parser::Frontmatter,
+        body: &str,
+    ) -> Result<(), crate::parser::ParseError> {
+        let contents = crate::parser::render_file(frontmatter, body);
+        self.write_atomic_new(path, contents.as_bytes())?;
+        Ok(())
+    }
+
+    /// Metadata for an exact no-follow regular file under the held root.
+    pub fn regular_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        let relative = self.capability_relative(path)?;
+        self.cached_reader()?.open(relative)?.metadata()
+    }
+
+    /// True only when `path` names a no-follow regular file under the held root.
+    pub fn regular_file_exists(&self, path: &Path) -> std::io::Result<bool> {
+        match self.regular_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// True only when `path` names a no-follow directory under the held root.
+    pub fn directory_exists(&self, path: &Path) -> std::io::Result<bool> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::directory_exists_beneath(&self.root_capability, relative)
+    }
+
+    /// Confirm exact on-disk component casing through the retained root.
+    pub fn path_case_matches(&self, path: &Path) -> std::io::Result<bool> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::path_case_matches_beneath(&self.root_capability, relative)
+    }
+
+    /// Ensure a directory hierarchy exists beneath the held root.
+    pub fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::open_directory_beneath(&self.root_capability, relative, true).map(drop)
+    }
+
+    /// Immediate visible child directory names, no-follow and nested-store
+    /// pruned.
+    pub fn directory_names(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::directory_names_beneath(&self.root_capability, relative)
+    }
+
+    /// Take the cooperative store-wide mutation gate.
+    pub fn transaction(&self) -> std::io::Result<StoreTransaction> {
+        Ok(StoreTransaction {
+            _lock: crate::fsx::lock_exclusive_beneath(
+                &self.root_capability,
+                Path::new(".dbmd.transaction.lock"),
+            )?,
+        })
+    }
+
+    /// Take a descriptor-relative advisory lock at `path`.
+    pub(crate) fn lock_file(&self, path: &Path) -> std::io::Result<File> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::lock_exclusive_beneath(&self.root_capability, relative)
+    }
+
+    /// Atomic no-replace rename resolved from the held store root.
+    pub fn rename_noreplace(&self, old: &Path, new: &Path) -> std::io::Result<()> {
+        let old = self.capability_relative(old)?;
+        let new = self.capability_relative(new)?;
+        crate::fsx::rename_beneath(&self.root_capability, old, new)
+    }
+
+    /// Remove one regular file beneath the held store root and sync its parent.
+    pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::remove_file_beneath(&self.root_capability, relative)
+    }
+
+    /// List immediate regular-file basenames in a store-relative directory.
+    /// Symlinks and nested-store paths are refused by descriptor traversal.
+    pub fn regular_file_names(&self, directory: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+        let relative = self.capability_relative(directory)?;
+        crate::fsx::regular_file_names_beneath(&self.root_capability, relative)
+    }
+
+    /// Recursively enumerate regular files beneath a store-relative directory.
+    /// The walk stays rooted at the descriptor retained by this `Store`, skips
+    /// symlinks/hidden entries/nested stores, and never reopens `self.root`.
+    pub fn walk_regular_files(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let relative = self.capability_relative(directory)?;
+        crate::fsx::walk_regular_files_beneath(&self.root_capability, relative)
+    }
+
+    pub fn capability_relative<'a>(&self, path: &'a Path) -> std::io::Result<&'a Path> {
+        let relative = if path.is_absolute() {
+            if let Ok(relative) = path.strip_prefix(&self.root_locator) {
+                relative
+            } else {
+                // macOS exposes the same temporary/system directory through both
+                // `/var` and `/private/var` (likewise `/tmp` and `/private/tmp`).
+                // A containment helper may return the canonical spelling while the
+                // held capability was opened through the alias. Match only these
+                // fixed OS aliases lexically; never canonicalize/reopen the root.
+                #[cfg(target_os = "macos")]
+                {
+                    let mut matched = None;
+                    for (alias, canonical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+                        if let Ok(suffix) = self.root_locator.strip_prefix(alias) {
+                            let equivalent_root = Path::new(canonical).join(suffix);
+                            if let Ok(relative) = path.strip_prefix(equivalent_root) {
+                                matched = Some(relative);
+                                break;
+                            }
+                        }
+                        if let Ok(suffix) = self.root_locator.strip_prefix(canonical) {
+                            let equivalent_root = Path::new(alias).join(suffix);
+                            if let Ok(relative) = path.strip_prefix(equivalent_root) {
+                                matched = Some(relative);
+                                break;
+                            }
+                        }
+                    }
+                    matched.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "path {} is outside store {}",
+                                path.display(),
+                                self.root_locator.display()
+                            ),
+                        )
+                    })?
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "path {} is outside store {}",
+                            path.display(),
+                            self.root_locator.display()
+                        ),
+                    ));
+                }
+            }
+        } else {
+            path
+        };
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "store capability requires a contained relative path",
+            ));
+        }
+        Ok(relative)
     }
 
     /// **SWEEP.** Recursively iterate every `.md` content file across
@@ -254,22 +561,15 @@ impl Store {
 
     /// **SWEEP.** Like [`Store::walk`] but scoped to a single layer.
     pub fn walk_layer(&self, layer: Layer) -> Result<Vec<PathBuf>, StoreError> {
-        let layer_root = self.root.join(layer.dir_name());
-        if !layer_root.is_dir() {
-            return Ok(Vec::new());
-        }
-        self.walk_content_md(&layer_root)
+        self.walk_content_md(Path::new(layer.dir_name()))
     }
 
     /// Enumerate every `.md` file in a single type-folder, **recursing through
     /// its date-shards** (`sources/emails/**/*.md`). The unit the index builder
     /// and per-folder rebuild operate on. SWEEP-class (scoped to one folder).
     pub fn walk_type_folder(&self, type_folder: &Path) -> Result<Vec<PathBuf>, StoreError> {
-        let abs = self.resolve_under_root(type_folder);
-        if !abs.is_dir() {
-            return Ok(Vec::new());
-        }
-        self.walk_content_md(&abs)
+        let relative = self.capability_relative(type_folder)?;
+        self.walk_content_md(relative)
     }
 
     /// Return visible descendant db.md store roots, stopping at each boundary.
@@ -279,55 +579,7 @@ impl Store {
     /// it, while `validate` reports the structural error against its `DB.md`.
     /// Hidden directories stay outside the db.md content model and are skipped.
     pub fn nested_store_roots(&self) -> Result<Vec<PathBuf>, StoreError> {
-        let canonical_root = self.root.canonicalize()?;
-        let mut out = Vec::new();
-        let mut walker = walkdir::WalkDir::new(&self.root)
-            .follow_links(true)
-            .into_iter();
-
-        while let Some(result) = walker.next() {
-            let entry = match result {
-                Ok(entry) => entry,
-                // A symlink loop is not a nested store. The ordinary store walk
-                // has the same loop protection; skip the broken branch.
-                Err(err) if err.loop_ancestor().is_some() => continue,
-                Err(err) => {
-                    return Err(StoreError::Search {
-                        root: self.root.clone(),
-                        message: err.to_string(),
-                    });
-                }
-            };
-            if entry.depth() == 0 {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy();
-            if name.starts_with('.') {
-                if entry.path().is_dir() {
-                    walker.skip_current_dir();
-                }
-                continue;
-            }
-
-            let resolved = match resolve_within(&canonical_root, &self.root, entry.path()) {
-                Ok(path) => path,
-                Err(_) => {
-                    if entry.path().is_dir() {
-                        walker.skip_current_dir();
-                    }
-                    continue;
-                }
-            };
-            if resolved.is_dir() && Store::is_db_md_store(&resolved) {
-                if let Ok(rel) = entry.path().strip_prefix(&self.root) {
-                    out.push(rel.to_path_buf());
-                }
-                walker.skip_current_dir();
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        Ok(crate::fsx::ownership_boundaries_beneath(&self.root_capability)?.1)
     }
 
     /// Whether `candidate` resolves to content owned by this store.
@@ -335,42 +587,26 @@ impl Store {
     /// Ownership requires both filesystem containment and that the path does
     /// not cross a descendant store boundary.
     pub fn owns_path(&self, candidate: &Path) -> bool {
-        ensure_path_within_store(&self.root, candidate).is_ok()
+        self.capability_relative(candidate)
+            .and_then(|relative| {
+                if self.regular_file_exists(relative)? || self.directory_exists(relative)? {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "store path does not exist",
+                    ))
+                }
+            })
+            .is_ok()
     }
 
-    /// Visible symlinks whose targets are outside this store's ownership
-    /// boundary. The scan never follows a symlink or reads its target bytes;
-    /// mutating callers use it to surface that ignored content exists instead
-    /// of silently implying the whole visible tree was processed.
+    /// Visible symlinks, all outside the no-follow store ownership model. The
+    /// scan never follows a link or reads its target bytes; mutating callers use
+    /// it to surface that ignored content exists instead of silently implying
+    /// the whole visible tree was processed.
     pub fn unowned_symlinks(&self) -> Result<Vec<PathBuf>, StoreError> {
-        let mut out = Vec::new();
-        let mut walker = walkdir::WalkDir::new(&self.root)
-            .follow_links(false)
-            .into_iter();
-        while let Some(result) = walker.next() {
-            let entry = result.map_err(|err| StoreError::Search {
-                root: self.root.clone(),
-                message: err.to_string(),
-            })?;
-            if entry.depth() == 0 {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy();
-            if name.starts_with('.') {
-                if entry.file_type().is_dir() {
-                    walker.skip_current_dir();
-                }
-                continue;
-            }
-            if entry.file_type().is_symlink() && !self.owns_path(entry.path()) {
-                if let Some(rel) = self.rel_path(entry.path()) {
-                    out.push(rel);
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        Ok(crate::fsx::ownership_boundaries_beneath(&self.root_capability)?.0)
     }
 
     /// The ≤`n` most-recent files in a type-folder by frontmatter `updated`
@@ -394,7 +630,7 @@ impl Store {
         let mut keyed: Vec<(Option<DateTime<FixedOffset>>, PathBuf)> = files
             .into_iter()
             .map(|rel| {
-                let updated = self.read_updated(&self.abs_path(&rel));
+                let updated = self.read_updated(&rel);
                 (updated, rel)
             })
             .collect();
@@ -562,6 +798,13 @@ impl Store {
         }
 
         let mut hits = std::collections::BTreeSet::new();
+        let mut reader =
+            crate::fsx::BoundedDirReader::from_root(&self.root_capability).map_err(|error| {
+                StoreError::Search {
+                    root: self.root.clone(),
+                    message: format!("could not hold the store read capability: {error}"),
+                }
+            })?;
         // Scan every `.md` file in the store (skip hidden + `log/`), including
         // `index.md` catalogs — an incoming reference is wherever the link text
         // lives; the caller decides relevance. ONE walk for the whole target set;
@@ -569,7 +812,6 @@ impl Store {
         // so a file that links to several targets is read once, not once per
         // target.
         for rel in self.walk_all_md()? {
-            let abs = self.abs_path(&rel);
             // Read lossily: a `.md` verbatim-ingested into `sources/` can carry a
             // stray non-UTF-8 byte (a mis-decoded Latin-1 import). Decoding
             // lossily substitutes replacement characters instead of erroring, so
@@ -578,12 +820,12 @@ impl Store {
             // ASCII, so a replacement char elsewhere on the line never hides a
             // `[[...]]`. A read error (not a decode error) is genuine I/O trouble
             // and propagates.
-            let bytes = match std::fs::read(&abs) {
-                Ok(b) => b,
-                Err(e) => {
+            let bytes = match reader.read(&rel, crate::parser::MAX_DBMD_FILE_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => {
                     return Err(StoreError::Search {
                         root: self.root.clone(),
-                        message: format!("read failed in {}: {e}", abs.display()),
+                        message: format!("read failed in {}: {error}", rel.display()),
                     })
                 }
             };
@@ -682,7 +924,13 @@ impl Store {
     /// last-write-wins by `path` over any un-compacted lines. The sidecar-read
     /// primitive every structured query sits on.
     pub fn read_type_index(&self, index_jsonl: &Path) -> Result<Vec<IndexRecord>, StoreError> {
-        let text = std::fs::read_to_string(index_jsonl).map_err(|e| StoreError::BadTypeIndex {
+        let bytes = self
+            .read_bounded(index_jsonl, crate::parser::MAX_DBMD_FILE_BYTES)
+            .map_err(|e| StoreError::BadTypeIndex {
+                path: index_jsonl.to_path_buf(),
+                message: e.to_string(),
+            })?;
+        let text = String::from_utf8(bytes).map_err(|e| StoreError::BadTypeIndex {
             path: index_jsonl.to_path_buf(),
             message: e.to_string(),
         })?;
@@ -724,42 +972,24 @@ impl Store {
 
     // ── Private helpers ─────────────────────────────────────────────────────
 
-    /// Resolve a caller-supplied folder path (store-relative or absolute) to an
-    /// absolute path under the store root.
-    fn resolve_under_root(&self, folder: &Path) -> PathBuf {
-        if folder.is_absolute() {
-            folder.to_path_buf()
-        } else {
-            self.root.join(folder)
-        }
-    }
-
     /// Walk a subtree for content `.md` files (skip hidden dirs, skip `index.md`
     /// / `DB.md` / `log.md`), returning store-relative paths. Used by the layer
     /// and type-folder walks.
     fn walk_content_md(&self, root: &Path) -> Result<Vec<PathBuf>, StoreError> {
         let mut out = Vec::new();
-        for entry in self.md_walker(root).build() {
-            let entry = entry.map_err(|e| StoreError::Search {
-                root: root.to_path_buf(),
-                message: e.to_string(),
-            })?;
-            if !is_file_entry(&entry) {
+        let files = match crate::fsx::walk_regular_files_beneath(&self.root_capability, root) {
+            Ok(files) => files,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        for path in files {
+            if !has_md_extension(&path) {
                 continue;
             }
-            let path = entry.path();
-            if !self.owns_path(path) {
+            if is_non_content_basename(&path) {
                 continue;
             }
-            if !has_md_extension(path) {
-                continue;
-            }
-            if is_non_content_basename(path) {
-                continue;
-            }
-            if let Some(rel) = self.rel_path(path) {
-                out.push(rel);
-            }
+            out.push(path);
         }
         out.sort();
         Ok(out)
@@ -770,27 +1000,14 @@ impl Store {
     /// scan, where the literal link text can live in any markdown file.
     fn walk_all_md(&self) -> Result<Vec<PathBuf>, StoreError> {
         let mut out = Vec::new();
-        for entry in self.md_walker(&self.root).build() {
-            let entry = entry.map_err(|e| StoreError::Search {
-                root: self.root.clone(),
-                message: e.to_string(),
-            })?;
-            if !is_file_entry(&entry) {
+        for path in crate::fsx::walk_regular_files_beneath(&self.root_capability, Path::new(""))? {
+            if !has_md_extension(&path) {
                 continue;
             }
-            let path = entry.path();
-            if !self.owns_path(path) {
+            if path.components().next().map(|c| c.as_os_str()) == Some("log".as_ref()) {
                 continue;
             }
-            if !has_md_extension(path) {
-                continue;
-            }
-            if self.is_in_log_dir(path) {
-                continue;
-            }
-            if let Some(rel) = self.rel_path(path) {
-                out.push(rel);
-            }
+            out.push(path);
         }
         out.sort();
         Ok(out)
@@ -808,7 +1025,7 @@ impl Store {
     ) -> Result<Vec<IndexRecord>, StoreError> {
         let mut out = Vec::new();
         for sidecar in self.find_type_index_files_in(layer)? {
-            out.extend(self.read_type_index(&self.abs_path(&sidecar))?);
+            out.extend(self.read_type_index(&sidecar)?);
         }
         Ok(out)
     }
@@ -836,80 +1053,34 @@ impl Store {
             out.sort();
             return Ok(out);
         };
-        let walk_root = self.root.join(layer.dir_name());
-        // A scoped walk over a layer folder that does not exist yet must be an
-        // empty result, mirroring `walk_layer`'s missing-dir guard — not a walk
-        // error from `ignore` over a nonexistent path.
-        if !walk_root.is_dir() {
-            return Ok(Vec::new());
-        }
         let mut out = Vec::new();
-        let mut builder = WalkBuilder::new(&walk_root);
-        let store_root = self.root.clone();
-        builder
-            .standard_filters(false)
-            .hidden(true)
-            .follow_links(true)
-            .filter_entry(move |entry| ensure_path_within_store(&store_root, entry.path()).is_ok());
-        for entry in builder.build() {
-            let entry = entry.map_err(|e| StoreError::Search {
-                root: walk_root.clone(),
-                message: e.to_string(),
-            })?;
-            if !is_file_entry(&entry) {
-                continue;
-            }
-            let path = entry.path();
-            if !self.owns_path(path) {
-                continue;
-            }
+        let paths = match crate::fsx::walk_regular_files_beneath(
+            &self.root_capability,
+            Path::new(layer.dir_name()),
+        ) {
+            Ok(paths) => paths,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        for path in paths {
             if path.file_name().and_then(|n| n.to_str()) != Some(TYPE_INDEX_FILE) {
                 continue;
             }
-            if self.is_in_log_dir(path) {
-                continue;
-            }
-            if let Some(rel) = self.rel_path(path) {
-                out.push(rel);
-            }
+            out.push(path);
         }
         out.sort();
         Ok(out)
-    }
-
-    /// A `WalkBuilder` configured for db.md SWEEPs: gitignore/global-ignore are
-    /// OFF (a SWEEP must see every file even if the store is a git repo with a
-    /// `.gitignore`), but hidden files/dirs are skipped. Symlinks are
-    /// **followed** (`follow_links(true)`) so an in-store alias to an in-store
-    /// `.md` file or type folder is walked like ordinary content rather than
-    /// silently vanishing. The ownership filter prunes aliases that escape the
-    /// root or cross a descendant-store boundary.
-    fn md_walker(&self, root: &Path) -> WalkBuilder {
-        let mut builder = WalkBuilder::new(root);
-        let store_root = self.root.clone();
-        builder
-            .standard_filters(false)
-            .hidden(true)
-            .follow_links(true)
-            .filter_entry(move |entry| ensure_path_within_store(&store_root, entry.path()).is_ok());
-        builder
-    }
-
-    /// True if an absolute path lives under the store's root-level `log/`
-    /// rotation-archive directory.
-    fn is_in_log_dir(&self, abs: &Path) -> bool {
-        match self.rel_path(abs) {
-            Some(rel) => rel.components().next().map(|c| c.as_os_str()) == Some("log".as_ref()),
-            None => false,
-        }
     }
 
     /// Read a file's frontmatter `updated` field as an RFC3339 timestamp,
     /// returning `None` when absent/unparseable. A self-contained reader (does
     /// not depend on the not-yet-implemented `parser::read_file`); parses the
     /// leading `---`-fenced YAML block with the same engine the parser uses.
-    fn read_updated(&self, abs: &Path) -> Option<DateTime<FixedOffset>> {
-        let text = std::fs::read_to_string(abs).ok()?;
+    fn read_updated(&self, path: &Path) -> Option<DateTime<FixedOffset>> {
+        let bytes = self
+            .read_bounded(path, crate::parser::MAX_DBMD_FILE_BYTES)
+            .ok()?;
+        let text = String::from_utf8(bytes).ok()?;
         let yaml = frontmatter_block(&text)?;
         let value: serde_norway::Value = serde_norway::from_str(yaml).ok()?;
         let raw = value.get("updated")?;
@@ -949,6 +1120,7 @@ impl Store {
 /// `/tmp` → `/private/tmp`).
 pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
     reject_parent_components(store_root, candidate)?;
+    reject_symlink_tail(store_root, candidate)?;
 
     // Canonicalize the root so both sides of the containment check are in the
     // same (fully-resolved) namespace. This also resolves any `..` the root
@@ -958,6 +1130,74 @@ pub fn ensure_path_within_store(store_root: &Path, candidate: &Path) -> std::io:
     let resolved = resolve_within(&root, store_root, candidate)?;
     reject_nested_store_boundary(&root, &resolved, candidate, store_root)?;
     Ok(resolved)
+}
+
+/// Reject every existing symlink in the caller-influenced path below the store
+/// root. Canonical containment alone is check-then-reopen: an in-root symlink
+/// may validate, then select different bytes before a later path open. Actual
+/// reads/writes also use handle-relative `O_NOFOLLOW`; this lexical pass gives
+/// callers an early, explicit containment refusal while the open is the
+/// race-proof enforcement.
+fn reject_symlink_tail(store_root: &Path, candidate: &Path) -> std::io::Result<()> {
+    // macOS exposes `/var` and `/tmp` as stable system symlink aliases for
+    // `/private/var` and `/private/tmp`. A store locator may return the
+    // canonical spelling while an absolute CLI argument retains the alias.
+    // Normalize only those OS-owned prefixes; caller-controlled symlinks below
+    // the store root remain forbidden.
+    let lexical_root = platform_lexical_path(store_root);
+    let lexical_candidate = platform_lexical_path(candidate);
+    let tail = lexical_candidate
+        .strip_prefix(&lexical_root)
+        .unwrap_or(&lexical_candidate);
+    let mut cursor = if lexical_candidate.starts_with(&lexical_root) {
+        lexical_root
+    } else if lexical_candidate.is_absolute() {
+        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+    } else {
+        PathBuf::new()
+    };
+    for component in tail.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => continue,
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                // The lexical containment gate reports the more specific error.
+                continue;
+            }
+            std::path::Component::Normal(name) => cursor.push(name),
+        }
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "path {} crosses symlink component {}",
+                        candidate.display(),
+                        cursor.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn platform_lexical_path(path: &Path) -> PathBuf {
+    for (alias, canonical) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+        if let Ok(tail) = path.strip_prefix(alias) {
+            return Path::new(canonical).join(tail);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_lexical_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// Reject a path owned by a descendant store. Every directory between the
@@ -1156,6 +1396,11 @@ impl StoreContainment {
                 let canon_parent = match self.dirs.get(parent) {
                     Some(p) => p.clone(),
                     None => {
+                        // Check each distinct parent chain once. The actual file
+                        // open remains handle-relative and no-follow, so this
+                        // cache affects diagnostics/performance, not the
+                        // race-proof enforcement at the I/O boundary.
+                        reject_symlink_tail(&self.store_root, parent)?;
                         let p = parent.canonicalize()?;
                         self.dirs.insert(parent.to_path_buf(), p.clone());
                         p
@@ -1172,6 +1417,7 @@ impl StoreContainment {
 
         // Slow path — symlink leaf, missing file, no parent: the full peel,
         // against the already-canonical root.
+        reject_symlink_tail(&self.store_root, candidate)?;
         let resolved = resolve_within(&self.root, &self.store_root, candidate)?;
         reject_nested_store_boundary(&self.root, &resolved, candidate, &self.store_root)?;
         Ok(resolved)
@@ -1510,27 +1756,6 @@ fn fs_is_case_insensitive() -> bool {
 }
 
 // ── Free helpers (no `self`) ────────────────────────────────────────────────
-
-/// True if a walk entry is a regular file, **following symlinks** so a
-/// symlinked `.md` content file (or a file inside a symlinked type folder) is
-/// counted like any other content file.
-///
-/// The store walks enable `follow_links(true)`, so a symlink entry's
-/// `file_type()` still reports `is_symlink()` (the `ignore` walker does not
-/// rewrite the entry's own type), not the followed target's type. Treat a
-/// symlink whose target is a regular file as a file: `stat` (follow) the path
-/// and check. A broken symlink (no target) is not a file.
-fn is_file_entry(entry: &ignore::DirEntry) -> bool {
-    match entry.file_type() {
-        Some(ft) if ft.is_file() => true,
-        Some(ft) if ft.is_symlink() => std::fs::metadata(entry.path())
-            .map(|m| m.is_file())
-            .unwrap_or(false),
-        // A `None` file type (the walk root itself) or a non-file/non-symlink
-        // entry is not a content file.
-        _ => false,
-    }
-}
 
 /// True if the path ends in a `.md` extension (case-sensitive — db.md files are
 /// lowercase `.md`).
@@ -2100,6 +2325,94 @@ mod tests {
             "open() must surface DB.md ## Policies, got {:?}",
             store.config.frozen_pages
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_store_keeps_original_root_capability_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        fs::create_dir_all(root.join("records/notes")).unwrap();
+        fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(root.join("records/notes/owned.md"), b"owned").unwrap();
+
+        let outside = sandbox.path().join("outside");
+        fs::create_dir_all(outside.join("records/notes")).unwrap();
+        fs::write(outside.join("records/notes/owned.md"), b"outside secret").unwrap();
+        fs::write(
+            outside.join("records/notes/external-only.md"),
+            b"must never be enumerated",
+        )
+        .unwrap();
+
+        let store = Store::open_strict(&root).unwrap();
+        let detached = sandbox.path().join("detached-store");
+        fs::rename(&root, &detached).unwrap();
+        symlink(&outside, &root).unwrap();
+
+        assert_eq!(
+            store
+                .read_bounded(Path::new("records/notes/owned.md"), 1024)
+                .unwrap(),
+            b"owned",
+            "reads must remain rooted at the directory selected by open()"
+        );
+        store
+            .write_atomic(
+                Path::new("records/notes/created.md"),
+                b"created in held store",
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(detached.join("records/notes/created.md")).unwrap(),
+            b"created in held store"
+        );
+        assert!(
+            !outside.join("records/notes/created.md").exists(),
+            "writes must not follow a swapped store pathname"
+        );
+        assert_eq!(
+            fs::read(outside.join("records/notes/owned.md")).unwrap(),
+            b"outside secret"
+        );
+        let walked = store.walk().unwrap();
+        assert!(
+            walked.contains(&PathBuf::from("records/notes/owned.md"))
+                && walked.contains(&PathBuf::from("records/notes/created.md")),
+            "sweeps must enumerate the held original directory"
+        );
+        assert!(
+            !walked.contains(&PathBuf::from("records/notes/external-only.md")),
+            "sweeps must not enumerate a replacement at the old root pathname"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_gate_serializes_cooperative_mutators() {
+        let dir = empty_store();
+        let first_store = Store::open_strict(dir.path()).unwrap();
+        let second_store = Store::open_strict(dir.path()).unwrap();
+        let first = first_store.transaction().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            let _second = second_store.transaction().unwrap();
+            sent.send(()).unwrap();
+        });
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a second cooperative mutator must wait while rename owns the gate"
+        );
+        drop(first);
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("waiter acquires immediately after the first transaction ends");
+        waiter.join().unwrap();
     }
 
     // ── walk / walk_layer / walk_type_folder ─────────────────────────────────
@@ -3994,11 +4307,11 @@ After [[records/companies/acme]].
         );
     }
 
-    // ── walk follows symlinked content ───────────────────────────────────────
+    // ── walk refuses symlinked content ───────────────────────────────────────
 
     #[cfg(unix)]
     #[test]
-    fn walk_includes_symlinked_content_file_and_symlinked_folder() {
+    fn walk_skips_symlinked_content_file_and_symlinked_folder() {
         use std::os::unix::fs::symlink;
         let dir = empty_store();
         let root = dir.path();
@@ -4024,13 +4337,10 @@ After [[records/companies/acme]].
 
         let store = open(&dir);
         let got = rels(&store.walk().unwrap());
-        assert!(
-            got.contains(&"records/contacts/elena.md".to_string()),
-            "a symlinked content file must be walked: {got:?}"
-        );
-        assert!(
-            got.contains(&"records/companies/acme.md".to_string()),
-            "a file inside a symlinked type folder must be walked: {got:?}"
+        assert_eq!(
+            got,
+            vec!["records/contacts/sarah.md".to_string()],
+            "store sweeps must not follow symlink leaves or ancestors: {got:?}"
         );
     }
 

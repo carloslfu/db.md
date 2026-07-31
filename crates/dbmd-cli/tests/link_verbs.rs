@@ -16,12 +16,19 @@
 //! REFUSES a hostile path with nothing written, push collects the owned store
 //! and nothing else).
 
+#![allow(dead_code)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ring::signature::KeyPair as _;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Absolute path to the `dbmd` binary Cargo built for this integration-test
 /// target.
@@ -35,7 +42,7 @@ const RECORD_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7e";
 // signature covers its unsigned canonical JSON and `feedHash` covers the exact
 // signed JSON plus its trailing newline, matching the hub contract.
 const SIGNED_HEAD_HASH: &str = "d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd";
-const SIGNED_HEAD_CARD: &str = r#"{"id":"01j5qc3v9k4ym8rwbn2tqe6f7d","headSeq":41,"feedHash":"d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd","updatedAt":"2026-07-13T00:00:00.000Z"}"#;
+const SIGNED_HEAD_CARD: &str = r#"{"id":"01j5qc3v9k4ym8rwbn2tqe6f7d","headSeq":41,"feedHash":"d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd","updatedAt":"2026-07-13T00:00:00.000Z","identity":{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","publicKeySpki":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU","previous":[],"rotations":[]}}"#;
 const SIGNED_HEAD_FEED: &str = r#"{"headSeq":41,"feedHash":"d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd","identity":{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","publicKeySpki":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU"},"entries":[{"hash":"d93db0de1f5f9b7b98da87d34520e02df7aa4a9786da28ce191fdf0ede88a2cd","entry":{"v":1,"seq":41,"ts":"2026-07-14T00:00:00.000Z","brain":"ed25519:plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","public_key":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU","kind":"push","op":"snapshot","pack_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","files":[{"path":"DB.md","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bytes":3}],"removed":[],"prev_entry_hash":null,"sig":"TEozQnDFrOBDvYR2x_pfgah2Oyr3xGZX3acjvAmrniytxN0x6J5bgQwd0Vso1fgWJqvO3UPytDMN8QFJeRRQBw"}}],"scopeLimited":false}"#;
 
 fn signed_head_responses() -> Vec<(u16, String)> {
@@ -43,6 +50,216 @@ fn signed_head_responses() -> Vec<(u16, String)> {
         (200, SIGNED_HEAD_CARD.to_string()),
         (200, SIGNED_HEAD_FEED.to_string()),
     ]
+}
+
+fn signed_card_with_metadata() -> String {
+    let mut card: serde_json::Value = serde_json::from_str(SIGNED_HEAD_CARD).unwrap();
+    card["slug"] = serde_json::json!("acme");
+    card["name"] = serde_json::json!("Acme");
+    card["visibility"] = serde_json::json!("private");
+    card["indexedFeedSeq"] = serde_json::json!(41);
+    card["stats"] = serde_json::json!({"records": 4, "sources": 1});
+    card.to_string()
+}
+
+#[derive(Serialize)]
+struct TestFeedFile<'a> {
+    path: &'a str,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct TestUnsignedFeed<'a> {
+    v: u8,
+    seq: u64,
+    ts: &'a str,
+    brain: &'a str,
+    public_key: &'a str,
+    kind: &'a str,
+    op: &'a str,
+    pack_sha256: &'a str,
+    files: &'a [TestFeedFile<'a>],
+    removed: &'a [String],
+    prev_entry_hash: &'a Option<String>,
+}
+
+#[derive(Serialize)]
+struct TestSignedFeed<'a> {
+    v: u8,
+    seq: u64,
+    ts: &'a str,
+    brain: &'a str,
+    public_key: &'a str,
+    kind: &'a str,
+    op: &'a str,
+    pack_sha256: &'a str,
+    files: &'a [TestFeedFile<'a>],
+    removed: &'a [String],
+    prev_entry_hash: &'a Option<String>,
+    sig: &'a str,
+}
+
+#[derive(Serialize)]
+struct TestUnsignedRotation<'a> {
+    v: u8,
+    op: &'a str,
+    brain: &'a str,
+    public_key: &'a str,
+    new_brain: &'a str,
+    new_public_key: &'a str,
+    prior_head_seq: u64,
+    prior_feed_hash: Option<&'a str>,
+    ts: &'a str,
+}
+
+fn signed_inline_snapshot(
+    files: &[(&str, &str)],
+) -> (String, String, String, ring::signature::Ed25519KeyPair) {
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let mut spki = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    spki.extend_from_slice(pair.public_key().as_ref());
+    let public_key = URL_SAFE_NO_PAD.encode(&spki);
+    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&spki));
+    let multikey = format!("ed25519:{fingerprint}");
+    let manifest: Vec<TestFeedFile<'_>> = files
+        .iter()
+        .map(|(path, content)| TestFeedFile {
+            path,
+            sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+            bytes: content.len() as u64,
+        })
+        .collect();
+    let removed = Vec::new();
+    let previous = None;
+    let pack_sha256 = "a".repeat(64);
+    let unsigned = TestUnsignedFeed {
+        v: 1,
+        seq: 1,
+        ts: "2026-07-30T12:00:00.000Z",
+        brain: &multikey,
+        public_key: &public_key,
+        kind: "push",
+        op: "snapshot",
+        pack_sha256: &pack_sha256,
+        files: &manifest,
+        removed: &removed,
+        prev_entry_hash: &previous,
+    };
+    let sig = URL_SAFE_NO_PAD.encode(pair.sign(&serde_json::to_vec(&unsigned).unwrap()).as_ref());
+    let signed = TestSignedFeed {
+        v: unsigned.v,
+        seq: unsigned.seq,
+        ts: unsigned.ts,
+        brain: unsigned.brain,
+        public_key: unsigned.public_key,
+        kind: unsigned.kind,
+        op: unsigned.op,
+        pack_sha256: unsigned.pack_sha256,
+        files: unsigned.files,
+        removed: unsigned.removed,
+        prev_entry_hash: unsigned.prev_entry_hash,
+        sig: &sig,
+    };
+    let entry = serde_json::to_value(&signed).unwrap();
+    let mut exact = serde_json::to_vec(&signed).unwrap();
+    exact.push(b'\n');
+    let hash = format!("{:x}", Sha256::digest(&exact));
+    let card = serde_json::json!({
+        "id": BRAIN_ID,
+        "headSeq": 1,
+        "feedHash": hash,
+    })
+    .to_string();
+    let feed = serde_json::json!({
+        "headSeq": 1,
+        "feedHash": hash,
+        "identity": {
+            "fingerprint": fingerprint,
+            "publicKeySpki": public_key,
+            "previous": [],
+            "rotations": [],
+        },
+        "entries": [{"hash": hash, "entry": entry}],
+        "scopeLimited": false,
+    })
+    .to_string();
+    let export = serde_json::json!({
+        "brain": BRAIN_ID,
+        "slug": "acme",
+        "headSeq": 1,
+        "feedHash": hash,
+        "files": files.iter().map(|(path, content)| {
+            serde_json::json!({"path": path, "content": content})
+        }).collect::<Vec<_>>(),
+    })
+    .to_string();
+    (card, feed, export, pair)
+}
+
+fn signed_head_for_key(pair: &ring::signature::Ed25519KeyPair) -> (String, String, String) {
+    let mut spki = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    spki.extend_from_slice(pair.public_key().as_ref());
+    let public_key = URL_SAFE_NO_PAD.encode(&spki);
+    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&spki));
+    let multikey = format!("ed25519:{fingerprint}");
+    let files = Vec::new();
+    let removed = Vec::new();
+    let previous = None;
+    let pack_sha256 = "a".repeat(64);
+    let unsigned = TestUnsignedFeed {
+        v: 1,
+        seq: 1,
+        ts: "2026-07-30T12:00:00.000Z",
+        brain: &multikey,
+        public_key: &public_key,
+        kind: "push",
+        op: "snapshot",
+        pack_sha256: &pack_sha256,
+        files: &files,
+        removed: &removed,
+        prev_entry_hash: &previous,
+    };
+    let sig = URL_SAFE_NO_PAD.encode(pair.sign(&serde_json::to_vec(&unsigned).unwrap()).as_ref());
+    let signed = TestSignedFeed {
+        v: unsigned.v,
+        seq: unsigned.seq,
+        ts: unsigned.ts,
+        brain: unsigned.brain,
+        public_key: unsigned.public_key,
+        kind: unsigned.kind,
+        op: unsigned.op,
+        pack_sha256: unsigned.pack_sha256,
+        files: unsigned.files,
+        removed: unsigned.removed,
+        prev_entry_hash: unsigned.prev_entry_hash,
+        sig: &sig,
+    };
+    let entry = serde_json::to_value(&signed).unwrap();
+    let mut exact = serde_json::to_vec(&signed).unwrap();
+    exact.push(b'\n');
+    let hash = format!("{:x}", Sha256::digest(&exact));
+    let card = serde_json::json!({"id": BRAIN_ID, "headSeq": 1, "feedHash": hash}).to_string();
+    let feed = serde_json::json!({
+        "headSeq": 1,
+        "feedHash": hash,
+        "identity": {
+            "fingerprint": fingerprint,
+            "publicKeySpki": public_key,
+            "previous": [],
+            "rotations": [],
+        },
+        "entries": [{"hash": hash, "entry": entry}],
+        "scopeLimited": false,
+    })
+    .to_string();
+    (card, feed, multikey)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,13 +296,23 @@ struct MockHub {
 
 impl MockHub {
     fn serve(responses: Vec<(u16, String)>) -> MockHub {
+        Self::serve_generated(move |_| {
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, "application/json", body.into_bytes()))
+                .collect()
+        })
+    }
+
+    fn serve_generated(build: impl FnOnce(&str) -> Vec<(u16, &'static str, Vec<u8>)>) -> MockHub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock hub");
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let responses = build(&url);
         let requests: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
 
         let handle = std::thread::spawn(move || {
-            for (status, body) in responses {
+            for (status, content_type, body) in responses {
                 let (stream, _) = match listener.accept() {
                     Ok(s) => s,
                     Err(_) => return,
@@ -137,11 +364,12 @@ impl MockHub {
                 });
 
                 let response = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len(),
                 );
                 let mut stream = reader.into_inner();
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
                 let _ = stream.flush();
             }
         });
@@ -165,6 +393,117 @@ impl MockHub {
     }
 }
 
+fn serve_exact_snapshot_hub() -> MockHub {
+    serve_snapshot_hub(vec![
+        (
+            "DB.md".to_string(),
+            "---\ntype: db-md\nscope: company\nname: Mirror\n---\n\n# Mirror\n".to_string(),
+        ),
+        (
+            "records/note.md".to_string(),
+            "---\ntype: note\nid: 01j5qc3v9k4ym8rwbn2tqe6f7e\nsummary: Signed note\n---\n\n# Note\n".to_string(),
+        ),
+    ])
+}
+
+fn serve_snapshot_hub(files: Vec<(String, String)>) -> MockHub {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default())
+        .unix_permissions(0o600);
+    for (path, content) in &files {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+    }
+    let pack = writer.finish().unwrap().into_inner();
+    let pack_sha256 = format!("{:x}", Sha256::digest(&pack));
+
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let mut spki = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    spki.extend_from_slice(pair.public_key().as_ref());
+    let public_key = URL_SAFE_NO_PAD.encode(&spki);
+    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&spki));
+    let multikey = format!("ed25519:{fingerprint}");
+    let manifest: Vec<TestFeedFile<'_>> = files
+        .iter()
+        .map(|(path, content)| TestFeedFile {
+            path: path.as_str(),
+            sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+            bytes: content.len() as u64,
+        })
+        .collect();
+    let removed = Vec::new();
+    let previous = None;
+    let unsigned = TestUnsignedFeed {
+        v: 1,
+        seq: 1,
+        ts: "2026-07-30T12:00:00.000Z",
+        brain: &multikey,
+        public_key: &public_key,
+        kind: "push",
+        op: "snapshot",
+        pack_sha256: &pack_sha256,
+        files: &manifest,
+        removed: &removed,
+        prev_entry_hash: &previous,
+    };
+    let sig = URL_SAFE_NO_PAD.encode(pair.sign(&serde_json::to_vec(&unsigned).unwrap()).as_ref());
+    let signed = TestSignedFeed {
+        v: unsigned.v,
+        seq: unsigned.seq,
+        ts: unsigned.ts,
+        brain: unsigned.brain,
+        public_key: unsigned.public_key,
+        kind: unsigned.kind,
+        op: unsigned.op,
+        pack_sha256: unsigned.pack_sha256,
+        files: unsigned.files,
+        removed: unsigned.removed,
+        prev_entry_hash: unsigned.prev_entry_hash,
+        sig: &sig,
+    };
+    let entry = serde_json::to_value(&signed).unwrap();
+    let mut exact = serde_json::to_vec(&signed).unwrap();
+    exact.push(b'\n');
+    let feed_hash = format!("{:x}", Sha256::digest(&exact));
+    let card = serde_json::json!({"id": BRAIN_ID, "headSeq": 1, "feedHash": feed_hash}).to_string();
+    let feed = serde_json::json!({
+        "headSeq": 1,
+        "feedHash": feed_hash,
+        "identity": {
+            "fingerprint": fingerprint,
+            "publicKeySpki": public_key,
+            "previous": [],
+            "rotations": [],
+        },
+        "entries": [{"hash": feed_hash, "entry": entry}],
+        "scopeLimited": false,
+    })
+    .to_string();
+    MockHub::serve_generated(move |url| {
+        let export = serde_json::json!({
+            "brain": BRAIN_ID,
+            "slug": "mirror",
+            "headSeq": 1,
+            "feedHash": feed_hash,
+            "sha256": pack_sha256,
+            "url": format!("{url}/snapshot.pack"),
+        })
+        .to_string();
+        vec![
+            (200, "application/json", card.into_bytes()),
+            (200, "application/json", feed.into_bytes()),
+            (200, "application/json", export.into_bytes()),
+            (200, "application/zip", pack),
+        ]
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Test scaffolding
 // ─────────────────────────────────────────────────────────────────────────────
@@ -179,17 +518,34 @@ struct Output {
 /// `hub`/`key` map to the `DBMD_HUB_URL` / `DBMD_HUB_KEY` env vars; both are
 /// otherwise scrubbed so the developer's real environment never leaks in.
 fn run_dbmd(cwd: &Path, args: &[&str], hub: Option<&str>, key: Option<&str>) -> Output {
+    run_dbmd_options(cwd, args, hub, key, false)
+}
+
+fn run_dbmd_options(
+    cwd: &Path,
+    args: &[&str],
+    hub: Option<&str>,
+    key: Option<&str>,
+    allow_private_registry: bool,
+) -> Output {
     let mut cmd = Command::new(DBMD);
     cmd.args(args)
         .current_dir(cwd)
         .env_remove("DBMD_HUB_URL")
         .env_remove("DBMD_HUB_KEY")
-        .env_remove("DBMD_AGENT_KEY_FILE");
+        .env_remove("DBMD_AGENT_KEY_FILE")
+        .env_remove("DBMD_BRAIN_KEY_FILE")
+        .env_remove("DBMD_HUB_CREDENTIAL_ORIGIN")
+        .env_remove("DBMD_ALLOW_PRIVATE_REGISTRY_HOME")
+        .env("DBMD_STATE_DIR", cwd.join(".dbmd-test-state"));
     if let Some(h) = hub {
         cmd.env("DBMD_HUB_URL", h);
     }
     if let Some(k) = key {
         cmd.env("DBMD_HUB_KEY", k);
+    }
+    if allow_private_registry {
+        cmd.env("DBMD_ALLOW_PRIVATE_REGISTRY_HOME", "1");
     }
     let out = cmd.output().expect("spawn dbmd");
     Output {
@@ -288,13 +644,17 @@ fn bad_address_shapes_fail_with_bad_address() {
 
 #[test]
 fn config_file_supplies_hub_and_flag_overrides_it() {
-    let hub = MockHub::serve(vec![(200, format!("{{\"id\":\"{BRAIN_ID}\"}}"))]);
+    let hub = MockHub::serve(vec![
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
+    ]);
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".dbmd")).unwrap();
-    // The file points at a dead port; the --hub flag must win.
+    // The file points at a different production-shaped origin; --hub wins.
     std::fs::write(
         dir.path().join(".dbmd/config"),
-        "# toolkit state\nhub = http://127.0.0.1:9\n",
+        "# toolkit state\nhub = https://hub.example.invalid\n",
     )
     .unwrap();
     let out = run_dbmd(
@@ -312,8 +672,9 @@ fn config_file_supplies_hub_and_flag_overrides_it() {
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     hub.finish();
 
-    // And with no flag/env, the file is used: dead port → HUB_UNREACHABLE
-    // (proving the file was read, not NO_HUB).
+    // A store-selected hub cannot receive an ambient bearer without an
+    // explicit origin binding. The refusal happens before dialing the dead
+    // port, closing cloned-store credential exfiltration.
     let out = run_dbmd(
         dir.path(),
         &["resolve", &format!("@{BRAIN_ID}"), "--json"],
@@ -321,7 +682,76 @@ fn config_file_supplies_hub_and_flag_overrides_it() {
         Some("vc_account_test"),
     );
     assert_eq!(out.code, Some(1));
-    assert_eq!(error_code(&out.stderr), "HUB_UNREACHABLE");
+    assert_eq!(error_code(&out.stderr), "UNBOUND_CREDENTIAL");
+}
+
+#[test]
+fn cloned_store_cannot_redirect_an_ambient_bearer_to_its_hub() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".dbmd")).unwrap();
+    std::fs::write(
+        dir.path().join(".dbmd/config"),
+        "hub = https://hub.example.invalid\n",
+    )
+    .unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &["resolve", &format!("@{BRAIN_ID}"), "--json"],
+        None,
+        Some("valuable-account-token"),
+    );
+    assert_eq!(out.code, Some(1));
+    assert_eq!(error_code(&out.stderr), "UNBOUND_CREDENTIAL");
+    assert!(!out.stderr.contains("valuable-account-token"));
+}
+
+#[test]
+fn cloned_store_cannot_use_an_ambient_brain_key_as_a_signing_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("brain.key");
+    let generated = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            key_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(generated.code, Some(0), "stderr: {}", generated.stderr);
+
+    std::fs::create_dir_all(dir.path().join(".dbmd")).unwrap();
+    std::fs::write(
+        dir.path().join(".dbmd/config"),
+        "hub = https://hub.example.invalid\n",
+    )
+    .unwrap();
+    let output = Command::new(DBMD)
+        .args([
+            "sync",
+            &format!("@{BRAIN_ID}"),
+            "--push",
+            "--dir",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .env_remove("DBMD_HUB_URL")
+        .env_remove("DBMD_HUB_KEY")
+        .env_remove("DBMD_AGENT_KEY_FILE")
+        .env_remove("DBMD_HUB_CREDENTIAL_ORIGIN")
+        .env("DBMD_BRAIN_KEY_FILE", &key_file)
+        .env("DBMD_STATE_DIR", dir.path().join(".dbmd-test-state"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        error_code(&String::from_utf8_lossy(&output.stderr)),
+        "UNBOUND_CREDENTIAL"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -330,12 +760,11 @@ fn config_file_supplies_hub_and_flag_overrides_it() {
 
 #[test]
 fn resolve_bare_brain_gets_card_with_bearer() {
-    let hub = MockHub::serve(vec![(
-        200,
-        format!(
-            "{{\"id\":\"{BRAIN_ID}\",\"slug\":\"acme\",\"name\":\"Acme\",\"visibility\":\"private\",\"indexedFeedSeq\":3,\"stats\":{{\"records\":4,\"sources\":1}}}}"
-        ),
-    )]);
+    let hub = MockHub::serve(vec![
+        (200, signed_card_with_metadata()),
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
+    ]);
     let dir = tempfile::tempdir().unwrap();
     let out = run_dbmd(
         dir.path(),
@@ -345,10 +774,10 @@ fn resolve_bare_brain_gets_card_with_bearer() {
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     assert!(out.stdout.contains("slug: acme"), "stdout: {}", out.stdout);
-    assert!(out.stdout.contains("feed seq: 3"));
+    assert!(out.stdout.contains("feed seq: 41"));
 
     let reqs = hub.finish();
-    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs.len(), 3);
     assert_eq!(reqs[0].method, "GET");
     assert_eq!(reqs[0].path, "/api/hub/brains/acme");
     assert_eq!(
@@ -359,12 +788,9 @@ fn resolve_bare_brain_gets_card_with_bearer() {
 
 #[test]
 fn resolve_ulid_target_queries_by_id_and_path_target_by_path() {
-    let doc = format!(
-        "{{\"brain\":\"{BRAIN_ID}\",\"document\":{{\"path\":\"records/clients/lumio.md\",\"id\":\"{RECORD_ID}\",\"type\":\"client\",\"summary\":\"Lumio\",\"body\":\"# Lumio\\n\"}}}}"
-    );
-    let hub = MockHub::serve(vec![(200, doc.clone()), (200, doc)]);
     let dir = tempfile::tempdir().unwrap();
 
+    let hub = serve_exact_snapshot_hub();
     let by_id = run_dbmd(
         dir.path(),
         &["resolve", &format!("@{BRAIN_ID}/{RECORD_ID}")],
@@ -372,24 +798,30 @@ fn resolve_ulid_target_queries_by_id_and_path_target_by_path() {
         Some("k"),
     );
     assert_eq!(by_id.code, Some(0), "stderr: {}", by_id.stderr);
-    assert!(by_id.stdout.contains("# Lumio"), "stdout: {}", by_id.stdout);
+    assert!(by_id.stdout.contains("# Note"), "stdout: {}", by_id.stdout);
+    let reqs = hub.finish();
+    assert_eq!(reqs[0].path, format!("/api/hub/brains/{BRAIN_ID}"));
+    assert!(
+        reqs.iter()
+            .all(|request| !request.path.contains("/resolve?")),
+        "record resolution must not trust the unsigned query endpoint"
+    );
 
+    let hub = serve_exact_snapshot_hub();
     let by_path = run_dbmd(
         dir.path(),
-        &["resolve", "@acme/records/clients/lumio.md", "--json"],
+        &["resolve", "@acme/records/note.md", "--json"],
         Some(&hub.url),
         Some("k"),
     );
     assert_eq!(by_path.code, Some(0), "stderr: {}", by_path.stderr);
 
     let reqs = hub.finish();
-    assert_eq!(
-        reqs[0].path,
-        format!("/api/hub/brains/{BRAIN_ID}/resolve?id={RECORD_ID}")
-    );
-    assert_eq!(
-        reqs[1].path,
-        "/api/hub/brains/acme/resolve?path=records/clients/lumio.md"
+    assert_eq!(reqs[0].path, "/api/hub/brains/acme");
+    assert!(
+        reqs.iter()
+            .all(|request| !request.path.contains("/resolve?")),
+        "record resolution must come from the signed pack"
     );
 }
 
@@ -438,19 +870,16 @@ fn non_json_2xx_is_refused_as_not_a_hub_answer() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn sync_pull_materializes_files_rebuilds_index_and_reports() {
-    let export = serde_json::json!({
-        "brain": BRAIN_ID,
-        "slug": "acme",
-        "name": "Acme",
-        "headSeq": 7,
-        "fileCount": 2,
-        "files": [
-            {"path": "DB.md", "content": "---\ntype: db-md\nscope: company\nname: Acme\n---\n\n# Acme\n"},
-            {"path": "records/clients/lumio.md", "content": format!("---\ntype: client\nid: {RECORD_ID}\nsummary: Lumio\n---\n\n# Lumio\n")},
-        ],
-    });
-    let hub = MockHub::serve(vec![(200, export.to_string())]);
+fn sync_pull_materializes_files_and_reports() {
+    let db = "---\ntype: db-md\nscope: company\nname: Acme\n---\n\n# Acme\n";
+    let lumio = format!("---\ntype: client\nid: {RECORD_ID}\nsummary: Lumio\n---\n\n# Lumio\n");
+    let (card, feed, export, _) =
+        signed_inline_snapshot(&[("DB.md", db), ("records/clients/lumio.md", &lumio)]);
+    let feed_hash = serde_json::from_str::<serde_json::Value>(&feed).unwrap()["feedHash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
     let work = tempfile::tempdir().unwrap();
     let dest = work.path().join("pulled");
 
@@ -470,35 +899,30 @@ fn sync_pull_materializes_files_rebuilds_index_and_reports() {
 
     let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["files"], 2);
-    assert_eq!(v["headSeq"], 7);
-    assert_eq!(v["index"], "rebuilt");
+    assert_eq!(v["headSeq"], 1);
 
     // The files landed, byte-for-byte.
     assert!(dest.join("DB.md").is_file());
     let lumio = std::fs::read_to_string(dest.join("records/clients/lumio.md")).unwrap();
     assert!(lumio.contains("# Lumio"));
-    // And the derived catalog exists so loop ops work immediately.
-    assert!(dest.join("records/clients/index.md").is_file());
+    // Derived catalogs are rebuilt separately. Running a second path-based
+    // writer here would reopen the ancestor-swap race closed by sync itself.
+    assert!(!dest.join("records/clients/index.md").exists());
 
     let reqs = hub.finish();
     assert_eq!(
-        reqs[0].path,
-        format!("/api/hub/brains/{BRAIN_ID}/export?format=pack")
+        reqs[2].path,
+        format!("/api/hub/brains/{BRAIN_ID}/export?format=pack&atSeq=1&feedHash={feed_hash}")
     );
 }
 
 #[test]
 fn sync_pull_refuses_hostile_paths_with_nothing_written() {
-    let export = serde_json::json!({
-        "brain": BRAIN_ID,
-        "slug": "acme",
-        "headSeq": 1,
-        "files": [
-            {"path": "DB.md", "content": "---\ntype: db-md\n---\n# A\n"},
-            {"path": "../escape.md", "content": "evil"},
-        ],
-    });
-    let hub = MockHub::serve(vec![(200, export.to_string())]);
+    let (card, feed, export, _) = signed_inline_snapshot(&[
+        ("DB.md", "---\ntype: db-md\n---\n# A\n"),
+        ("../escape.md", "evil"),
+    ]);
+    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
     let work = tempfile::tempdir().unwrap();
     let dest = work.path().join("pulled");
 
@@ -522,18 +946,93 @@ fn sync_pull_refuses_hostile_paths_with_nothing_written() {
     hub.finish();
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_pull_refuses_a_symlink_in_the_destination_ancestor_chain() {
+    use std::os::unix::fs::symlink;
+
+    let db = "---\ntype: db-md\nscope: company\nname: Acme\n---\n\n# Acme\n";
+    let (card, feed, export, _) = signed_inline_snapshot(&[("DB.md", db)]);
+    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
+    let work = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), work.path().join("redirect")).unwrap();
+    let dest = work.path().join("redirect/pulled");
+
+    let out = run_dbmd(
+        work.path(),
+        &[
+            "sync",
+            &format!("@{BRAIN_ID}"),
+            "--out",
+            dest.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(1));
+    assert_eq!(error_code(&out.stderr), "UNSAFE_PATH");
+    assert!(!outside.path().join("pulled").exists());
+    hub.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_pull_conflict_leaves_every_live_file_unchanged() {
+    let new_db = "---\ntype: db-md\nscope: company\nname: New\n---\n\n# New\n";
+    let conflict = "---\ntype: note\nsummary: Conflict\n---\n\n# Remote\n";
+    let (card, feed, export, _) =
+        signed_inline_snapshot(&[("DB.md", new_db), ("records/conflict.md", conflict)]);
+    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
+    let work = tempfile::tempdir().unwrap();
+    let dest = work.path().join("pulled");
+    std::fs::create_dir_all(dest.join("records/conflict.md")).unwrap();
+    let old_db = "---\ntype: db-md\nscope: company\nname: Old\n---\n\n# Old\n";
+    std::fs::write(dest.join("DB.md"), old_db).unwrap();
+    std::fs::write(dest.join("records/conflict.md/sentinel"), "local").unwrap();
+
+    let out = run_dbmd(
+        work.path(),
+        &[
+            "sync",
+            &format!("@{BRAIN_ID}"),
+            "--out",
+            dest.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
+    assert_eq!(
+        std::fs::read_to_string(dest.join("DB.md")).unwrap(),
+        old_db,
+        "a later conflict must not expose an earlier staged write"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("records/conflict.md/sentinel")).unwrap(),
+        "local"
+    );
+    hub.finish();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // sync — push
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn sync_push_sends_owned_content_only_with_bearer() {
-    let hub = MockHub::serve(vec![(
-        200,
-        format!(
+    let hub = MockHub::serve(vec![
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
+        (
+            200,
+            format!(
             "{{\"brain\":\"{BRAIN_ID}\",\"indexed\":{{\"documents\":2}},\"durable\":true,\"headSeq\":1}}"
         ),
-    )]);
+        ),
+    ]);
     let store = tempfile::tempdir().unwrap();
     seed_store(store.path());
 
@@ -551,14 +1050,14 @@ fn sync_push_sends_owned_content_only_with_bearer() {
     );
 
     let reqs = hub.finish();
-    assert_eq!(reqs[0].method, "POST");
-    assert_eq!(reqs[0].path, format!("/api/hub/brains/{BRAIN_ID}/push"));
+    assert_eq!(reqs[2].method, "POST");
+    assert_eq!(reqs[2].path, format!("/api/hub/brains/{BRAIN_ID}/push"));
     assert_eq!(
-        reqs[0].header("authorization"),
+        reqs[2].header("authorization"),
         Some("Bearer vc_account_test")
     );
 
-    let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
     let mut paths: Vec<&str> = body["files"]
         .as_array()
         .unwrap()
@@ -600,18 +1099,24 @@ fn sync_push_outside_a_store_is_the_standard_not_a_store_exit() {
 fn grant_issue_list_revoke_speak_the_grants_binding() {
     let grant_id = "01j5qc3v9k4ym8rwbn2tqe6f7f";
     let hub = MockHub::serve(vec![
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
         (
             201,
             format!(
                 "{{\"id\":\"{grant_id}\",\"brain\":\"{BRAIN_ID}\",\"grantee\":{{\"email\":\"maya@example.com\"}},\"capability\":\"read\",\"scopePrefix\":\"records/clients/\",\"expiresAt\":\"2026-09-01T00:00:00.000Z\"}}"
             ),
         ),
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
         (
             200,
             format!(
                 "{{\"brain\":\"{BRAIN_ID}\",\"grants\":[{{\"id\":\"{grant_id}\",\"email\":\"maya@example.com\",\"capability\":\"read\",\"scopePrefix\":\"records/clients/\"}}],\"invites\":[]}}"
             ),
         ),
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
         (200, format!("{{\"revoked\":true,\"id\":\"{grant_id}\"}}")),
     ]);
     let dir = tempfile::tempdir().unwrap();
@@ -660,17 +1165,17 @@ fn grant_issue_list_revoke_speak_the_grants_binding() {
     assert_eq!(revoke.code, Some(0));
 
     let reqs = hub.finish();
-    assert_eq!(reqs[0].method, "POST");
-    assert_eq!(reqs[0].path, format!("/api/hub/brains/{BRAIN_ID}/grants"));
-    let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    assert_eq!(reqs[2].method, "POST");
+    assert_eq!(reqs[2].path, format!("/api/hub/brains/{BRAIN_ID}/grants"));
+    let body: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
     assert_eq!(body["email"], "maya@example.com");
     assert_eq!(body["capability"], "read");
     assert_eq!(body["scopePrefix"], "records/clients/");
     assert_eq!(body["expiresAt"], "2026-09-01");
-    assert_eq!(reqs[1].method, "GET");
-    assert_eq!(reqs[2].method, "DELETE");
+    assert_eq!(reqs[5].method, "GET");
+    assert_eq!(reqs[8].method, "DELETE");
     assert_eq!(
-        reqs[2].path,
+        reqs[8].path,
         format!("/api/hub/brains/{BRAIN_ID}/grants/{grant_id}")
     );
 }
@@ -720,6 +1225,33 @@ fn propose_posts_to_the_site_inbox_without_a_bearer() {
     let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
     assert_eq!(body["app"], "intake");
     assert_eq!(body["body"], "New invoice: 4400 EUR.\n");
+}
+
+#[test]
+fn propose_never_treats_a_json_redirect_as_success() {
+    let hub = MockHub::serve(vec![(
+        302,
+        r#"{"id":"forged-success","location":"/elsewhere"}"#.to_string(),
+    )]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &[
+            "propose",
+            "@acme-site",
+            "--app",
+            "intake",
+            "--body",
+            "evidence",
+            "--json",
+        ],
+        Some(&hub.url),
+        None,
+    );
+    assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
+    assert_eq!(error_code(&out.stderr), "HUB_ERROR");
+    assert!(out.stderr.contains("302"), "stderr: {}", out.stderr);
+    hub.finish();
 }
 
 #[test]
@@ -780,8 +1312,122 @@ fn subscribe_once_reports_the_current_head_as_one_json_line() {
     let requests = hub.finish();
     assert_eq!(
         requests[1].path,
-        format!("/api/hub/brains/{BRAIN_ID}/feed?after=40&limit=1")
+        format!("/api/hub/brains/{BRAIN_ID}/feed?after=40&limit=100")
     );
+}
+
+#[test]
+fn subscribe_json_redirect_is_an_error_not_a_panic() {
+    let hub = MockHub::serve(vec![
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (
+            302,
+            r#"{"location":"/api/hub/brains/other/feed"}"#.to_string(),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &["subscribe", &format!("@{BRAIN_ID}"), "--once", "--json"],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
+    assert_eq!(error_code(&out.stderr), "HUB_ERROR");
+    assert!(!out.stderr.contains("panicked"), "stderr: {}", out.stderr);
+    hub.finish();
+}
+
+#[test]
+fn store_local_trust_file_cannot_preplant_the_global_identity_pin() {
+    let hub = MockHub::serve(signed_head_responses());
+    let dir = tempfile::tempdir().unwrap();
+    let key = format!(
+        "{:x}",
+        Sha256::digest(format!("{}\0{BRAIN_ID}", hub.url).as_bytes())
+    );
+    let planted = dir.path().join(".dbmd/trust").join(format!("{key}.json"));
+    std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+    std::fs::write(&planted, b"{\"attacker\":\"controls this store\"}\n").unwrap();
+
+    let out = run_dbmd(
+        dir.path(),
+        &["subscribe", &format!("@{BRAIN_ID}"), "--once", "--json"],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(planted).unwrap(),
+        "{\"attacker\":\"controls this store\"}\n",
+        "store-local attacker file must not be read or rewritten"
+    );
+    assert!(
+        dir.path().join(".dbmd-test-state/trust").is_dir(),
+        "the explicit user-state root owns the real checkpoint"
+    );
+    hub.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn global_trust_state_refuses_a_symlinked_root_without_writing_through_it() {
+    use std::os::unix::fs::symlink;
+
+    // The capability-safe trust root is opened before the first network
+    // request, so an unsafe root must consume no scripted response.
+    let hub = MockHub::serve(vec![]);
+    let work = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), work.path().join(".dbmd-test-state")).unwrap();
+
+    let out = run_dbmd(
+        work.path(),
+        &["subscribe", &format!("@{BRAIN_ID}"), "--once", "--json"],
+        Some(&hub.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(1));
+    assert_eq!(error_code(&out.stderr), "UNSAFE_PATH");
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    hub.finish();
+}
+
+#[test]
+fn persisted_checkpoint_rejects_feed_rollback_and_equivocation() {
+    for hostile_card in [
+        format!(
+            "{{\"id\":\"{BRAIN_ID}\",\"headSeq\":40,\"feedHash\":\"{}\"}}",
+            "a".repeat(64)
+        ),
+        format!(
+            "{{\"id\":\"{BRAIN_ID}\",\"headSeq\":41,\"feedHash\":\"{}\"}}",
+            "b".repeat(64)
+        ),
+    ] {
+        let hub = MockHub::serve(vec![
+            (200, SIGNED_HEAD_CARD.to_string()),
+            (200, SIGNED_HEAD_FEED.to_string()),
+            (200, hostile_card),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let first = run_dbmd(
+            dir.path(),
+            &["subscribe", &format!("@{BRAIN_ID}"), "--once", "--json"],
+            Some(&hub.url),
+            Some("k"),
+        );
+        assert_eq!(first.code, Some(0), "stderr: {}", first.stderr);
+        let hostile = run_dbmd(
+            dir.path(),
+            &["subscribe", &format!("@{BRAIN_ID}"), "--once", "--json"],
+            Some(&hub.url),
+            Some("k"),
+        );
+        assert_eq!(hostile.code, Some(1));
+        assert_eq!(error_code(&hostile.stderr), "INVALID_FEED");
+        hub.finish();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -892,17 +1538,23 @@ fn propose_body_file_over_the_inbox_cap_fails_before_the_upload() {
 fn hub_strings_render_terminal_sanitized_in_text_mode_and_verbatim_in_json() {
     // The summary and body carry an ANSI escape sequence and a BEL: text mode
     // strips them; `--json` is a machine surface and stays byte-verbatim.
-    let doc = format!(
-        "{{\"brain\":\"{BRAIN_ID}\",\"document\":{{\"path\":\"records/clients/lumio.md\",\"id\":\"{RECORD_ID}\",\"type\":\"client\",\"summary\":\"\\u001b[31mEVIL\\u0007summary\",\"body\":\"# Lumio\\u001b[2J\\u0007 ok\\n\"}}}}"
+    let record = format!(
+        "---\ntype: client\nid: {RECORD_ID}\nsummary: \"\\e[31mEVIL\\asummary\\nforged: yes\u{202e}\"\n---\n# Lumio\u{1b}[2J\u{7} ok\n"
     );
-    let hub = MockHub::serve(vec![(200, doc.clone()), (200, doc)]);
     let dir = tempfile::tempdir().unwrap();
     let addr = format!("@{BRAIN_ID}/{RECORD_ID}");
 
+    let hub = serve_snapshot_hub(vec![
+        (
+            "DB.md".to_string(),
+            "---\ntype: db-md\nscope: company\nname: Control test\n---\n".to_string(),
+        ),
+        ("records/clients/lumio.md".to_string(), record.clone()),
+    ]);
     let text = run_dbmd(dir.path(), &["resolve", &addr], Some(&hub.url), Some("k"));
     assert_eq!(text.code, Some(0), "stderr: {}", text.stderr);
     assert!(
-        text.stdout.contains("summary: EVILsummary"),
+        text.stdout.contains(r"summary: EVILsummary\nforged: yes"),
         "stdout: {:?}",
         text.stdout
     );
@@ -912,11 +1564,22 @@ fn hub_strings_render_terminal_sanitized_in_text_mode_and_verbatim_in_json() {
         text.stdout
     );
     assert!(
-        !text.stdout.contains('\u{1b}') && !text.stdout.contains('\u{7}'),
+        !text.stdout.contains('\u{1b}')
+            && !text.stdout.contains('\u{7}')
+            && !text.stdout.contains('\u{202e}')
+            && !text.stdout.lines().any(|line| line == "forged: yes"),
         "text mode must strip control bytes: {:?}",
         text.stdout
     );
+    hub.finish();
 
+    let hub = serve_snapshot_hub(vec![
+        (
+            "DB.md".to_string(),
+            "---\ntype: db-md\nscope: company\nname: Control test\n---\n".to_string(),
+        ),
+        ("records/clients/lumio.md".to_string(), record),
+    ]);
     let json = run_dbmd(
         dir.path(),
         &["resolve", &addr, "--json"],
@@ -926,10 +1589,9 @@ fn hub_strings_render_terminal_sanitized_in_text_mode_and_verbatim_in_json() {
     assert_eq!(json.code, Some(0), "stderr: {}", json.stderr);
     let v: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
     assert_eq!(
-        v["document"]["summary"], "\u{1b}[31mEVIL\u{7}summary",
+        v["document"]["summary"], "\u{1b}[31mEVIL\u{7}summary\nforged: yes\u{202e}",
         "--json must stay verbatim"
     );
-
     hub.finish();
 }
 
@@ -1076,7 +1738,8 @@ fn run_dbmd_signed(cwd: &Path, args: &[&str], hub: &str, key_file: &Path) -> Out
         .env_remove("DBMD_HUB_URL")
         .env_remove("DBMD_HUB_KEY")
         .env("DBMD_HUB_URL", hub)
-        .env("DBMD_AGENT_KEY_FILE", key_file);
+        .env("DBMD_AGENT_KEY_FILE", key_file)
+        .env("DBMD_STATE_DIR", cwd.join(".dbmd-test-state"));
     let out = cmd.output().expect("spawn dbmd");
     Output {
         code: out.status.code(),
@@ -1151,7 +1814,11 @@ fn an_agent_key_signs_requests_instead_of_sending_a_bearer() {
     let minted: serde_json::Value = serde_json::from_str(&gen.stdout).unwrap();
     let multikey = minted["multikey"].as_str().unwrap().to_string();
 
-    let hub = MockHub::serve(vec![(200, SIGNED_HEAD_CARD.to_string())]);
+    let hub = MockHub::serve(vec![
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
+    ]);
     let out = run_dbmd_signed(
         dir.path(),
         &["resolve", &format!("@{BRAIN_ID}"), "--json"],
@@ -1165,7 +1832,7 @@ fn an_agent_key_signs_requests_instead_of_sending_a_bearer() {
         .unwrap_or("")
         .to_string();
     assert!(
-        auth.starts_with(&format!("LinkMD-Sig v1,key={multikey},ts=")),
+        auth.starts_with(&format!("LinkMD-Sig v2,key={multikey},ts=")),
         "authorization: {auth}"
     );
     assert!(
@@ -1241,7 +1908,9 @@ fn propose_to_a_brain_id_uses_the_brain_inbox_and_optional_auth() {
 // mirror + serve — federation v0 (link-md-ship F)
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 const VEC_CARD: &str = r#"{"id":"01k0abcdefghjkmnpqrstvwxyz","headSeq":3,"feedHash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","updatedAt":"2026-07-23T00:00:03.000Z"}"#;
+#[allow(dead_code)]
 const VEC_HEADPAGE: &str = r#"{"brain":"01k0abcdefghjkmnpqrstvwxyz","headSeq":3,"feedHash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","identity":{"fingerprint":"ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","publicKeySpki":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4"},"entries":[{"hash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","entry":{"v":1,"seq":3,"ts":"2026-07-23T00:00:03.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"edit","op":"snapshot","pack_sha256":"04b744b2038c45a40f921e5985c66e525c352c84eb4306de5784ff00526516c1","files":[],"removed":["records/note.md"],"prev_entry_hash":"f6571c54b7e19b80fce21f134a51ef62f5612b99dd4b537bd49f54dc87d81769","sig":"x4CTOMHWU7KhxldQZWGeoUMhXOnwMW0qsQsFB0mhHbWqyx0kHEnoT4SyzvkhDE6p47pbdW3bZBSuPptQHD5iCQ"}}],"nextAfter":3,"hasMore":false,"scopeLimited":false}"#;
 const VEC_FULLFEED: &str = r#"{"brain":"01k0abcdefghjkmnpqrstvwxyz","headSeq":3,"feedHash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","identity":{"fingerprint":"ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","publicKeySpki":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4"},"entries":[{"hash":"115d34fe8f8375fae7e82208d679e9031eaf092cdd2ab9aa1c0294e9b9d7abaf","entry":{"v":1,"seq":1,"ts":"2026-07-23T00:00:01.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"push","op":"snapshot","pack_sha256":"6e808470fef12de964a8c9a446c1d60f334e6262c4a84ab1721b265659506146","files":[{"path":"DB.md","sha256":"b5a507d2fc555b66c9a829fcf9a6e2e1e7f351c30af57d9b79d036d8a0bef560","bytes":11},{"path":"records/note.md","sha256":"d5cd8c4150ccdd6969f469a0297f9cc49b0b851ac801415ea842fce7b8ad7026","bytes":8}],"removed":[],"prev_entry_hash":null,"sig":"LuTyjtV3VdBvGp6sBTqHmNwd1ELP4cQx1MPBrZt-9Ec0TfnScBeAFBMtgY-af_2yDXl0zneycoK5oFXaG5OxDw"}},{"hash":"f6571c54b7e19b80fce21f134a51ef62f5612b99dd4b537bd49f54dc87d81769","entry":{"v":1,"seq":2,"ts":"2026-07-23T00:00:02.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"edit","op":"snapshot","pack_sha256":"bc32d2bfda48d1429731eeb598927281a9e99803c6da6cdac752a378a2ef57f5","files":[{"path":"records/note.md","sha256":"4e880fb6c5735c3ce2018a23557429f1ef7c0eb07e2dc0638e4bf955a6665d58","bytes":8}],"removed":[],"prev_entry_hash":"115d34fe8f8375fae7e82208d679e9031eaf092cdd2ab9aa1c0294e9b9d7abaf","sig":"3DaK7U-Ug2cBnQ5qb2G6NPyBDyjWNcH6-G3W1XH_g88M9C5GgqwDf3EsccoTDdgDpFFSQ6hHg61Fcg1R9Io0Ag"}},{"hash":"50215474e01bb4698729fb1bab1befad430b95011a4d3fba35877591e8418d7a","entry":{"v":1,"seq":3,"ts":"2026-07-23T00:00:03.000Z","brain":"ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM","public_key":"MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4","kind":"edit","op":"snapshot","pack_sha256":"04b744b2038c45a40f921e5985c66e525c352c84eb4306de5784ff00526516c1","files":[],"removed":["records/note.md"],"prev_entry_hash":"f6571c54b7e19b80fce21f134a51ef62f5612b99dd4b537bd49f54dc87d81769","sig":"x4CTOMHWU7KhxldQZWGeoUMhXOnwMW0qsQsFB0mhHbWqyx0kHEnoT4SyzvkhDE6p47pbdW3bZBSuPptQHD5iCQ"}}],"nextAfter":3,"hasMore":false,"scopeLimited":false}"#;
 const VEC_EXPORT: &str = r#"{"brain":"01k0abcdefghjkmnpqrstvwxyz","slug":"vector-brain","headSeq":3,"files":[{"path":"DB.md","content":"---\ntype: db-md\n---\n\n# Vector\n"}]}"#;
@@ -1251,19 +1920,14 @@ const VEC_HASH_3: &str = "50215474e01bb4698729fb1bab1befad430b95011a4d3fba358775
 
 #[test]
 fn mirror_verifies_the_whole_chain_stores_exact_bytes_and_pins() {
-    let hub = MockHub::serve(vec![
-        (200, VEC_CARD.to_string()),
-        (200, VEC_HEADPAGE.to_string()),
-        (200, VEC_FULLFEED.to_string()),
-        (200, VEC_EXPORT.to_string()),
-    ]);
+    let hub = serve_exact_snapshot_hub();
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("mirror");
     let out = run_dbmd(
         dir.path(),
         &[
             "mirror",
-            &format!("@{VEC_BRAIN}"),
+            &format!("@{BRAIN_ID}"),
             "--dir",
             dest.to_str().unwrap(),
             "--json",
@@ -1273,17 +1937,15 @@ fn mirror_verifies_the_whole_chain_stores_exact_bytes_and_pins() {
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(report["entries"], 3);
-    assert_eq!(report["headSeq"], 3);
-    assert_eq!(report["files"], 1);
+    assert_eq!(report["entries"], 1);
+    assert_eq!(report["headSeq"], 1);
+    assert_eq!(report["files"], 2);
     assert!(report["pinned"].as_str().unwrap().starts_with("ed25519:"));
     // Exact bytes stored: entry 1's file carries the signed serialization.
     let raw1 = std::fs::read_to_string(dest.join(".dbmd/mirror/feed/1.json")).unwrap();
     assert!(raw1.contains("\"seq\":1") && raw1.ends_with('\n'));
-    assert!(
-        VEC_FULLFEED.contains(raw1.trim_end()),
-        "stored bytes are the served bytes"
-    );
+    let stored_hash = dbmd_core::linkmd::feed_entry_hash(raw1.trim_end());
+    assert_eq!(stored_hash, report["feedHash"].as_str().unwrap());
     let pin = std::fs::read_to_string(dest.join(".dbmd/config")).unwrap();
     assert!(pin.contains("pin = ed25519:"), "config: {pin}");
     // Store file materialized by the pull.
@@ -1291,22 +1953,46 @@ fn mirror_verifies_the_whole_chain_stores_exact_bytes_and_pins() {
     hub.finish();
 }
 
+#[cfg(unix)]
+#[test]
+fn mirror_refuses_a_planted_legacy_backup_without_touching_it_or_dialing() {
+    let work = tempfile::tempdir().unwrap();
+    let dest = work.path().join("mirror");
+    let backup = work.path().join(".mirror.dbmd-backup");
+    std::fs::create_dir(&backup).unwrap();
+    std::fs::write(backup.join("sentinel"), b"do not delete").unwrap();
+
+    let out = run_dbmd(
+        work.path(),
+        &[
+            "mirror",
+            &format!("@{BRAIN_ID}"),
+            "--dir",
+            dest.to_str().unwrap(),
+            "--json",
+        ],
+        Some("http://127.0.0.1:9"),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(1));
+    assert_eq!(error_code(&out.stderr), "UNSAFE_PATH");
+    assert_eq!(
+        std::fs::read(backup.join("sentinel")).unwrap(),
+        b"do not delete"
+    );
+}
+
 #[test]
 fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
     // Mirror from the mock hub first.
-    let hub = MockHub::serve(vec![
-        (200, VEC_CARD.to_string()),
-        (200, VEC_HEADPAGE.to_string()),
-        (200, VEC_FULLFEED.to_string()),
-        (200, VEC_EXPORT.to_string()),
-    ]);
+    let hub = serve_exact_snapshot_hub();
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("mirror");
     let mirrored = run_dbmd(
         dir.path(),
         &[
             "mirror",
-            &format!("@{VEC_BRAIN}"),
+            &format!("@{BRAIN_ID}"),
             "--dir",
             dest.to_str().unwrap(),
             "--json",
@@ -1315,6 +2001,8 @@ fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
         Some("k"),
     );
     assert_eq!(mirrored.code, Some(0), "stderr: {}", mirrored.stderr);
+    let mirror_report: serde_json::Value = serde_json::from_str(&mirrored.stdout).unwrap();
+    let pin = mirror_report["pinned"].as_str().unwrap().to_string();
     hub.finish();
 
     // Serve it, read the bound URL from the first stdout line.
@@ -1325,6 +2013,8 @@ fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
             dest.to_str().unwrap(),
             "--addr",
             "127.0.0.1:0",
+            "--pin",
+            pin.as_str(),
             "--json",
         ])
         .stdout(std::process::Stdio::piped())
@@ -1343,7 +2033,7 @@ fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
     // node — no hub in the loop. Federation v0.
     let sub = run_dbmd(
         dir.path(),
-        &["subscribe", &format!("@{VEC_BRAIN}"), "--once", "--json"],
+        &["subscribe", &format!("@{BRAIN_ID}"), "--once", "--json"],
         Some(&url),
         Some("k"),
     );
@@ -1352,13 +2042,12 @@ fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
     assert_eq!(sub.code, Some(0), "stderr: {}", sub.stderr);
     let line: serde_json::Value = serde_json::from_str(sub.stdout.lines().next().unwrap()).unwrap();
     assert_eq!(line["verified"], true);
-    assert_eq!(line["seq"], 3);
-    assert_eq!(line["feedHash"], VEC_HASH_3);
-    assert_eq!(line["brain"], VEC_BRAIN);
+    assert_eq!(line["seq"], 1);
+    assert_eq!(line["brain"], BRAIN_ID);
     let stored1 = std::fs::read_to_string(dest.join(".dbmd/mirror/feed/1.json")).unwrap();
     assert_eq!(
         dbmd_core::linkmd::feed_entry_hash(stored1.trim_end()),
-        VEC_HASH_1,
+        line["feedHash"].as_str().unwrap(),
         "the first mirrored entry hashes to its vector hash"
     );
 }
@@ -1387,7 +2076,11 @@ fn grant_issue_detects_a_key_grantee_and_sends_key_spki() {
         .unwrap()
         .to_string();
 
-    let hub = MockHub::serve(vec![(201, r#"{"id":"g1"}"#.to_string())]);
+    let hub = MockHub::serve(vec![
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
+        (201, r#"{"id":"g1"}"#.to_string()),
+    ]);
     let out = run_dbmd(
         dir.path(),
         &[
@@ -1404,7 +2097,7 @@ fn grant_issue_detects_a_key_grantee_and_sends_key_spki() {
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     let requests = hub.finish();
-    let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
     assert_eq!(body["keySpki"], spki);
     assert!(
         body.get("email").is_none(),
@@ -1435,15 +2128,84 @@ fn key_rotate_signs_with_the_old_key_and_writes_the_new_one() {
         .as_str()
         .unwrap()
         .to_string();
+    let old_pkcs8 = URL_SAFE_NO_PAD
+        .decode(std::fs::read_to_string(&old_file).unwrap().trim())
+        .unwrap();
+    let old_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&old_pkcs8).unwrap();
+    let (old_card, old_feed, verified_old_multikey) = signed_head_for_key(&old_pair);
+    assert_eq!(verified_old_multikey, old_multikey);
 
-    // The hub echoes an identity with a `previous` list; the CLI reports it.
-    let hub = MockHub::serve(vec![(
-        200,
-        format!(
-            r#"{{"brain":"{BRAIN_ID}","identity":{{"fingerprint":"newfp","multikey":"ed25519:newfp","previous":[{{"fingerprint":"{}"}}]}}}}"#,
-            old_multikey.trim_start_matches("ed25519:")
-        ),
-    )]);
+    // Pre-mint the durable retry key so the scripted hub can independently
+    // construct the valid post-rotation identity it will serve after the POST.
+    let generated_new = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            new_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(
+        generated_new.code,
+        Some(0),
+        "stderr: {}",
+        generated_new.stderr
+    );
+    let new_public: serde_json::Value = serde_json::from_str(&generated_new.stdout).unwrap();
+    let new_multikey = new_public["multikey"].as_str().unwrap().to_string();
+    let new_spki = new_public["publicKeySpki"].as_str().unwrap().to_string();
+    let old_spki = serde_json::from_str::<serde_json::Value>(&old_feed).unwrap()["identity"]
+        ["publicKeySpki"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let old_hash = serde_json::from_str::<serde_json::Value>(&old_card).unwrap()["feedHash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let postcondition_unsigned = serde_json::to_string(&TestUnsignedRotation {
+        v: 1,
+        op: "rotate",
+        brain: &old_multikey,
+        public_key: &old_spki,
+        new_brain: &new_multikey,
+        new_public_key: &new_spki,
+        prior_head_seq: 1,
+        prior_feed_hash: Some(&old_hash),
+        ts: "2026-07-30T12:01:00.000Z",
+    })
+    .unwrap();
+    let postcondition_sig =
+        URL_SAFE_NO_PAD.encode(old_pair.sign(postcondition_unsigned.as_bytes()).as_ref());
+    let postcondition_statement = format!(
+        "{},\"sig\":\"{}\"}}",
+        &postcondition_unsigned[..postcondition_unsigned.len() - 1],
+        postcondition_sig
+    );
+    let mut rotated_feed: serde_json::Value = serde_json::from_str(&old_feed).unwrap();
+    rotated_feed["identity"] = serde_json::json!({
+        "fingerprint": new_multikey.trim_start_matches("ed25519:"),
+        "publicKeySpki": new_spki,
+        "previous": [{
+            "fingerprint": old_multikey.trim_start_matches("ed25519:"),
+            "publicKeySpki": old_spki,
+        }],
+        "rotations": [postcondition_statement],
+    });
+
+    // A 2xx is followed by a fresh card/feed verification; only the verified
+    // new public key is authoritative.
+    let hub = MockHub::serve(vec![
+        (200, old_card.clone()),
+        (200, old_feed),
+        (200, r#"{"ok":true}"#.to_string()),
+        (200, old_card),
+        (200, rotated_feed.to_string()),
+    ]);
     let out = run_dbmd(
         dir.path(),
         &[
@@ -1462,31 +2224,326 @@ fn key_rotate_signs_with_the_old_key_and_writes_the_new_one() {
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     let requests = hub.finish();
     assert_eq!(
-        requests[0].path,
+        requests[2].path,
         format!("/api/hub/brains/{BRAIN_ID}/rotate")
     );
     // The statement's old side is the current key; it carries op=rotate + sig.
-    let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
-    let stmt: serde_json::Value =
-        serde_json::from_str(body["statement"].as_str().unwrap()).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    let statement_raw = body["statement"].as_str().unwrap().to_string();
+    let stmt: serde_json::Value = serde_json::from_str(&statement_raw).unwrap();
     assert_eq!(stmt["op"], "rotate");
     assert_eq!(stmt["brain"], old_multikey);
     assert!(stmt["sig"].as_str().is_some());
     assert!(stmt["new_brain"].as_str().unwrap().starts_with("ed25519:"));
+    assert_eq!(stmt["prior_head_seq"], 1);
+    assert!(stmt["prior_feed_hash"].as_str().is_some());
     // The new key file exists and differs from the old.
     assert!(new_file.exists());
     assert_ne!(
         std::fs::read_to_string(&old_file).unwrap(),
         std::fs::read_to_string(&new_file).unwrap()
     );
+    assert!(
+        !Path::new(&format!("{}.rotation.json", new_file.display())).exists(),
+        "a verified commit must remove the completed rotation journal"
+    );
     // The report surfaces the rotated-from identity.
     let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(report["previous"][0], old_multikey);
+
+    // Recovery/retry: the durable output key already exists and the hub now
+    // serves it as current through the exact old-key-signed rotation. The
+    // client must reconcile as success without generating/replacing a key or
+    // POSTing another rotation.
+    let durable_new = std::fs::read_to_string(&new_file).unwrap();
+    let new_pkcs8 = URL_SAFE_NO_PAD.decode(durable_new.trim()).unwrap();
+    let new_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&new_pkcs8).unwrap();
+    let mut new_spki = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    new_spki.extend_from_slice(new_pair.public_key().as_ref());
+    let new_spki = URL_SAFE_NO_PAD.encode(&new_spki);
+    let new_fingerprint =
+        URL_SAFE_NO_PAD.encode(Sha256::digest(URL_SAFE_NO_PAD.decode(&new_spki).unwrap()));
+    let (retry_card, retry_old_feed, _) = signed_head_for_key(&old_pair);
+    let mut retry_feed: serde_json::Value = serde_json::from_str(&retry_old_feed).unwrap();
+    retry_feed["identity"] = serde_json::json!({
+        "fingerprint": new_fingerprint,
+        "publicKeySpki": new_spki,
+        "previous": [{
+            "fingerprint": old_multikey.trim_start_matches("ed25519:"),
+            "publicKeySpki": stmt["public_key"],
+        }],
+        "rotations": [statement_raw],
+    });
+    let retry_hub = MockHub::serve(vec![(200, retry_card), (200, retry_feed.to_string())]);
+    let retry = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "rotate",
+            &format!("@{BRAIN_ID}"),
+            "--key-file",
+            old_file.to_str().unwrap(),
+            "--out",
+            new_file.to_str().unwrap(),
+            "--json",
+        ],
+        Some(&retry_hub.url),
+        Some("k"),
+    );
+    assert_eq!(retry.code, Some(0), "stderr: {}", retry.stderr);
+    assert_eq!(std::fs::read_to_string(&new_file).unwrap(), durable_new);
+    assert!(
+        retry_hub
+            .finish()
+            .iter()
+            .all(|request| request.method == "GET"),
+        "already-current retry must not POST"
+    );
+}
+
+#[test]
+fn key_rotate_ambiguous_retry_reuses_the_byte_identical_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_file = dir.path().join("old.key");
+    let new_file = dir.path().join("new.key");
+    let old = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            old_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(old.code, Some(0), "stderr: {}", old.stderr);
+    let new = run_dbmd(
+        dir.path(),
+        &[
+            "key",
+            "generate",
+            "--out",
+            new_file.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        None,
+    );
+    assert_eq!(new.code, Some(0), "stderr: {}", new.stderr);
+    let old_pkcs8 = URL_SAFE_NO_PAD
+        .decode(std::fs::read_to_string(&old_file).unwrap().trim())
+        .unwrap();
+    let old_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&old_pkcs8).unwrap();
+    let (old_card, old_feed, _) = signed_head_for_key(&old_pair);
+    let hub = MockHub::serve(vec![
+        (200, old_card.clone()),
+        (200, old_feed.clone()),
+        (500, r#"{"error":"ambiguous"}"#.to_string()),
+        (200, old_card.clone()),
+        (200, old_feed.clone()),
+        (200, old_card.clone()),
+        (200, old_feed.clone()),
+        (500, r#"{"error":"ambiguous"}"#.to_string()),
+        (200, old_card),
+        (200, old_feed),
+    ]);
+    let args = [
+        "key",
+        "rotate",
+        &format!("@{BRAIN_ID}"),
+        "--key-file",
+        old_file.to_str().unwrap(),
+        "--out",
+        new_file.to_str().unwrap(),
+        "--json",
+    ];
+    let first = run_dbmd(dir.path(), &args, Some(&hub.url), Some("k"));
+    assert_eq!(first.code, Some(1), "stdout: {}", first.stdout);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = run_dbmd(dir.path(), &args, Some(&hub.url), Some("k"));
+    assert_eq!(second.code, Some(1), "stdout: {}", second.stdout);
+
+    let requests = hub.finish();
+    assert_eq!(requests[2].method, "POST");
+    assert_eq!(requests[7].method, "POST");
+    assert_eq!(
+        requests[2].body, requests[7].body,
+        "the recovery key is insufficient: the exact timestamped, signed statement must be journaled"
+    );
+    let journal = format!("{}.rotation.json", new_file.display());
+    assert!(Path::new(&journal).is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(journal).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Registry resolution — federation v0 phonebook (link-md-ship E5)
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn registry_home_cannot_target_loopback_without_the_explicit_test_opt_in() {
+    let reg = MockHub::serve(vec![
+        (404, r#"{"error":"Brain not found"}"#.to_string()),
+        (
+            200,
+            format!(
+                r#"{{"handle":"acme-studio","home":"https://127.0.0.1:9","brain":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ"}}}}"#
+            ),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&reg.url),
+        Some("k"),
+    );
+    assert_eq!(out.code, Some(1));
+    assert_eq!(error_code(&out.stderr), "INVALID_FEED");
+    assert!(out.stderr.contains("non-public"));
+    reg.finish();
+}
+
+#[test]
+fn registry_home_redirect_is_not_followed_even_with_local_test_opt_in() {
+    let home = MockHub::serve(vec![(
+        302,
+        r#"{"location":"http://127.0.0.1:1/private"}"#.to_string(),
+    )]);
+    let reg = MockHub::serve(vec![
+        (404, r#"{"error":"Brain not found"}"#.to_string()),
+        (
+            200,
+            format!(
+                r#"{{"handle":"acme-studio","home":"{}","brain":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ"}}}}"#,
+                home.url
+            ),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd_options(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&reg.url),
+        Some("k"),
+        true,
+    );
+    assert_eq!(out.code, Some(1));
+    assert_eq!(error_code(&out.stderr), "HUB_ERROR");
+    reg.finish();
+    assert_eq!(home.finish().len(), 1);
+}
+
+#[test]
+fn registry_tofu_rejects_rotation_beyond_seq_zero_without_persisting_trust() {
+    let rng = ring::rand::SystemRandom::new();
+    let old_pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let old = ring::signature::Ed25519KeyPair::from_pkcs8(old_pkcs8.as_ref()).unwrap();
+    let new_pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let new = ring::signature::Ed25519KeyPair::from_pkcs8(new_pkcs8.as_ref()).unwrap();
+    let public_identity = |pair: &ring::signature::Ed25519KeyPair| {
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(pair.public_key().as_ref());
+        let public = URL_SAFE_NO_PAD.encode(&spki);
+        let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(&spki));
+        (
+            public,
+            fingerprint.clone(),
+            format!("ed25519:{fingerprint}"),
+        )
+    };
+    let (old_spki, old_fingerprint, old_multikey) = public_identity(&old);
+    let (new_spki, new_fingerprint, new_multikey) = public_identity(&new);
+    let prior_hash = "a".repeat(64);
+    let unsigned = serde_json::to_string(&TestUnsignedRotation {
+        v: 1,
+        op: "rotate",
+        brain: &old_multikey,
+        public_key: &old_spki,
+        new_brain: &new_multikey,
+        new_public_key: &new_spki,
+        prior_head_seq: 1,
+        prior_feed_hash: Some(&prior_hash),
+        ts: "2026-07-30T12:01:00.000Z",
+    })
+    .unwrap();
+    let signature = URL_SAFE_NO_PAD.encode(old.sign(unsigned.as_bytes()).as_ref());
+    let statement = format!(
+        "{},\"sig\":\"{}\"}}",
+        &unsigned[..unsigned.len() - 1],
+        signature
+    );
+    let home = MockHub::serve(vec![(
+        200,
+        serde_json::json!({
+            "id": BRAIN_ID,
+            "headSeq": 0,
+            "feedHash": serde_json::Value::Null,
+            "identity": {
+                "fingerprint": new_fingerprint,
+                "publicKeySpki": new_spki,
+                "previous": [{
+                    "fingerprint": old_fingerprint,
+                    "publicKeySpki": old_spki,
+                }],
+                "rotations": [statement],
+            },
+        })
+        .to_string(),
+    )]);
+    let registry = MockHub::serve(vec![
+        (404, r#"{"error":"Brain not found"}"#.to_string()),
+        (
+            200,
+            serde_json::json!({
+                "handle": "acme-studio",
+                "home": home.url,
+                "brain": BRAIN_ID,
+                "identity": {"fingerprint": new_fingerprint},
+            })
+            .to_string(),
+        ),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_dbmd_options(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&registry.url),
+        Some("k"),
+        true,
+    );
+    assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
+    assert_eq!(error_code(&out.stderr), "INVALID_FEED");
+    assert!(
+        out.stderr.contains("beyond the advertised head"),
+        "stderr: {}",
+        out.stderr
+    );
+    let trust = dir.path().join(".dbmd-test-state/trust");
+    if trust.exists() {
+        assert!(
+            std::fs::read_dir(&trust)
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "json")),
+            "neither the handle alias nor canonical identity pin may persist after rejection"
+        );
+    }
+    registry.finish();
+    home.finish();
+}
 
 #[test]
 fn resolve_follows_the_registry_to_a_foreign_home_and_pins_the_key() {
@@ -1495,7 +2552,7 @@ fn resolve_follows_the_registry_to_a_foreign_home_and_pins_the_key() {
     let home = MockHub::serve(vec![(
         200,
         format!(
-            r#"{{"id":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","publicKeySpki":"x"}}}}"#
+            r#"{{"id":"{BRAIN_ID}","headSeq":0,"feedHash":null,"identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","publicKeySpki":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU"}}}}"#
         ),
     )]);
     let reg = MockHub::serve(vec![
@@ -1509,11 +2566,12 @@ fn resolve_follows_the_registry_to_a_foreign_home_and_pins_the_key() {
         ),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let out = run_dbmd(
+    let out = run_dbmd_options(
         dir.path(),
         &["resolve", "@acme-studio", "--json"],
         Some(&reg.url),
         Some("k"),
+        true,
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
@@ -1525,13 +2583,61 @@ fn resolve_follows_the_registry_to_a_foreign_home_and_pins_the_key() {
 }
 
 #[test]
+fn registry_cannot_relocate_a_handle_after_first_verified_resolution() {
+    let home = MockHub::serve(vec![(
+        200,
+        format!(
+            r#"{{"id":"{BRAIN_ID}","headSeq":0,"feedHash":null,"identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ","publicKeySpki":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU"}}}}"#
+        ),
+    )]);
+    let first_registry = format!(
+        r#"{{"handle":"acme-studio","home":"{}","brain":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ"}}}}"#,
+        home.url
+    );
+    let relocated_registry = format!(
+        r#"{{"handle":"acme-studio","home":"http://127.0.0.1:9","brain":"{BRAIN_ID}","identity":{{"fingerprint":"plXvdIhBGCFUevYYhNO3LX-IEElGNZhgdUnaOIucWFQ"}}}}"#
+    );
+    let registry = MockHub::serve(vec![
+        (404, r#"{"error":"Brain not found"}"#.to_string()),
+        (200, first_registry),
+        (404, r#"{"error":"Brain not found"}"#.to_string()),
+        (200, relocated_registry),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let first = run_dbmd_options(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&registry.url),
+        Some("k"),
+        true,
+    );
+    assert_eq!(first.code, Some(0), "stderr: {}", first.stderr);
+    let second = run_dbmd_options(
+        dir.path(),
+        &["resolve", "@acme-studio", "--json"],
+        Some(&registry.url),
+        Some("k"),
+        true,
+    );
+    assert_eq!(second.code, Some(1), "stdout: {}", second.stdout);
+    assert_eq!(error_code(&second.stderr), "INVALID_FEED");
+    assert!(
+        second.stderr.contains("relocated"),
+        "stderr: {}",
+        second.stderr
+    );
+    registry.finish();
+    home.finish();
+}
+
+#[test]
 fn resolve_refuses_when_the_home_identity_does_not_match_the_registry() {
     // The home serves a DIFFERENT fingerprint than the registry advertised —
     // a rogue home, or a stale/rebound registry. The client must refuse.
     let home = MockHub::serve(vec![(
         200,
         format!(
-            r#"{{"id":"{BRAIN_ID}","identity":{{"fingerprint":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","publicKeySpki":"x"}}}}"#
+            r#"{{"id":"{BRAIN_ID}","headSeq":0,"feedHash":null,"identity":{{"fingerprint":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","publicKeySpki":"MCowBQYDK2VwAyEAgJLl1ujKETgW6L9RU4sVvKsDOURNZpjy6KnffeIj4VU"}}}}"#
         ),
     )]);
     let reg = MockHub::serve(vec![
@@ -1545,11 +2651,12 @@ fn resolve_refuses_when_the_home_identity_does_not_match_the_registry() {
         ),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let out = run_dbmd(
+    let out = run_dbmd_options(
         dir.path(),
         &["resolve", "@acme-studio", "--json"],
         Some(&reg.url),
         Some("k"),
+        true,
     );
     assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
     assert_eq!(error_code(&out.stderr), "INVALID_FEED");
@@ -1561,10 +2668,15 @@ fn resolve_refuses_when_the_home_identity_does_not_match_the_registry() {
 fn resolve_hits_direct_first_and_never_touches_the_registry_when_it_resolves() {
     // A hosted handle / the caller's own slug resolves directly — no registry
     // round-trip. The registry is only consulted on a direct 404.
-    let hub = MockHub::serve(vec![(
-        200,
-        format!(r#"{{"id":"{BRAIN_ID}","slug":"acme-studio"}}"#),
-    )]);
+    let hub = MockHub::serve(vec![
+        {
+            let mut card: serde_json::Value = serde_json::from_str(SIGNED_HEAD_CARD).unwrap();
+            card["slug"] = serde_json::json!("acme-studio");
+            (200, card.to_string())
+        },
+        (200, SIGNED_HEAD_CARD.to_string()),
+        (200, SIGNED_HEAD_FEED.to_string()),
+    ]);
     let dir = tempfile::tempdir().unwrap();
     let out = run_dbmd(
         dir.path(),
@@ -1574,6 +2686,6 @@ fn resolve_hits_direct_first_and_never_touches_the_registry_when_it_resolves() {
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     let requests = hub.finish();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].path, "/api/hub/brains/acme-studio");
 }

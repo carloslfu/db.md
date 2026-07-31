@@ -365,14 +365,12 @@ fn regression_validate_working_set_does_not_escape_store_via_log_object() {
     );
 }
 
-/// `validate --all` must follow symlinks like the loop default (`md_walker`
-/// `follow_links(true)`). A content file symlinked into a type-folder is checked
-/// by `dbmd validate` (the loop default), but pre-fix `walk_content_files` used a
-/// no-follow `WalkDir`, so `--all` silently SKIPPED it — the authoritative
-/// superset reporting FEWER issues than the loop scope on the same store.
+/// Both validation scopes must treat symlinks as unowned. Following a content
+/// symlink after a containment check lets an attacker swap its target before
+/// the later open and disclose a file outside the store.
 #[cfg(unix)]
 #[test]
-fn regression_validate_all_follows_symlinked_content_file() {
+fn regression_validate_scopes_never_follow_symlinked_content_file() {
     use std::os::unix::fs::symlink;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -395,12 +393,12 @@ fn regression_validate_all_follows_symlinked_content_file() {
     let ws = validate_working_set(&store, None).unwrap();
     let all = validate_all(&store).unwrap();
     assert!(
-        ws.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
-        "the loop default must flag the symlinked-in file's broken link: {ws:#?}"
+        !ws.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
+        "the loop default must not read the symlink target: {ws:#?}"
     );
     assert!(
-        all.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
-        "`validate --all` must also follow the symlink and flag it (superset contract): {all:#?}"
+        !all.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
+        "`validate --all` must not read the symlink target: {all:#?}"
     );
 }
 

@@ -8,7 +8,37 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.2**.
+  `Cargo.toml`, currently **v0.8.3**.
+
+## [0.8.3] — 2026-07-30
+
+### Security
+
+- Link.md identity trust now lives in the user's global dbmd state directory,
+  not a cloned store. Pins survive valid old-key-signed rotation chains;
+  rotation statements commit the prior feed sequence/hash so old keys cannot
+  append after their epoch. Persisted checkpoints reject rollback and
+  same-sequence equivocation across invocations.
+- Pull and mirror bind exports to the verified `(headSeq, feedHash)` snapshot.
+  Signed pack/file digests are checked before mutation. Unix pulls write
+  through no-follow directory handles; mirrors assemble a complete verified
+  sibling and atomically exchange it through a held parent capability.
+- Ambient bearer/agent/brain credentials cannot be redirected or used as a
+  signing oracle by a store-selected hub without an exact
+  `DBMD_HUB_CREDENTIAL_ORIGIN` binding. Key files are regular, private files
+  created durably at mode 0600 before remote rotation.
+- Foreign registry homes reject private/link-local DNS answers, pin the
+  validated answer against rebinding, and never follow redirects. `dbmd serve`
+  no-follow reads and cryptographically re-verifies mirror state before bind.
+- The installer gets both `latest` and per-asset digests from an independent
+  manifest. Same-origin verification is limited to explicitly configured
+  non-GitHub mirrors. Immutable GitHub releases remain drafts until every
+  asset and provenance gate succeeds.
+- CI and release workflows pin explicit runner OS releases and Rust 1.88.0;
+  mutable `*-latest` and `stable` aliases no longer change the build substrate.
+- Parser, extractor, spreadsheet, HTTP, and serve resource caps reject
+  adversarial expansion and slow-client inputs. Spreadsheet/XML dependencies
+  were upgraded to remove the current quick-xml advisories.
 
 ## [0.8.2] — 2026-07-30
 

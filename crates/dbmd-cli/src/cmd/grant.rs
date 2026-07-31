@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::cli::{GrantArgs, GrantCapability, GrantCommand};
 use crate::context::Context;
 use crate::error::CliResult;
-use crate::sanitize::sanitize;
+use crate::sanitize::sanitize_single_line;
 
 /// Run `dbmd grant`.
 pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
@@ -40,7 +40,7 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                 .get("pending")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let cap = sanitize(
+            let cap = sanitize_single_line(
                 body.get("capability")
                     .and_then(Value::as_str)
                     .unwrap_or(capability(a.can).as_str()),
@@ -48,17 +48,21 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
             if pending {
                 println!(
                     "invited {} ({cap}) — the grant activates when they sign up",
-                    a.grantee
+                    sanitize_single_line(&a.grantee)
                 );
             } else {
-                let id = sanitize(body.get("id").and_then(Value::as_str).unwrap_or("?"));
-                println!("granted {cap} to {} (grant {id})", a.grantee);
+                let id =
+                    sanitize_single_line(body.get("id").and_then(Value::as_str).unwrap_or("?"));
+                println!(
+                    "granted {cap} to {} (grant {id})",
+                    sanitize_single_line(&a.grantee)
+                );
             }
             if let Some(scope) = body.get("scopePrefix").and_then(Value::as_str) {
-                println!("scope: {}", sanitize(scope));
+                println!("scope: {}", sanitize_single_line(scope));
             }
             if let Some(until) = body.get("expiresAt").and_then(Value::as_str) {
-                println!("expires: {}", sanitize(until));
+                println!("expires: {}", sanitize_single_line(until));
             }
             Ok(())
         }
@@ -85,8 +89,9 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                 return Ok(());
             }
             // Every field is hub-authored → terminal-sanitized on the way out.
-            let field =
-                |v: &Value, key: &str| sanitize(v.get(key).and_then(Value::as_str).unwrap_or("?"));
+            let field = |v: &Value, key: &str| {
+                sanitize_single_line(v.get(key).and_then(Value::as_str).unwrap_or("?"))
+            };
             for g in &grants {
                 println!(
                     "{}  {}  {}{}{}",
@@ -95,11 +100,11 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                     field(g, "email"),
                     g.get("scopePrefix")
                         .and_then(Value::as_str)
-                        .map(|s| format!("  scope={}", sanitize(s)))
+                        .map(|s| format!("  scope={}", sanitize_single_line(s)))
                         .unwrap_or_default(),
                     g.get("expiresAt")
                         .and_then(Value::as_str)
-                        .map(|s| format!("  until={}", sanitize(s)))
+                        .map(|s| format!("  until={}", sanitize_single_line(s)))
                         .unwrap_or_default(),
                 );
             }
@@ -121,7 +126,7 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                 println!("{}", pretty(&body));
                 return Ok(());
             }
-            println!("revoked {}", a.grant_id);
+            println!("revoked {}", sanitize_single_line(&a.grant_id));
             Ok(())
         }
     }

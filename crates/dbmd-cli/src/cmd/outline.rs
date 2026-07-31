@@ -45,10 +45,15 @@ pub fn run(ctx: &Context, args: &OutlineArgs) -> CliResult {
     };
     let display = abs.strip_prefix(dir).unwrap_or(given).to_path_buf();
 
-    let text = std::fs::read_to_string(&abs).map_err(|e| {
-        CliError::new(ExitCode::Runtime, "IO_ERROR", e.to_string())
-            .with_hint(format!("could not read `{}`", args.file))
-    })?;
+    let text = dbmd_core::fsx::read_bounded_nofollow(&abs, dbmd_core::parser::MAX_DBMD_FILE_BYTES)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
+        .map_err(|e| {
+            CliError::new(ExitCode::Runtime, "IO_ERROR", e.to_string())
+                .with_hint(format!("could not read `{}`", args.file))
+        })?;
     let sections = extract_sections_in_file(&text);
 
     let outline = Outline {

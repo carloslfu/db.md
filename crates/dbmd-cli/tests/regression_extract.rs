@@ -26,6 +26,76 @@ use std::process::{Command, Stdio};
 
 use common::dbmd;
 
+// ── hard worker isolation ────────────────────────────────────────────────────
+
+/// The real CLI starts a parser worker under RLIMIT_CPU. This debug-only fault
+/// injection makes that worker spin and lowers its CPU budget to one second. If
+/// extraction ever moves back in-process or drops the rlimit, this test hangs or
+/// exceeds the wall-clock bound instead of returning the stable resource-limit
+/// refusal.
+#[cfg(unix)]
+#[test]
+fn parser_worker_cpu_limit_is_enforced_out_of_process() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let document = tmp.path().join("small.html");
+    std::fs::write(&document, "<p>small</p>").unwrap();
+
+    let output = dbmd()
+        .arg("--json")
+        .arg("extract")
+        .arg(&document)
+        .env("DBMD_TEST_EXTRACT_WORKER_SPIN", "1")
+        .env("DBMD_TEST_EXTRACT_CPU_SECONDS", "1")
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(
+        output.stdout.is_empty(),
+        "a resource-killed worker must not emit partial extracted text"
+    );
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("JSON error envelope");
+    assert_eq!(error["error"]["code"], "EXTRACT_RESOURCE_LIMIT");
+}
+
+/// The worker also has a hard memory boundary: RLIMIT_AS on Unix platforms that
+/// support lowering it, and a 10 ms resident-memory watchdog on macOS (whose
+/// kernel rejects RLIMIT_AS/RLIMIT_DATA for these dynamically linked workers).
+#[cfg(unix)]
+#[test]
+fn parser_worker_memory_limit_is_enforced_out_of_process() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let document = tmp.path().join("small.html");
+    std::fs::write(&document, "<p>small</p>").unwrap();
+
+    let output = dbmd()
+        .arg("--json")
+        .arg("extract")
+        .arg(&document)
+        .env(
+            "DBMD_TEST_EXTRACT_MEMORY_BYTES",
+            (64 * 1024 * 1024).to_string(),
+        )
+        .env(
+            "DBMD_TEST_EXTRACT_WORKER_ALLOCATE",
+            (128 * 1024 * 1024).to_string(),
+        )
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(
+        output.stdout.is_empty(),
+        "a resource-killed worker must not emit partial extracted text"
+    );
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("JSON error envelope");
+    assert_eq!(error["error"]["code"], "EXTRACT_RESOURCE_LIMIT");
+}
+
 // ── #4: malicious spreadsheet refused, not OOM ────────────────────────────────
 
 /// CRC-32 (IEEE, the zip polynomial), table-free. `dbmd-cli` has no `zip` /

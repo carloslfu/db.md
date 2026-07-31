@@ -16,11 +16,11 @@ use dbmd_core::Store;
 
 use crate::cli::LinkArgs;
 use crate::cmd::write::{
-    core_err, enforce_frozen, index_on_write, open_store, path_escapes_store_error,
-    require_store_relative,
+    core_err, enforce_frozen, index_on_write, open_store, require_store_relative,
 };
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
+use crate::sanitize::sanitize_single_line;
 
 /// The two canonical layer dirs a full-path wiki-link target must start with.
 const LAYER_DIRS: [&str; 2] = ["sources", "records"];
@@ -32,19 +32,14 @@ const LAYER_DIRS: [&str; 2] = ["sources", "records"];
 /// `[[<to>]]` to `<from>`'s body; (5) update the index write-through; (6) report.
 pub fn run(ctx: &Context, args: &LinkArgs) -> CliResult {
     let store = open_store(&args.dir)?;
+    let _transaction = store.transaction().map_err(CliError::from)?;
 
     let from_rel = require_store_relative(&store, &args.from)?;
-    let from_abs = store.abs_path(&from_rel);
 
-    // Containment: `<from>` is a write target; `require_store_relative` is lexical
-    // only and follows symlinks, so a `<from>` reached through an in-store symlink
-    // to a directory outside the store would have its body rewritten OUTSIDE the
-    // store root. Enforce the same resolved-path guard `dbmd write`/`rename` use.
-    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &from_abs) {
-        return Err(path_escapes_store_error(&path_to_unix(&from_rel), &e));
-    }
-
-    if !from_abs.exists() {
+    if !store
+        .regular_file_exists(&from_rel)
+        .map_err(CliError::from)?
+    {
         return Err(missing_from_error(&from_rel));
     }
 
@@ -54,7 +49,7 @@ pub fn run(ctx: &Context, args: &LinkArgs) -> CliResult {
     // The target is recorded as a bare, full store-relative path.
     let target = canonical_link_target(&store, &args.to)?;
 
-    append_wiki_link(&from_abs, &target)?;
+    append_wiki_link(&store, &from_rel, &target)?;
     let index_warning = index_on_write(&store, &from_rel);
 
     emit_result(ctx, &path_to_unix(&from_rel), &target, &index_warning);
@@ -65,8 +60,8 @@ pub fn run(ctx: &Context, args: &LinkArgs) -> CliResult {
 /// body verbatim. The link goes on its own line at the end of the body, with a
 /// single separating blank line if the body has content and doesn't already end
 /// in a blank line.
-fn append_wiki_link(abs: &Path, target: &str) -> Result<(), CliError> {
-    let (mut fm, mut body) = dbmd_core::parser::read_file(abs).map_err(core_err)?;
+fn append_wiki_link(store: &Store, abs: &Path, target: &str) -> Result<(), CliError> {
+    let (mut fm, mut body) = store.read_file(abs).map_err(core_err)?;
 
     let link_line = format!("[[{target}]]\n");
     if body.is_empty() {
@@ -89,7 +84,7 @@ fn append_wiki_link(abs: &Path, target: &str) -> Result<(), CliError> {
     // the edit (SPEC: `updated` is auto-maintained on content edits).
     fm.updated = Some(dbmd_core::now());
 
-    dbmd_core::parser::write_file(abs, &fm, &body).map_err(core_err)?;
+    store.write_file(abs, &fm, &body).map_err(core_err)?;
     Ok(())
 }
 
@@ -134,7 +129,7 @@ fn short_form_error(raw: &str) -> CliError {
 /// `--json` object); a non-fatal index warning goes to stderr.
 fn emit_result(ctx: &Context, from: &str, to: &str, index_warning: &Option<String>) {
     if let Some(w) = index_warning {
-        eprintln!("dbmd: warning: {w}");
+        eprintln!("dbmd: warning: {}", sanitize_single_line(w));
     }
     if ctx.json {
         let out = serde_json::json!({
@@ -143,7 +138,11 @@ fn emit_result(ctx: &Context, from: &str, to: &str, index_warning: &Option<Strin
         });
         println!("{out}");
     } else {
-        println!("{from} -> [[{to}]]");
+        println!(
+            "{} -> [[{}]]",
+            sanitize_single_line(from),
+            sanitize_single_line(to)
+        );
     }
 }
 
@@ -201,7 +200,12 @@ mod tests {
         )
         .unwrap();
 
-        append_wiki_link(&abs, "records/companies/acme").unwrap();
+        append_wiki_link(
+            &store,
+            Path::new("records/contacts/sarah.md"),
+            "records/companies/acme",
+        )
+        .unwrap();
         let text = fs::read_to_string(&abs).unwrap();
         assert!(text.contains("[[records/companies/acme]]"));
         // Frontmatter survived.
@@ -217,7 +221,12 @@ mod tests {
         let abs = store.root.join("records/contacts/empty.md");
         fs::create_dir_all(abs.parent().unwrap()).unwrap();
         fs::write(&abs, "---\ntype: contact\nsummary: x\n---\n").unwrap();
-        append_wiki_link(&abs, "records/companies/acme").unwrap();
+        append_wiki_link(
+            &store,
+            Path::new("records/contacts/empty.md"),
+            "records/companies/acme",
+        )
+        .unwrap();
         let text = fs::read_to_string(&abs).unwrap();
         assert!(text.ends_with("[[records/companies/acme]]\n"));
     }

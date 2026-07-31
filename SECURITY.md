@@ -1,78 +1,121 @@
 # Security
 
-`db.md` is a file-format spec + reference tooling (`dbmd`, a single
-deterministic CLI). The threat model is correspondingly simple:
-`dbmd` reads and writes markdown files on a local filesystem. It
-makes **no network calls and no LLM/API calls** — it ships zero AI
-and handles no API keys. The intelligence lives in the user's own
-agent harness, which drives `dbmd`; the security properties of that
-harness are the operator's responsibility, not `dbmd`'s.
+db.md is an open file format. `dbmd` is its deterministic reference toolkit
+and also carries the optional link.md network client. The format itself does
+not provide encryption or access control. The link.md verbs do handle network
+credentials, signing keys, untrusted hub responses, and replicated content.
 
 ## Reporting a vulnerability
 
-Report privately via GitHub's **"Report a vulnerability"** button on
-the repository's Security tab (Security advisories). Include details
-and reproduction steps. Do not open a public issue for security
-problems. We aim to acknowledge within 2 business days.
+Report privately with GitHub's **Report a vulnerability** button on this
+repository's Security tab. Include affected versions, reproduction steps, and
+impact. Do not open a public issue for an unpatched vulnerability.
 
-## Threat model (summary)
+## Local-store boundary
 
-**The store is a directory of markdown files.** Anyone who can
-read the directory can read the store. Anyone who can write the
-directory can write the store. There is no encryption, no
-authentication, no access control built into the format — those
-live at the filesystem layer (Unix permissions, encrypted
-filesystem, etc.).
+- Anyone who can read a store's files can read its data. Anyone who can write
+  them can change its data. Use operating-system permissions and disk
+  encryption for confidentiality.
+- An opened store retains its root directory descriptor. Security-sensitive
+  reads and writes traverse from that capability with `openat`, `O_NOFOLLOW`,
+  bounded regular-file reads, and handle-relative atomic replacement; a later
+  pathname or symlink swap cannot redirect them. Walks prune symlinks and
+  nested-store markers.
+- Parser and extractor input, aggregate inflation, XML-event, spine, table,
+  cell, response, pack, and file-count budgets reject known amplification
+  shapes before allocation. Document parser libraries run in a child process
+  with a hard Unix CPU limit, a hard address-space limit where the kernel
+  supports lowering it, and a parent-enforced 10 ms resident-memory watchdog
+  on macOS. The parent also enforces an elapsed deadline and bounded transport.
+  Extraction fails closed on native platforms where these process limits are
+  unavailable.
+- Rename stages every authored byte and persists a forward-recovery journal
+  before commit. It installs the new target while the old target remains valid,
+  commits all linkers, then removes the old target; restart recovery is
+  idempotent and a destination race never clobbers an existing file.
+- `dbmd` runs no model and makes no provider calls. Prompt injection and data
+  disclosure by the agent that invokes `dbmd` remain properties of that agent
+  harness.
 
-**`dbmd` itself sends nothing anywhere.** It computes on local
-files only — no telemetry, no provider calls, no key handling. If
-an agent harness driving `dbmd` sends file contents to an LLM, that
-data flow belongs to the harness; review its configuration.
+## link.md boundary
 
-**Frontmatter parsing uses `serde_norway`.** YAML deserialization has
-historically been a source of exploits when parsing untrusted
-input. `dbmd` deserializes into typed structures, not arbitrary
-code paths, which limits the attack surface. If you parse db.md
-files from an untrusted source, review the YAML before parsing.
+Network access occurs only when an operator explicitly invokes a link.md verb:
+`resolve`, `sync`, `grant`, `propose`, `subscribe`, `mirror`, or key rotation.
+There is no telemetry or background phone-home behavior.
 
-**Store traversal is rooted at the store directory.** `dbmd` walks
-the store filesystem (via the `ignore` crate) and resolves
-wiki-links by path relative to the store root; it does not resolve
-`..` outside the store. As with any tool, a store containing
-symlinks that point outside the store can expose those targets to
-processes that read the store — keep untrusted symlinks out of a
-store you operate on.
-
-## What's out of scope
-
-- **Access control on synthesis records.** Single-writer on
-  `meta-type: conclusion` records is a curator-contract convention, not an
-  enforced permission: it is a frontmatter property the agent honors, not a
-  filesystem boundary `dbmd` guards. db.md access control is filesystem-level.
-- **Encryption of file contents.** Use an encrypted filesystem
-  (LUKS, FileVault, etc.) if the store contains sensitive data.
-- **PII redaction.** Operator's responsibility. The store's
-  `DB.md ## Policies` section can declare which types or fields the
-  agent should treat as sensitive.
-- **LLM prompt injection.** `dbmd` runs no model, so it has no
-  prompt to inject. When an agent harness curates a store, a
-  malicious source file could try to steer that agent. That risk
-  lives in the harness, not in `dbmd`; operators should review
-  agent-authored records — especially synthesis records carrying
-  `meta-type: conclusion` — before treating them as authoritative.
+- A hub must be HTTPS, except for literal loopback development endpoints.
+  Redirects are not followed while credentials or packs are in flight.
+- `DBMD_HUB_KEY`, `DBMD_AGENT_KEY_FILE`, and `DBMD_BRAIN_KEY_FILE` are ambient
+  credentials. If an untrusted store selects its hub through `.dbmd/config`,
+  dbmd refuses to send a bearer, agent proof, brain signature, or brain
+  content unless `DBMD_HUB_CREDENTIAL_ORIGIN` exactly binds it to that origin.
+  Selecting the hub with `--hub` or `DBMD_HUB_URL` is explicit.
+- Agent and brain key files must be regular, non-symlink files. On Unix they
+  must not be group- or world-accessible. New keys are created atomically at
+  mode 0600 and synced before their public identity can be sent remotely.
+- Identity is trust-on-first-use. Pins and monotonic feed checkpoints live in
+  the user's global state directory, never inside a cloned store. Override
+  that directory only with an absolute `DBMD_STATE_DIR`.
+- A later identity is accepted only through exact old-key-signed rotation
+  statements. Each statement commits the prior feed sequence and hash, which
+  bounds the old and new signing epochs. Feed rollback, same-sequence
+  equivocation, broken hash chains, signer regression, and truncated/forked
+  rotation histories are refused.
+- Pull and mirror bind the export to the verified `(headSeq, feedHash)` token.
+  Pack bytes must match the signed head's `pack_sha256`; full signed manifests
+  are checked path-for-path and byte-for-byte. A path-scoped unsigned slice is
+  refused until the protocol supplies an independently signed scoped proof.
+- Registry-provided foreign homes are HTTPS origins whose DNS is resolved
+  once, rejected if any answer is non-public, and pinned into a no-redirect
+  client to prevent private-network SSRF and rebinding. Local federation tests
+  require the explicit `DBMD_ALLOW_PRIVATE_REGISTRY_HOME=1` opt-in.
+- Mirror staging, atomic exchange, cleanup, and pull materialization stay
+  relative to held no-follow directory capabilities. `dbmd serve` no-follow
+  reads bounded mirror files and re-verifies the identity chain, every feed
+  signature/hash, rotation epoch, head, and snapshot pack before listening.
+- TOFU cannot detect a malicious identity on the first connection. Verify an
+  initial fingerprint out of band when that risk matters. A compromised
+  current private key remains authoritative until a valid rotation or recovery
+  changes it.
 
 ## Supply chain
 
-`dbmd` is a single Rust binary with a small, audited dependency
-tree (every crate + its license is recorded in
-[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES); dependency licenses must stay
-inside the allowlist enforced by `deny.toml` and
-`crates/dbmd-cli/tests/license_policy.rs`; zero AI/LLM crates). Build from
-source to verify.
+The normal installer resolves both the latest version and its artifact digest
+from the independently deployed Sevra release manifest. It then downloads the
+GitHub release asset and verifies the independent SHA-256 before extraction.
+The same-origin checksum mode is restricted to explicitly configured,
+non-GitHub mirrors for controlled tests. GitHub releases are assembled as
+drafts and receive every asset and provenance attestation. Before the protected
+publishing environment is approved, the trusted local controller independently
+rebuilds both Darwin binaries and both musl binaries and requires byte-for-byte
+equality with CI. Linux builds use digest-pinned `cross` images; Darwin build
+metadata is normalized before comparison. CI publishes the two permanent
+crates first, then the immutable GitHub release without promoting it to latest.
+The controller verifies exact crates.io package checksums, updates Homebrew
+through an optimistic GitHub Contents API write using its existing `gh`
+identity, and makes the GitHub release latest only after every channel
+converges. CI stores no Homebrew deploy key or release write secret.
 
-CI runs format, build, test, and clippy on every pull request. Dependency
-changes also run `cargo deny check licenses bans` (the permissive-only license
-policy and no-AI/no-vector bans are machine-enforced). RustSec advisories run
-on dependency changes and on a daily schedule, so a new advisory against an
-unchanged dependency still fails the audit gate. See [`deny.toml`](deny.toml)
-and the workflows under `.github/workflows/`.
+Release builds also publish Sigstore/GitHub build provenance. For the strongest
+verification, download an asset and run:
+
+```sh
+gh attestation verify dbmd-*.tar.gz --repo carloslfu/db.md
+```
+
+The Rust dependency tree is permissive-only and contains no AI, embedding, or
+vector dependencies. CI enforces this with `cargo deny`, RustSec advisories,
+the shipped-closure license test, formatting, tests, and clippy. See
+[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES) and [`deny.toml`](deny.toml).
+
+## Out of scope
+
+- Encryption, backup policy, PII redaction, and filesystem access control.
+- Trustworthiness of an agent or human authorized to change store content.
+- Availability of a remote hub, independent release-manifest service, DNS,
+  certificate authorities, or the operating system.
+- Native Windows filesystem hardening. Official prebuilt installation supports
+  Windows through WSL; native Windows builds are not a release target.
+  Security-sensitive operations that persist identity checkpoints, create or
+  rotate keys, pull snapshots, or mirror brains fail closed on native Windows
+  instead of falling back to weaker path-based writes.

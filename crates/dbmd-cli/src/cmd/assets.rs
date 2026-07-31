@@ -33,6 +33,11 @@ pub fn run(ctx: &Context, args: &AssetsArgs) -> CliResult {
 /// `dbmd assets scan` — rebuild the manifest from wrapper declarations.
 fn run_scan(ctx: &Context, args: &AssetsScanArgs) -> CliResult {
     let store = Store::open_strict(Path::new(&args.dir))?;
+    let _transaction = if args.dry_run {
+        None
+    } else {
+        Some(store.transaction()?)
+    };
     let report = assets::scan(&store, args.dry_run, args.untracked)?;
 
     if ctx.json {

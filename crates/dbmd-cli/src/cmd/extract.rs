@@ -7,7 +7,10 @@
 //! between `dbmd-core` and the chosen output sink and maps the typed
 //! [`dbmd_core::extract::ExtractError`] onto the CLI's stable exit codes.
 
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use dbmd_core::extract::{self, ExtractError};
 
@@ -19,9 +22,16 @@ use crate::error::{CliError, CliResult, ExitCode};
 pub fn run(ctx: &Context, args: &ExtractArgs) -> CliResult {
     let path = Path::new(&args.file);
 
-    // All the real work — extension dispatch, PDF/docx/xlsx/epub/html adapters,
-    // text normalization, metadata — happens in dbmd-core.
-    let extracted = extract::extract(path).map_err(map_extract_error)?;
+    // Parser libraries run in a child with OS-enforced memory/CPU ceilings.
+    // The environment marker is private plumbing for that child; the parent
+    // never parses an untrusted document in its own address space.
+    let extracted = if std::env::var_os("DBMD_INTERNAL_EXTRACT_WORKER").is_some() {
+        #[cfg(debug_assertions)]
+        extraction_worker_test_hook();
+        extract::extract(path).map_err(map_extract_error)?
+    } else {
+        sandbox_extract(args)?
+    };
 
     if ctx.json {
         // `{text, metadata}` exactly as `Extracted` serializes. Pretty-printed
@@ -34,6 +44,307 @@ pub fn run(ctx: &Context, args: &ExtractArgs) -> CliResult {
         // affordance). `extracted.text` already ends in a single newline (or is
         // empty for a no-text-layer document), so don't add another.
         emit(&args.out, &extracted.text, false)
+    }
+}
+
+const EXTRACT_ADDRESS_SPACE_BYTES: u64 = 768 * 1024 * 1024;
+const EXTRACT_CPU_SECONDS: u64 = 12;
+const EXTRACT_ELAPSED_LIMIT: Duration = Duration::from_secs(20);
+const EXTRACT_WORKER_OUTPUT_BYTES: u64 = 96 * 1024 * 1024;
+
+fn sandbox_extract(args: &ExtractArgs) -> Result<extract::Extracted, CliError> {
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        return Err(CliError::new(
+            ExitCode::Runtime,
+            "EXTRACT_SANDBOX_UNAVAILABLE",
+            "document extraction is disabled because this platform build cannot enforce memory and CPU limits",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        let executable = std::env::current_exe().map_err(CliError::from)?;
+        #[cfg(debug_assertions)]
+        let cpu_seconds = std::env::var("DBMD_TEST_EXTRACT_CPU_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| (1..=EXTRACT_CPU_SECONDS).contains(seconds))
+            .unwrap_or(EXTRACT_CPU_SECONDS);
+        #[cfg(not(debug_assertions))]
+        let cpu_seconds = EXTRACT_CPU_SECONDS;
+        #[cfg(debug_assertions)]
+        let skip_cpu_limit = std::env::var_os("DBMD_TEST_EXTRACT_SKIP_CPU_LIMIT").is_some();
+        #[cfg(not(debug_assertions))]
+        let skip_cpu_limit = false;
+        #[cfg(debug_assertions)]
+        let memory_limit_bytes = std::env::var("DBMD_TEST_EXTRACT_MEMORY_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|bytes| *bytes >= 16 * 1024 * 1024)
+            .unwrap_or(EXTRACT_ADDRESS_SPACE_BYTES);
+        #[cfg(not(debug_assertions))]
+        let memory_limit_bytes = EXTRACT_ADDRESS_SPACE_BYTES;
+        let mut command = Command::new(executable);
+        command
+            .arg("--json")
+            .arg("extract")
+            .arg("--")
+            .arg(&args.file)
+            .env("DBMD_INTERNAL_EXTRACT_WORKER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // `pre_exec` runs after fork and before the worker image starts. Only
+        // async-signal-safe `setrlimit` calls live in the closure.
+        unsafe {
+            command.pre_exec(move || {
+                // macOS rejects lowering RLIMIT_AS/RLIMIT_DATA on these
+                // dynamically linked processes. The parent enforces the same
+                // ceiling from `proc_pidinfo` below. Other Unix workers get a
+                // hard address-space limit before executing parser code.
+                #[cfg(not(target_os = "macos"))]
+                let (memory_resource, memory) = (
+                    libc::RLIMIT_AS,
+                    libc::rlimit {
+                        rlim_cur: memory_limit_bytes as libc::rlim_t,
+                        rlim_max: memory_limit_bytes as libc::rlim_t,
+                    },
+                );
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if libc::setrlimit(memory_resource, &memory) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                let cpu = libc::rlimit {
+                    rlim_cur: cpu_seconds as libc::rlim_t,
+                    rlim_max: cpu_seconds.saturating_add(1) as libc::rlim_t,
+                };
+                if !skip_cpu_limit && libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = command.spawn().map_err(|error| {
+            CliError::new(
+                ExitCode::Runtime,
+                "EXTRACT_SANDBOX_FAILED",
+                format!("could not start the extraction sandbox: {error}"),
+            )
+        })?;
+        let stdout = child.stdout.take().expect("piped extraction worker stdout");
+        let stderr = child.stderr.take().expect("piped extraction worker stderr");
+        let stdout_reader =
+            std::thread::spawn(move || read_worker_pipe(stdout, EXTRACT_WORKER_OUTPUT_BYTES));
+        let stderr_reader = std::thread::spawn(move || read_worker_pipe(stderr, 1024 * 1024));
+
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < EXTRACT_ELAPSED_LIMIT => {
+                    #[cfg(target_os = "macos")]
+                    match macos_worker_resident_bytes(child.id()) {
+                        Ok(bytes) if bytes > memory_limit_bytes => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = stdout_reader.join();
+                            let _ = stderr_reader.join();
+                            return Err(CliError::new(
+                                ExitCode::Runtime,
+                                "EXTRACT_RESOURCE_LIMIT",
+                                format!(
+                                    "document extraction exceeded the {} MiB resident-memory limit",
+                                    memory_limit_bytes / (1024 * 1024)
+                                ),
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            if let Ok(Some(status)) = child.try_wait() {
+                                break status;
+                            }
+                            // The worker can exit after the loop's first
+                            // `try_wait` but before `proc_pidinfo`. macOS then
+                            // reports ESRCH (or no task information with errno
+                            // left at zero) for a perfectly normal exit, and a
+                            // second non-blocking wait can still race process
+                            // reaping by a few microseconds. Do not turn that
+                            // disappearance into EXTRACT_SANDBOX_FAILED: retry
+                            // the wait loop so the child's real typed stderr is
+                            // collected and surfaced.
+                            if error.kind() == std::io::ErrorKind::NotFound
+                                || error.raw_os_error() == Some(libc::ESRCH)
+                            {
+                                std::thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = stdout_reader.join();
+                            let _ = stderr_reader.join();
+                            return Err(CliError::new(
+                                ExitCode::Runtime,
+                                "EXTRACT_SANDBOX_FAILED",
+                                format!("could not inspect extraction worker memory: {error}"),
+                            ));
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(CliError::new(
+                        ExitCode::Runtime,
+                        "EXTRACT_TIMEOUT",
+                        format!(
+                            "document extraction exceeded the {} second elapsed-time limit",
+                            EXTRACT_ELAPSED_LIMIT.as_secs()
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CliError::new(
+                        ExitCode::Runtime,
+                        "EXTRACT_SANDBOX_FAILED",
+                        format!("could not monitor the extraction sandbox: {error}"),
+                    ));
+                }
+            }
+        };
+
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| CliError::runtime("extraction stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| CliError::runtime("extraction stderr reader panicked"))??;
+
+        if !status.success() {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&stderr) {
+                if let Some(error) = value.get("error") {
+                    let code = error
+                        .get("code")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("EXTRACT_PARSE_ERROR");
+                    let message = error
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("document extraction failed");
+                    return Err(CliError::new(
+                        ExitCode::Runtime,
+                        stable_extract_code(code),
+                        message,
+                    ));
+                }
+            }
+            return Err(CliError::new(
+                ExitCode::Runtime,
+                "EXTRACT_RESOURCE_LIMIT",
+                format!(
+                    "the extraction worker was terminated by a CPU, memory, or process failure ({status})"
+                ),
+            ));
+        }
+
+        serde_json::from_slice(&stdout).map_err(|error| {
+            CliError::new(
+                ExitCode::Runtime,
+                "EXTRACT_WORKER_PROTOCOL",
+                format!("invalid extraction worker response: {error}"),
+            )
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_worker_resident_bytes(pid: u32) -> std::io::Result<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let expected = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            expected,
+        )
+    };
+    if written != expected {
+        let error = std::io::Error::last_os_error();
+        return Err(if error.raw_os_error().unwrap_or(0) == 0 {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "proc_pidinfo returned no task information",
+            )
+        } else {
+            error
+        });
+    }
+    Ok(info.pti_resident_size)
+}
+
+/// Debug-build-only fault injection used by the real-binary integration test.
+/// It runs only inside the spawned extraction worker, so the test proves the OS
+/// CPU limit terminates parser work without risking the parent process. Release
+/// binaries do not compile this path or its environment variable.
+#[cfg(debug_assertions)]
+fn extraction_worker_test_hook() {
+    if let Some(bytes) = std::env::var("DBMD_TEST_EXTRACT_WORKER_ALLOCATE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        let mut allocation = vec![0u8; bytes];
+        for page in allocation.chunks_mut(4096) {
+            page[0] = 0xA5;
+        }
+        std::hint::black_box(&mut allocation);
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+    if std::env::var_os("DBMD_TEST_EXTRACT_WORKER_SPIN").is_some() {
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+fn read_worker_pipe<R: Read>(reader: R, max_bytes: u64) -> Result<Vec<u8>, CliError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(CliError::from)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CliError::new(
+            ExitCode::Runtime,
+            "EXTRACT_WORKER_PROTOCOL",
+            "extraction worker output exceeded its transport cap",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn stable_extract_code(code: &str) -> &'static str {
+    match code {
+        "UNSUPPORTED_FORMAT" => "UNSUPPORTED_FORMAT",
+        "DOCUMENT_ENCRYPTED" => "DOCUMENT_ENCRYPTED",
+        "EXTRACT_PARSE_ERROR" => "EXTRACT_PARSE_ERROR",
+        "IO_ERROR" => "IO_ERROR",
+        _ => "EXTRACT_PARSE_ERROR",
     }
 }
 
@@ -60,7 +371,7 @@ fn emit(out: &Option<String>, content: &str, add_trailing_newline: bool) -> CliR
             if add_trailing_newline && !body.ends_with('\n') {
                 body.push('\n');
             }
-            std::fs::write(path, body).map_err(|e| {
+            dbmd_core::fsx::write_atomic(Path::new(path), body.as_bytes()).map_err(|e| {
                 CliError::new(
                     ExitCode::Runtime,
                     "IO_ERROR",

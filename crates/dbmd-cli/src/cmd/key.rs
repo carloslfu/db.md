@@ -57,7 +57,7 @@ pub fn run(ctx: &Context, args: &KeyArgs) -> CliResult {
             } else {
                 println!("rotated {}: now {}", report.brain, report.multikey);
                 println!(
-                    "new key file: {} (0600 — retire the old file yourself)",
+                    "new key file: {} (0600 — back it up; retain the old key as recovery material)",
                     report.key_file
                 );
             }

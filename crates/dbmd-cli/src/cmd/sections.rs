@@ -23,10 +23,15 @@ pub fn run(ctx: &Context, args: &SectionsArgs) -> CliResult {
     // Read the raw file text; a missing / unreadable path is a runtime error
     // (exit 1), mirroring `dbmd outline`. Sections are then extracted with
     // source-relative line numbers (frontmatter offset applied in the parser).
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        CliError::new(ExitCode::Runtime, "IO_ERROR", e.to_string())
-            .with_hint(format!("could not read sections from `{}`", args.file))
-    })?;
+    let text = dbmd_core::fsx::read_bounded_nofollow(path, dbmd_core::parser::MAX_DBMD_FILE_BYTES)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
+        .map_err(|e| {
+            CliError::new(ExitCode::Runtime, "IO_ERROR", e.to_string())
+                .with_hint(format!("could not read sections from `{}`", args.file))
+        })?;
     let sections = extract_sections_in_file(&text);
 
     if ctx.json {

@@ -18,7 +18,6 @@
 //! a new module) respects the wired module tree — `write`/`link`/`rename` are
 //! already declared in `cmd/mod.rs`.
 
-use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
@@ -27,6 +26,7 @@ use dbmd_core::{summary, Frontmatter, Store};
 use crate::cli::WriteArgs;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
+use crate::sanitize::sanitize_single_line;
 
 /// Run `dbmd write`.
 ///
@@ -46,6 +46,9 @@ use crate::error::{CliError, CliResult, ExitCode};
 ///    `--json`), plus the ignored-type-derivation warning when it applies.
 pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     let store = open_store(&args.dir)?;
+    let _transaction = store
+        .transaction()
+        .map_err(|error| CliError::runtime(format!("cannot lock store transaction: {error}")))?;
 
     // ── compose frontmatter ──────────────────────────────────────────────────
     let mut fm = Frontmatter::default();
@@ -120,23 +123,6 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     // ── resolve the on-disk path (auto-shard) ────────────────────────────────
     let resolved = resolve_write_path(&store, &args.r#type, &fm, &args.path)?;
     let resolved_disp = path_to_unix(&resolved);
-    let abs = store.abs_path(&resolved);
-
-    // ── containment: the resolved target must stay inside the store ──────────
-    // `ensure_safe_store_relative` only rejects `..`/root/prefix components
-    // LEXICALLY; it never resolves symlinks. A path like
-    // `records/linkdir/pwned.md` where `records/linkdir` is a symlink to a
-    // directory outside the store passes that lexical gate (all `Normal`
-    // components) and the durable writer's `create_dir_all` + `create_new`
-    // would follow the symlink and land the file (plus the type-folder
-    // `index.md`/`index.jsonl`) OUTSIDE the store root. Resolve the target's
-    // parent chain (canonicalizing every symlink) and require the result to
-    // stay under the canonical store root before any disk write. The store
-    // explicitly anticipates externally-dropped content (rsync/mbsync into
-    // `sources/`), which can carry symlinks, so this gate is load-bearing.
-    if let Err(e) = dbmd_core::store::ensure_path_within_store(&store.root, &abs) {
-        return Err(path_escapes_store_error(&resolved_disp, &e));
-    }
 
     // ── policy: also refuse on the resolved path (sharded destination) ───────
     enforce_frozen(&store, &resolved)?;
@@ -147,7 +133,7 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     // `AlreadyExists` if a prior file or concurrent creator won the path. This
     // keeps create-new semantics in `dbmd-core` and avoids the old empty-sentinel
     // placeholder window at the CLI layer.
-    if let Err(e) = dbmd_core::parser::write_file_new(&abs, &fm, &body) {
+    if let Err(e) = store.write_file_new(&resolved, &fm, &body) {
         if matches!(&e, dbmd_core::ParseError::Io(io) if io.kind() == ErrorKind::AlreadyExists) {
             return Err(collision_error(&store, &resolved));
         }
@@ -174,7 +160,31 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
 /// `NOT_A_STORE` exit. The single store-open gate every writer in this group
 /// goes through.
 pub(crate) fn open_store(dir: &str) -> Result<Store, CliError> {
-    Store::open_strict(Path::new(dir)).map_err(CliError::from)
+    let store = Store::open_strict(Path::new(dir)).map_err(CliError::from)?;
+    #[cfg(test)]
+    AFTER_STORE_OPEN.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    Ok(store)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_STORE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_store_open_hook(hook: impl FnOnce() + 'static) {
+    AFTER_STORE_OPEN.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "an open-store test hook is already set"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
 /// Normalize a caller-supplied path argument to a clean store-relative path.
@@ -183,24 +193,19 @@ pub(crate) fn open_store(dir: &str) -> Result<Store, CliError> {
 /// store root (rewritten to relative), or a `./`-prefixed path. The result uses
 /// `/` separators and is what the index + policy layers key on.
 ///
-/// **Canonicalizes both the target and the store root first** (via
-/// [`canonical_store_relative`]) so an absolute target resolves to the *same*
-/// store-relative key as the equivalent relative one. This is what makes the
-/// frozen-page gate match when the store is opened from CWD (`store.root` is the
-/// literal `.`) and the caller passes an absolute path: a bare
-/// `strip_prefix(".")` / `rel_path` against a `.` root fails on an absolute
-/// target, leaving the raw absolute path that no relative frozen entry can
-/// equal, and the gate is silently skipped. A target that does not yet exist (a
-/// fresh `write` / `rename` destination) cannot be canonicalized; it falls
-/// through to the literal normalization below — correct, because such a path is
-/// not on disk to be frozen.
+/// Absolute spellings are translated against the immutable lexical locator
+/// captured when the store capability was opened. Actual existence and I/O
+/// checks still use that held capability: this avoids reopening either the
+/// target or root by pathname after an ancestor swap. It also makes an absolute
+/// target resolve to the same store-relative policy key as its relative
+/// spelling when the store was opened from `.`.
 pub(crate) fn to_store_relative(store: &Store, raw: &str) -> PathBuf {
-    if let Some(rel) = canonical_store_relative(store, Path::new(raw)) {
-        return rel;
-    }
     let p = Path::new(raw);
     let rel = if p.is_absolute() {
-        store_relative_for_missing_absolute(store, p).unwrap_or_else(|| p.to_path_buf())
+        store
+            .capability_relative(p)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| p.to_path_buf())
     } else {
         // Drop a single leading `./`.
         p.strip_prefix("./").unwrap_or(p).to_path_buf()
@@ -219,49 +224,24 @@ pub(crate) fn require_store_relative(store: &Store, raw: &str) -> Result<PathBuf
     Ok(rel)
 }
 
-/// Resolve `target` to a store-relative path by canonicalizing **both** it and
-/// the store root, then stripping the root prefix. The single canonicalizing
-/// path resolver every write surface funnels through, so an absolute and a
-/// relative spelling of the same file collapse to one key before the
-/// frozen-page matcher (`Config::frozen_match`) and the index write-through see
-/// it — the same property `format` already had via its own canonicalizing
-/// `store_relative`.
+/// Resolve `target` to a store-relative path against the locator captured when
+/// the store capability was opened. An absolute and a relative spelling of the
+/// same file collapse to one key before the frozen-page matcher
+/// (`Config::frozen_match`) and index write-through see it.
 ///
-/// Returns `Some(rel)` only when `target` exists on disk **and** lives under the
-/// canonicalized store root; otherwise `None` so the caller falls back to
-/// literal normalization. The result uses `/` separators on every OS.
+/// Returns `Some(rel)` only when `target` exists through the held root
+/// capability; otherwise `None`. The result uses `/` separators on every OS.
 pub(crate) fn canonical_store_relative(store: &Store, target: &Path) -> Option<PathBuf> {
-    let canonical_target = std::fs::canonicalize(target).ok()?;
-    let canonical_root = std::fs::canonicalize(&store.root).unwrap_or_else(|_| store.root.clone());
-    let rel = canonical_target.strip_prefix(&canonical_root).ok()?;
-    Some(PathBuf::from(path_to_unix(rel)))
-}
-
-/// Like [`canonical_store_relative`], but for an absolute path whose leaf may
-/// not exist yet (e.g. a `rename` destination). It canonicalizes the nearest
-/// existing ancestor and then appends the missing tail lexically. If that
-/// ancestor is outside the store, the path is rejected by returning `None`.
-fn store_relative_for_missing_absolute(store: &Store, target: &Path) -> Option<PathBuf> {
-    if !target.is_absolute() {
-        return None;
+    let rel = if target.is_absolute() {
+        store.capability_relative(target).ok()?.to_path_buf()
+    } else {
+        target.strip_prefix("./").unwrap_or(target).to_path_buf()
+    };
+    if store.regular_file_exists(&rel).ok()? || store.directory_exists(&rel).ok()? {
+        Some(PathBuf::from(path_to_unix(&rel)))
+    } else {
+        None
     }
-
-    let canonical_root = std::fs::canonicalize(&store.root).ok()?;
-    let mut cursor = target;
-    let mut missing_tail: Vec<OsString> = Vec::new();
-
-    while !cursor.exists() {
-        missing_tail.push(cursor.file_name()?.to_os_string());
-        cursor = cursor.parent()?;
-    }
-
-    let canonical_existing = std::fs::canonicalize(cursor).ok()?;
-    let base = canonical_existing.strip_prefix(&canonical_root).ok()?;
-    let mut rel = PathBuf::from(path_to_unix(base));
-    for part in missing_tail.iter().rev() {
-        rel.push(part);
-    }
-    Some(PathBuf::from(path_to_unix(&rel)))
 }
 
 /// Reject paths that cannot be a safe store-relative key. `Path::join` treats
@@ -495,7 +475,7 @@ fn reserved_index_name_error(name: &str) -> CliError {
 /// write to a disambiguated path.
 fn collision_error(store: &Store, resolved: &Path) -> CliError {
     let path = path_to_unix(resolved);
-    let (existing_type, existing_summary) = read_type_and_summary(&store.abs_path(resolved));
+    let (existing_type, existing_summary) = read_type_and_summary(store, resolved);
 
     let mut message = format!("`{path}` already exists");
     match (&existing_type, &existing_summary) {
@@ -537,7 +517,7 @@ fn emit_result(
     policy_warning: &Option<String>,
 ) {
     for w in [index_warning, policy_warning].into_iter().flatten() {
-        eprintln!("dbmd: warning: {w}");
+        eprintln!("dbmd: warning: {}", sanitize_single_line(w));
     }
     if ctx.json {
         let out = serde_json::json!({
@@ -546,7 +526,7 @@ fn emit_result(
         });
         println!("{out}");
     } else {
-        println!("{resolved}");
+        println!("{}", sanitize_single_line(resolved));
     }
 }
 
@@ -572,7 +552,11 @@ fn apply_fm_assignments(fm: &mut Frontmatter, assignments: &[String]) -> Result<
 /// Read the optional `--body-file` into a string (verbatim; the writer preserves
 /// it byte-for-byte).
 fn read_body_file(path: &str) -> Result<String, CliError> {
-    std::fs::read_to_string(path)
+    dbmd_core::fsx::read_bounded_nofollow(Path::new(path), dbmd_core::parser::MAX_DBMD_FILE_BYTES)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
         .map_err(|e| CliError::runtime(format!("cannot read --body-file {path}: {e}")))
 }
 
@@ -612,8 +596,8 @@ fn is_content_type(type_: &str) -> bool {
 /// Read a file's `type` + `summary` frontmatter for collision / derivation
 /// reporting. Resilient: any read/parse failure yields `(None, None)` rather
 /// than erroring — the collision itself is the message, not the parse.
-fn read_type_and_summary(abs: &Path) -> (Option<String>, Option<String>) {
-    match dbmd_core::parser::read_file(abs) {
+fn read_type_and_summary(store: &Store, path: &Path) -> (Option<String>, Option<String>) {
+    match store.read_file(path) {
         Ok((fm, _body)) => (fm.type_, fm.summary),
         Err(_) => (None, None),
     }
@@ -893,6 +877,58 @@ mod tests {
         assert_eq!(
             to_store_relative(&store, "./records/decisions/new.md"),
             PathBuf::from("records/decisions/new.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_command_uses_opened_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        let detached = sandbox.path().join("detached");
+        let replacement = sandbox.path().join("replacement");
+        std::fs::create_dir_all(replacement.join("sources/notes/2026/07")).unwrap();
+        std::fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        std::fs::write(
+            replacement.join("sources/notes/2026/07/new.md"),
+            "---\ntype: note\nsummary: replacement secret\n---\n",
+        )
+        .unwrap();
+
+        let root_for_hook = root.clone();
+        let detached_for_hook = detached.clone();
+        let replacement_for_hook = replacement.clone();
+        set_after_store_open_hook(move || {
+            std::fs::rename(&root_for_hook, &detached_for_hook).unwrap();
+            symlink(&replacement_for_hook, &root_for_hook).unwrap();
+        });
+        let args = WriteArgs {
+            path: "records/notes/new.md".to_string(),
+            r#type: "note".to_string(),
+            summary: Some("owned write".to_string()),
+            fm: Vec::new(),
+            body_file: None,
+            dir: root.to_string_lossy().into_owned(),
+        };
+        let context = Context {
+            json: false,
+            color: crate::context::ColorChoice::default(),
+        };
+        run(&context, &args).expect("replacement collision must be invisible");
+
+        assert!(
+            std::fs::read_to_string(detached.join("sources/notes/2026/07/new.md"))
+                .unwrap()
+                .contains("summary: owned write")
+        );
+        assert!(
+            std::fs::read_to_string(replacement.join("sources/notes/2026/07/new.md"))
+                .unwrap()
+                .contains("summary: replacement secret")
         );
     }
 }

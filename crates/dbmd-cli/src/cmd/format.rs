@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dbmd_core::parser::{read_file, write_file};
+use dbmd_core::parser::{split_frontmatter, Frontmatter, MAX_DBMD_FILE_BYTES};
 use dbmd_core::validate::codes;
 use dbmd_core::Store;
 
@@ -19,13 +19,15 @@ use crate::error::{CliError, CliResult, ExitCode};
 
 /// Run `dbmd format`.
 pub fn run(ctx: &Context, args: &FormatArgs) -> CliResult {
-    let file = Path::new(&args.file);
+    let input = Path::new(&args.file);
+    let file = lexical_absolute_before_open(input)?;
 
     // Resolve the store the file lives in so the frozen-page policy can be
     // consulted. `dbmd format` takes only a file path (no `--dir`); the store
     // root is the nearest ancestor that carries a `DB.md` marker.
-    let store = locate_store(file)?;
-    let rel = store_relative(&store, file);
+    let store = locate_store(&file)?;
+    let _transaction = store.transaction().map_err(CliError::from)?;
+    let rel = store_relative(&store, &file);
 
     // Policy gate: a frozen page is never rewritten, even by a no-op reformat.
     // The same canonical `.md`-insensitive matcher every write surface uses.
@@ -41,12 +43,23 @@ pub fn run(ctx: &Context, args: &FormatArgs) -> CliResult {
     // Read (frontmatter + verbatim body), then re-emit canonically. The writer
     // preserves the body byte-for-byte and only normalizes the frontmatter
     // block's key order / YAML style.
-    let original = std::fs::read_to_string(file).map_err(CliError::from)?;
-    let (frontmatter, body) = read_file(file).map_err(|e| {
+    let original = store
+        .read_bounded(&rel, MAX_DBMD_FILE_BYTES)
+        .map_err(CliError::from)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| CliError::runtime(format!("file is not UTF-8: {error}")))
+        })?;
+    let parsed = split_frontmatter(&original, &rel).map_err(|e| {
         CliError::from(dbmd_core::Error::from(e))
             .with_hint(format!("could not read `{}`", args.file))
     })?;
-    write_file(file, &frontmatter, &body).map_err(|e| {
+    let frontmatter = Frontmatter::parse(&parsed.frontmatter_yaml, &rel).map_err(|e| {
+        CliError::from(dbmd_core::Error::from(e))
+            .with_hint(format!("could not read `{}`", args.file))
+    })?;
+    let body = parsed.body;
+    store.write_file(&rel, &frontmatter, &body).map_err(|e| {
         CliError::from(dbmd_core::Error::from(e))
             .with_hint(format!("could not write `{}`", args.file))
     })?;
@@ -76,6 +89,15 @@ pub fn run(ctx: &Context, args: &FormatArgs) -> CliResult {
     Ok(())
 }
 
+fn lexical_absolute_before_open(file: &Path) -> Result<PathBuf, CliError> {
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(CliError::from)?;
+    let leaf = file.file_name().ok_or_else(|| {
+        CliError::runtime(format!("file path `{}` has no filename", file.display()))
+    })?;
+    Ok(parent.join(leaf))
+}
+
 /// Find the nearest db.md store owning the file. A descendant `DB.md` starts a
 /// separate store boundary, so an outer store's policy must not govern writes
 /// beneath it. A file outside any store is the stable `NOT_A_STORE` error.
@@ -96,11 +118,9 @@ fn locate_store(file: &Path) -> Result<Store, CliError> {
 /// root; if that fails (file absent), falls back to the literal arg so the
 /// frozen-page comparison still has something to match.
 fn store_relative(store: &Store, file: &Path) -> PathBuf {
-    let canonical_file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    let canonical_root = std::fs::canonicalize(&store.root).unwrap_or_else(|_| store.root.clone());
-    canonical_file
-        .strip_prefix(&canonical_root)
-        .map(|p| p.to_path_buf())
+    store
+        .capability_relative(file)
+        .map(Path::to_path_buf)
         .unwrap_or_else(|_| file.to_path_buf())
 }
 
@@ -151,5 +171,41 @@ mod tests {
             store.config.is_frozen(&rel),
             "the nested store's frozen-page policy must apply"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format_refuses_external_symlink_before_reading_or_replacing_it() {
+        use std::os::unix::fs::symlink;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            store_dir.path().join("DB.md"),
+            "---\ntype: db-md\nscope: test\nowner: Test\n---\n# Test\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(store_dir.path().join("records/notes")).unwrap();
+        let secret = outside.path().join("secret.md");
+        std::fs::write(
+            &secret,
+            "---\ntype: note\nsummary: outside\n---\nTOP SECRET\n",
+        )
+        .unwrap();
+        let link = store_dir.path().join("records/notes/leak.md");
+        symlink(&secret, &link).unwrap();
+
+        let store = locate_store(&link).unwrap();
+        assert!(
+            dbmd_core::store::ensure_path_within_store(&store.root, &link).is_err(),
+            "an external symlink must fail before format reads its bytes"
+        );
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&secret)
+            .unwrap()
+            .contains("TOP SECRET"));
     }
 }

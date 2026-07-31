@@ -60,12 +60,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
-
 use crate::index::IndexRecord;
 use crate::store::{
-    canonical_link_target, ensure_path_within_store, extract_edge_targets, fence_closes,
-    fence_opens, link_edge_key, Layer, Store, StoreError,
+    canonical_link_target, extract_edge_targets, fence_closes, fence_opens, link_edge_key, Layer,
+    Store, StoreError,
 };
 
 /// Which edge directions a traversal follows.
@@ -238,7 +236,7 @@ pub fn forwardlinks(store: &Store, path: &Path) -> Result<Vec<PathBuf>, StoreErr
     // SCOPED backlinks (which ride `forwardlinks`) agree with unscoped backlinks
     // on a Latin-1-imported file instead of silently dropping its edges — a
     // `read_to_string` that errored on `InvalidData` returned NO edges.
-    let body = match std::fs::read(&abs) {
+    let body = match store.read_bounded(&abs, crate::parser::MAX_DBMD_FILE_BYTES) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => return Err(StoreError::Io(e)),
     };
@@ -529,7 +527,7 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
         // `[[...]]` edge, or `orphans` would over-report BOTH endpoints of a live
         // edge as orphans (and `stats` would inflate the orphan count) on a file
         // with a stray Latin-1 byte beside a valid ASCII link line.
-        let body = match std::fs::read(abs) {
+        let body = match store.read_bounded(abs, crate::parser::MAX_DBMD_FILE_BYTES) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => return Err(StoreError::Io(e)),
         };
@@ -668,6 +666,153 @@ pub fn rewrite_links_to(text: &str, old: &Path, new: &Path) -> String {
         rewrite_links_in_line(line, &old_key, &new_target, &mut out);
     }
     out
+}
+
+/// Byte-preserving counterpart to [`rewrite_links_to`] for externally dropped
+/// content that is not valid UTF-8.
+///
+/// Link targets are required to be valid UTF-8 before they can match a db.md
+/// path, but every byte outside the matched target (including an invalid display
+/// label or unrelated legacy-encoded prose) is copied verbatim. This lets
+/// `rename` retarget a live ASCII/UTF-8 wiki-link without either dangling it or
+/// replacing unrelated invalid bytes with U+FFFD.
+pub fn rewrite_links_to_bytes(bytes: &[u8], old: &Path, new: &Path) -> Vec<u8> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return rewrite_links_to(text, old, new).into_bytes();
+    }
+
+    let old_target = normalize_target(old);
+    let new_target = normalize_target(new);
+    if old_target.is_empty() {
+        return bytes.to_vec();
+    }
+    let old_key = edge_key(&old_target);
+    let mut out = Vec::with_capacity(bytes.len());
+    let body_start = match frontmatter_body_split_bytes(bytes) {
+        Some(body_offset) => {
+            for line in byte_lines(&bytes[..body_offset]) {
+                rewrite_links_in_byte_line(line, &old_key, new_target.as_bytes(), &mut out);
+            }
+            body_offset
+        }
+        None => 0,
+    };
+
+    let mut fence: Option<(u8, usize)> = None;
+    for line in byte_lines(&bytes[body_start..]) {
+        let content = line
+            .strip_suffix(b"\n")
+            .unwrap_or(line)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
+        if let Some(active) = fence {
+            if std::str::from_utf8(content)
+                .ok()
+                .is_some_and(|line| fence_closes(line, active))
+            {
+                fence = None;
+            }
+            out.extend_from_slice(line);
+            continue;
+        }
+        if let Some(opened) = std::str::from_utf8(content).ok().and_then(fence_opens) {
+            fence = Some(opened);
+            out.extend_from_slice(line);
+            continue;
+        }
+        rewrite_links_in_byte_line(line, &old_key, new_target.as_bytes(), &mut out);
+    }
+    out
+}
+
+fn byte_lines(mut bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        if bytes.is_empty() {
+            return None;
+        }
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |index| index + 1);
+        let (line, rest) = bytes.split_at(end);
+        bytes = rest;
+        Some(line)
+    })
+}
+
+fn frontmatter_body_split_bytes(bytes: &[u8]) -> Option<usize> {
+    let bom = usize::from(bytes.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;
+    let after_open = if bytes.get(bom..)?.starts_with(b"---\n") {
+        bom + 4
+    } else if bytes.get(bom..)?.starts_with(b"---\r\n") {
+        bom + 5
+    } else {
+        return None;
+    };
+    let mut offset = after_open;
+    for line in byte_lines(&bytes[after_open..]) {
+        offset += line.len();
+        let content = line
+            .strip_suffix(b"\n")
+            .unwrap_or(line)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
+        if content == b"---" {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+fn rewrite_links_in_byte_line(line: &[u8], old_key: &str, new_target: &[u8], out: &mut Vec<u8>) {
+    let mut cursor = 0usize;
+    let mut copied = 0usize;
+    while cursor + 1 < line.len() {
+        if line[cursor..].starts_with(b"[[") {
+            let inner_start = cursor + 2;
+            if let Some(close_offset) = line[inner_start..]
+                .windows(2)
+                .position(|window| window == b"]]")
+            {
+                let close = inner_start + close_offset;
+                let inner = &line[inner_start..close];
+                let split = inner.iter().position(|byte| *byte == b'|');
+                let raw_target = split.map_or(inner, |index| &inner[..index]);
+                let raw_target = trim_ascii(raw_target);
+                if let Ok(raw_target) = std::str::from_utf8(raw_target) {
+                    if !raw_target.is_empty()
+                        && !raw_target.starts_with('[')
+                        && edge_key(&canonical_link_target(raw_target)) == old_key
+                    {
+                        out.extend_from_slice(&line[copied..cursor]);
+                        out.extend_from_slice(b"[[");
+                        out.extend_from_slice(new_target);
+                        if let Some(index) = split {
+                            out.extend_from_slice(&inner[index..]);
+                        }
+                        out.extend_from_slice(b"]]");
+                        cursor = close + 2;
+                        copied = cursor;
+                        continue;
+                    }
+                }
+                cursor = close + 2;
+                continue;
+            }
+        }
+        cursor += 1;
+    }
+    out.extend_from_slice(&line[copied..]);
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 /// Byte offset where the body begins after a leading `---`…`---` frontmatter
@@ -814,13 +959,12 @@ fn is_within_store_target(target: &str) -> bool {
 /// disclosure vector). Containment is enforced via the shared
 /// [`ensure_path_within_store`] gate, matching validate's safe-path guard.
 fn resolve_existing(store: &Store, store_relative: &Path) -> Option<PathBuf> {
-    let direct = store.root.join(store_relative);
-    if direct.is_file() && resolves_within_store(store, &direct) {
-        return Some(direct);
+    if store.regular_file_exists(store_relative).ok()? {
+        return Some(store_relative.to_path_buf());
     }
     let normalized = normalize_target(store_relative);
-    let with_md = store.root.join(format!("{normalized}.md"));
-    if with_md.is_file() && resolves_within_store(store, &with_md) {
+    let with_md = PathBuf::from(format!("{normalized}.md"));
+    if store.regular_file_exists(&with_md).ok()? {
         return Some(with_md);
     }
     None
@@ -852,38 +996,22 @@ fn target_escapes_store(store: &Store, store_relative: &Path) -> bool {
     // Not resolvable in-store: is it because it points OUTSIDE (a symlink escape),
     // or because it does not exist at all (a dangling link)? It escapes iff the
     // path (as written or with `.md`) exists on disk yet fails containment.
-    let direct = store.root.join(store_relative);
-    if direct.exists() && !resolves_within_store(store, &direct) {
-        return true;
-    }
+    let direct_refused = store
+        .regular_file_exists(store_relative)
+        .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound);
     let normalized = normalize_target(store_relative);
-    let with_md = store.root.join(format!("{normalized}.md"));
-    with_md.exists() && !resolves_within_store(store, &with_md)
+    let with_md = PathBuf::from(format!("{normalized}.md"));
+    direct_refused
+        || store
+            .regular_file_exists(&with_md)
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
 }
 
-/// Containment check for a candidate on-disk path. Always routes through the
-/// authoritative, symlink-resolving [`ensure_path_within_store`] gate — the only
-/// thing that can prove an escaping or symlink-redirected path actually stays
-/// inside the store.
-///
-/// There is deliberately **no** "all-`Normal`-components" fast path that returns
-/// `true` without canonicalizing. A `Normal` component is not safe by spelling:
-/// it can itself be a symlink to a directory or file outside the store
-/// (`records/linkdir -> /etc`, or a directly-symlinked `records/aliased.md ->
-/// ../../outside/secret.md`). `store.root.join(rel)` follows that in-store symlink,
-/// `is_file()` succeeds (it follows symlinks), and without canonicalizing the
-/// resolved target the out-of-store file's `summary`/`type` leak into a
-/// `graph neighborhood` slice. `ensure_path_within_store` canonicalizes `abs`
-/// (resolving every symlink in its chain) and confirms the result is under the
-/// canonicalized root, closing that disclosure vector — the same gate the `..`
-/// path already passes through.
-fn resolves_within_store(store: &Store, abs: &Path) -> bool {
-    ensure_path_within_store(&store.root, abs).is_ok()
-}
-
-/// Convert an absolute path under the store root into its store-relative form.
+/// Convert a caller path to the relative key used by the held store capability.
+/// Later reads traverse that capability with no-follow semantics, so a
+/// normal-looking component cannot redirect graph hydration through a symlink.
 fn rel_path(store: &Store, abs: &Path) -> Option<PathBuf> {
-    abs.strip_prefix(&store.root).ok().map(|p| p.to_path_buf())
+    store.capability_relative(abs).ok().map(Path::to_path_buf)
 }
 
 /// Which layer a store-relative path sits in, by its first component.
@@ -917,64 +1045,11 @@ fn is_content_rel(rel: &Path) -> bool {
 /// per-folder `index.md` sidecars are filtered out ([`is_content_rel`]). Honors
 /// `.gitignore` the way `rg` does. Returns absolute paths. SWEEP-class.
 fn walk_content_files(store: &Store) -> Result<Vec<PathBuf>, StoreError> {
-    let mut out = Vec::new();
-    for layer in Layer::all() {
-        let dir = store.root.join(layer_dir_name(layer));
-        if !dir.is_dir() {
-            continue;
-        }
-        let store_root = store.root.clone();
-        let mut builder = WalkBuilder::new(&dir);
-        builder
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(false)
-            .require_git(false)
-            // Follow symlinks so a symlinked `.md` content file or a symlinked
-            // type folder is walked like any other content (consistent with the
-            // store SWEEP walker), rather than silently vanishing from orphans.
-            .follow_links(true)
-            .filter_entry(move |entry| {
-                crate::store::ensure_path_within_store(&store_root, entry.path()).is_ok()
-            });
-        let walker = builder.build();
-        for result in walker {
-            let entry = result.map_err(|e| StoreError::Search {
-                root: store.root.clone(),
-                message: format!("walk failed: {e}"),
-            })?;
-            // A followed symlink entry reports its own type as `is_symlink()`, so
-            // also accept a symlink whose target is a regular file.
-            let is_file = match entry.file_type() {
-                Some(ft) if ft.is_file() => true,
-                Some(ft) if ft.is_symlink() => std::fs::metadata(entry.path())
-                    .map(|m| m.is_file())
-                    .unwrap_or(false),
-                _ => false,
-            };
-            if !is_file {
-                continue;
-            }
-            let abs = entry.into_path();
-            if let Some(rel) = rel_path(store, &abs) {
-                if is_content_rel(&rel) {
-                    out.push(abs);
-                }
-            }
-        }
-    }
-    Ok(out)
+    store.walk()
 }
 
 /// The on-disk folder name for a layer. Mirrors `Layer::dir_name`; kept local
 /// so the graph module owns its own copy rather than coupling to that body.
-fn layer_dir_name(layer: Layer) -> &'static str {
-    match layer {
-        Layer::Sources => "sources",
-        Layer::Records => "records",
-    }
-}
-
 /// Read a reached node's `summary` and `type` from its frontmatter. A missing
 /// file, missing frontmatter, or unparseable YAML degrades to an empty summary
 /// / unknown type rather than failing the whole hydration — `neighborhood` is
@@ -986,7 +1061,7 @@ fn read_summary_and_type(store: &Store, rel: &Path) -> (String, Option<String>) 
     };
     // Lossy decode so a node's summary/type still resolve when the file carries
     // a stray non-UTF8 byte (consistent with the edge readers above).
-    let text = match std::fs::read(&abs) {
+    let text = match store.read_bounded(&abs, crate::parser::MAX_DBMD_FILE_BYTES) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => return (String::new(), None),
     };
@@ -1066,10 +1141,7 @@ mod tests {
             let tmp = TempDir::new().expect("tempdir");
             let root = tmp.path().to_path_buf();
             fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n# store\n").expect("DB.md");
-            let store = Store {
-                root,
-                config: Config::default(),
-            };
+            let store = Store::from_root_and_config(&root, Config::default()).unwrap();
             Fixture { _tmp: tmp, store }
         }
 
@@ -1279,6 +1351,45 @@ mod tests {
         let input = "[[records/x]] [[]] text";
         let got = rewrite_links_to(input, Path::new(""), Path::new("records/y"));
         assert_eq!(got, input);
+    }
+
+    #[test]
+    fn byte_rewrite_preserves_invalid_prose_and_display_bytes() {
+        let mut input = b"before ".to_vec();
+        input.push(0xE9);
+        input.extend_from_slice(b"\n[[ records/contacts/sarah.md |Sara");
+        input.push(0xFF);
+        input.extend_from_slice(b"h]]\nafter\n");
+
+        let got = rewrite_links_to_bytes(
+            &input,
+            Path::new("records/contacts/sarah"),
+            Path::new("records/contacts/sarah-chen"),
+        );
+        let mut expected = b"before ".to_vec();
+        expected.push(0xE9);
+        expected.extend_from_slice(b"\n[[records/contacts/sarah-chen|Sara");
+        expected.push(0xFF);
+        expected.extend_from_slice(b"h]]\nafter\n");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn byte_rewrite_keeps_invalid_fenced_example_untouched() {
+        let mut input = b"```\ninvalid ".to_vec();
+        input.push(0xFF);
+        input.extend_from_slice(b" [[records/contacts/sarah]]\n```\n[[records/contacts/sarah]]\n");
+        let got = rewrite_links_to_bytes(
+            &input,
+            Path::new("records/contacts/sarah"),
+            Path::new("records/contacts/sarah-chen"),
+        );
+        let mut expected = b"```\ninvalid ".to_vec();
+        expected.push(0xFF);
+        expected.extend_from_slice(
+            b" [[records/contacts/sarah]]\n```\n[[records/contacts/sarah-chen]]\n",
+        );
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -3005,6 +3116,50 @@ Trailing [[records/contacts/sarah]].
                 .iter()
                 .any(|p| p.contains("bio") || p.contains("sarah")),
             "neither endpoint of a live edge may be an orphan: {orph:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forwardlinks_read_opened_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        fs::create_dir_all(root.join("records/notes")).unwrap();
+        fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(
+            root.join("records/notes/a.md"),
+            "---\ntype: note\nsummary: A\n---\n[[records/notes/b]]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("records/notes/b.md"),
+            "---\ntype: note\nsummary: B\n---\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let detached = sandbox.path().join("detached");
+        fs::rename(&root, &detached).unwrap();
+
+        let replacement = sandbox.path().join("replacement");
+        fs::create_dir_all(replacement.join("records/notes")).unwrap();
+        fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(
+            replacement.join("records/notes/a.md"),
+            "---\ntype: note\nsummary: replacement\n---\n[[records/notes/secret]]\n",
+        )
+        .unwrap();
+        fs::write(
+            replacement.join("records/notes/secret.md"),
+            "---\ntype: note\nsummary: secret\n---\n",
+        )
+        .unwrap();
+        symlink(&replacement, &root).unwrap();
+
+        assert_eq!(
+            forwardlinks(&store, Path::new("records/notes/a.md")).unwrap(),
+            vec![PathBuf::from("records/notes/b")]
         );
     }
 }

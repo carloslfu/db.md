@@ -4,27 +4,24 @@
 //! push the local store as a whole-store snapshot.
 //!
 //! Thin wrapper over [`dbmd_core::linkmd::sync_pull`] /
-//! [`dbmd_core::linkmd::sync_push`]. Two behaviors live at this layer, not in
-//! the library, because they are CLI ergonomics rather than wire semantics:
-//!
-//! - **After a pull that materialized an openable store** (a `DB.md` arrived),
-//!   the local `index.md` / `index.jsonl` catalogs are rebuilt so loop ops
-//!   work immediately — the index is derived and disposable, and a store
-//!   without its catalog is half-delivered. A rebuild failure is reported as
-//!   a note, never as a pull failure (the files ARE on disk).
-//! - **Push opens the store strictly** (`Store::open_strict`) so pushing from
+//! [`dbmd_core::linkmd::sync_push`]. Push opens the store strictly
+//! (`Store::open_strict`) so pushing from
 //!   a non-store exits with the standard `NOT_A_STORE` contract (exit `3`).
+//! Pull deliberately does not run a second path-based index rebuild after the
+//! capability-relative materialization: an attacker swapping a destination
+//! ancestor between those phases could redirect the derived writes. Indexes
+//! are disposable and the agent can rebuild them as a separate local action.
 
 use std::path::Path;
 
 use dbmd_core::linkmd;
-use dbmd_core::{Index, Store};
-use serde_json::{json, Value};
+use dbmd_core::Store;
+use serde_json::Value;
 
 use crate::cli::SyncArgs;
 use crate::context::Context;
 use crate::error::CliResult;
-use crate::sanitize::sanitize;
+use crate::sanitize::sanitize_single_line;
 
 /// Run `dbmd sync`.
 pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
@@ -41,24 +38,11 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
 fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) -> CliResult {
     let report = linkmd::sync_pull(cfg, brain, out.map(Path::new))?;
 
-    // Rebuild the derived catalogs when the pull produced an openable store.
-    // Best-effort by design: the pulled files are already durable on disk.
-    let index_note = match Store::open_strict(Path::new(&report.dest)) {
-        Ok(store) => match Index::rebuild_all(&store) {
-            Ok(()) => Some("rebuilt".to_string()),
-            Err(e) => Some(format!("rebuild failed: {e}")),
-        },
-        // A scoped pull may not include DB.md — not a store, nothing to index.
-        Err(_) => None,
-    };
-
     if ctx.json {
-        let mut v = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
-        v["index"] = match &index_note {
-            Some(n) => json!(n),
-            None => Value::Null,
-        };
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
         return Ok(());
     }
 
@@ -69,11 +53,8 @@ fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) 
         report.head_seq,
         // Without --out the destination derives from the hub's slug —
         // hub-authored, so terminal-sanitized.
-        sanitize(&report.dest),
+        sanitize_single_line(&report.dest),
     );
-    if let Some(n) = index_note {
-        println!("index: {n}");
-    }
     if !report.extra_local.is_empty() {
         println!(
             "{} local content file{} the export did not carry (nothing was deleted):",
@@ -85,7 +66,7 @@ fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) 
             },
         );
         for p in &report.extra_local {
-            println!("  {p}");
+            println!("  {}", sanitize_single_line(p));
         }
     }
     Ok(())
@@ -94,6 +75,7 @@ fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) 
 fn push(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, dir: &str) -> CliResult {
     // Strict open: pushing from a non-store is the standard NOT_A_STORE exit.
     let store = Store::open_strict(Path::new(dir))?;
+    let _transaction = store.transaction()?;
     let files = linkmd::collect_push_files(&store)?;
     let sent = files.len();
     let body = linkmd::sync_push(cfg, brain, &files)?;

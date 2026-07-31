@@ -16,10 +16,12 @@ env:
 jobs:
   msrv:
     name: MSRV 1.88
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4
+        with:
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           key: msrv-1.88
@@ -27,13 +29,18 @@ jobs:
         run: cargo check --workspace --locked
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+      - name: Installer trust-boundary tests
+        run: sh scripts/test-install-security.sh
+      - name: Release trust-boundary tests
+        run: sh scripts/test-release-security.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Build

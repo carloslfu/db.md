@@ -36,10 +36,11 @@ path = "src/main.rs"
 [dependencies]
 # `link` requested explicitly (not just via default) so the binary keeps the
 # link.md client verbs even if a future build turns core defaults off.
-dbmd-core = { path = "../dbmd-core", version = "0.8.2", features = ["link"] }
+dbmd-core = { path = "../dbmd-core", version = "0.8.3", features = ["link"] }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 # `dbmd fm`/`dbmd log` build a `dbmd_core::LogEntry`, parse user RFC3339/date
 # timestamps, and render frontmatter YAML scalars (`fm get`). chrono + serde_norway
 # are the minimal glue for that — already `dbmd-core` deps, so MIT OR Apache-2.0
@@ -54,14 +55,16 @@ serde_norway = { workspace = true }
 grep = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
+# `dbmd serve` opens mirrored metadata relative to a held directory capability
+# with openat/O_NOFOLLOW before core re-verifies it.
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 insta = { workspace = true }
-# The `emit` e2e test recomputes the dump's file-bytes SHA-256 independently.
-# Dev-only — never shipped; the same crate is already a `dbmd-core` runtime
-# dep, so this adds no new crate or license surface to the tree.
-sha2 = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+zip = { workspace = true }
 # Integration-test driver for the `dbmd` binary (spawn, assert exit code +
 # stdout/stderr). Dev-only — never shipped in the binary. MIT OR Apache-2.0
 # (transitive `predicates`, `bstr`, `doc-comment`); recorded in

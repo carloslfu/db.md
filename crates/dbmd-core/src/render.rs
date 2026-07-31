@@ -73,34 +73,26 @@ pub fn tree(store: &Store, layer: Option<Layer>, type_: Option<&str>) -> Result<
             }
         }
 
-        let layer_abs = store.root.join(layer_dir_name(l));
-        if !layer_abs.is_dir() {
-            continue;
-        }
-
-        // Each immediate sub-directory of the layer is a type-folder. Sort the
-        // type-folder names for a stable branch order.
-        let mut type_dir_names: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&layer_abs)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if !file_type.is_dir() || !store.owns_path(&entry.path()) {
+        let mut grouped: std::collections::BTreeMap<String, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        for rel in store.walk_layer(l)? {
+            if rel.components().nth(2).is_none() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if is_skipped_dir(&name) {
+            let Some(type_name) = rel
+                .components()
+                .nth(1)
+                .and_then(|component| component.as_os_str().to_str())
+            else {
+                continue;
+            };
+            if type_name == "log" {
                 continue;
             }
-            type_dir_names.push(name);
+            grouped.entry(type_name.to_string()).or_default().push(rel);
         }
-        type_dir_names.sort();
-
         let mut type_folders = Vec::new();
-        for type_name in type_dir_names {
-            let type_abs = layer_abs.join(&type_name);
-            let mut files: Vec<PathBuf> = Vec::new();
-            collect_content_files(store, &type_abs, &mut files)?;
-
+        for (type_name, mut files) in grouped {
             // `--type` restricts to a single frontmatter `type` (matching every
             // other `--type` flag in the binary), NOT the folder directory
             // name. Canonical folders are pluralized (`contact` lives under
@@ -145,49 +137,6 @@ fn layer_dir_name(layer: Layer) -> &'static str {
     }
 }
 
-/// Directory names skipped during the store walk: hidden dot-dirs and the
-/// rotated-log archive folder.
-fn is_skipped_dir(name: &str) -> bool {
-    name == "log" || name.starts_with('.')
-}
-
-/// True if a file name is a content file we list in the tree: a `.md` file that
-/// is not a per-folder `index.md` meta file. `index.jsonl`, `.DS_Store`, and
-/// any non-`.md` artifact are not content.
-fn is_content_md(name: &str) -> bool {
-    name.ends_with(".md") && name != "index.md"
-}
-
-/// Recursively collect content `.md` files beneath a type-folder, descending
-/// through date-shard subdirectories, into `out` as store-relative paths.
-/// Skips hidden dirs and any nested `index.md` meta files.
-fn collect_content_files(
-    store: &Store,
-    dir: &Path,
-    out: &mut Vec<PathBuf>,
-) -> Result<(), StoreError> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !store.owns_path(&entry.path()) {
-            continue;
-        }
-
-        if file_type.is_dir() {
-            if name.starts_with('.') {
-                continue;
-            }
-            collect_content_files(store, &entry.path(), out)?;
-        } else if file_type.is_file() && is_content_md(&name) {
-            let abs = entry.path();
-            let rel = abs.strip_prefix(&store.root).unwrap_or(&abs).to_path_buf();
-            out.push(rel);
-        }
-    }
-    Ok(())
-}
-
 /// True if the content file at store-relative `rel` declares the frontmatter
 /// `type` `want`. Lenient by design: a file that can't be read, has no
 /// frontmatter, or has no `type:` key simply doesn't match (it is not an error)
@@ -197,11 +146,7 @@ fn collect_content_files(
 /// on malformed frontmatter): split off the leading `---` block and read the
 /// `type` key as a string, mirroring `stats`'s frontmatter-type reader.
 fn file_type_matches(store: &Store, rel: &Path, want: &str) -> bool {
-    let abs = store.root.join(rel);
-    if !store.owns_path(&abs) {
-        return false;
-    }
-    let text = match std::fs::read_to_string(&abs) {
+    let text = match store.read_text_bounded(rel, crate::parser::MAX_DBMD_FILE_BYTES) {
         Ok(t) => t,
         Err(_) => return false,
     };
@@ -254,15 +199,9 @@ fn frontmatter_type(text: &str) -> Option<String> {
 /// headings are sections (a single leading `#` title is not a section); headings
 /// inside fenced code blocks are not mistaken for real headings.
 pub fn outline(store: &Store, file: &Path) -> Result<Outline, StoreError> {
-    let abs = if file.is_absolute() {
-        file.to_path_buf()
-    } else {
-        store.root.join(file)
-    };
+    let rel = store.capability_relative(file)?.to_path_buf();
 
-    let rel = abs.strip_prefix(&store.root).unwrap_or(file).to_path_buf();
-
-    let text = std::fs::read_to_string(&abs)?;
+    let text = store.read_text_bounded(&rel, crate::parser::MAX_DBMD_FILE_BYTES)?;
     let body = strip_frontmatter(&text);
     let sections = parse_sections(body);
 
@@ -497,10 +436,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             // A real store is marked by a DB.md at the root.
             fs::write(dir.path().join("DB.md"), "---\ntype: db\n---\n").expect("write DB.md");
-            let store = Store {
-                root: dir.path().to_path_buf(),
-                config: Config::default(),
-            };
+            let store = Store::from_root_and_config(dir.path(), Config::default()).unwrap();
             Fixture { _dir: dir, store }
         }
 

@@ -127,6 +127,7 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Propose(args) => cmd::propose::run(ctx, args),
         Command::Subscribe(args) => cmd::subscribe::run(ctx, args),
         Command::Key(args) => cmd::key::run(ctx, args),
+        Command::InstallVerified(args) => cmd::install_verified::run(args),
         Command::Mirror(args) => cmd::mirror::run(ctx, args),
         Command::Serve(args) => cmd::serve::run(ctx, args),
         Command::Spec(args) => cmd::spec::run(ctx, args),
@@ -144,9 +145,9 @@ fn emit_error(ctx: &Context, err: &CliError) {
         // Error text can carry hub-authored strings (the hub's own `error`
         // message, its machine `code` in the hint) — strip terminal control
         // sequences before they reach a human terminal.
-        eprintln!("dbmd: {}", sanitize::sanitize(&err.message));
+        eprintln!("dbmd: {}", sanitize::sanitize_single_line(&err.message));
         if let Some(hint) = &err.hint {
-            eprintln!("  hint: {}", sanitize::sanitize(hint));
+            eprintln!("  hint: {}", sanitize::sanitize_single_line(hint));
         }
     }
 }

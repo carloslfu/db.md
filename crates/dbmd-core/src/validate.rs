@@ -285,17 +285,16 @@ pub fn validate_working_set(
 
     let mut issues = nested_store_issues(store)?;
     for rel in &working {
-        let abs = store.root.join(rel);
         // A changed path can be a *deletion* — skip files that no longer exist;
         // the incoming-linker scan above already flagged links into them.
-        if !abs.is_file() || !store.owns_path(&abs) {
+        if !store.regular_file_exists(rel).unwrap_or(false) {
             continue;
         }
         // `None` basename index: the working-set pass does not build the
         // store-wide basename map (that is a `--all`-only structure), so a bare
         // short-form target is reported as plain `WIKI_LINK_SHORT_FORM` and the
         // `--all` sweep does the ambiguity upgrade.
-        check_content_file(store, rel, &abs, None, &mut issues);
+        check_content_file(store, rel, None, &mut issues);
     }
     issues.sort_by(issue_order);
     Ok(issues)
@@ -304,8 +303,7 @@ pub fn validate_working_set(
 fn validate_content_sweep(store: &Store) -> crate::Result<Vec<Issue>> {
     let mut issues = nested_store_issues(store)?;
     for rel in store.walk()? {
-        let abs = store.root.join(&rel);
-        check_content_file(store, &rel, &abs, None, &mut issues);
+        check_content_file(store, &rel, None, &mut issues);
     }
     issues.sort_by(issue_order);
     Ok(issues)
@@ -366,8 +364,7 @@ pub fn validate_all(store: &Store) -> crate::Result<Vec<Issue>> {
     // Per-file checks over the whole store.
     let mut parsed: Vec<(PathBuf, Parsed)> = Vec::new();
     for rel in &files {
-        let abs = store.root.join(rel);
-        if let Some(p) = check_content_file(store, rel, &abs, Some(&basenames), &mut issues) {
+        if let Some(p) = check_content_file(store, rel, Some(&basenames), &mut issues) {
             parsed.push((rel.clone(), p));
         }
     }
@@ -415,11 +412,10 @@ struct Parsed {
 fn check_content_file(
     store: &Store,
     rel: &Path,
-    abs: &Path,
     basenames: Option<&BasenameIndex>,
     issues: &mut Vec<Issue>,
 ) -> Option<Parsed> {
-    let text = match std::fs::read_to_string(abs) {
+    let text = match store.read_text_bounded(rel, crate::parser::MAX_DBMD_FILE_BYTES) {
         Ok(t) => t,
         Err(e) => {
             // The file exists in the walk but can't be read as UTF-8 text
@@ -1637,8 +1633,10 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
 
     // ── Root index.md ──── (only when a type-folder exists to roll up) ──────────
     if !type_folders.is_empty() {
-        let root_index = store.root.join("index.md");
-        if !root_index.is_file() || !store.owns_path(&root_index) {
+        if !store
+            .regular_file_exists(Path::new("index.md"))
+            .unwrap_or(false)
+        {
             push(
                 issues,
                 Severity::Error,
@@ -1658,8 +1656,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     // ── Layer index.md ──── (only layers that contain a type-folder) ───────────
     for layer in &layers_with_type_folders {
         let layer_index_rel = PathBuf::from(layer).join("index.md");
-        let abs = store.root.join(&layer_index_rel);
-        if !abs.is_file() || !store.owns_path(&abs) {
+        if !store.regular_file_exists(&layer_index_rel).unwrap_or(false) {
             push(
                 issues,
                 Severity::Error,
@@ -1679,8 +1676,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     // ── Type-folder index.md + index.jsonl ───────────────────────────────────
     for (tf, members) in &type_folders {
         let index_md_rel = tf.join("index.md");
-        let index_md_abs = store.root.join(&index_md_rel);
-        let index_md_present = index_md_abs.is_file() && store.owns_path(&index_md_abs);
+        let index_md_present = store.regular_file_exists(&index_md_rel).unwrap_or(false);
         if !index_md_present {
             // The whole folder index is absent → a single `INDEX_MISSING` keyed
             // on the FOLDER (not the would-be `index.md` path). When the index is
@@ -1711,8 +1707,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
         // when the `index.md` is present (above): a folder whose entire index is
         // missing is one `INDEX_MISSING`, not also an `INDEX_JSONL_MISSING`.
         let jsonl_rel = tf.join("index.jsonl");
-        let jsonl_abs = store.root.join(&jsonl_rel);
-        if !jsonl_abs.is_file() || !store.owns_path(&jsonl_abs) {
+        if !store.regular_file_exists(&jsonl_rel).unwrap_or(false) {
             push(
                 issues,
                 Severity::Error,
@@ -1750,8 +1745,7 @@ fn check_indexes(store: &Store, files: &[PathBuf], issues: &mut Vec<Issue>) {
     }
     for (layer_dir, members) in &loose_by_layer {
         let jsonl_rel = layer_dir.join("index.jsonl");
-        let jsonl_abs = store.root.join(&jsonl_rel);
-        if !jsonl_abs.is_file() || !store.owns_path(&jsonl_abs) {
+        if !store.regular_file_exists(&jsonl_rel).unwrap_or(false) {
             push(
                 issues,
                 Severity::Error,
@@ -1810,8 +1804,7 @@ fn check_type_folder_index_md(
     members: &[PathBuf],
     issues: &mut Vec<Issue>,
 ) {
-    let abs = store.root.join(index_rel);
-    let Ok(text) = std::fs::read_to_string(&abs) else {
+    let Ok(text) = store.read_text_bounded(index_rel, crate::parser::MAX_DBMD_FILE_BYTES) else {
         return;
     };
     let entries = parse_index_entries(&text);
@@ -1866,7 +1859,7 @@ fn check_type_folder_index_md(
         // entry to quote the file's `summary` (`- [[path]] — <summary>`), so a
         // missing quote can't validate clean just because there's nothing to
         // compare.
-        if let Some(expected) = read_summary(&target_abs) {
+        if let Some(expected) = read_summary(store, &target_abs) {
             match &entry.summary_text {
                 // Compare with the SAME whitespace normalization the renderer
                 // applies when it writes the `index.md` browse line
@@ -1950,8 +1943,7 @@ fn check_type_folder_index_jsonl(
     members: &[PathBuf],
     issues: &mut Vec<Issue>,
 ) {
-    let abs = store.root.join(jsonl_rel);
-    let Ok(text) = std::fs::read_to_string(&abs) else {
+    let Ok(text) = store.read_text_bounded(jsonl_rel, crate::parser::MAX_DBMD_FILE_BYTES) else {
         return;
     };
 
@@ -2006,8 +1998,7 @@ fn check_type_folder_index_jsonl(
 
     // jsonl record → missing file = desync.
     for path in records.keys() {
-        let target_abs = store.root.join(path);
-        if !target_abs.is_file() {
+        if !store.regular_file_exists(path).unwrap_or(false) {
             push(
                 issues,
                 Severity::Error,
@@ -2059,11 +2050,11 @@ fn check_type_folder_index_jsonl(
     // and diff the two as flat JSON maps. Every key the projection emits is
     // covered automatically; `path` is the join key and is skipped.
     for (path, rec) in &records {
-        let target_abs = store.root.join(path);
-        if !target_abs.is_file() {
+        if !store.regular_file_exists(path).unwrap_or(false) {
             continue;
         }
-        let Ok(expected) = crate::index::IndexRecord::expected_from_file(&target_abs, path.clone())
+        let Ok(expected) =
+            crate::index::IndexRecord::expected_from_store(store, path, path.clone())
         else {
             continue; // unreadable / unparseable frontmatter is reported elsewhere
         };
@@ -2116,8 +2107,7 @@ fn check_index_scope(
     expected_folder: Option<&str>,
     issues: &mut Vec<Issue>,
 ) {
-    let abs = store.root.join(index_rel);
-    let Ok(text) = std::fs::read_to_string(&abs) else {
+    let Ok(text) = store.read_text_bounded(index_rel, crate::parser::MAX_DBMD_FILE_BYTES) else {
         return;
     };
     let Some((yaml, _, _)) = split_frontmatter(&text) else {
@@ -2198,28 +2188,26 @@ fn check_log(store: &Store, issues: &mut Vec<Issue>) {
 /// simply absent from the list.
 fn log_files_chronological(store: &Store) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
-    let archive_dir = store.root.join("log");
-    if let Ok(entries) = std::fs::read_dir(&archive_dir) {
+    let archive_dir = Path::new("log");
+    if let Ok(entries) = store.regular_file_names(archive_dir) {
         let mut archives: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && store.owns_path(p)
-                    && p.file_name()
-                        .and_then(|s| s.to_str())
-                        .and_then(|n| n.strip_suffix(".md"))
-                        .is_some_and(is_year_month_archive)
+            .into_iter()
+            .filter(|name| {
+                name.to_str()
+                    .and_then(|n| n.strip_suffix(".md"))
+                    .is_some_and(is_year_month_archive)
             })
-            .filter_map(|p| p.strip_prefix(&store.root).ok().map(Path::to_path_buf))
+            .map(|name| archive_dir.join(name))
             .collect();
         // `YYYY-MM` stems sort lexically == chronologically; oldest first.
         archives.sort();
         files.extend(archives);
     }
     // The active file holds the current month — newest, so it comes last.
-    let active = store.root.join("log.md");
-    if active.is_file() && store.owns_path(&active) {
+    if store
+        .regular_file_exists(Path::new("log.md"))
+        .unwrap_or(false)
+    {
         files.push(PathBuf::from("log.md"));
     }
     files
@@ -2234,11 +2222,7 @@ fn check_log_file(
     prev: &mut Option<DateTime<FixedOffset>>,
     issues: &mut Vec<Issue>,
 ) {
-    let abs = store.root.join(log_rel);
-    if !store.owns_path(&abs) {
-        return;
-    }
-    let Ok(text) = std::fs::read_to_string(&abs) else {
+    let Ok(text) = store.read_text_bounded(log_rel, crate::parser::MAX_DBMD_FILE_BYTES) else {
         return;
     };
 
@@ -2309,7 +2293,9 @@ struct Link {
 /// case-insensitive filesystem `db.md` would also match `DB.md`; we require the
 /// exact-cased directory entry to be present.
 fn store_marker_present(store: &Store) -> bool {
-    Store::is_db_md_store(&store.root)
+    store
+        .regular_file_exists(Path::new("DB.md"))
+        .unwrap_or(false)
 }
 
 /// Validate the store's identity file, `DB.md`: its frontmatter `type:` must be
@@ -2324,11 +2310,7 @@ fn store_marker_present(store: &Store) -> bool {
 /// `NOT_A_STORE`. Issues anchor to `DB.md` as the store-relative path.
 fn check_db_md(store: &Store, issues: &mut Vec<Issue>) {
     let rel = Path::new("DB.md");
-    let abs = store.root.join("DB.md");
-    let Ok(owned) = crate::store::ensure_path_within_store(&store.root, &abs) else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(&owned) else {
+    let Ok(text) = store.read_text_bounded(rel, crate::parser::MAX_DBMD_FILE_BYTES) else {
         return; // marker present but unreadable: nothing more to say.
     };
 
@@ -2800,8 +2782,10 @@ fn body_opens_with_frontmatter(body: &str) -> bool {
 }
 
 /// Read just the `summary` field of a file, or `None` if absent/unparseable.
-fn read_summary(abs: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(abs).ok()?;
+fn read_summary(store: &Store, abs: &Path) -> Option<String> {
+    let text = store
+        .read_text_bounded(abs, crate::parser::MAX_DBMD_FILE_BYTES)
+        .ok()?;
     let (yaml, _, _) = split_frontmatter(&text)?;
     let value: Value = serde_norway::from_str(&yaml).ok()?;
     if let Value::Mapping(m) = value {
@@ -3253,59 +3237,36 @@ fn resolved_target_abs(store: &Store, bare: &str) -> Option<PathBuf> {
     }
     // The literal path, as written (e.g. an `.eml`/`.pdf` source file kept
     // verbatim under `sources/`).
-    let literal = store.root.join(bare);
-    if literal.is_file() && store.owns_path(&literal) && disk_case_matches(store, &literal, bare) {
+    let literal = PathBuf::from(bare);
+    if store.regular_file_exists(&literal).ok()? && disk_case_matches(store, &literal, bare) {
         return Some(literal);
     }
     // The `.md`-appended path (a content page referenced without its extension).
     let with_md_rel = format!("{bare}.md");
-    let with_md = store.root.join(&with_md_rel);
-    if with_md.is_file()
-        && store.owns_path(&with_md)
-        && disk_case_matches(store, &with_md, &with_md_rel)
+    let with_md = PathBuf::from(&with_md_rel);
+    if store.regular_file_exists(&with_md).ok()? && disk_case_matches(store, &with_md, &with_md_rel)
     {
         return Some(with_md);
     }
     None
 }
 
-/// True if `abs` (already confirmed to be an existing file under `store.root`)
-/// has the exact on-disk casing of the requested store-relative path `requested`.
+/// True if `abs` has the exact on-disk casing of the requested store-relative
+/// path `requested`.
 ///
 /// Makes wiki-link existence resolution platform-independent: on case-insensitive
-/// filesystems (APFS/macOS, NTFS) `Path::is_file()` says yes to a wrong-case
-/// path, so we canonicalize the candidate — which returns the *real* on-disk
-/// casing — and compare its store-relative portion to `requested`
-/// case-sensitively. A mismatch means the file the link actually names does not
-/// exist on a case-sensitive host, so the caller treats it as not found.
+/// filesystems (APFS/macOS, NTFS) an ordinary open can accept a wrong-case
+/// path, so the held capability enumerates and compares every component
+/// byte-for-byte. A mismatch means the link would fail on a case-sensitive
+/// host, so the caller treats it as not found.
 ///
-/// Conservative on `canonicalize` failure: if we cannot read the real path (a
-/// transient FS error, a symlink we cannot resolve, a root that is itself a
-/// symlink we cannot strip), we fall back to accepting the `is_file()` result
+/// Conservative on a case-enumeration failure: if a transient filesystem error
+/// prevents the comparison, we fall back to accepting the held-open result
 /// rather than producing a spurious `WIKI_LINK_BROKEN`. This keeps the check
 /// additive — it only ever *adds* the case-mismatch detection; it never makes a
 /// genuinely-resolvable correct-case link fail.
 fn disk_case_matches(store: &Store, abs: &Path, requested: &str) -> bool {
-    let Ok(canon_abs) = abs.canonicalize() else {
-        return true; // cannot read real casing — don't invent a broken link
-    };
-    // Strip the store root (also canonicalized so a symlinked root still cancels)
-    // to get the real on-disk store-relative path, then compare to what the link
-    // asked for. `canonicalize` on the root may itself fail (e.g. the root no
-    // longer exists by the time we probe) — be conservative there too.
-    let Ok(canon_root) = store.root.canonicalize() else {
-        return true;
-    };
-    let Ok(disk_rel) = canon_abs.strip_prefix(&canon_root) else {
-        // The real file lives outside the (canonical) root — e.g. reached via a
-        // symlink in the store. Containment is already enforced by
-        // `is_safe_store_relative_path`; here we simply cannot make a
-        // case-comparison, so don't manufacture a broken link.
-        return true;
-    };
-    // Compare store-relative paths component-by-component, case-sensitively,
-    // independent of the host's path separator and case folding.
-    disk_rel == Path::new(requested)
+    abs == Path::new(requested) && store.path_case_matches(abs).unwrap_or(true)
 }
 
 /// True if a bare target path is under `prefix` (both `.md`-stripped).
@@ -3342,41 +3303,21 @@ fn loose_layer_dir(rel: &Path) -> Option<PathBuf> {
 
 /// Every `index.md` under the store (root + layers + type-folders), as
 /// store-relative paths. Used to detect orphan indexes. A `log`-named folder
-/// inside a layer is real content; external symlinks and nested stores are
-/// pruned through [`Store::owns_path`].
+/// inside a layer is real content; all symlinks and nested stores are pruned
+/// through [`Store::owns_path`].
 fn walk_index_files(store: &Store) -> Vec<PathBuf> {
-    let root = &store.root;
     let mut out = Vec::new();
-    if root.join("index.md").is_file() {
+    if store
+        .regular_file_exists(Path::new("index.md"))
+        .unwrap_or(false)
+    {
         out.push(PathBuf::from("index.md"));
     }
     for layer in ["sources", "records"] {
-        let base = root.join(layer);
-        if !base.is_dir() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(&base)
-            // Follow symlinks, matching the loop-default `md_walker`
-            // (store.rs `follow_links(true)`): a content file that is a symlink
-            // into the store, or that lives in a symlinked-in type-folder, is
-            // checked by `dbmd validate` (the loop default rides `Store::walk` /
-            // `walk_all_md`, both following symlinks). Without this the `--all`
-            // sweep silently SKIPPED such files, so the authoritative superset
-            // reported FEWER issues than the loop scope on the same store —
-            // inverting the `--all`-is-the-superset contract. walkdir's loop
-            // detection drops a symlink cycle (yields an Err that `.flatten()`
-            // discards), so this cannot hang.
-            .follow_links(true)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_str().unwrap_or("");
-                !name.starts_with('.') && store.owns_path(e.path())
-            })
-            .flatten()
-        {
-            if entry.file_type().is_file() && entry.file_name().to_str() == Some("index.md") {
-                if let Ok(rel) = entry.path().strip_prefix(root) {
-                    out.push(rel.to_path_buf());
+        if let Ok(files) = store.walk_regular_files(Path::new(layer)) {
+            for rel in files {
+                if rel.file_name().and_then(|name| name.to_str()) == Some("index.md") {
+                    out.push(rel);
                 }
             }
         }
@@ -3535,20 +3476,17 @@ fn parse_log_header(line: &str) -> Option<(DateTime<FixedOffset>, String, Option
 /// prevents `dbmd validate` from silently skipping archived changed files. Reads
 /// only log headers, never the content store, so the loop budget is preserved.
 fn log_files_for_working_set(store: &Store) -> Vec<PathBuf> {
-    let mut files = vec![store.root.join("log.md")];
-    let archive_dir = store.root.join("log");
-    if let Ok(entries) = std::fs::read_dir(&archive_dir) {
+    let mut files = vec![PathBuf::from("log.md")];
+    let archive_dir = Path::new("log");
+    if let Ok(entries) = store.regular_file_names(archive_dir) {
         let mut archives: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && store.owns_path(p)
-                    && p.file_name()
-                        .and_then(|s| s.to_str())
-                        .and_then(|n| n.strip_suffix(".md"))
-                        .is_some_and(is_year_month_archive)
+            .into_iter()
+            .filter(|name| {
+                name.to_str()
+                    .and_then(|n| n.strip_suffix(".md"))
+                    .is_some_and(is_year_month_archive)
             })
+            .map(|name| archive_dir.join(name))
             .collect();
         // Deterministic order (oldest month first); the callers fold across all
         // files so order doesn't affect the result, but a stable order keeps the
@@ -3556,7 +3494,7 @@ fn log_files_for_working_set(store: &Store) -> Vec<PathBuf> {
         archives.sort();
         files.extend(archives);
     }
-    files.retain(|path| path.is_file() && store.owns_path(path));
+    files.retain(|path| store.regular_file_exists(path).unwrap_or(false));
     files
 }
 
@@ -3578,7 +3516,7 @@ fn is_year_month_archive(s: &str) -> bool {
 fn last_validate_at(store: &Store) -> Option<DateTime<FixedOffset>> {
     let mut latest: Option<DateTime<FixedOffset>> = None;
     for file in log_files_for_working_set(store) {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = store.read_text_bounded(&file, crate::parser::MAX_DBMD_FILE_BYTES) else {
             continue;
         };
         for line in text.lines() {
@@ -3614,7 +3552,7 @@ fn changed_objects_since(
 ) -> BTreeSet<PathBuf> {
     let mut out = BTreeSet::new();
     for file in log_files_for_working_set(store) {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = store.read_text_bounded(&file, crate::parser::MAX_DBMD_FILE_BYTES) else {
             continue;
         };
         for line in text.lines() {
@@ -3724,8 +3662,10 @@ where
 /// Resolve the `type` of a wiki-link target file (bare, no `.md`), or `None`.
 fn link_target_type(store: &Store, target: &str) -> Option<String> {
     let bare = target.trim_end_matches(".md");
-    let abs = store.root.join(safe_md_target_rel(bare)?);
-    let text = std::fs::read_to_string(&abs).ok()?;
+    let rel = safe_md_target_rel(bare)?;
+    let text = store
+        .read_text_bounded(&rel, crate::parser::MAX_DBMD_FILE_BYTES)
+        .ok()?;
     let (yaml, _, _) = split_frontmatter(&text)?;
     let value: Value = serde_norway::from_str(&yaml).ok()?;
     if let Value::Mapping(m) = value {
@@ -3873,12 +3813,11 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
     use crate::assets;
 
     let manifest_rel = Path::new(assets::MANIFEST_FILE);
-    let manifest_abs = store.root.join(assets::MANIFEST_FILE);
-
     // Lenient manifest read: a malformed line is reported, not fatal.
     let mut manifest: BTreeMap<String, assets::AssetRecord> = BTreeMap::new();
-    if store.owns_path(&manifest_abs) {
-        if let Ok(text) = std::fs::read_to_string(&manifest_abs) {
+    if store.regular_file_exists(manifest_rel).unwrap_or(false) {
+        if let Ok(text) = store.read_text_bounded(manifest_rel, crate::parser::MAX_DBMD_FILE_BYTES)
+        {
             for (i, line) in text.lines().enumerate() {
                 if line.trim().is_empty() {
                     continue;
@@ -3956,8 +3895,7 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
     // Per-record: wrapper existence + orphan detection.
     for (path, rec) in &manifest {
         for w in &rec.wrappers {
-            let wrapper = store.root.join(w);
-            if !wrapper.is_file() || !store.owns_path(&wrapper) {
+            if !store.regular_file_exists(Path::new(w)).unwrap_or(false) {
                 push(
                     issues,
                     Severity::Error,
@@ -4124,10 +4062,7 @@ mod tests {
         }
 
         fn store(&self) -> Store {
-            Store {
-                root: self.dir.path().to_path_buf(),
-                config: self.config.clone(),
-            }
+            Store::from_root_and_config(self.dir.path(), self.config.clone()).unwrap()
         }
 
         fn store_all(&self) -> Vec<Issue> {
@@ -6957,6 +6892,49 @@ mod tests {
         assert!(
             has(&issues, codes::INDEX_JSONL_MISSING),
             "a loose file with no layer index.jsonl must raise INDEX_JSONL_MISSING, got: {issues:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_reads_opened_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        fs::create_dir_all(root.join("records/notes")).unwrap();
+        fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(
+            root.join("records/notes/owned.md"),
+            "---\ntype: note\n---\nowned body\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let detached = sandbox.path().join("detached");
+        fs::rename(&root, &detached).unwrap();
+
+        let replacement = sandbox.path().join("replacement");
+        fs::create_dir_all(replacement.join("records/notes")).unwrap();
+        fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(
+            replacement.join("records/notes/replacement-secret.md"),
+            "not frontmatter\n",
+        )
+        .unwrap();
+        symlink(&replacement, &root).unwrap();
+
+        let issues = validate_content_sweep(&store).unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.file == Path::new("records/notes/owned.md")),
+            "the held original file must be validated: {issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .all(|issue| !issue.file.to_string_lossy().contains("replacement-secret")),
+            "replacement-root files must be invisible: {issues:?}"
         );
     }
 }

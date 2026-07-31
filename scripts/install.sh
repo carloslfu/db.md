@@ -9,14 +9,15 @@
 #
 # What it does:
 #   1. Detects your platform (darwin / linux  ×  x86_64 / aarch64).
-#   2. Resolves the version to install (latest GitHub release, or $DBMD_VERSION).
+#   2. Resolves the version to install (independent trusted manifest, or $DBMD_VERSION).
 #   3. Downloads the matching tarball from the GitHub release assets.
-#   4. SHA256-verifies it against that release's SHA256SUMS manifest.
+#   4. SHA256-verifies it against an independently deployed digest.
 #   5. Installs the `dbmd` binary to ~/.dbmd/bin/ (no sudo).
 #   6. Prints the PATH line to add (and detects if it is already on PATH).
 #
 # POSIX sh. No bashisms. No sudo. Honors $DBMD_INSTALL_DIR, $DBMD_VERSION,
-# $DBMD_REPO, and $DBMD_BASE_URL (point the downloader at a local mirror).
+# $DBMD_REPO, $DBMD_BASE_URL, $DBMD_TRUSTED_LATEST_URL, and
+# $DBMD_TRUSTED_MANIFEST_BASE.
 #
 # Linux always installs the static musl build, so it runs on any glibc/musl
 # distro without a libc version dance.
@@ -24,15 +25,22 @@
 set -eu
 
 # ── Configuration (override via env) ─────────────────────────────────────────
-# The GitHub repo that hosts the releases. Release assets live at
-# https://github.com/<repo>/releases/download/v<version>/<asset>, and the
-# latest version is resolved from the GitHub releases API.
+# The GitHub repo that hosts the release artifacts. Release assets live at
+# https://github.com/<repo>/releases/download/v<version>/<asset>. The latest
+# version and per-asset digest are resolved independently from sevrahq.com.
 DBMD_REPO="${DBMD_REPO:-carloslfu/db.md}"
+DBMD_BASE_URL_WAS_SET="${DBMD_BASE_URL+x}"
 # Base URL the tarball + SHA256SUMS are fetched from. Per-version assets live at
 # $DBMD_BASE_URL/v<version>/<asset>. Defaults to the GitHub release-download base;
 # override $DBMD_BASE_URL to point at a local mirror (the release smoke test
 # serves the just-built tree over http://127.0.0.1:8099 and sets this).
 DBMD_BASE_URL="${DBMD_BASE_URL:-https://github.com/${DBMD_REPO}/releases/download}"
+# A digest on a separately deployed origin is the normal trust root. A
+# same-release SHA256SUMS file proves download integrity but cannot protect
+# against a compromised release publisher replacing both files.
+DBMD_TRUSTED_MANIFEST_BASE="${DBMD_TRUSTED_MANIFEST_BASE:-https://www.sevrahq.com/api/hub/releases/dbmd}"
+# Independently deployed latest pointer. It returns one exact SemVer line.
+DBMD_TRUSTED_LATEST_URL="${DBMD_TRUSTED_LATEST_URL:-${DBMD_TRUSTED_MANIFEST_BASE}/latest}"
 # Where the binary lands. Default ~/.dbmd/bin (no sudo).
 DBMD_INSTALL_DIR="${DBMD_INSTALL_DIR:-$HOME/.dbmd/bin}"
 # Pinned version (without leading v). Empty => resolve "latest".
@@ -93,59 +101,68 @@ if [ -n "$DBMD_VERSION" ]; then
     version="$DBMD_VERSION"
 else
     info "Resolving latest dbmd release..."
-    # Parse the GitHub releases API for the latest tag_name (e.g. "v0.2.0"),
-    # then strip the leading "v". POSIX-friendly: grep + sed, no jq.
-    api="https://api.github.com/repos/${DBMD_REPO}/releases/latest"
-    tag="$(fetch_stdout "$api" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/')"
-    version="${tag#v}"
-    [ -n "$version" ] || err "could not resolve latest version from $api"
+    version="$(fetch_stdout "$DBMD_TRUSTED_LATEST_URL" | tr -d '[:space:]')"
+    [ -n "$version" ] || err "could not resolve latest version from independent manifest"
+fi
+printf '%s\n' "$version" |
+    grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' ||
+    err "invalid release version: $version"
+
+# Same-origin checksums are a controlled-mirror test escape hatch, never a
+# production downgrade. They require an explicitly supplied non-GitHub base.
+if [ "${DBMD_ALLOW_SAME_ORIGIN_CHECKSUM:-0}" = "1" ]; then
+    [ -n "$DBMD_BASE_URL_WAS_SET" ] ||
+        err "same-origin checksum opt-in requires an explicit custom DBMD_BASE_URL"
+    case "$DBMD_BASE_URL" in
+        https://github.com/*/releases/download | https://github.com/*/releases/download/)
+            err "same-origin checksum opt-in is forbidden for the official GitHub release origin" ;;
+    esac
 fi
 info "Installing dbmd v${version} for ${plat_os}/${plat_arch}..."
 
 # ── Download + verify ─────────────────────────────────────────────────────────
 tarball="dbmd-${version}-${asset_target}.tar.gz"
 workdir="$(mktemp -d)"
-# `staged` is the same-filesystem temp copy of the new binary (see install
-# below). Cleaned up alongside $workdir if we die before the atomic rename so a
-# crashed run never leaves a half-written sibling next to the live binary.
-staged=""
-trap 'rm -rf "$workdir"; [ -n "$staged" ] && rm -f "$staged"' EXIT
+trap 'rm -rf "$workdir"' EXIT
 
 base="$DBMD_BASE_URL/v$version"
 info "Downloading $tarball..."
 fetch "$base/$tarball" "$workdir/$tarball"
 
-# Verify SHA256 against the release manifest.
+# Verify SHA256 against the independent origin. A custom mirror used in CI or
+# an air-gapped deployment must provide its own independent digest endpoint.
+# The weaker same-origin manifest path exists only behind an explicit,
+# loudly-named opt-in; it is never an outage fallback.
 info "Verifying checksum..."
-fetch "$base/SHA256SUMS" "$workdir/SHA256SUMS"
 sha_tool=""
 if have sha256sum; then sha_tool="sha256sum"; elif have shasum; then sha_tool="shasum -a 256"; fi
 [ -n "$sha_tool" ] || err "need sha256sum or shasum to verify the download"
-( cd "$workdir" && grep " ${tarball}\$" SHA256SUMS | $sha_tool -c - ) \
-    || err "checksum verification failed for $tarball"
+actual="$( $sha_tool "$workdir/$tarball" | cut -d' ' -f1 )"
+if [ "${DBMD_ALLOW_SAME_ORIGIN_CHECKSUM:-0}" = "1" ]; then
+    fetch "$base/SHA256SUMS" "$workdir/SHA256SUMS"
+    expected="$(grep " ${tarball}\$" "$workdir/SHA256SUMS" | awk '{print $1}')"
+    info "warning: using explicitly enabled same-origin release checksum"
+else
+    expected="$(fetch_stdout "$DBMD_TRUSTED_MANIFEST_BASE/$version/$tarball" | tr -d '[:space:]')"
+fi
+case "$expected" in *[!0-9a-f]* | "") err "no valid independent checksum for $tarball" ;; esac
+[ "$actual" = "$expected" ] || err "checksum verification failed for $tarball"
+info "checksum: verified"
 
 # ── Unpack + install (atomically) ─────────────────────────────────────────────
 info "Installing to $DBMD_INSTALL_DIR..."
-mkdir -p "$DBMD_INSTALL_DIR"
 tar -xzf "$workdir/$tarball" -C "$workdir"
 # Tarball layout: dbmd-<ver>-<target>/dbmd
 #
-# Install atomically: $workdir is usually on a different filesystem than
-# $DBMD_INSTALL_DIR (mktemp is on /tmp or a separate volume), so a direct
-# `mv $workdir/.../dbmd $DBMD_INSTALL_DIR/dbmd` is a cross-device copy+unlink
-# that rewrites the live binary IN PLACE — an interrupted upgrade (Ctrl-C, lost
-# ssh, ENOSPC) leaves a truncated, still-executable binary. Instead copy the new
-# binary to a temp sibling on the SAME filesystem as the destination, ready it,
-# then rename(2) over the destination — rename within one filesystem is atomic,
-# so an existing working `dbmd` is replaced whole or not at all.
-staged="$DBMD_INSTALL_DIR/.dbmd.tmp.$$"
-rm -f "$staged"
-cp "$workdir/dbmd-${version}-${asset_target}/dbmd" "$staged" \
-    || err "could not stage the new binary in $DBMD_INSTALL_DIR"
-chmod +x "$staged"
-mv "$staged" "$DBMD_INSTALL_DIR/dbmd" \
-    || err "could not install the new binary to $DBMD_INSTALL_DIR/dbmd"
-staged=""  # consumed by the rename; nothing left for the EXIT trap to remove
+# The verified binary performs the final copy itself. It opens/creates every
+# destination component with openat(O_NOFOLLOW), retains the resulting dirfd,
+# stages with O_EXCL on that exact filesystem, fsyncs, and renameat(2)s the
+# regular `dbmd` leaf. The shell never reopens a mutable destination pathname.
+verified="$workdir/dbmd-${version}-${asset_target}/dbmd"
+chmod +x "$verified"
+"$verified" __install-verified "$verified" "$DBMD_INSTALL_DIR" ||
+    err "could not securely install the new binary to $DBMD_INSTALL_DIR/dbmd"
+install_stage=""  # consumed by the rename; nothing left for EXIT to remove
 
 # ── PATH hint ──────────────────────────────────────────────────────────────────
 info "Installed dbmd to $DBMD_INSTALL_DIR/dbmd"

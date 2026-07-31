@@ -268,11 +268,11 @@ on top? Build one; the files stay the source of truth.
 
 ## Safe to paste
 
-Start with the fact that matters most: **the binary makes no network
-calls.** No telemetry, no API keys, no AI SDKs; `dbmd` reads and writes
-local files and does nothing else (check `Cargo.lock`: there is no HTTP
-client in the tree). And you don't have to take this page's word for
-anything. The audit is one more prompt:
+Start with the fact that matters most: **the binary makes no background
+network calls.** There is no telemetry, AI SDK, model call, or auto-update.
+Local format commands stay local. The explicit link.md verbs connect only to
+the hub you select and may carry the credential you configured. You don't
+have to take this page's word for anything. The audit is one more prompt:
 
 ```text
 Read scripts/install.sh and .github/workflows/release.yml in carloslfu/db.md
@@ -281,13 +281,12 @@ and tell me whether this is safe to install.
 
 For the reader who verifies by hand, the chain:
 
-- **The installer is readable.** [`scripts/install.sh`](scripts/install.sh)
-  is about 160 lines of POSIX sh: detect the platform, download the tarball
-  from this repo's GitHub Releases, verify its SHA-256 against the
-  release's `SHA256SUMS`, install to `~/.dbmd/bin`. No sudo, no
-  shell-config edits, nothing outside that folder. `DBMD_VERSION` pins a
-  version. The checksum proves integrity; provenance is the separate check
-  below.
+- **The installer splits authority.** [`scripts/install.sh`](scripts/install.sh)
+  resolves `latest` and the expected SHA-256 from an independently deployed
+  manifest, then downloads the tarball from GitHub Releases. A compromised
+  release origin cannot choose both bytes and digest. The installer writes
+  only to `~/.dbmd/bin`, uses no sudo, and does not edit shell configuration.
+  `DBMD_VERSION` pins a version.
 - **Every binary traces back to source.** Releases are built in CI from a
   tagged commit, never on a laptop, and every tarball carries a signed
   build-provenance attestation anyone can verify:
