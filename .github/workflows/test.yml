@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - uses: dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           key: msrv-1.88
@@ -33,6 +35,10 @@ jobs:
         run: |
           cargo build --workspace --release --locked
           ./target/release/dbmd --version
+      - name: Lint every target from a fresh graph at declared MSRV
+        run: |
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/dbmd-clippy-msrv" \
+            cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -53,4 +59,6 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/dbmd-clippy-stable" \
+            cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -17,6 +17,25 @@ release_resume_action() {
     printf '%s\n' invalid
 }
 
+release_artifact_state() {
+    pending_record="$1"
+    run_status="$2"
+    run_conclusion="$3"
+    if [ -n "$pending_record" ]; then
+        printf '%s\n' ready
+        return 0
+    fi
+    if [ "$run_status" = completed ]; then
+        if [ "$run_conclusion" = success ]; then
+            printf '%s\n' ready
+        else
+            printf '%s\n' failed
+        fi
+        return 0
+    fi
+    printf '%s\n' invalid
+}
+
 # Classify a candidate release relative to a version already serving a mutable
 # distribution channel. `comparison_status` is GitHub's compare status for
 # `v<current>...v<candidate>`: `ahead` means the candidate descends from the

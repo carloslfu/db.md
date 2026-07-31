@@ -8,7 +8,25 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.6**.
+  `Cargo.toml`, currently **v0.8.7**.
+
+## [0.8.7] — 2026-07-30
+
+### Fixed
+
+- Release and publish workflows now use the immutable Rust 1.88 action commit
+  directly instead of supplying an ignored `toolchain` input to the immutable
+  stable action commit.
+- Main and release Clippy gates lint every target from a fresh target
+  directory. This prevents restored build fingerprints from hiding a lint in
+  an unchanged integration-test target; the v0.8.6 tag failed closed on that
+  clean preflight and published no CLI, assets, Homebrew update, or `latest`.
+- The release controller now classifies a failed workflow before it attempts
+  to download build artifacts, preserving the real preflight conclusion
+  instead of masking it with a secondary “no artifacts” error.
+- The presigned download ceiling is derived through checked addition, with an
+  exploit-specific regression proving the former attacker-controlled
+  `u64::MAX + 1` shape cannot overflow.
 
 ## [0.8.6] — 2026-07-30
 

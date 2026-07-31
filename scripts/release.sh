@@ -299,6 +299,21 @@ rebuild_and_compare() {
 }
 
 pending_record="$(wait_for_pending_approval || true)"
+run_json="$(gh api "repos/${SOURCE_REPO}/actions/runs/${run_id}")"
+status="$(printf '%s' "$run_json" | jq -r .status)"
+conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""')"
+artifact_state="$(
+    release_artifact_state "$pending_record" "$status" "$conclusion"
+)"
+case "$artifact_state" in
+    ready) ;;
+    failed)
+        die "release workflow $run_id failed before review: ${conclusion:-unknown}"
+        ;;
+    *)
+        die "release run has no protected publishing approval to review"
+        ;;
+esac
 # This comparison is unconditional. A fresh pending approval, a manually
 # approved run, a completed/resumed run, and a rerun all pass through the same
 # independent four-target rebuild before any permanent-channel convergence.
@@ -323,7 +338,6 @@ EOF
 else
     # A completed run is resumable: re-verify published bytes below. A running
     # run without a pending deployment is either already approved or malformed.
-    status="$(gh api "repos/${SOURCE_REPO}/actions/runs/${run_id}" --jq .status)"
     [ "$(release_resume_action "$pending_record" "$status")" = resume ] ||
         die "release run has no protected publishing approval to review"
 fi

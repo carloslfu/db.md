@@ -1427,6 +1427,15 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
     }
 }
 
+fn one_past_bounded_limit(max_bytes: u64) -> Option<u64> {
+    max_bytes.checked_add(1)
+}
+
+fn presigned_download_read_limit() -> u64 {
+    one_past_bounded_limit(MAX_PACK_BYTES)
+        .expect("the fixed presigned-download ceiling must leave room for the refusal byte")
+}
+
 fn get_presigned(cfg: &HubConfig, raw: &str) -> LinkResult<Vec<u8>> {
     let http = presigned_agent(cfg, raw)?;
     let resp = match with_connect_retries(|| http.get(raw).call().map_err(Box::new)) {
@@ -1458,7 +1467,7 @@ fn get_presigned(cfg: &HubConfig, raw: &str) -> LinkResult<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     resp.into_reader()
-        .take(MAX_PACK_BYTES + 1)
+        .take(presigned_download_read_limit())
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PACK_BYTES {
         return Err(LinkError::InvalidPack {
@@ -6909,6 +6918,25 @@ mod tests {
         assert!(
             hub_agent(&store_selected).is_err(),
             "bytes in a cloned store must not select a private-network hub"
+        );
+    }
+
+    #[test]
+    fn presigned_download_ceiling_cannot_overflow_at_u64_max() {
+        assert_eq!(
+            one_past_bounded_limit(MAX_PACK_BYTES),
+            Some(MAX_PACK_BYTES + 1),
+            "the presigned reader consumes exactly one refusal byte beyond its fixed pack cap"
+        );
+        assert_eq!(
+            presigned_download_read_limit(),
+            MAX_PACK_BYTES + 1,
+            "the presigned reader is capped by the client constant, not a hub response"
+        );
+        assert_eq!(
+            one_past_bounded_limit(u64::MAX),
+            None,
+            "the former attacker-controlled u64::MAX + 1 shape must fail without overflow"
         );
     }
 

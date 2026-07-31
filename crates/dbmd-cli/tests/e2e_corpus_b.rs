@@ -411,8 +411,7 @@ fn policy_refusals_refuse_with_structured_error_and_do_not_write() {
                 let sharded = store.join("records/synthesis").join(name);
                 assert!(
                     !sharded.exists(),
-                    "{fixture}: the refused write must not slip through to a sharded location {:?}",
-                    sharded
+                    "{fixture}: the refused write must not slip through to a sharded location {sharded:?}"
                 );
             }
         }

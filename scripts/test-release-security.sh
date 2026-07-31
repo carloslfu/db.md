@@ -10,6 +10,8 @@ set -eu
 
 repo_root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 workflow="$repo_root/.github/workflows/release.yml"
+publish_workflow="$repo_root/.github/workflows/publish-check.yml"
+test_workflow="$repo_root/.github/workflows/test.yml"
 controller="$repo_root/scripts/release.sh"
 controller_lib="$repo_root/scripts/release-lib.sh"
 crates_controller_lib="$repo_root/scripts/crates-release-lib.sh"
@@ -64,6 +66,18 @@ require_fixed \
 require_fixed 'use_cross: true' "$workflow"
 reject_fixed 'apt-get install' "$workflow"
 reject_fixed 'musl-tools' "$workflow"
+
+# Version-specific dtolnay action commits encode the toolchain in action.yml;
+# a `toolchain:` input is ignored and creates a false claim about the compiler.
+rust_188_action='dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4'
+require_fixed "$rust_188_action" "$workflow"
+require_fixed "$rust_188_action" "$publish_workflow"
+require_fixed "$rust_188_action" "$test_workflow"
+reject_fixed 'toolchain:' "$workflow"
+reject_fixed 'toolchain:' "$publish_workflow"
+require_fixed 'CARGO_TARGET_DIR="${RUNNER_TEMP}/dbmd-clippy-release"' "$workflow"
+require_fixed 'CARGO_TARGET_DIR="${RUNNER_TEMP}/dbmd-clippy-msrv"' "$test_workflow"
+require_fixed 'CARGO_TARGET_DIR="${RUNNER_TEMP}/dbmd-clippy-stable"' "$test_workflow"
 
 # CI may publish only after a protected approval. It must publish crates before
 # making the immutable GitHub release public, and never chooses `latest`.
@@ -142,7 +156,11 @@ require_fixed '--source-ref "refs/tags/${tag}"' "$controller"
 require_fixed '--deny-self-hosted-runners' "$controller"
 
 compare_line="$(grep -n 'rebuild_and_compare$' "$controller" | head -n 1 | cut -d: -f1)"
+artifact_state_line="$(grep -n 'release_artifact_state ' "$controller" | head -n 1 | cut -d: -f1)"
 approve_line="$(grep -n 'state: "approved"' "$controller" | head -n 1 | cut -d: -f1)"
+[ -n "$artifact_state_line" ] && [ -n "$compare_line" ] &&
+    [ "$artifact_state_line" -lt "$compare_line" ] ||
+    fail "failed workflow state must be rejected before artifact download"
 [ -n "$compare_line" ] && [ -n "$approve_line" ] &&
     [ "$compare_line" -lt "$approve_line" ] ||
     fail "publishing approval is not ordered after independent rebuild comparison"

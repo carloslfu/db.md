@@ -23,6 +23,15 @@ test "$(release_resume_action '' completed)" = resume ||
 test "$(release_resume_action '' in_progress)" = invalid ||
     fail "unreviewed in-progress state must fail closed"
 
+test "$(release_artifact_state '7	true' in_progress '')" = ready ||
+    fail "pending reviewed release must expose build artifacts"
+test "$(release_artifact_state '' completed success)" = ready ||
+    fail "completed successful release must remain resumable"
+test "$(release_artifact_state '' completed failure)" = failed ||
+    fail "failed preflight must not fall through to artifact download"
+test "$(release_artifact_state '' in_progress '')" = invalid ||
+    fail "running release without pending approval must not download artifacts"
+
 # GitHub compare is queried as current-channel tag -> candidate tag. A
 # descendant may advance the channel; a candidate behind the served tag is the
 # stale-controller exploit and must fail closed.
