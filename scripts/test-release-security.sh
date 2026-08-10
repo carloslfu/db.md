@@ -137,6 +137,7 @@ require_fixed 'fc36805b79a681ab56883bd36b6c70abad259ac04043c3084bf3a67599dfa176'
 require_fixed 'CoreOCModules.framework/Versions/A/CoreOCModules.tbd' "$darwin_verifier"
 require_fixed 'find . -type l -print' "$darwin_verifier"
 require_fixed 'link_target="$(readlink "$link_name")"' "$darwin_verifier"
+require_fixed '[ ! -e "$link_name" ]' "$darwin_verifier"
 require_fixed 'resolved_target="$(realpath "$link_name")"' "$darwin_verifier"
 require_fixed 'absolute SDK symlink refused' "$darwin_verifier"
 require_fixed 'broken or cyclic SDK symlink refused' "$darwin_verifier"

@@ -220,6 +220,14 @@ if ! (
                     exit 1
                     ;;
             esac
+            # macOS realpath fails for a missing/cyclic leaf, while GNU
+            # realpath may still print a canonical spelling. Make the
+            # fail-closed existence rule explicit and platform-independent.
+            if [ ! -e "$link_name" ]; then
+                printf 'darwin toolchain verifier: broken or cyclic SDK symlink refused: %s -> %s\n' \
+                    "$link_name" "$link_target" >&2
+                exit 1
+            fi
             resolved_target="$(realpath "$link_name")" || {
                 printf 'darwin toolchain verifier: broken or cyclic SDK symlink refused: %s -> %s\n' \
                     "$link_name" "$link_target" >&2
