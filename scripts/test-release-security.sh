@@ -101,29 +101,51 @@ require_fixed 'sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"' "$test_wo
 require_fixed 'sh scripts/diagnose-darwin-toolchain.sh "$DEVELOPER_DIR"' "$workflow"
 require_fixed 'sh scripts/diagnose-darwin-toolchain.sh "$DEVELOPER_DIR"' "$test_workflow"
 require_fixed 'codesign --remove-signature "$arm64_file"' "$darwin_diagnostics"
-require_fixed "find . -type f" "$darwin_diagnostics"
-require_fixed "-name '*.tbd'" "$darwin_diagnostics"
+require_fixed "! -path './usr/lib/swift/XPC.swiftmodule/arm64e-apple-macos.package.swiftinterface'" "$darwin_diagnostics"
+require_fixed '        -print0 |' "$darwin_diagnostics"
+require_fixed 'find . -type l -print' "$darwin_diagnostics"
 require_fixed 'Build shipped release target twice' "$test_workflow"
 require_fixed 'cmp "$first" "$second"' "$test_workflow"
 require_fixed 'CARGO_TARGET_DIR="$target_dir"' "$test_workflow"
 require_fixed 'DBMD_RELEASE_DARWIN_DEVELOPER_DIR:-$(xcode-select -p)' "$controller"
 require_fixed 'sh scripts/verify-darwin-toolchain.sh "$DARWIN_DEVELOPER_DIR"' "$controller"
 require_fixed 'Xcode 26.6\nBuild version 17F113' "$darwin_verifier"
+require_fixed '26.6.0.0.1781586589' "$darwin_verifier"
 require_fixed 'xcrun --sdk macosx --show-sdk-version)" = 26.5' "$darwin_verifier"
-require_fixed '7def90dd8829726686213a747fc5bff1583df933dae5edc55d755479e0bfe00a' "$darwin_verifier"
-require_fixed '5897b275efd93b201b6df5832dd541262b3f20f290859ba78f2200a6a66ef38b' "$darwin_verifier"
-require_fixed 'c87bf9bb62dc6a3c5d7faf5c5f8dabc94aba865161a3e08b9f1871150e938fe6' "$darwin_verifier"
-require_fixed 'e49ffad64ad1cee722540fc5ecb00a230fd8071680682c60d9c851029d20e814' "$darwin_verifier"
-require_fixed '229eb9d8027953d2aee0590f983eed587d52bdd1ebc21114a62ce693f77b03f1' "$darwin_verifier"
+require_fixed '5bbebcabb7dde1aade0a479ef3788ef65edbd975af444db345f3020f6be7c29c' "$darwin_verifier"
+require_fixed 'c671cedbd64871318c377e0a25c0725fcc84bca5c6cfd73a5ab8aa2a1118e2ad' "$darwin_verifier"
+require_fixed 'd75943f54dedbdcd0b889222df3073ab43ef9785ce0116a2d222fd34d783317c' "$darwin_verifier"
+require_fixed 'f1ab6041e05473409044c79dd37bc87eb8b26804dcf4ad3e80f9f87388ed7493' "$darwin_verifier"
+require_fixed '0ce41502412f3f421fa62ad8cf1a8d7078890063566f1189cc23d690ac9796c5' "$darwin_verifier"
+require_fixed 'codesign --verify --strict "$arm64_file"' "$darwin_verifier"
+require_fixed 'codesign --remove-signature "$arm64_file"' "$darwin_verifier"
+require_fixed 'TeamIdentifier=//p' "$darwin_verifier"
+require_fixed 'team_identifier" != 59GAB85EFG' "$darwin_verifier"
+require_fixed 'lipo "$tool_file" -thin arm64' "$darwin_verifier"
+require_fixed '"x86_64 arm64")' "$darwin_verifier"
+require_fixed 'reviewed_package_shape="$package_shape"' "$darwin_verifier"
+require_fixed 'inconsistent package shape for %s' "$darwin_verifier"
 require_fixed 'f8d005f09381389167f9e0aeaa169bc9e7dff162ef22ca2fd8e98df7ff1acafe' "$darwin_verifier"
 require_fixed '20cfce043f11a083e2eb6111efe3579919a8082fa4cc912a7bd839af2010ec57' "$darwin_verifier"
 require_fixed 'f18a90790d05e826fbaad1892be4fe32270fd24cb73ac131049a55c7866a6d8e' "$darwin_verifier"
-require_fixed 'find . -type f -print0' "$darwin_verifier"
+require_fixed "! -path './usr/lib/swift/XPC.swiftmodule/arm64e-apple-macos.package.swiftinterface'" "$darwin_verifier"
+require_fixed '        -print0 |' "$darwin_verifier"
 require_fixed 'LC_ALL=C sort -z' "$darwin_verifier"
 require_fixed 'xargs -0 shasum -a 256' "$darwin_verifier"
-require_fixed '5600799d9ea652e4f6b1a1158d730344388ffa7e3bba32f532beb5011ebcf129' "$darwin_verifier"
+require_fixed 'expected_sdk_regular_count=32343' "$darwin_verifier"
+require_fixed 'fc36805b79a681ab56883bd36b6c70abad259ac04043c3084bf3a67599dfa176' "$darwin_verifier"
+require_fixed 'CoreOCModules.framework/Versions/A/CoreOCModules.tbd' "$darwin_verifier"
+require_fixed 'find . -type l -print' "$darwin_verifier"
+require_fixed 'link_target="$(readlink "$link_name")"' "$darwin_verifier"
+require_fixed 'resolved_target="$(realpath "$link_name")"' "$darwin_verifier"
+require_fixed 'absolute SDK symlink refused' "$darwin_verifier"
+require_fixed 'broken or cyclic SDK symlink refused' "$darwin_verifier"
+require_fixed 'SDK-escaping symlink refused' "$darwin_verifier"
+require_fixed 'expected_sdk_symlink_count=7448' "$darwin_verifier"
+require_fixed '6f3445524cef60cf2d718453a1c3298432317de3148be1786892554f664b2100' "$darwin_verifier"
 require_fixed 'expected %s, actual %s' "$darwin_verifier"
 require_fixed 'rejected %s mismatched release input(s)' "$darwin_verifier"
+require_fixed 'codesign lipo realpath readlink pkgutil' "$controller"
 reject_fixed 'os: macos-15-intel' "$workflow"
 reject_fixed 'os: macos-14' "$workflow"
 
@@ -138,6 +160,7 @@ cleanup_darwin_mock() {
 trap cleanup_darwin_mock EXIT HUP INT TERM
 mkdir -p \
     "$darwin_mock/bin" \
+    "$darwin_mock/sdk/usr/include" \
     "$darwin_mock/sdk/usr/lib" \
     "$darwin_mock/sdk/System/Library/Frameworks/CoreFoundation.framework"
 for tool in clang ld vtool ar ranlib; do
@@ -145,6 +168,9 @@ for tool in clang ld vtool ar ranlib; do
 done
 printf 'mismatched SDK settings\n' >"$darwin_mock/sdk/SDKSettings.json"
 printf 'mismatched libSystem\n' >"$darwin_mock/sdk/usr/lib/libSystem.tbd"
+printf 'another reviewed stub fixture\n' >"$darwin_mock/sdk/usr/lib/libOther.tbd"
+printf 'mismatched native compilation header\n' >"$darwin_mock/sdk/usr/include/stdint.h"
+ln -s libSystem.tbd "$darwin_mock/sdk/usr/lib/libAlias.tbd"
 printf 'mismatched CoreFoundation\n' \
     >"$darwin_mock/sdk/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd"
 cat >"$darwin_mock/bin/uname" <<'EOF'
@@ -172,10 +198,60 @@ case "$*" in
         ;;
 esac
 EOF
+cat >"$darwin_mock/bin/lipo" <<'EOF'
+#!/bin/sh
+if [ "$1" = -archs ]; then
+    tool="$(basename "$2")"
+    if [ "${DBMD_DARWIN_MOCK_UNIVERSAL_TOOL:-}" = "$tool" ]; then
+        printf 'x86_64 arm64\n'
+    else
+        printf '%s\n' "${DBMD_DARWIN_MOCK_ARCHES:-arm64}"
+    fi
+    exit 0
+fi
+if [ "$2" = -thin ] && [ "$3" = arm64 ] && [ "$4" = -output ]; then
+    printf '%s\n' "$(basename "$1")" >>"$DBMD_DARWIN_MOCK_LIPO_TRACE"
+    cp "$1" "$5"
+    exit 0
+fi
+exit 1
+EOF
+cat >"$darwin_mock/bin/codesign" <<'EOF'
+#!/bin/sh
+if [ "$1" = --verify ] && [ "${DBMD_DARWIN_MOCK_BAD_SIGNATURE:-}" = 1 ]; then
+    exit 1
+fi
+if [ "$1" = --verify ]; then
+    exit 0
+fi
+if [ "$1" = --remove-signature ]; then
+    exit 0
+fi
+if [ "$1" = -dvvv ]; then
+    tool="$(basename "$2")"
+    printf 'TeamIdentifier=%s\n' "${DBMD_DARWIN_MOCK_TEAM:-59GAB85EFG}"
+    if [ "${DBMD_DARWIN_MOCK_BAD_CDHASH:-}" = 1 ]; then
+        printf 'CDHash=0000000000000000000000000000000000000000\n'
+        exit 0
+    fi
+    case "$tool" in
+        clang) printf 'CDHash=20a014a92f165cfaf456ba661639d0535043c4b7\n' ;;
+        ld) printf 'CDHash=08fef69d7476af67d62beb5a812153a22d356ffe\n' ;;
+        vtool) printf 'CDHash=6654bac92b216bea76b6a9256460d95b5dbdf1ef\n' ;;
+        ar) printf 'CDHash=03e32556e2d501e2807bdd24f94be27776a7f20b\n' ;;
+        ranlib) printf 'CDHash=a2fb8aa7d6b66628c00f2d7c179dabf2639b31bf\n' ;;
+        *) exit 1 ;;
+    esac
+    exit 0
+fi
+exit 1
+EOF
 chmod 700 \
     "$darwin_mock/bin/uname" \
     "$darwin_mock/bin/xcodebuild" \
-    "$darwin_mock/bin/xcrun"
+    "$darwin_mock/bin/xcrun" \
+    "$darwin_mock/bin/lipo" \
+    "$darwin_mock/bin/codesign"
 darwin_diagnostic="$darwin_mock/diagnostic"
 if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
     PATH="$darwin_mock/bin:/usr/bin:/bin" \
@@ -185,9 +261,177 @@ if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
 fi
 [ "$(grep -c 'digest mismatch for ' "$darwin_diagnostic")" -eq 8 ] ||
     fail "Darwin verifier did not report all eight file mismatches"
-require_fixed 'full SDK manifest mismatch (expected ' "$darwin_diagnostic"
-require_fixed 'rejected 9 mismatched release input(s)' "$darwin_diagnostic"
+require_fixed 'canonical SDK regular-file manifest mismatch' "$darwin_diagnostic"
+require_fixed 'SDK symlink manifest mismatch' "$darwin_diagnostic"
+require_fixed 'rejected 10 mismatched release input(s)' "$darwin_diagnostic"
 reject_fixed 'Darwin release toolchain verified.' "$darwin_mock/stdout"
+
+# The CI tool package is universal. Prove that the verifier canonicalizes all
+# five reviewed executables to their arm64 slices before applying the same
+# signature, identity, and byte checks used for a thin local installation.
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    DBMD_DARWIN_MOCK_ARCHES='x86_64 arm64' \
+    DBMD_DARWIN_MOCK_LIPO_TRACE="$darwin_mock/lipo-trace" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/universal-stdout" 2>"$darwin_mock/universal-diagnostic"; then
+    fail "mismatched universal Darwin release inputs were accepted"
+fi
+[ "$(wc -l <"$darwin_mock/lipo-trace" | tr -d ' ')" -eq 5 ] ||
+    fail "Darwin verifier did not extract every reviewed universal tool"
+reject_fixed 'unsupported architectures for ' "$darwin_mock/universal-diagnostic"
+[ "$(grep -c 'digest mismatch for ' "$darwin_mock/universal-diagnostic")" -eq 8 ] ||
+    fail "Darwin verifier did not verify every extracted arm64 slice"
+
+# Signature, team, and CDHash checks are independent fail-closed gates, not
+# comments around the content hash. Exercise each path in isolation.
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    DBMD_DARWIN_MOCK_BAD_SIGNATURE=1 \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/signature-stdout" 2>"$darwin_mock/signature-diagnostic"; then
+    fail "invalidly signed Darwin release inputs were accepted"
+fi
+[ "$(grep -c 'invalid Apple signature for ' "$darwin_mock/signature-diagnostic")" -eq 5 ] ||
+    fail "Darwin verifier did not reject every invalid tool signature"
+
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    DBMD_DARWIN_MOCK_TEAM=ATTACKER \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/team-stdout" 2>"$darwin_mock/team-diagnostic"; then
+    fail "an unexpected Apple signing team was accepted"
+fi
+[ "$(grep -c 'unexpected Apple team for ' "$darwin_mock/team-diagnostic")" -eq 5 ] ||
+    fail "Darwin verifier did not reject every unexpected signing team"
+reject_fixed 'invalid Apple signature for ' "$darwin_mock/team-diagnostic"
+
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    DBMD_DARWIN_MOCK_BAD_CDHASH=1 \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/cdhash-stdout" 2>"$darwin_mock/cdhash-diagnostic"; then
+    fail "an unexpected Apple CDHash was accepted"
+fi
+[ "$(grep -c 'CDHash mismatch for ' "$darwin_mock/cdhash-diagnostic")" -eq 5 ] ||
+    fail "Darwin verifier did not reject every unexpected CDHash"
+reject_fixed 'invalid Apple signature for ' "$darwin_mock/cdhash-diagnostic"
+reject_fixed 'unexpected Apple team for ' "$darwin_mock/cdhash-diagnostic"
+
+# The complete SDK manifest is bound to one authenticated package shape.
+# Mixing one universal tool into a thin installation (or vice versa) must fail,
+# even though the extracted arm64 slice is independently identical.
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    DBMD_DARWIN_MOCK_UNIVERSAL_TOOL=ld \
+    DBMD_DARWIN_MOCK_LIPO_TRACE="$darwin_mock/mixed-lipo-trace" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/mixed-stdout" 2>"$darwin_mock/mixed-diagnostic"; then
+    fail "a mixed Darwin tool package shape was accepted"
+fi
+[ "$(grep -c 'inconsistent package shape for ' "$darwin_mock/mixed-diagnostic")" -eq 1 ] ||
+    fail "Darwin verifier did not reject the one mixed-package tool"
+[ "$(wc -l <"$darwin_mock/mixed-lipo-trace" | tr -d ' ')" -eq 1 ] ||
+    fail "mixed-package fixture did not exercise one universal arm64 extraction"
+
+# A new package shape must be reviewed explicitly. Do not let canonicalization
+# silently select one slice from an unknown architecture set.
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    DBMD_DARWIN_MOCK_ARCHES='arm64 arm64e' \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/arches-stdout" 2>"$darwin_mock/arches-diagnostic"; then
+    fail "an unknown Darwin package shape was accepted"
+fi
+[ "$(grep -c 'unsupported architectures for ' "$darwin_mock/arches-diagnostic")" -eq 5 ] ||
+    fail "Darwin verifier did not reject every unknown tool package shape"
+
+# Native compilation inputs are part of the canonical SDK manifest. Mutating a
+# header must change the reported fingerprint even when every linker stub is
+# untouched.
+sdk_regular_before="$(
+    sed -n \
+        's/.*canonical SDK regular-file manifest mismatch.*actual [0-9][0-9]* files\/\([a-f0-9][a-f0-9]*\)).*/\1/p' \
+        "$darwin_diagnostic"
+)"
+printf 'attacker header mutation\n' >>"$darwin_mock/sdk/usr/include/stdint.h"
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/header-stdout" 2>"$darwin_mock/header-diagnostic"; then
+    fail "a mutated SDK header was accepted"
+fi
+sdk_regular_after="$(
+    sed -n \
+        's/.*canonical SDK regular-file manifest mismatch.*actual [0-9][0-9]* files\/\([a-f0-9][a-f0-9]*\)).*/\1/p' \
+        "$darwin_mock/header-diagnostic"
+)"
+[ -n "$sdk_regular_before" ] && [ -n "$sdk_regular_after" ] &&
+    [ "$sdk_regular_before" != "$sdk_regular_after" ] ||
+    fail "SDK header mutation did not change the full regular-file manifest"
+
+# Retargeting an alias between two already-hashed stubs must change the
+# authenticated path→target topology even though regular-file bytes do not.
+sdk_symlink_before="$(
+    sed -n \
+        's/.*SDK symlink manifest mismatch.*actual [0-9][0-9]* links\/\([a-f0-9][a-f0-9]*\)).*/\1/p' \
+        "$darwin_mock/header-diagnostic"
+)"
+ln -sfn libOther.tbd "$darwin_mock/sdk/usr/lib/libAlias.tbd"
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/retarget-stdout" 2>"$darwin_mock/retarget-diagnostic"; then
+    fail "a retargeted SDK alias was accepted"
+fi
+sdk_symlink_after="$(
+    sed -n \
+        's/.*SDK symlink manifest mismatch.*actual [0-9][0-9]* links\/\([a-f0-9][a-f0-9]*\)).*/\1/p' \
+        "$darwin_mock/retarget-diagnostic"
+)"
+[ -n "$sdk_symlink_before" ] && [ -n "$sdk_symlink_after" ] &&
+    [ "$sdk_symlink_before" != "$sdk_symlink_after" ] ||
+    fail "SDK alias retarget did not change the symlink manifest"
+
+# Absolute, broken/cyclic, and relative SDK-escaping aliases all fail before
+# topology acceptance.
+ln -sfn "$darwin_mock/sdk/usr/lib/libSystem.tbd" \
+    "$darwin_mock/sdk/usr/lib/libAlias.tbd"
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/absolute-stdout" 2>"$darwin_mock/absolute-diagnostic"; then
+    fail "an absolute SDK symlink was accepted"
+fi
+require_fixed 'absolute SDK symlink refused' "$darwin_mock/absolute-diagnostic"
+
+ln -sfn missing.tbd "$darwin_mock/sdk/usr/lib/libAlias.tbd"
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/broken-stdout" 2>"$darwin_mock/broken-diagnostic"; then
+    fail "a broken SDK symlink was accepted"
+fi
+require_fixed 'broken or cyclic SDK symlink refused' "$darwin_mock/broken-diagnostic"
+
+ln -sfn libAlias.tbd "$darwin_mock/sdk/usr/lib/libAlias.tbd"
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/cyclic-stdout" 2>"$darwin_mock/cyclic-diagnostic"; then
+    fail "a cyclic SDK symlink was accepted"
+fi
+require_fixed 'broken or cyclic SDK symlink refused' "$darwin_mock/cyclic-diagnostic"
+
+printf 'outside SDK\n' >"$darwin_mock/outside.tbd"
+ln -sfn ../../../outside.tbd "$darwin_mock/sdk/usr/lib/libAlias.tbd"
+if DBMD_DARWIN_MOCK_ROOT="$darwin_mock" \
+    PATH="$darwin_mock/bin:/usr/bin:/bin" \
+    sh "$darwin_verifier" "$darwin_mock/developer" \
+    >"$darwin_mock/escape-stdout" 2>"$darwin_mock/escape-diagnostic"; then
+    fail "an SDK-escaping symlink was accepted"
+fi
+require_fixed 'SDK-escaping symlink refused' "$darwin_mock/escape-diagnostic"
 cleanup_darwin_mock
 trap - EXIT HUP INT TERM
 

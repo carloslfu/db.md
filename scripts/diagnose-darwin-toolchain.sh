@@ -65,20 +65,43 @@ for tool in clang ld vtool ar ranlib; do
 done
 
 sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
-linker_manifest="$diagnostic_dir/sdk-linker-inputs"
+regular_manifest="$diagnostic_dir/sdk-regular-files"
 (
     cd "$sdk_path"
-    {
-        shasum -a 256 SDKSettings.json
-        find . -type f \
-            \( -name '*.tbd' -o -name '*.dylib' -o -name '*.a' -o -name '*.o' \) \
-            -print0 |
-            LC_ALL=C sort -z |
-            xargs -0 shasum -a 256
-    } |
-        LC_ALL=C sort
-) >"$linker_manifest"
-printf 'darwin toolchain diagnostics: SDK linker-input files: %s\n' \
-    "$(wc -l <"$linker_manifest" | tr -d ' ')"
-printf 'darwin toolchain diagnostics: SDK linker-input manifest sha256: '
-shasum -a 256 "$linker_manifest" | awk '{print $1}'
+    find . -type f \
+        ! -path './System/Cryptexes/OS/System/iOSSupport/System/Library/Frameworks/SafariServices.framework/PlugIns/SafariServices.wkbundle/Contents/MacOS/SafariServices' \
+        ! -path './System/Library/PrivateFrameworks/EmailCore.framework/Versions/A/PlugIns/EmailCore.wkbundle/Contents/MacOS/EmailCore' \
+        ! -path './System/Library/PrivateFrameworks/CoreOCModules.framework/Versions/A/CoreOCModules.tbd' \
+        ! -path './usr/lib/swift/XPC.swiftmodule/arm64e-apple-ios-macabi.package.swiftinterface' \
+        ! -path './usr/lib/swift/XPC.swiftmodule/arm64e-apple-macos.package.swiftinterface' \
+        ! -path './usr/lib/swift/XPC.swiftmodule/x86_64-apple-ios-macabi.package.swiftinterface' \
+        ! -path './usr/lib/swift/XPC.swiftmodule/x86_64-apple-macos.package.swiftinterface' \
+        -print0 |
+        LC_ALL=C sort -z |
+        xargs -0 shasum -a 256
+) >"$regular_manifest"
+printf 'darwin toolchain diagnostics: canonical SDK regular files: %s\n' \
+    "$(wc -l <"$regular_manifest" | tr -d ' ')"
+printf 'darwin toolchain diagnostics: canonical SDK regular-file manifest sha256: '
+shasum -a 256 "$regular_manifest" | awk '{print $1}'
+
+symlink_manifest="$diagnostic_dir/sdk-symlinks"
+(
+    cd "$sdk_path"
+    find . -type l -print |
+        LC_ALL=C sort |
+        while IFS= read -r link_name; do
+            case "$link_name" in
+                './System/Library/PrivateFrameworks/CoreOCModules.framework/CoreOCModules.tbd' | \
+                './System/Library/PrivateFrameworks/CoreOCModules.framework/Versions/Current')
+                    ;;
+                *)
+                    printf '%s\t%s\n' "$link_name" "$(readlink "$link_name")"
+                    ;;
+            esac
+        done
+) >"$symlink_manifest"
+printf 'darwin toolchain diagnostics: canonical SDK symlinks: %s\n' \
+    "$(wc -l <"$symlink_manifest" | tr -d ' ')"
+printf 'darwin toolchain diagnostics: SDK symlink manifest sha256: '
+shasum -a 256 "$symlink_manifest" | awk '{print $1}'

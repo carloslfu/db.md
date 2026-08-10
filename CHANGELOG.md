@@ -10,17 +10,21 @@ Two things version independently:
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
   `Cargo.toml`, currently **v0.8.10**.
 
-## [0.8.10] — 2026-07-30
+## [0.8.10] — 2026-08-10
 
 ### Fixed
 
-- Darwin release builders now use the same explicitly verified Xcode 26.6
-  build and macOS 26.5 SDK on GitHub and the trusted controller. The v0.8.9
-  controller failed closed before approval because older hosted SDK stubs
-  produced a materially different Mach-O binary despite normalized deployment
-  metadata.
+- Darwin release builders now use an explicitly verified Xcode 26.6 / Command
+  Line Tools 26.6 native-build boundary and the same canonical macOS 26.5 SDK
+  inputs on GitHub and the trusted controller. Apple signatures, team identity,
+  CDHashes, executable bytes after signature removal, SDK regular files, and
+  SDK symlink topology are all pinned. The v0.8.9 controller failed closed
+  before approval because older hosted SDK stubs produced a materially
+  different Mach-O binary despite normalized deployment metadata.
 - Both shipped Darwin targets now compile on every main commit, so a missing
   pinned Apple toolchain or cross-target regression fails before tagging.
+- The opened-root path-swap regression derives its date-sharded note path from
+  the current UTC month instead of expiring when the calendar advances.
 
 ## [0.8.9] — 2026-07-30
 

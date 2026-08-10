@@ -30,7 +30,7 @@ die() {
     exit 1
 }
 
-for command_name in git gh jq shasum cargo rustup cross tar xcode-select xcodebuild xcrun cmp curl find sort xargs openssl; do
+for command_name in git gh jq shasum cargo rustup cross tar xcode-select xcodebuild xcrun codesign lipo realpath readlink pkgutil cmp curl find sort xargs openssl; do
     command -v "$command_name" >/dev/null 2>&1 ||
         die "required command not found: $command_name"
 done

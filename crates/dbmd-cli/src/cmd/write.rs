@@ -891,10 +891,13 @@ mod tests {
         std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
         let detached = sandbox.path().join("detached");
         let replacement = sandbox.path().join("replacement");
-        std::fs::create_dir_all(replacement.join("sources/notes/2026/07")).unwrap();
+        let dated_note = chrono::Utc::now()
+            .format("sources/notes/%Y/%m/new.md")
+            .to_string();
+        std::fs::create_dir_all(replacement.join(&dated_note).parent().unwrap()).unwrap();
         std::fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
         std::fs::write(
-            replacement.join("sources/notes/2026/07/new.md"),
+            replacement.join(&dated_note),
             "---\ntype: note\nsummary: replacement secret\n---\n",
         )
         .unwrap();
@@ -920,15 +923,11 @@ mod tests {
         };
         run(&context, &args).expect("replacement collision must be invisible");
 
-        assert!(
-            std::fs::read_to_string(detached.join("sources/notes/2026/07/new.md"))
-                .unwrap()
-                .contains("summary: owned write")
-        );
-        assert!(
-            std::fs::read_to_string(replacement.join("sources/notes/2026/07/new.md"))
-                .unwrap()
-                .contains("summary: replacement secret")
-        );
+        assert!(std::fs::read_to_string(detached.join(&dated_note))
+            .unwrap()
+            .contains("summary: owned write"));
+        assert!(std::fs::read_to_string(replacement.join(&dated_note))
+            .unwrap()
+            .contains("summary: replacement secret"));
     }
 }
