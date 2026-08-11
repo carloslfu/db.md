@@ -18,7 +18,9 @@ Two things version independently:
   live Docker engine, both digest-pinned Linux builder images, the complete
   Darwin toolchain, and required Rust targets before any GitHub setting or tag
   mutation. A missing local container engine can no longer strand a protected
-  release tag before independent reproduction and approval.
+  release tag before independent reproduction and approval. The Apple arm64
+  controller pulls those reviewed amd64-hosted Cross images with an explicit
+  platform and verifies the resolved architecture before use.
 - Darwin release builders now use an explicitly verified Xcode 26.6 / Command
   Line Tools 26.6 native-build boundary and the same canonical macOS 26.5 SDK
   inputs on GitHub and the trusted controller. Apple signatures, team identity,

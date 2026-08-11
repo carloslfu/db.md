@@ -150,8 +150,9 @@ require_fixed 'codesign lipo realpath readlink pkgutil' "$controller"
 require_fixed 'cross docker tar xcode-select' "$controller"
 require_fixed "grep -Eq '^cross 0\\.2\\.5 '" "$controller"
 require_fixed 'docker info >/dev/null 2>&1' "$controller"
-require_fixed 'docker pull "$builder_image"' "$controller"
-require_fixed 'docker image inspect "$builder_image"' "$controller"
+require_fixed 'docker pull --platform linux/amd64 "$builder_image"' "$controller"
+require_fixed "--format '{{.Architecture}}' \"\$builder_image\"" "$controller"
+require_fixed ')" = amd64 || die "cross builder image is not linux/amd64: $builder_image"' "$controller"
 preflight_call_line="$(grep -n '^preflight_release_builder$' "$controller" | cut -d: -f1)"
 first_remote_mutation_line="$({
     grep -n '^# Immutable release enforcement' "$controller" || true

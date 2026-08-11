@@ -146,8 +146,15 @@ preflight_release_builder() {
     for builder_image in \
         'ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99' \
         'ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4'; do
-        docker pull "$builder_image" >/dev/null
-        docker image inspect "$builder_image" >/dev/null
+        # Cross's reviewed compiler images are amd64-hosted even when the
+        # target is aarch64. The trusted controller is Apple arm64, so make the
+        # emulated host architecture explicit instead of letting Docker select
+        # an unavailable native manifest.
+        docker pull --platform linux/amd64 "$builder_image" >/dev/null
+        test "$(
+            docker image inspect \
+                --format '{{.Architecture}}' "$builder_image"
+        )" = amd64 || die "cross builder image is not linux/amd64: $builder_image"
     done
 }
 
