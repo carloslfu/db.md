@@ -52,6 +52,9 @@ sh "$repo_root/scripts/test-crates-release-state.sh"
 # Every trusted local input is frozen from the exact reviewed commit in a
 # read-only archive before the controller waits on external workflow gates.
 require_fixed 'git archive --format=tar "$source_sha" | tar -xf - -C "$release_source"' "$controller"
+require_fixed 'release_git_dir="$(git rev-parse --absolute-git-dir)"' "$controller"
+require_fixed 'mktemp -d "$release_git_dir/dbmd-release.XXXXXXXX"' "$controller"
+reject_fixed '${TMPDIR:-/tmp}/dbmd-release.' "$controller"
 require_fixed 'cd "$release_source"' "$controller"
 require_fixed '"$release_source/NOTICE"' "$controller"
 require_fixed '"$release_source/THIRD_PARTY_NOTICES"' "$controller"

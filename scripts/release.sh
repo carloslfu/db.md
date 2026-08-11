@@ -105,7 +105,14 @@ require_monotonic_channel() {
     esac
 }
 
-release_tmp="$(mktemp -d "${TMPDIR:-/tmp}/dbmd-release.XXXXXXXX")"
+release_git_dir="$(git rev-parse --absolute-git-dir)"
+test -d "$release_git_dir" ||
+    die "could not resolve the private Git directory for release scratch space"
+# The trusted macOS controller runs Linux rebuilds in Colima. Colima shares
+# the repository's /Users path but not the host's /tmp, so an external TMPDIR
+# turns Cross's source/target mounts into an unwritable container path. Keep
+# the exact-source scratch tree private and invisible inside .git instead.
+release_tmp="$(mktemp -d "$release_git_dir/dbmd-release.XXXXXXXX")"
 chmod 700 "$release_tmp"
 cleanup() {
     cleanup_status=$?
