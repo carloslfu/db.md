@@ -30,7 +30,7 @@ die() {
     exit 1
 }
 
-for command_name in git gh jq shasum cargo rustup cross tar xcode-select xcodebuild xcrun codesign lipo realpath readlink pkgutil cmp curl find sort xargs openssl; do
+for command_name in git gh jq shasum cargo rustup cross docker tar xcode-select xcodebuild xcrun codesign lipo realpath readlink pkgutil cmp curl find sort xargs openssl; do
     command -v "$command_name" >/dev/null 2>&1 ||
         die "required command not found: $command_name"
 done
@@ -123,6 +123,35 @@ mkdir -p "$release_source"
 # caller's working tree can enter the independent rebuild or trusted notices.
 # `git archive` is read-only and leaves no linked-worktree metadata to clean up.
 git archive --format=tar "$source_sha" | tar -xf - -C "$release_source"
+
+# Prove that every trusted local builder input is present before the first
+# remote mutation. In particular, `cross` discovers a missing container engine
+# only when it starts the Linux rebuild; doing that after the tag push would
+# strand an otherwise valid version behind an unapprovable release run.
+preflight_release_builder() {
+    cross --version 2>/dev/null | sed -n '1p' |
+        grep -Eq '^cross 0\.2\.5 ' ||
+        die "cross 0.2.5 is required for Linux release reproduction"
+    docker info >/dev/null 2>&1 ||
+        die "the Docker daemon is required for Linux release reproduction"
+
+    (
+        cd "$release_source"
+        sh scripts/verify-darwin-toolchain.sh "$DARWIN_DEVELOPER_DIR"
+    )
+    rustup target add \
+        --toolchain "$RUST_TOOLCHAIN" \
+        x86_64-apple-darwin aarch64-apple-darwin >/dev/null
+
+    for builder_image in \
+        'ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99' \
+        'ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4'; do
+        docker pull "$builder_image" >/dev/null
+        docker image inspect "$builder_image" >/dev/null
+    done
+}
+
+preflight_release_builder
 
 # Immutable release enforcement is repository state, not workflow convention.
 if ! gh api \
