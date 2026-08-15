@@ -335,6 +335,8 @@ jobs:
     runs-on: ubuntu-24.04
     if: ${{ github.ref_type == 'tag' }}
     environment: release-publishing
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
     permissions:
       contents: write       # create the GitHub Release + upload assets
       id-token: write        # OIDC, for the build-provenance attestation
@@ -386,26 +388,48 @@ jobs:
       # release draft-only while assets and attestations are assembled, then
       # publish exactly once after every preceding gate succeeds.
       - name: Create draft GitHub Release
+        id: draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           tag="v${VERSION}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-               --json isDraft --jq '.isDraft' >is-draft 2>/dev/null; then
-            if [ "$(cat is-draft)" != "true" ]; then
-              echo "::error::release $tag already exists and is not a draft" >&2
-              exit 1
-            fi
-          else
+
+          find_release() {
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${tag}\") | [.id, .draft] | @tsv"
+          }
+
+          record="$(find_release)"
+          if [ -z "$record" ]; then
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --draft \
               --verify-tag \
               --title "dbmd $tag" \
               --generate-notes
+            for _ in $(seq 1 30); do
+              record="$(find_release)"
+              [ -n "$record" ] && break
+              sleep 1
+            done
           fi
+          test -n "$record" || {
+            echo "::error::draft release $tag did not become readable" >&2
+            exit 1
+          }
+          test "$(printf '%s\n' "$record" | wc -l | tr -d ' ')" = 1 || {
+            echo "::error::multiple releases claim tag $tag" >&2
+            exit 1
+          }
+          IFS=$'\t' read -r release_id is_draft <<<"$record"
+          test "$is_draft" = true || {
+            echo "::error::release $tag already exists and is not a draft" >&2
+            exit 1
+          }
+          printf 'release_id=%s\n' "$release_id" >>"$GITHUB_OUTPUT"
 
       - name: Upload every release asset to the draft
         env:
@@ -453,21 +477,27 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
           tag="v${VERSION}"
-          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft --jq .isDraft)" = true || {
+          release_json="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          )"
+          test "$(printf '%s' "$release_json" | jq -r .tag_name)" = "$tag" || {
+            echo "::error::draft release ID is not bound to $tag" >&2
+            exit 1
+          }
+          test "$(printf '%s' "$release_json" | jq -r .draft)" = true || {
             echo "::error::release $tag must remain a draft until crates publish" >&2
             exit 1
           }
           actual="$(
-            gh api \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2026-03-10' \
-              "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
-              --jq '.assets[].name' |
+            printf '%s' "$release_json" | jq -r '.assets[].name' |
               LC_ALL=C sort
           )"
           expected="$(
@@ -527,7 +557,7 @@ jobs:
   # after it independently verifies the four binaries and updates Homebrew.
   publish-release:
     name: Publish immutable GitHub release
-    needs: [version, publish-crates]
+    needs: [version, publish, publish-crates]
     runs-on: ubuntu-24.04
     if: ${{ github.ref_type == 'tag' }}
     permissions:
@@ -537,14 +567,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_ID: ${{ needs.publish.outputs.release_id }}
         shell: bash
         run: |
           set -euo pipefail
           tag="v${VERSION}"
-          release_id="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq .id
-          )"
-          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+          test "$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq .tag_name
+          )" = "$tag"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             -F draft=false -f make_latest=false >/dev/null
           for _ in $(seq 1 10); do
             immutable="$(

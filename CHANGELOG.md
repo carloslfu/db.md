@@ -8,7 +8,17 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.11**.
+  `Cargo.toml`, currently **v0.8.12**.
+
+## [0.8.12] — 2026-08-15
+
+### Fixed
+
+- Protected publication now carries a draft release's numeric ID between jobs
+  and verifies or publishes that exact object. GitHub's release-by-tag REST
+  endpoint does not resolve drafts; v0.8.11 therefore remained unpublished
+  after its independently reproduced artifacts were staged. The successor
+  refuses duplicate tag records and no longer depends on draft tag lookup.
 
 ## [0.8.11] — 2026-08-15
 
