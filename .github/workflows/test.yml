@@ -130,9 +130,10 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
           MACOSX_DEPLOYMENT_TARGET: '11.0'
-          RUSTFLAGS: '-C link-arg=-Wl,-no_uuid'
         run: |
           set -euo pipefail
+          RUSTFLAGS="-C link-arg=-Wl,-no_uuid --remap-path-prefix=${GITHUB_WORKSPACE}=/dbmd-source --remap-path-prefix=${HOME}/.cargo=/dbmd-cargo"
+          export RUSTFLAGS
           for build in first second; do
             target_dir="${RUNNER_TEMP}/dbmd-darwin-${{ matrix.rust_target }}-${build}"
             CARGO_TARGET_DIR="$target_dir" \
@@ -148,6 +149,11 @@ jobs:
           second="${RUNNER_TEMP}/dbmd-darwin-${{ matrix.rust_target }}-second/${{ matrix.rust_target }}/release/dbmd"
           cmp "$first" "$second"
           test "$(lipo -archs "$first")" = "${{ matrix.expected_arch }}"
+          if LC_ALL=C grep -aFq "$GITHUB_WORKSPACE" "$first" ||
+            LC_ALL=C grep -aFq "$HOME/.cargo" "$first"; then
+            echo "::error::Darwin binary retained a builder-specific source path" >&2
+            exit 1
+          fi
 
   test:
     runs-on: ubuntu-24.04

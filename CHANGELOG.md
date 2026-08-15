@@ -8,7 +8,19 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.10**.
+  `Cargo.toml`, currently **v0.8.11**.
+
+## [0.8.11] — 2026-08-15
+
+### Fixed
+
+- Darwin release builds now remap the checkout and Cargo registry to canonical
+  paths in both GitHub Actions and the independent trusted controller. This
+  removes builder-home paths from Rust crate metadata, so the controller can
+  reproduce the shipped binaries byte-for-byte on a different machine. The
+  v0.8.10 tag remains unpublished because its otherwise identical builds
+  embedded `/Users/runner` versus `/Users/carlos` and correctly failed the
+  independent comparison.
 
 ## [0.8.10] — 2026-08-10
 

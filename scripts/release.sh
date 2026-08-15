@@ -306,12 +306,15 @@ rebuild_and_compare() {
             --toolchain "$RUST_TOOLCHAIN" \
             x86_64-apple-darwin aarch64-apple-darwin >/dev/null
 
+        cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+        darwin_rustflags="-C link-arg=-Wl,-no_uuid --remap-path-prefix=${release_source}=/dbmd-source --remap-path-prefix=${cargo_home}=/dbmd-cargo"
+
         for rust_target in x86_64-apple-darwin aarch64-apple-darwin; do
             target_dir="$rebuilt_dir/$rust_target"
             CARGO_TARGET_DIR="$target_dir" \
             DEVELOPER_DIR="$DARWIN_DEVELOPER_DIR" \
             MACOSX_DEPLOYMENT_TARGET=11.0 \
-            RUSTFLAGS='-C link-arg=-Wl,-no_uuid' \
+            RUSTFLAGS="$darwin_rustflags" \
                 cargo "+${RUST_TOOLCHAIN}" build \
                     --release --locked --target "$rust_target" -p dbmd-cli
             binary="$target_dir/$rust_target/release/dbmd"
@@ -320,6 +323,10 @@ rebuild_and_compare() {
                 -replace -output "${binary}.normalized" "$binary"
             mv "${binary}.normalized" "$binary"
             chmod +x "$binary"
+            if LC_ALL=C grep -aFq "$release_source" "$binary" ||
+                LC_ALL=C grep -aFq "$cargo_home" "$binary"; then
+                die "Darwin rebuild retained a builder-specific source path"
+            fi
         done
 
         for rust_target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do

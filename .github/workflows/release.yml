@@ -160,22 +160,18 @@ jobs:
             rust_target: x86_64-apple-darwin
             os: macos-26
             use_cross: false
-            rustflags: '-C link-arg=-Wl,-no_uuid'
           - target_name: darwin-aarch64
             rust_target: aarch64-apple-darwin
             os: macos-26
             use_cross: false
-            rustflags: '-C link-arg=-Wl,-no_uuid'
           - target_name: linux-x86_64-musl
             rust_target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
             use_cross: true
-            rustflags: ''
           - target_name: linux-aarch64-musl
             rust_target: aarch64-unknown-linux-musl
             os: ubuntu-24.04
             use_cross: true
-            rustflags: ''
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
@@ -231,8 +227,11 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
           MACOSX_DEPLOYMENT_TARGET: '11.0'
-          RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-C link-arg=-Wl,-no_uuid --remap-path-prefix=${GITHUB_WORKSPACE}=/dbmd-source --remap-path-prefix=${HOME}/.cargo=/dbmd-cargo"
+          export RUSTFLAGS
+          cargo build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
 
       - name: Build (cross)
         if: matrix.use_cross
@@ -250,6 +249,11 @@ jobs:
             -replace -output "${binary}.normalized" "$binary"
           mv "${binary}.normalized" "$binary"
           chmod +x "$binary"
+          if LC_ALL=C grep -aFq "$GITHUB_WORKSPACE" "$binary" ||
+            LC_ALL=C grep -aFq "$HOME/.cargo" "$binary"; then
+            echo "::error::Darwin binary retained a builder-specific source path" >&2
+            exit 1
+          fi
 
       # Assemble the per-target tarball: binary + the three legal files.
       # Tarball name: dbmd-<version>-<target>.tar.gz
