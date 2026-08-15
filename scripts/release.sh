@@ -11,6 +11,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(git rev-parse --show-toplevel)"
 # shellcheck source=scripts/release-lib.sh
 source "$script_dir/release-lib.sh"
 # shellcheck source=scripts/crates-release-lib.sh
@@ -502,15 +503,33 @@ compare_final_target linux-aarch64-musl aarch64-unknown-linux-musl
 printf 'Independent rebuild matched all four immutable release binaries byte-for-byte.\n'
 
 # Verify crates.io converged to the exact local package bytes, not merely the
-# requested version label. A yanked version is not a converged public release,
-# even when its immutable tarball checksum is exact.
+# requested version label. Cargo includes `.cargo_vcs_info.json` only when the
+# package source has Git metadata, so package from an isolated checkout of the
+# reviewed commit rather than the archive used for binary reproduction.
+# A yanked version is not a converged public release, even when its immutable
+# tarball checksum is exact.
+package_source="$release_tmp/package-source"
+git clone --quiet --no-local --no-checkout "$repo_root" "$package_source"
+git -C "$package_source" checkout --quiet --detach "$source_sha"
+test "$(git -C "$package_source" rev-parse HEAD)" = "$source_sha" ||
+    die "crate package checkout does not match the reviewed source"
+test -z "$(git -C "$package_source" status --porcelain)" ||
+    die "crate package checkout is dirty"
 (
-    cd "$release_source"
+    cd "$package_source"
     CARGO_TARGET_DIR="$release_tmp/package-target" \
         cargo "+${RUST_TOOLCHAIN}" package --workspace --locked
 )
 for crate_name in dbmd-core dbmd-cli; do
     local_crate="$release_tmp/package-target/package/${crate_name}-${version}.crate"
+    vcs_info="$(
+        tar -xOzf "$local_crate" \
+            "${crate_name}-${version}/.cargo_vcs_info.json"
+    )"
+    test "$(printf '%s' "$vcs_info" | jq -r .git.sha1)" = "$source_sha" ||
+        die "local ${crate_name} package is not bound to the reviewed source"
+    test "$(printf '%s' "$vcs_info" | jq -r .path_in_vcs)" = "crates/${crate_name}" ||
+        die "local ${crate_name} package has an unexpected source path"
     local_checksum="$(shasum -a 256 "$local_crate" | awk '{print $1}')"
     crate_response="$release_tmp/${crate_name}-version.json"
     curl \

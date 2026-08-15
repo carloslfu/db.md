@@ -10,6 +10,15 @@ Two things version independently:
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
   `Cargo.toml`, currently **v0.8.12**.
 
+## Unreleased
+
+### Fixed
+
+- The trusted release controller now reproduces crates.io packages from an
+  isolated Git checkout of the reviewed commit, preserving Cargo's committed
+  `.cargo_vcs_info.json` instead of falsely comparing a metadata-free source
+  archive against the published crate.
+
 ## [0.8.12] — 2026-08-15
 
 ### Fixed

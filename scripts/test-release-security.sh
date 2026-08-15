@@ -621,6 +621,12 @@ homebrew_line="$(grep -n 'HomebrewFormula/render.sh' "$controller" | head -n 1 |
 # covered by the hermetic yanked fixture rather than reimplementing a weaker
 # checksum-only query.
 require_fixed 'source "$script_dir/crates-release-lib.sh"' "$controller"
+require_fixed 'git clone --quiet --no-local --no-checkout "$repo_root" "$package_source"' "$controller"
+require_fixed 'git -C "$package_source" checkout --quiet --detach "$source_sha"' "$controller"
+require_fixed 'cd "$package_source"' "$controller"
+require_fixed '"${crate_name}-${version}/.cargo_vcs_info.json"' "$controller"
+require_fixed 'jq -r .git.sha1' "$controller"
+require_fixed 'jq -r .path_in_vcs' "$controller"
 require_fixed 'crates_version_state "$crate_response" "$local_checksum" "$version"' "$controller"
 require_fixed 'yanked) die "crates.io ${crate_name} ${version} is yanked"' "$controller"
 require_fixed 'actual_checksum="$(' "$crates_controller_lib"
