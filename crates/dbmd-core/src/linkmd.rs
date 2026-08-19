@@ -5586,6 +5586,82 @@ struct FeedFile {
     bytes: u64,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V1DisclosureError {
+    DuplicateFile,
+    DuplicateRemoved,
+    PushManifestMismatch,
+    EditMissingChange,
+    EditFalseFile,
+    RemovedMismatch,
+}
+
+/// Validate wire-profile-v1 `files`/`removed` disclosure semantics against
+/// the exact previous and resulting pack manifests. `edit` accepts the
+/// historical superset form while still requiring every actual changed path.
+#[cfg(test)]
+fn verify_v1_manifest_disclosure(
+    kind: &str,
+    previous: &[FeedFile],
+    resulting: &[FeedFile],
+    files: &[FeedFile],
+    removed: &[String],
+) -> Result<(), V1DisclosureError> {
+    fn as_map(
+        files: &[FeedFile],
+    ) -> Result<std::collections::BTreeMap<&str, (&str, u64)>, V1DisclosureError> {
+        let mut result = std::collections::BTreeMap::new();
+        for file in files {
+            if result
+                .insert(file.path.as_str(), (file.sha256.as_str(), file.bytes))
+                .is_some()
+            {
+                return Err(V1DisclosureError::DuplicateFile);
+            }
+        }
+        Ok(result)
+    }
+    let previous = as_map(previous)?;
+    let resulting = as_map(resulting)?;
+    let disclosed = as_map(files)?;
+    let removed_set: std::collections::BTreeSet<&str> =
+        removed.iter().map(String::as_str).collect();
+    if removed_set.len() != removed.len() {
+        return Err(V1DisclosureError::DuplicateRemoved);
+    }
+    let expected_removed: std::collections::BTreeSet<&str> = previous
+        .keys()
+        .copied()
+        .filter(|path| !resulting.contains_key(path))
+        .collect();
+    if removed_set != expected_removed {
+        return Err(V1DisclosureError::RemovedMismatch);
+    }
+    if kind == "push" {
+        return if disclosed == resulting {
+            Ok(())
+        } else {
+            Err(V1DisclosureError::PushManifestMismatch)
+        };
+    }
+    if kind != "edit" {
+        return Err(V1DisclosureError::EditFalseFile);
+    }
+    if disclosed
+        .iter()
+        .any(|(path, value)| resulting.get(path) != Some(value))
+    {
+        return Err(V1DisclosureError::EditFalseFile);
+    }
+    for (path, value) in &resulting {
+        if previous.get(path) != Some(value) && !disclosed.contains_key(path) {
+            return Err(V1DisclosureError::EditMissingChange);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct FeedEntry {
     v: u8,
@@ -7697,6 +7773,88 @@ mod tests {
             },
             identity,
         }
+    }
+
+    #[test]
+    fn v1_edit_disclosure_accepts_minimal_and_superset_forms() {
+        let file = |path: &str, byte: char| FeedFile {
+            path: path.to_string(),
+            sha256: byte.to_string().repeat(64),
+            bytes: 1,
+        };
+        let a0 = file("records/a.md", 'a');
+        let a1 = file("records/a.md", 'b');
+        let stable = file("records/stable.md", 'c');
+        let added = file("records/added.md", 'd');
+        let removed_file = file("records/removed.md", 'e');
+        let previous = vec![a0, stable.clone(), removed_file.clone()];
+        let resulting = vec![a1.clone(), stable.clone(), added.clone()];
+        let removed = vec![removed_file.path.clone()];
+
+        assert_eq!(
+            verify_v1_manifest_disclosure(
+                "edit",
+                &previous,
+                &resulting,
+                &[a1.clone(), added.clone()],
+                &removed,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_v1_manifest_disclosure(
+                "edit",
+                &previous,
+                &resulting,
+                &[stable.clone(), added.clone(), a1.clone()],
+                &removed,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_v1_manifest_disclosure(
+                "edit",
+                &previous,
+                &resulting,
+                std::slice::from_ref(&added),
+                &removed,
+            ),
+            Err(V1DisclosureError::EditMissingChange)
+        );
+        assert_eq!(
+            verify_v1_manifest_disclosure(
+                "edit",
+                &previous,
+                &resulting,
+                &[file("records/a.md", 'f'), added.clone()],
+                &removed,
+            ),
+            Err(V1DisclosureError::EditFalseFile)
+        );
+        assert_eq!(
+            verify_v1_manifest_disclosure(
+                "edit",
+                &previous,
+                &resulting,
+                &[a1.clone(), added.clone()],
+                &[],
+            ),
+            Err(V1DisclosureError::RemovedMismatch)
+        );
+        assert_eq!(
+            verify_v1_manifest_disclosure(
+                "push",
+                &previous,
+                &resulting,
+                &[added.clone(), stable, a1],
+                &removed,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_v1_manifest_disclosure("push", &previous, &resulting, &[added], &removed,),
+            Err(V1DisclosureError::PushManifestMismatch)
+        );
     }
 
     #[test]
