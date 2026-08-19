@@ -60,7 +60,10 @@
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2196,6 +2199,8 @@ struct V2SignedPointer {
 
 #[derive(Debug, Clone, Deserialize)]
 struct V2HeadIdentity {
+    #[serde(default)]
+    custody: String,
     fingerprint: String,
     public_key_spki: String,
     #[serde(default)]
@@ -2232,6 +2237,7 @@ struct V2VerifiedHead {
     brain_id: String,
     view_kind: String,
     view_revision: String,
+    identity: V2HeadIdentity,
     pointer: Option<V2PointerBody>,
     trust: TrustState,
     alias: Option<AliasBinding>,
@@ -2624,6 +2630,7 @@ fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2Verifie
         brain_id: head.brain_id,
         view_kind,
         view_revision,
+        identity: identity.clone(),
         pointer: head.pointer.map(|signed| signed.pointer),
         trust,
         alias: alias_binding,
@@ -2718,6 +2725,34 @@ struct V2ManifestPage {
     content_root: Option<String>,
     files: Vec<V2ManifestFile>,
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2SigningCandidate {
+    seq: u64,
+    content_root: Option<String>,
+    signing_bytes_base64: String,
+    changes_base64: String,
+    actor_claim_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2SigningCandidatePage {
+    v: u8,
+    challenge_id: String,
+    mutation_id: String,
+    request_hash: String,
+    parent: V2SigningParent,
+    candidate: V2SigningCandidate,
+    files: Vec<V2ManifestFile>,
+    next_cursor: Option<String>,
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2SigningParent {
+    seq: u64,
+    commit_hash: Option<String>,
 }
 
 fn verify_v2_file_proof(root: &str, file: &V2ManifestFile) -> LinkResult<()> {
@@ -2831,6 +2866,332 @@ fn v2_manifest(
         }
     }
     Ok(files)
+}
+
+fn sign_verified_v2_candidate(
+    cfg: &HubConfig,
+    head: &V2VerifiedHead,
+    expected: &std::collections::BTreeMap<String, V2BaselineFile>,
+    mutation_id: &str,
+    request_body: &Value,
+    challenge_value: &Value,
+) -> LinkResult<(String, String, String)> {
+    if head.view_kind != "full" {
+        return Err(invalid_feed(
+            "a scoped self-custody writer must use the proposal workflow",
+        ));
+    }
+    if head.identity.custody != "self" {
+        return Err(invalid_feed(
+            "a hub-custodied brain unexpectedly requested an external signature",
+        ));
+    }
+    let key = cfg
+        .brain_key
+        .as_ref()
+        .ok_or_else(|| bad_agent_key("this self-custodied brain requires DBMD_BRAIN_KEY_FILE"))?;
+    if key.multikey != format!("ed25519:{}", head.identity.fingerprint)
+        || key.public_key_spki != head.identity.public_key_spki
+    {
+        return Err(bad_agent_key(
+            "DBMD_BRAIN_KEY_FILE does not match the verified brain identity",
+        ));
+    }
+    let challenge_id = challenge_value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| crate::ulid::is_ulid(id))
+        .ok_or_else(|| invalid_feed("self-custody challenge has no canonical id"))?;
+    let expected_endpoint = format!(
+        "/api/hub/brains/{}/v2/signing-challenges/{challenge_id}",
+        head.brain_id
+    );
+    if challenge_value
+        .get("candidate_endpoint")
+        .and_then(Value::as_str)
+        != Some(expected_endpoint.as_str())
+    {
+        return Err(invalid_feed(
+            "self-custody challenge candidate endpoint is not origin-bound",
+        ));
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut after = String::new();
+    let mut pinned: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        u64,
+        Option<String>,
+    )> = None;
+    loop {
+        let encoded_after: String =
+            url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
+        let path = format!("{expected_endpoint}?limit=500&after={encoded_after}");
+        let value = ensure_ok(
+            request_capped(
+                cfg,
+                "GET",
+                &path,
+                None,
+                Auth::Required,
+                MAX_FEED_RESPONSE_BYTES,
+            )?,
+            "v2 self-custody candidate",
+        )?;
+        let page: V2SigningCandidatePage = serde_json::from_value(value)
+            .map_err(|_| invalid_feed("self-custody candidate has an invalid shape"))?;
+        if page.v != 2
+            || page.challenge_id != challenge_id
+            || page.mutation_id != mutation_id
+            || page.candidate.seq != page.parent.seq + 1
+            || page.files.len() > 500
+            || page.expires_at.is_empty()
+        {
+            return Err(invalid_feed(
+                "self-custody candidate is not bound to this mutation",
+            ));
+        }
+        let coordinate = (
+            page.request_hash.clone(),
+            page.candidate.signing_bytes_base64.clone(),
+            page.candidate.changes_base64.clone(),
+            page.candidate.actor_claim_base64.clone(),
+            page.candidate.content_root.clone(),
+            page.parent.seq,
+            page.parent.commit_hash.clone(),
+        );
+        if pinned.as_ref().is_some_and(|prior| prior != &coordinate) {
+            return Err(invalid_feed(
+                "self-custody candidate changed between manifest pages",
+            ));
+        }
+        pinned = Some(coordinate);
+        let root = page
+            .candidate
+            .content_root
+            .as_deref()
+            .ok_or_else(|| invalid_feed("self-custody candidate has no content root"))?;
+        for file in page.files {
+            verify_v2_file_proof(root, &file)?;
+            if files
+                .insert(
+                    file.path.clone(),
+                    V2BaselineFile {
+                        sha256: file.sha256,
+                        bytes: file.bytes,
+                        proof: Some(file.proof),
+                    },
+                )
+                .is_some()
+            {
+                return Err(invalid_feed(
+                    "self-custody candidate repeats a manifest path",
+                ));
+            }
+            if files.len() > MAX_PUSH_FILES {
+                return Err(invalid_feed(
+                    "self-custody candidate exceeds the file-count bound",
+                ));
+            }
+        }
+        match page.next_cursor {
+            None => break,
+            Some(next) if next > after => after = next,
+            Some(_) => {
+                return Err(invalid_feed(
+                    "self-custody candidate cursor did not advance",
+                ))
+            }
+        }
+    }
+    if files.len() != expected.len()
+        || files.iter().any(|(path, file)| {
+            expected.get(path).is_none_or(|expected| {
+                expected.sha256 != file.sha256 || expected.bytes != file.bytes
+            })
+        })
+    {
+        return Err(invalid_feed(
+            "self-custody candidate contains an unexpected file mutation",
+        ));
+    }
+    let Some((request_hash, signing_b64, changes_b64, actor_b64, root, parent_seq, parent)) =
+        pinned
+    else {
+        return Err(invalid_feed("self-custody candidate has no manifest"));
+    };
+    let current_seq = head.pointer.as_ref().map_or(0, |pointer| pointer.seq);
+    let current_commit = head
+        .pointer
+        .as_ref()
+        .map(|pointer| pointer.commit_hash.clone());
+    if parent_seq != current_seq || parent != current_commit {
+        return Err(LinkError::RemoteAdvancedDuringSync);
+    }
+    let changes = STANDARD
+        .decode(changes_b64)
+        .map_err(|_| invalid_feed("self-custody changeset is not base64"))?;
+    let expected_changes = json!({
+        "mutation_id": mutation_id,
+        "operations": request_body.get("operations").cloned().unwrap_or(Value::Null),
+        "reason": request_body.get("reason").cloned().unwrap_or(Value::Null),
+        "v": 2,
+    });
+    let expected_changes_bytes = crate::linkmd_v2::canonical_bytes(&expected_changes)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    if changes != expected_changes_bytes {
+        return Err(invalid_feed(
+            "self-custody changeset differs from the requested mutation",
+        ));
+    }
+    let changes_hash = crate::linkmd_v2::domain_hash_bytes("v2/changeset", &changes)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    let request_value = json!({
+        "base": request_body.get("base").cloned().unwrap_or(Value::Null),
+        "brain": head.brain_id,
+        "changes_sha256": changes_hash,
+        "rebase": request_body.get("rebase").cloned().unwrap_or(Value::Null),
+        "v": 2,
+    });
+    let expected_request_hash = crate::linkmd_v2::domain_hash("v2/request", &request_value)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    if request_hash != expected_request_hash {
+        return Err(invalid_feed(
+            "self-custody request hash differs from the requested mutation",
+        ));
+    }
+    let actor = STANDARD
+        .decode(actor_b64)
+        .map_err(|_| invalid_feed("self-custody actor claim is not base64"))?;
+    let actor_value: Value = serde_json::from_slice(&actor)
+        .map_err(|_| invalid_feed("self-custody actor claim is not JSON"))?;
+    if crate::linkmd_v2::canonical_bytes(&actor_value)
+        .map_err(|error| invalid_feed(error.to_string()))?
+        != actor
+    {
+        return Err(invalid_feed("self-custody actor claim is not canonical"));
+    }
+    let actor_object = actor_value
+        .as_object()
+        .ok_or_else(|| invalid_feed("self-custody actor claim is not an object"))?;
+    let actor_claim = actor_object
+        .get("claim")
+        .ok_or_else(|| invalid_feed("self-custody actor claim body is missing"))?;
+    let actor_public_key = actor_object
+        .get("public_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("self-custody actor signer is missing"))?;
+    let actor_fingerprint = actor_object
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("self-custody actor fingerprint is missing"))?;
+    let actor_signature = actor_object
+        .get("sig")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("self-custody actor signature is missing"))?;
+    let actor_message = crate::linkmd_v2::canonical_bytes(actor_claim)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    let actor_der = verify_v2_spki_signature(actor_public_key, &actor_message, actor_signature)?;
+    let expected_actor_signer = format!("{actor_fingerprint}:{actor_public_key}");
+    let expected_actor_root = root.clone().map(Value::String).unwrap_or(Value::Null);
+    if format!("{:x}", Sha256::digest(&actor_der)) != actor_fingerprint
+        || head
+            .trust
+            .hub_signer
+            .as_ref()
+            .is_some_and(|known| known != &expected_actor_signer)
+        || actor_claim.get("mutation_id").and_then(Value::as_str) != Some(mutation_id)
+        || actor_claim.get("request_hash").and_then(Value::as_str) != Some(request_hash.as_str())
+        || actor_claim
+            .get("candidate")
+            .and_then(|candidate| candidate.get("changes_sha256"))
+            .and_then(Value::as_str)
+            != Some(changes_hash.as_str())
+        || actor_claim
+            .get("candidate")
+            .and_then(|candidate| candidate.get("state_root"))
+            != Some(&expected_actor_root)
+        || actor_claim
+            .get("candidate")
+            .and_then(|candidate| candidate.get("control_revision"))
+            .and_then(Value::as_str)
+            != Some(head.view_revision.as_str())
+    {
+        return Err(invalid_feed(
+            "self-custody actor claim does not bind the verified authority",
+        ));
+    }
+    let actor_hash = crate::linkmd_v2::domain_hash_bytes("v2/actor-claim", &actor)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    let signing = STANDARD
+        .decode(signing_b64)
+        .map_err(|_| invalid_feed("self-custody signing bytes are not base64"))?;
+    let signing_value: Value = serde_json::from_slice(&signing)
+        .map_err(|_| invalid_feed("self-custody signing bytes are not JSON"))?;
+    if crate::linkmd_v2::canonical_bytes(&signing_value)
+        .map_err(|error| invalid_feed(error.to_string()))?
+        != signing
+    {
+        return Err(invalid_feed("self-custody signing bytes are not canonical"));
+    }
+    let pointer = head.pointer.as_ref();
+    let expected_materializer = pointer
+        .map(|value| value.materializer.as_str())
+        .unwrap_or("dbmd-projection-v1");
+    let expected_parent_commit = request_body
+        .get("base")
+        .and_then(|base| base.get("commit_hash"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let expected_parent_root = request_body
+        .get("base")
+        .and_then(|base| base.get("content_root"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let expected_state_root = root.clone().map(Value::String).unwrap_or(Value::Null);
+    let expected_asset_root = pointer
+        .and_then(|value| value.asset_root.clone())
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let expected_prev_entry = pointer
+        .map(|value| Value::String(value.feed_hash.clone()))
+        .unwrap_or(Value::Null);
+    let expected_signer_epoch = u64::try_from(head.identity.previous.len())
+        .map_err(|_| invalid_feed("brain identity history is too large"))?
+        + 1;
+    if signing_value.get("v").and_then(Value::as_u64) != Some(2)
+        || signing_value.get("seq").and_then(Value::as_u64) != Some(current_seq + 1)
+        || signing_value.get("signer_epoch").and_then(Value::as_u64) != Some(expected_signer_epoch)
+        || signing_value.get("brain").and_then(Value::as_str) != Some(key.multikey.as_str())
+        || signing_value.get("public_key").and_then(Value::as_str)
+            != Some(key.public_key_spki.as_str())
+        || signing_value.get("parent_commit") != Some(&expected_parent_commit)
+        || signing_value.get("parent_root") != Some(&expected_parent_root)
+        || signing_value.get("state_root") != Some(&expected_state_root)
+        || signing_value.get("parent_asset_root") != Some(&expected_asset_root)
+        || signing_value.get("asset_root") != Some(&expected_asset_root)
+        || signing_value.get("materializer").and_then(Value::as_str) != Some(expected_materializer)
+        || signing_value.get("changes_sha256").and_then(Value::as_str)
+            != Some(changes_hash.as_str())
+        || signing_value.get("actor_ref").and_then(Value::as_str) != Some(actor_hash.as_str())
+        || signing_value
+            .get("control_revision")
+            .and_then(Value::as_str)
+            != Some(head.view_revision.as_str())
+        || signing_value.get("prev_entry_hash") != Some(&expected_prev_entry)
+        || signing_value.get("op").and_then(Value::as_str) != Some("changeset")
+    {
+        return Err(invalid_feed(
+            "self-custody signing bytes do not bind the verified candidate",
+        ));
+    }
+    let pair = agent_keypair(&key.pkcs8)?;
+    let signature = URL_SAFE_NO_PAD.encode(pair.sign(&signing).as_ref());
+    Ok((challenge_id.to_string(), signature, expected_actor_signer))
 }
 
 fn v2_baseline_name(cfg: &HubConfig, brain: &str, checkout: &Path) -> LinkResult<String> {
@@ -3765,6 +4126,41 @@ fn v2_sync_push(
         serde_json::to_string(&operations).unwrap_or_default()
     );
     let mutation_id = format!("dbmd-{}", content_sha256(entropy.as_bytes()));
+    let mut expected_candidate = remote.clone();
+    for operation in &operations {
+        match operation.get("op").and_then(Value::as_str) {
+            Some("put") => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 put has no path"))?;
+                let sha256 = operation
+                    .get("blob")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 put has no blob"))?;
+                let bytes = operation
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_feed("v2 put has no byte count"))?;
+                expected_candidate.insert(
+                    path.to_string(),
+                    V2BaselineFile {
+                        sha256: sha256.to_string(),
+                        bytes,
+                        proof: None,
+                    },
+                );
+            }
+            Some("delete") => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 delete has no path"))?;
+                expected_candidate.remove(path);
+            }
+            _ => return Err(invalid_feed("dbmd generated an unsupported v2 operation")),
+        }
+    }
     let mut body = json!({
         "mutation_id": mutation_id,
         "base": base_value,
@@ -3853,12 +4249,41 @@ fn v2_sync_push(
         });
     }
     let path = format!("/api/hub/brains/{requested_brain}/v2/commits");
+    let mut candidate_hub_signer: Option<String> = None;
     let mut result = ensure_ok(
         request(cfg, "POST", &path, Some(&body), Auth::Required)?,
         "v2 sync push",
     )?;
+    if result.get("code").and_then(Value::as_str) == Some("brain_signature_required") {
+        let challenge = result
+            .get("signing_challenge")
+            .ok_or_else(|| invalid_feed("self-custody response has no signing challenge"))?;
+        let (challenge_id, signature, actor_signer) = sign_verified_v2_candidate(
+            cfg,
+            &head,
+            &expected_candidate,
+            &mutation_id,
+            &body,
+            challenge,
+        )?;
+        body["signing_challenge_id"] = Value::String(challenge_id);
+        body["signature_base64url"] = Value::String(signature);
+        candidate_hub_signer = Some(actor_signer);
+        result = ensure_ok(
+            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            "v2 self-custody commit",
+        )?;
+    }
     let refreshed = v2_verified_head(cfg, requested_brain)?
         .ok_or_else(|| invalid_feed("v2 head disappeared after commit"))?;
+    if candidate_hub_signer
+        .as_ref()
+        .is_some_and(|expected| refreshed.trust.hub_signer.as_ref() != Some(expected))
+    {
+        return Err(invalid_feed(
+            "self-custody actor signer differs from the committed hub pointer signer",
+        ));
+    }
     let accepted_hash = result.get("commit_hash").and_then(Value::as_str);
     if refreshed
         .pointer
@@ -9429,6 +9854,13 @@ mod tests {
             brain_id: TEST_BRAIN_ID.to_string(),
             view_kind: "scoped".to_string(),
             view_revision: revision.to_string(),
+            identity: V2HeadIdentity {
+                custody: "hub".to_string(),
+                fingerprint: "test".to_string(),
+                public_key_spki: "test".to_string(),
+                previous: Vec::new(),
+                rotations: Vec::new(),
+            },
             pointer: None,
             trust: TrustState {
                 v: 2,
