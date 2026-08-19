@@ -60,6 +60,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -170,6 +171,13 @@ const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 /// capabilities must not create an unbounded connection storm. Keep the
 /// verified downloads inside this fixed worker count.
 const V2_BLOB_DOWNLOAD_WORKERS: usize = 16;
+/// One authenticated link.md v2 bulk frame remains small enough for bounded
+/// retries and serverless streaming while amortizing tens of thousands of
+/// immutable blobs over a few hundred requests instead of one request each.
+const V2_BULK_STREAM_FILES: usize = 256;
+const V2_BULK_STREAM_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
+const V2_BULK_STREAM_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+const V2_BULK_STREAM_MAGIC: &[u8; 8] = b"LMD2STRM";
 
 /// Everything that can go wrong on the wire or at its edges. Each variant maps
 /// onto one stable CLI error code; messages are single-line and never echo the
@@ -337,6 +345,19 @@ pub enum LinkError {
         paths: Vec<String>,
     },
 
+    /// A readable v2 conflict was preserved as a private, exact-head bundle.
+    /// The bundle is local control state; none of its bytes ride with the
+    /// brain, and resolving it always creates a fresh explicit mutation.
+    #[error(
+        "sync conflict preserved in private bundle `{bundle}` for {paths:?} — run `dbmd sync resolve {bundle} --keep-local`, `--take-remote`, or `--from <safe-file>`"
+    )]
+    ConflictBundle {
+        /// Local ULID naming `.dbmd/conflicts/<bundle>/plan.json`.
+        bundle: String,
+        /// Bounded, readable conflict paths.
+        paths: Vec<String>,
+    },
+
     /// `.sevralocal` newly made paths eligible to ride. Uploading them is an
     /// explicit adoption boundary, never an accidental side effect of editing
     /// or removing a local policy file.
@@ -441,17 +462,17 @@ impl V2BulkConfirmation {
     }
 }
 
-/// Security-sensitive link.md state and destination writes rely on Unix
-/// `openat`/`O_NOFOLLOW` semantics. Native Windows is not an official release
-/// target yet, so fail closed there instead of silently using a weaker
-/// path-based approximation.
+/// Security-sensitive link.md state and destination writes require a hardened
+/// descriptor/handle-relative filesystem implementation. Unix uses
+/// `openat`/`O_NOFOLLOW`; Windows uses held directory handles, reparse-point
+/// refusal, exclusive share modes, and write-through replacement.
 fn require_hardened_filesystem(operation: &'static str) -> LinkResult<()> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         let _ = operation;
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Err(LinkError::UnsupportedPlatform { operation })
     }
@@ -755,6 +776,13 @@ fn toolkit_state_dir() -> LinkResult<PathBuf> {
             return Ok(base.join("dbmd").join("state"));
         }
     }
+    #[cfg(windows)]
+    {
+        Err(LinkError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("cannot locate user state; set {STATE_DIR_ENV} or LOCALAPPDATA"),
+        )))
+    }
     #[cfg(not(windows))]
     if let Some(base) = env_nonempty("XDG_STATE_HOME") {
         let base = PathBuf::from(base);
@@ -762,12 +790,14 @@ fn toolkit_state_dir() -> LinkResult<PathBuf> {
             return Ok(base.join("dbmd"));
         }
     }
+    #[cfg(not(windows))]
     let home = PathBuf::from(env_nonempty("HOME").ok_or_else(|| {
         LinkError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("cannot locate user state; set {STATE_DIR_ENV}"),
         ))
     })?);
+    #[cfg(not(windows))]
     if !home.is_absolute() {
         return Err(LinkError::UnsafePath {
             path: home.display().to_string(),
@@ -2755,7 +2785,7 @@ fn verify_v1_to_v2_bridge(
         || legacy.feed_hash.as_deref() != Some(checkpoint_feed)
         || item.entry.seq != checkpoint.head_seq
         || item.hash != checkpoint_feed
-        || &legacy_identity != &v2_identity(identity)
+        || legacy_identity != v2_identity(identity)
         || bridge.get("pack_sha256").and_then(Value::as_str)
             != Some(item.entry.pack_sha256.as_str())
     {
@@ -3002,6 +3032,8 @@ struct V2SyncBaseline {
     v: u8,
     origin: String,
     brain: String,
+    #[serde(default)]
+    head_seq: Option<u64>,
     commit_hash: Option<String>,
     content_root: Option<String>,
     #[serde(default)]
@@ -3024,7 +3056,7 @@ struct V2SyncBaseline {
 }
 
 struct V2LocalView {
-    riding: std::collections::BTreeMap<String, (String, Vec<u8>)>,
+    riding: std::collections::BTreeMap<String, (String, u64)>,
     eligibility: std::collections::BTreeMap<String, bool>,
     policy: crate::linkmd_sync_policy::SyncPolicy,
 }
@@ -3382,31 +3414,6 @@ fn v2_asset_manifest_bytes(
     Ok(bytes)
 }
 
-fn download_v2_asset(
-    cfg: &HubConfig,
-    brain: &str,
-    pointer: &V2PointerBody,
-    path: &str,
-    asset: &V2BaselineAsset,
-) -> LinkResult<Vec<u8>> {
-    if asset.disposition != "hosted" {
-        return Err(invalid_feed("withheld assets have no hosted bytes"));
-    }
-    let encoded_path: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
-    let endpoint = format!(
-        "/api/hub/brains/{brain}/v2/assets/blob?commit={}&path={encoded_path}&sha256={}",
-        pointer.commit_hash, asset.blob_sha256
-    );
-    let bytes = ensure_raw_ok(
-        request_raw(cfg, "GET", &endpoint, None, Auth::Required, asset.bytes)?,
-        "v2 asset download",
-    )?;
-    if bytes.len() as u64 != asset.bytes || content_sha256(&bytes) != asset.blob_sha256 {
-        return Err(invalid_feed("v2 asset bytes failed integrity verification"));
-    }
-    Ok(bytes)
-}
-
 fn sign_verified_v2_candidate(
     cfg: &HubConfig,
     head: &V2VerifiedHead,
@@ -3458,7 +3465,7 @@ fn sign_verified_v2_candidate(
 
     let mut files = std::collections::BTreeMap::new();
     let mut after = String::new();
-    let mut pinned: Option<(
+    type CandidateCoordinate = (
         String,
         String,
         String,
@@ -3467,7 +3474,8 @@ fn sign_verified_v2_candidate(
         Option<String>,
         u64,
         Option<String>,
-    )> = None;
+    );
+    let mut pinned: Option<CandidateCoordinate> = None;
     loop {
         let encoded_after: String =
             url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
@@ -3878,7 +3886,7 @@ fn v2_baseline_name(cfg: &HubConfig, brain: &str, checkout: &Path) -> LinkResult
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn lock_v2_sync_operation(cfg: &HubConfig, brain: &str) -> LinkResult<TrustLock> {
     let directory = open_trust_dir(cfg)?;
     let origin = normalized_origin(&cfg.hub)?;
@@ -3889,7 +3897,7 @@ fn lock_v2_sync_operation(cfg: &HubConfig, brain: &str) -> LinkResult<TrustLock>
     lock_trust_name(&directory, &name)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn lock_v2_sync_operation(_cfg: &HubConfig, _brain: &str) -> LinkResult<()> {
     Err(LinkError::UnsupportedPlatform {
         operation: "serialized link.md v2 sync",
@@ -4046,41 +4054,9 @@ fn files_for_v2_view(
     files
 }
 
-#[cfg(unix)]
-fn load_v2_baseline(
-    cfg: &HubConfig,
-    brain: &str,
-    checkout: &Path,
-) -> LinkResult<Option<V2SyncBaseline>> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    let directory = open_trust_dir(cfg)?;
-    let name_string = v2_baseline_name(cfg, brain, checkout)?;
-    let _lock = lock_trust_name(&directory, &name_string)?;
-    let name = c_name(name_string.as_bytes(), &name_string)?;
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(LinkError::UnsafePath { path: name_string })
-        };
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut bytes = Vec::new();
-    file.take(MAX_FEED_RESPONSE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FEED_RESPONSE_BYTES {
-        return Err(invalid_feed("v2 sync baseline is oversized"));
-    }
+fn parse_v2_baseline(cfg: &HubConfig, brain: &str, bytes: &[u8]) -> LinkResult<V2SyncBaseline> {
     let baseline: V2SyncBaseline =
-        serde_json::from_slice(&bytes).map_err(|_| invalid_feed("v2 sync baseline is corrupt"))?;
+        serde_json::from_slice(bytes).map_err(|_| invalid_feed("v2 sync baseline is corrupt"))?;
     if baseline.v != 2
         || baseline.origin != normalized_origin(&cfg.hub)?
         || baseline.brain != brain
@@ -4147,10 +4123,63 @@ fn load_v2_baseline(
     {
         return Err(invalid_feed("v2 sync baseline failed validation"));
     }
-    Ok(Some(baseline))
+    Ok(baseline)
 }
 
-#[cfg(not(unix))]
+#[cfg(unix)]
+fn load_v2_baseline(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+) -> LinkResult<Option<V2SyncBaseline>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let directory = open_trust_dir(cfg)?;
+    let name_string = v2_baseline_name(cfg, brain, checkout)?;
+    let _lock = lock_trust_name(&directory, &name_string)?;
+    let name = c_name(name_string.as_bytes(), &name_string)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(LinkError::UnsafePath { path: name_string })
+        };
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    file.take(MAX_FEED_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FEED_RESPONSE_BYTES {
+        return Err(invalid_feed("v2 sync baseline is oversized"));
+    }
+    Ok(Some(parse_v2_baseline(cfg, brain, &bytes)?))
+}
+
+#[cfg(windows)]
+fn load_v2_baseline(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+) -> LinkResult<Option<V2SyncBaseline>> {
+    let directory = open_trust_dir(cfg)?;
+    let name = v2_baseline_name(cfg, brain, checkout)?;
+    let _lock = lock_trust_name(&directory, &name)?;
+    let mut reader = crate::fsx::BoundedDirReader::from_root(&directory)?;
+    match reader.read(Path::new(&name), MAX_FEED_RESPONSE_BYTES) {
+        Ok(bytes) => Ok(Some(parse_v2_baseline(cfg, brain, &bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(LinkError::UnsafePath { path: name }),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn load_v2_baseline(
     _cfg: &HubConfig,
     _brain: &str,
@@ -4219,7 +4248,24 @@ fn save_v2_baseline(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn save_v2_baseline(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+    baseline: &V2SyncBaseline,
+) -> LinkResult<()> {
+    let directory = open_trust_dir(cfg)?;
+    let name = v2_baseline_name(cfg, brain, checkout)?;
+    let _lock = lock_trust_name(&directory, &name)?;
+    let mut bytes = serde_json::to_vec(baseline)
+        .map_err(|_| invalid_feed("could not serialize v2 sync baseline"))?;
+    bytes.push(b'\n');
+    crate::fsx::write_atomic_beneath(&directory, Path::new(&name), &bytes, false, true)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn save_v2_baseline(
     _cfg: &HubConfig,
     _brain: &str,
@@ -4261,6 +4307,7 @@ fn v2_baseline_from_head(
         v: 2,
         origin: normalized_origin(&cfg.hub)?,
         brain: head.brain_id.clone(),
+        head_seq: Some(head.pointer.as_ref().map_or(0, |pointer| pointer.seq)),
         commit_hash: head
             .pointer
             .as_ref()
@@ -4330,7 +4377,7 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
         if std::str::from_utf8(&bytes).is_err() {
             return Err(LinkError::NotUtf8 { path });
         }
-        result.insert(path, (content_sha256(&bytes), bytes));
+        result.insert(path, (content_sha256(&bytes), bytes.len() as u64));
     }
     Ok(V2LocalView {
         riding: result,
@@ -4353,6 +4400,105 @@ struct V2DownloadWindow {
     v: u8,
     commit: String,
     downloads: Vec<V2DownloadItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2BulkStreamHeader {
+    v: u8,
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+fn parse_v2_bulk_stream(
+    bytes: &[u8],
+    expected: &[(&String, &V2BaselineFile)],
+) -> LinkResult<Vec<(String, Vec<u8>)>> {
+    if !bytes.starts_with(V2_BULK_STREAM_MAGIC) {
+        return Err(invalid_feed("v2 bulk stream has an invalid magic"));
+    }
+    let mut cursor = V2_BULK_STREAM_MAGIC.len();
+    let mut result = Vec::with_capacity(expected.len());
+    for (expected_path, expected_file) in expected {
+        let length_bytes = bytes
+            .get(cursor..cursor + 4)
+            .ok_or_else(|| invalid_feed("v2 bulk stream ended before a frame header"))?;
+        cursor += 4;
+        let header_len = u32::from_be_bytes(length_bytes.try_into().expect("four bytes")) as usize;
+        if header_len == 0 || header_len > 4 * 1024 {
+            return Err(invalid_feed("v2 bulk stream has an invalid frame length"));
+        }
+        let header_bytes = bytes
+            .get(cursor..cursor + header_len)
+            .ok_or_else(|| invalid_feed("v2 bulk stream ended inside a frame header"))?;
+        cursor += header_len;
+        let header: V2BulkStreamHeader = serde_json::from_slice(header_bytes)
+            .map_err(|_| invalid_feed("v2 bulk stream has an invalid frame header"))?;
+        if header.v != 2
+            || &header.path != *expected_path
+            || header.sha256 != expected_file.sha256
+            || header.bytes != expected_file.bytes
+            || header.bytes > V2_BULK_STREAM_CONTENT_BYTES
+        {
+            return Err(invalid_feed(
+                "v2 bulk stream frame differs from its proven manifest entry",
+            ));
+        }
+        let body_len = usize::try_from(header.bytes)
+            .map_err(|_| invalid_feed("v2 bulk stream frame length overflows this platform"))?;
+        let body = bytes
+            .get(cursor..cursor + body_len)
+            .ok_or_else(|| invalid_feed("v2 bulk stream ended inside file bytes"))?;
+        cursor += body_len;
+        if content_sha256(body) != header.sha256 {
+            return Err(invalid_feed(
+                "v2 bulk stream file differs from its proven manifest entry",
+            ));
+        }
+        result.push((header.path, body.to_vec()));
+    }
+    if bytes.get(cursor..cursor + 4) != Some(&[0, 0, 0, 0]) {
+        return Err(invalid_feed("v2 bulk stream has no exact end marker"));
+    }
+    cursor += 4;
+    if cursor != bytes.len() {
+        return Err(invalid_feed("v2 bulk stream carries trailing data"));
+    }
+    Ok(result)
+}
+
+fn download_v2_bulk_stream(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    pending: &[(&String, &V2BaselineFile)],
+) -> LinkResult<Vec<(String, Vec<u8>)>> {
+    let claims = pending
+        .iter()
+        .map(|(path, file)| {
+            Ok(json!({
+                "path": path,
+                "sha256": file.sha256,
+                "bytes": file.bytes,
+                "proof": file.proof.as_ref().ok_or_else(|| {
+                    invalid_feed("v2 manifest omitted a bulk-stream proof")
+                })?,
+            }))
+        })
+        .collect::<LinkResult<Vec<_>>>()?;
+    let raw = request_raw(
+        cfg,
+        "POST",
+        &format!("/api/hub/brains/{brain}/v2/stream"),
+        Some(&json!({
+            "commit": pointer.commit_hash,
+            "files": claims,
+        })),
+        Auth::Required,
+        V2_BULK_STREAM_RESPONSE_BYTES,
+    )?;
+    let body = ensure_raw_ok(raw, "download v2 bulk stream")?;
+    parse_v2_bulk_stream(&body, pending)
 }
 
 fn prepare_v2_downloads(
@@ -4427,12 +4573,428 @@ fn prepare_v2_downloads(
     Ok(result)
 }
 
+fn prepare_v2_asset_downloads(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    pending: &[(&String, &V2BaselineAsset)],
+) -> LinkResult<Vec<V2DownloadItem>> {
+    let mut result = Vec::with_capacity(pending.len());
+    for chunk in pending.chunks(128) {
+        let claims = chunk
+            .iter()
+            .map(|(path, asset)| {
+                json!({
+                    "path": path,
+                    "sha256": asset.blob_sha256,
+                    "bytes": asset.bytes,
+                    "leaf_hash": asset.leaf_hash,
+                })
+            })
+            .collect::<Vec<_>>();
+        let value = ensure_ok(
+            request_capped(
+                cfg,
+                "POST",
+                &format!("/api/hub/brains/{brain}/v2/assets/downloads"),
+                Some(&json!({
+                    "commit": pointer.commit_hash,
+                    "assets": claims,
+                })),
+                Auth::Required,
+                MAX_FEED_RESPONSE_BYTES,
+            )?,
+            "prepare v2 asset downloads",
+        )?;
+        let window: V2DownloadWindow = serde_json::from_value(value)
+            .map_err(|_| invalid_feed("v2 asset download window has an invalid shape"))?;
+        if window.v != 2
+            || window.commit != pointer.commit_hash
+            || window.downloads.len() != chunk.len()
+        {
+            return Err(invalid_feed(
+                "v2 asset download window is not bound to the requested assets",
+            ));
+        }
+        let mut by_path = window
+            .downloads
+            .into_iter()
+            .map(|item| (item.path.clone(), item))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if by_path.len() != chunk.len() {
+            return Err(invalid_feed("v2 asset download window repeats a path"));
+        }
+        for (path, asset) in chunk {
+            let item = by_path
+                .remove(*path)
+                .ok_or_else(|| invalid_feed("v2 asset download window omitted a path"))?;
+            if item.method != "GET"
+                || item.sha256 != asset.blob_sha256
+                || item.bytes != asset.bytes
+                || item.url.is_empty()
+            {
+                return Err(invalid_feed(
+                    "v2 asset download capability differs from its signed leaf",
+                ));
+            }
+            result.push(item);
+        }
+    }
+    Ok(result)
+}
+
 fn download_v2_blob(cfg: &HubConfig, item: &V2DownloadItem) -> LinkResult<Vec<u8>> {
     let bytes = get_presigned(cfg, &item.url)?;
     if bytes.len() as u64 != item.bytes || content_sha256(&bytes) != item.sha256 {
         return Err(invalid_feed("v2 blob differs from its proven path entry"));
     }
     Ok(bytes)
+}
+
+#[derive(Debug, Clone)]
+struct V2StagedFile {
+    path: String,
+    source: PathBuf,
+    sha256: String,
+    bytes: u64,
+}
+
+#[cfg(unix)]
+fn v2_download_cache_dir(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+) -> LinkResult<PathBuf> {
+    v2_download_cache_dir_for(cfg, brain, &pointer.commit_hash)
+}
+
+#[cfg(unix)]
+fn v2_download_cache_dir_for(
+    cfg: &HubConfig,
+    brain: &str,
+    transaction: &str,
+) -> LinkResult<PathBuf> {
+    if !crate::ulid::is_ulid(brain) || !is_sha256(transaction) {
+        return Err(invalid_feed("v2 download cache address is invalid"));
+    }
+    let path = cfg
+        .state_dir
+        .join("downloads")
+        .join(brain)
+        .join(transaction);
+    let directory = open_or_create_dir_nofollow(&path)?;
+    use std::os::fd::AsRawFd as _;
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    directory.sync_all()?;
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn v2_download_cache_dir(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+) -> LinkResult<PathBuf> {
+    v2_download_cache_dir_for(cfg, brain, &pointer.commit_hash)
+}
+
+#[cfg(windows)]
+fn v2_download_cache_dir_for(
+    cfg: &HubConfig,
+    brain: &str,
+    transaction: &str,
+) -> LinkResult<PathBuf> {
+    if !crate::ulid::is_ulid(brain) || !is_sha256(transaction) {
+        return Err(invalid_feed("v2 download cache address is invalid"));
+    }
+    let path = cfg
+        .state_dir
+        .join("downloads")
+        .join(brain)
+        .join(transaction);
+    crate::fsx::write_atomic(&path.join(".directory"), b"v2 download cache\n")?;
+    crate::fsx::open_directory_nofollow(&path)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn cleanup_v2_download_cache(cfg: &HubConfig, brain: &str, transaction: &str) {
+    use std::os::fd::AsRawFd as _;
+    let parent = cfg.state_dir.join("downloads").join(brain);
+    let Ok(directory) = open_existing_dir_nofollow(&parent) else {
+        return;
+    };
+    let Ok(name) = c_name(transaction.as_bytes(), transaction) else {
+        return;
+    };
+    let _ = remove_tree_at(directory.as_raw_fd(), &name, &parent.display().to_string());
+    let _ = directory.sync_all();
+}
+
+#[cfg(windows)]
+fn cleanup_v2_download_cache(cfg: &HubConfig, brain: &str, transaction: &str) {
+    if !crate::ulid::is_ulid(brain) || !is_sha256(transaction) {
+        return;
+    }
+    let parent = cfg.state_dir.join("downloads").join(brain);
+    let Ok(root) = crate::fsx::open_directory_nofollow(&parent) else {
+        return;
+    };
+    let _ = crate::fsx::remove_tree_beneath(&root, Path::new(transaction));
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cleanup_v2_download_cache(_cfg: &HubConfig, _brain: &str, _transaction: &str) {}
+
+#[cfg(not(any(unix, windows)))]
+fn v2_download_cache_dir_for(
+    _cfg: &HubConfig,
+    _brain: &str,
+    _transaction: &str,
+) -> LinkResult<PathBuf> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "resumable v2 download staging",
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn cached_blob_is_exact(path: &Path, sha256: &str, bytes: u64) -> LinkResult<bool> {
+    let file = match crate::fsx::open_regular_nofollow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() != bytes {
+        return Ok(false);
+    }
+    Ok(content_sha256_reader(file)? == sha256)
+}
+
+#[cfg(any(unix, windows))]
+fn cache_v2_blob_bytes(
+    cache_dir: &Path,
+    sha256: &str,
+    expected_bytes: u64,
+    bytes: &[u8],
+) -> LinkResult<PathBuf> {
+    if bytes.len() as u64 != expected_bytes || content_sha256(bytes) != sha256 {
+        return Err(invalid_feed("v2 cached blob differs from its declaration"));
+    }
+    let path = cache_dir.join(sha256);
+    if !cached_blob_is_exact(&path, sha256, expected_bytes)? {
+        crate::fsx::write_atomic(&path, bytes)?;
+    }
+    Ok(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cache_v2_blob_bytes(
+    _cache_dir: &Path,
+    _sha256: &str,
+    _expected_bytes: u64,
+    _bytes: &[u8],
+) -> LinkResult<PathBuf> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "resumable v2 download staging",
+    })
+}
+
+#[cfg(unix)]
+fn download_presigned_to_cache(
+    cfg: &HubConfig,
+    url: &str,
+    cache_dir: &Path,
+    sha256: &str,
+    expected_bytes: u64,
+) -> LinkResult<PathBuf> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let target = cache_dir.join(sha256);
+    if cached_blob_is_exact(&target, sha256, expected_bytes)? {
+        return Ok(target);
+    }
+    let directory = open_existing_dir_nofollow(cache_dir)?;
+    let mut nonce = [0_u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
+        .map_err(|_| invalid_feed("could not mint a download cache name"))?;
+    let temp_string = format!(".download-{}", URL_SAFE_NO_PAD.encode(nonce));
+    let temp = c_name(temp_string.as_bytes(), &temp_string)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut output = unsafe { std::fs::File::from_raw_fd(fd) };
+    let response = match presigned_agent(cfg, url)?.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => {
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+            return Err(LinkError::Http {
+                what: "v2 direct download",
+                status: response.status(),
+                message: "object store rejected the download".to_string(),
+                code: None,
+                details: None,
+            });
+        }
+        Err(ureq::Error::Transport(error)) => {
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+            return Err(LinkError::Transport {
+                hub: cfg.hub.clone(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let mut reader = response
+        .into_reader()
+        .take(expected_bytes.saturating_add(1));
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    let write_result = (|| -> std::io::Result<()> {
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            digest.update(&buffer[..read]);
+            output.write_all(&buffer[..read])?;
+        }
+        output.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    drop(output);
+    if total != expected_bytes || format!("{:x}", digest.finalize()) != sha256 {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(invalid_feed(
+            "v2 direct download failed integrity verification",
+        ));
+    }
+    let target_name = c_name(sha256.as_bytes(), sha256)?;
+    // Replace only a previously inspected cache leaf. Cache bytes are private
+    // and content-addressed; final install re-verifies them again.
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            directory.as_raw_fd(),
+            target_name.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    directory.sync_all()?;
+    Ok(target)
+}
+
+#[cfg(windows)]
+fn download_presigned_to_cache(
+    cfg: &HubConfig,
+    url: &str,
+    cache_dir: &Path,
+    sha256: &str,
+    expected_bytes: u64,
+) -> LinkResult<PathBuf> {
+    use std::fs::OpenOptions;
+
+    let target = cache_dir.join(sha256);
+    if cached_blob_is_exact(&target, sha256, expected_bytes)? {
+        return Ok(target);
+    }
+    // Keep the checked directory handle alive while the private cache path is
+    // used. Windows opens omit FILE_SHARE_DELETE, so neither this directory nor
+    // an ancestor can be swapped after validation.
+    let _directory = crate::fsx::open_directory_nofollow(cache_dir)?;
+    let temp = cache_dir.join(format!(".download-{}", crate::ulid::mint()));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let response = match presigned_agent(cfg, url)?.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(LinkError::Http {
+                what: "v2 direct download",
+                status: response.status(),
+                message: "object store rejected the download".to_string(),
+                code: None,
+                details: None,
+            });
+        }
+        Err(ureq::Error::Transport(error)) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(LinkError::Transport {
+                hub: cfg.hub.clone(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let mut reader = response
+        .into_reader()
+        .take(expected_bytes.saturating_add(1));
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    let copied = (|| -> std::io::Result<()> {
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            digest.update(&buffer[..read]);
+            output.write_all(&buffer[..read])?;
+        }
+        output.sync_all()
+    })();
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    drop(output);
+    if total != expected_bytes || format!("{:x}", digest.finalize()) != sha256 {
+        let _ = std::fs::remove_file(&temp);
+        return Err(invalid_feed(
+            "v2 direct download failed integrity verification",
+        ));
+    }
+    if target.exists() {
+        std::fs::remove_file(&target)?;
+    }
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(target)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn download_presigned_to_cache(
+    _cfg: &HubConfig,
+    _url: &str,
+    _cache_dir: &Path,
+    _sha256: &str,
+    _expected_bytes: u64,
+) -> LinkResult<PathBuf> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "resumable v2 download staging",
+    })
 }
 
 fn download_v2_blobs(
@@ -4444,7 +5006,47 @@ fn download_v2_blobs(
     if pending.is_empty() {
         return Ok(Vec::new());
     }
-    let downloads = prepare_v2_downloads(cfg, brain, pointer, &pending)?;
+    let expected_order = pending
+        .iter()
+        .map(|(path, _)| (*path).clone())
+        .collect::<Vec<_>>();
+    let mut streamed = std::collections::BTreeMap::new();
+    let mut direct = Vec::new();
+    let mut window = Vec::new();
+    let mut window_bytes = 0_u64;
+    let flush = |window: &mut Vec<(&String, &V2BaselineFile)>,
+                 window_bytes: &mut u64,
+                 streamed: &mut std::collections::BTreeMap<String, Vec<u8>>|
+     -> LinkResult<()> {
+        if window.is_empty() {
+            return Ok(());
+        }
+        for (path, bytes) in download_v2_bulk_stream(cfg, brain, pointer, window)? {
+            if streamed.insert(path, bytes).is_some() {
+                return Err(invalid_feed("v2 bulk streams repeated a path"));
+            }
+        }
+        window.clear();
+        *window_bytes = 0;
+        Ok(())
+    };
+    for &(path, file) in &pending {
+        if file.bytes > V2_BULK_STREAM_CONTENT_BYTES {
+            flush(&mut window, &mut window_bytes, &mut streamed)?;
+            direct.push((path, file));
+            continue;
+        }
+        if window.len() == V2_BULK_STREAM_FILES
+            || window_bytes.saturating_add(file.bytes) > V2_BULK_STREAM_CONTENT_BYTES
+        {
+            flush(&mut window, &mut window_bytes, &mut streamed)?;
+        }
+        window.push((path, file));
+        window_bytes += file.bytes;
+    }
+    flush(&mut window, &mut window_bytes, &mut streamed)?;
+
+    let downloads = prepare_v2_downloads(cfg, brain, pointer, &direct)?;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let worker_count = downloads.len().min(V2_BLOB_DOWNLOAD_WORKERS);
     let mut results = std::iter::repeat_with(|| None)
@@ -4472,15 +5074,367 @@ fn download_v2_blobs(
             results[index] = Some(result);
         }
     });
-    results
+    for result in results.into_iter().map(|result| {
+        result.ok_or_else(|| LinkError::Transport {
+            hub: cfg.hub.clone(),
+            message: "a bounded v2 blob worker stopped before reporting its result".to_string(),
+        })?
+    }) {
+        let (path, bytes) = result?;
+        if streamed.insert(path, bytes).is_some() {
+            return Err(invalid_feed("v2 download lanes repeated a path"));
+        }
+    }
+    expected_order
         .into_iter()
-        .map(|result| {
-            result.ok_or_else(|| LinkError::Transport {
-                hub: cfg.hub.clone(),
-                message: "a bounded v2 blob worker stopped before reporting its result".to_string(),
-            })?
+        .map(|path| {
+            streamed
+                .remove(&path)
+                .map(|bytes| (path, bytes))
+                .ok_or_else(|| invalid_feed("v2 download lanes omitted a proven path"))
         })
         .collect()
+}
+
+/// Resume an exact-head materialization into the private global cache. Each
+/// verified frame is durable before the next network window begins, so a
+/// retry skips it and memory never grows with total changed bytes.
+#[cfg(any(unix, windows))]
+fn stage_v2_blobs(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    pending: Vec<(&String, &V2BaselineFile)>,
+) -> LinkResult<Vec<V2StagedFile>> {
+    let cache_dir = v2_download_cache_dir(cfg, brain, pointer)?;
+    let mut staged = std::collections::BTreeMap::<String, V2StagedFile>::new();
+    let mut direct = Vec::new();
+    let mut window = Vec::new();
+    let mut window_bytes = 0_u64;
+    let flush = |window: &mut Vec<(&String, &V2BaselineFile)>,
+                 window_bytes: &mut u64,
+                 staged: &mut std::collections::BTreeMap<String, V2StagedFile>|
+     -> LinkResult<()> {
+        if window.is_empty() {
+            return Ok(());
+        }
+        let missing = window
+            .iter()
+            .filter_map(|(path, file)| {
+                let target = cache_dir.join(&file.sha256);
+                match cached_blob_is_exact(&target, &file.sha256, file.bytes) {
+                    Ok(true) => {
+                        staged.insert(
+                            (*path).clone(),
+                            V2StagedFile {
+                                path: (*path).clone(),
+                                source: target,
+                                sha256: file.sha256.clone(),
+                                bytes: file.bytes,
+                            },
+                        );
+                        None
+                    }
+                    Ok(false) => Some(Ok((*path, *file))),
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<LinkResult<Vec<_>>>()?;
+        if !missing.is_empty() {
+            for (path, bytes) in download_v2_bulk_stream(cfg, brain, pointer, &missing)? {
+                let file = missing
+                    .iter()
+                    .find_map(|(expected_path, file)| (*expected_path == &path).then_some(*file))
+                    .ok_or_else(|| invalid_feed("v2 stream returned an unrequested cache path"))?;
+                let source = cache_v2_blob_bytes(&cache_dir, &file.sha256, file.bytes, &bytes)?;
+                staged.insert(
+                    path.clone(),
+                    V2StagedFile {
+                        path,
+                        source,
+                        sha256: file.sha256.clone(),
+                        bytes: file.bytes,
+                    },
+                );
+            }
+        }
+        window.clear();
+        *window_bytes = 0;
+        Ok(())
+    };
+    for &(path, file) in &pending {
+        if file.bytes > V2_BULK_STREAM_CONTENT_BYTES {
+            flush(&mut window, &mut window_bytes, &mut staged)?;
+            direct.push((path, file));
+            continue;
+        }
+        if window.len() == V2_BULK_STREAM_FILES
+            || window_bytes.saturating_add(file.bytes) > V2_BULK_STREAM_CONTENT_BYTES
+        {
+            flush(&mut window, &mut window_bytes, &mut staged)?;
+        }
+        window.push((path, file));
+        window_bytes += file.bytes;
+    }
+    flush(&mut window, &mut window_bytes, &mut staged)?;
+    for item in prepare_v2_downloads(cfg, brain, pointer, &direct)? {
+        let source =
+            download_presigned_to_cache(cfg, &item.url, &cache_dir, &item.sha256, item.bytes)?;
+        staged.insert(
+            item.path.clone(),
+            V2StagedFile {
+                path: item.path,
+                source,
+                sha256: item.sha256,
+                bytes: item.bytes,
+            },
+        );
+    }
+    pending
+        .into_iter()
+        .map(|(path, _)| {
+            staged
+                .remove(path)
+                .ok_or_else(|| invalid_feed("v2 download cache omitted a proven path"))
+        })
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stage_v2_blobs(
+    _cfg: &HubConfig,
+    _brain: &str,
+    _pointer: &V2PointerBody,
+    _pending: Vec<(&String, &V2BaselineFile)>,
+) -> LinkResult<Vec<V2StagedFile>> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "resumable v2 download staging",
+    })
+}
+
+const V2_CONFLICT_BUNDLE_MAX: usize = 32;
+const V2_CONFLICT_BUNDLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const V2_CONFLICT_REMOTE_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2ConflictCoordinate {
+    sha256: Option<String>,
+    bytes: Option<u64>,
+    file: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2ConflictFile {
+    path: String,
+    base: V2ConflictCoordinate,
+    local: V2ConflictCoordinate,
+    remote: V2ConflictCoordinate,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2ConflictPlan {
+    v: u8,
+    class: String,
+    bundle: String,
+    brain: String,
+    origin: String,
+    created_unix: u64,
+    expires_unix: u64,
+    base_seq: Option<u64>,
+    base_commit: Option<String>,
+    remote_seq: u64,
+    remote_commit: Option<String>,
+    remote_content_root: Option<String>,
+    view_kind: String,
+    view_revision: String,
+    files: Vec<V2ConflictFile>,
+}
+
+fn v2_conflict_relative(bundle: &str, suffix: &str) -> PathBuf {
+    PathBuf::from(".dbmd")
+        .join("conflicts")
+        .join(bundle)
+        .join(suffix)
+}
+
+fn read_historical_conflict_blob(
+    cfg: &HubConfig,
+    brain: &str,
+    baseline: &V2SyncBaseline,
+    path: &str,
+    file: &V2BaselineFile,
+) -> LinkResult<Option<Vec<u8>>> {
+    let (Some(seq), Some(commit)) = (baseline.head_seq, baseline.commit_hash.as_deref()) else {
+        return Ok(None);
+    };
+    if seq == 0 {
+        return Ok(None);
+    }
+    let encoded_path: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+    let endpoint = format!(
+        "/api/hub/brains/{brain}/v2/history/blob?seq={seq}&commit={commit}&path={encoded_path}&sha256={}",
+        file.sha256
+    );
+    let raw = request_raw(cfg, "GET", &endpoint, None, Auth::Required, file.bytes)?;
+    if raw.status == 404 || raw.status == 403 {
+        return Ok(None);
+    }
+    let bytes = ensure_raw_ok(raw, "v2 conflict base")?;
+    if bytes.len() as u64 != file.bytes || content_sha256(&bytes) != file.sha256 {
+        return Err(invalid_feed(
+            "v2 conflict base failed integrity verification",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Persist a readable content conflict without modifying either side. The
+/// plan is written last, so an interrupted bundle build is never actionable.
+fn create_v2_conflict_bundle(
+    cfg: &HubConfig,
+    store: &Store,
+    head: &V2VerifiedHead,
+    baseline: Option<&V2SyncBaseline>,
+    local: &std::collections::BTreeMap<String, (String, u64)>,
+    remote: &std::collections::BTreeMap<String, V2BaselineFile>,
+    paths: &[String],
+) -> LinkResult<(String, Vec<String>)> {
+    let conflicts_root = Path::new(".dbmd/conflicts");
+    store.create_dir_all(conflicts_root)?;
+    let completed = store
+        .directory_names(conflicts_root)?
+        .into_iter()
+        .filter(|name| name.to_str().is_some_and(crate::ulid::is_ulid))
+        .count();
+    if completed >= V2_CONFLICT_BUNDLE_MAX {
+        return Err(LinkError::InvalidPack {
+            message: format!(
+                "private conflict cache has {completed} bundles; resolve or prune one before syncing"
+            ),
+        });
+    }
+
+    // A conflict bundle is diagnostic state, not a second whole-brain cache.
+    // Materialize a deterministic prefix whose remote artifacts fit one
+    // bounded window. Resolving it exposes the next prefix on the next sync.
+    let mut selected_paths = Vec::new();
+    let mut selected_remote_bytes = 0_u64;
+    for path in paths {
+        let bytes = remote.get(path).map_or(0, |file| file.bytes);
+        if !selected_paths.is_empty()
+            && selected_remote_bytes.saturating_add(bytes) > V2_CONFLICT_REMOTE_BYTES_MAX
+        {
+            break;
+        }
+        selected_remote_bytes = selected_remote_bytes.saturating_add(bytes);
+        selected_paths.push(path.clone());
+        if selected_remote_bytes >= V2_CONFLICT_REMOTE_BYTES_MAX {
+            break;
+        }
+    }
+    if selected_paths.is_empty() {
+        return Err(invalid_feed("content conflict set is empty"));
+    }
+    let bundle = crate::ulid::mint();
+    let bundle_root = v2_conflict_relative(&bundle, "");
+    store.create_dir_all(&bundle_root.join("files"))?;
+    let pointer = head.pointer.as_ref();
+    let remote_bytes = match pointer {
+        Some(pointer) => download_v2_blobs(
+            cfg,
+            &head.brain_id,
+            pointer,
+            selected_paths
+                .iter()
+                .filter_map(|path| {
+                    remote
+                        .get(path)
+                        .filter(|file| file.bytes <= V2_CONFLICT_REMOTE_BYTES_MAX)
+                        .map(|file| (path, file))
+                })
+                .collect(),
+        )?
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>(),
+        None => std::collections::BTreeMap::new(),
+    };
+
+    let mut files = Vec::with_capacity(selected_paths.len());
+    for (index, path) in selected_paths.iter().enumerate() {
+        let base_file = baseline.and_then(|state| state.files.get(path));
+        let base_bytes = match (baseline, base_file) {
+            (Some(state), Some(file)) => {
+                read_historical_conflict_blob(cfg, &head.brain_id, state, path, file)?
+            }
+            _ => None,
+        };
+        let local_file = local.get(path);
+        let remote_file = remote.get(path);
+        let remote_content = remote_bytes.get(path);
+        let prefix = format!("files/{index:04}");
+        let base_name = base_bytes.as_ref().map(|_| format!("{prefix}.base"));
+        let local_name = local_file.as_ref().map(|_| format!("{prefix}.local"));
+        let remote_name = remote_content.as_ref().map(|_| format!("{prefix}.remote"));
+        if let (Some(name), Some(bytes)) = (&base_name, &base_bytes) {
+            store.write_atomic_new(&v2_conflict_relative(&bundle, name), bytes)?;
+        }
+        if let (Some(name), Some((expected_hash, expected_bytes))) = (&local_name, local_file) {
+            let bytes = store.read_bounded(Path::new(path), *expected_bytes)?;
+            if bytes.len() as u64 != *expected_bytes || content_sha256(&bytes) != *expected_hash {
+                return Err(LinkError::InvalidPack {
+                    message: format!("local conflict path `{path}` changed while bundling"),
+                });
+            }
+            store.write_atomic_new(&v2_conflict_relative(&bundle, name), &bytes)?;
+        }
+        if let (Some(name), Some(bytes)) = (&remote_name, remote_content) {
+            store.write_atomic_new(&v2_conflict_relative(&bundle, name), bytes)?;
+        }
+        files.push(V2ConflictFile {
+            path: path.clone(),
+            base: V2ConflictCoordinate {
+                sha256: base_file.map(|file| file.sha256.clone()),
+                bytes: base_file.map(|file| file.bytes),
+                file: base_name,
+            },
+            local: V2ConflictCoordinate {
+                sha256: local_file.map(|(sha256, _)| sha256.clone()),
+                bytes: local_file.map(|(_, bytes)| *bytes),
+                file: local_name,
+            },
+            remote: V2ConflictCoordinate {
+                sha256: remote_file.map(|file| file.sha256.clone()),
+                bytes: remote_file.map(|file| file.bytes),
+                file: remote_name,
+            },
+        });
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let plan = V2ConflictPlan {
+        v: 2,
+        class: "content_resolution_required".to_string(),
+        bundle: bundle.clone(),
+        brain: head.brain_id.clone(),
+        origin: normalized_origin(&cfg.hub)?,
+        created_unix: now,
+        expires_unix: now.saturating_add(V2_CONFLICT_BUNDLE_TTL_SECS),
+        base_seq: baseline.and_then(|state| state.head_seq),
+        base_commit: baseline.and_then(|state| state.commit_hash.clone()),
+        remote_seq: pointer.map_or(0, |value| value.seq),
+        remote_commit: pointer.map(|value| value.commit_hash.clone()),
+        remote_content_root: pointer.and_then(|value| value.content_root.clone()),
+        view_kind: head.view_kind.clone(),
+        view_revision: head.view_revision.clone(),
+        files,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&plan)
+        .map_err(|_| invalid_feed("could not serialize v2 conflict plan"))?;
+    bytes.push(b'\n');
+    store.write_atomic_new(&v2_conflict_relative(&bundle, "plan.json"), &bytes)?;
+    Ok((bundle, selected_paths))
 }
 
 fn v2_sync_pull(
@@ -4493,6 +5447,7 @@ fn v2_sync_pull(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(requested_brain));
     let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
+    recover_windows_v2_pull(cfg, &head.brain_id, &dest)?;
     let head = v2_verified_head(cfg, requested_brain)?
         .ok_or_else(|| invalid_feed("v2 head disappeared while waiting for the checkout lock"))?;
     let remote = files_for_v2_view(
@@ -4560,6 +5515,18 @@ fn v2_sync_pull(
     }
     if !conflicts.is_empty() {
         conflicts.truncate(100);
+        if let Some(store) = local_store.as_ref() {
+            let (bundle, paths) = create_v2_conflict_bundle(
+                cfg,
+                store,
+                &head,
+                baseline.as_ref(),
+                &local,
+                &remote,
+                &conflicts,
+            )?;
+            return Err(LinkError::ConflictBundle { bundle, paths });
+        }
         return Err(LinkError::Conflict { paths: conflicts });
     }
     let asset_paths = base_assets
@@ -4588,8 +5555,13 @@ fn v2_sync_pull(
         return Err(LinkError::Conflict { paths: conflicts });
     }
     let pointer = head.pointer.as_ref();
+    let cache_transaction = pointer.map_or_else(
+        || content_sha256(format!("empty\0{}", head.view_revision).as_bytes()),
+        |value| value.commit_hash.clone(),
+    );
+    let cache_dir = v2_download_cache_dir_for(cfg, &head.brain_id, &cache_transaction)?;
     let mut changed = match pointer {
-        Some(pointer) => download_v2_blobs(
+        Some(pointer) => stage_v2_blobs(
             cfg,
             &head.brain_id,
             pointer,
@@ -4622,13 +5594,19 @@ fn v2_sync_pull(
         if remote_assets.is_empty() {
             deleted.push("assets.jsonl".to_string());
         } else {
-            changed.push((
-                "assets.jsonl".to_string(),
-                v2_asset_manifest_bytes(&remote_assets)?,
-            ));
+            let bytes = v2_asset_manifest_bytes(&remote_assets)?;
+            let sha256 = content_sha256(&bytes);
+            let source = cache_v2_blob_bytes(&cache_dir, &sha256, bytes.len() as u64, &bytes)?;
+            changed.push(V2StagedFile {
+                path: "assets.jsonl".to_string(),
+                source,
+                sha256,
+                bytes: bytes.len() as u64,
+            });
         }
     }
     if let Some(pointer) = pointer {
+        let mut pending_assets = Vec::new();
         for (path, asset) in &remote_assets {
             if asset.disposition != "hosted" || kept_home(path) {
                 continue;
@@ -4644,11 +5622,18 @@ fn v2_sync_pull(
                         })
             });
             if !already_current {
-                changed.push((
-                    path.clone(),
-                    download_v2_asset(cfg, &head.brain_id, pointer, path, asset)?,
-                ));
+                pending_assets.push((path, asset));
             }
+        }
+        for item in prepare_v2_asset_downloads(cfg, &head.brain_id, pointer, &pending_assets)? {
+            let source =
+                download_presigned_to_cache(cfg, &item.url, &cache_dir, &item.sha256, item.bytes)?;
+            changed.push(V2StagedFile {
+                path: item.path,
+                source,
+                sha256: item.sha256,
+                bytes: item.bytes,
+            });
         }
     }
     for (path, prior) in &base_assets {
@@ -4672,51 +5657,78 @@ fn v2_sync_pull(
         .cloned()
         .collect::<Vec<_>>();
     if head.view_kind == "scoped" {
-        changed.push(("DB.md".to_string(), scoped_projection_bytes(&head.brain_id)));
-        changed.push((
-            ".dbmd/view.json".to_string(),
-            scoped_view_metadata(&head, remote.len())?,
-        ));
-    }
-    #[cfg(unix)]
-    install_pulled_delta(&dest, &changed, &deleted, true)?;
-    let installed_store = Store::open_strict(&dest).map_err(|error| LinkError::InvalidPack {
-        message: format!("installed v2 checkout is not a valid db.md store: {error}"),
-    })?;
-    let mut installed_local = v2_local_files(&installed_store)?;
-    remove_scoped_projection(&head, baseline.as_ref(), &mut installed_local)?;
-    let mut expected_local = local.clone();
-    for (path, file) in &remote {
-        if !kept_home(path) {
-            expected_local.insert(path.clone(), (file.sha256.clone(), Vec::new()));
+        for (path, bytes) in [
+            ("DB.md".to_string(), scoped_projection_bytes(&head.brain_id)),
+            (
+                ".dbmd/view.json".to_string(),
+                scoped_view_metadata(&head, remote.len())?,
+            ),
+        ] {
+            let sha256 = content_sha256(&bytes);
+            let source = cache_v2_blob_bytes(&cache_dir, &sha256, bytes.len() as u64, &bytes)?;
+            changed.push(V2StagedFile {
+                path,
+                source,
+                sha256,
+                bytes: bytes.len() as u64,
+            });
         }
     }
-    for path in &deleted {
-        expected_local.remove(path);
-    }
-    let local_dirty = installed_local.riding.iter().any(|(path, (hash, _))| {
-        expected_local.get(path).map(|expected| &expected.0) != Some(hash)
-    }) || expected_local.iter().any(|(path, (hash, _))| {
-        installed_local.riding.get(path).map(|actual| &actual.0) != Some(hash)
-    });
-    let final_head = v2_verified_head(cfg, requested_brain)?
-        .ok_or_else(|| invalid_feed("v2 head disappeared during pull"))?;
-    if !same_v2_head(&head, &final_head) {
-        return Err(LinkError::RemoteAdvancedDuringSync);
-    }
-    accept_v2_head(cfg, &final_head)?;
-    save_v2_baseline(
-        cfg,
-        &head.brain_id,
-        &dest,
-        &v2_baseline_from_head(
+    install_pulled_delta_sources(&dest, &changed, &deleted, true, baseline.as_ref(), &head)?;
+    let finalized = (|| -> LinkResult<bool> {
+        let installed_store =
+            Store::open_strict(&dest).map_err(|error| LinkError::InvalidPack {
+                message: format!("installed v2 checkout is not a valid db.md store: {error}"),
+            })?;
+        let mut installed_local = v2_local_files(&installed_store)?;
+        remove_scoped_projection(&head, baseline.as_ref(), &mut installed_local)?;
+        let mut expected_local = local.clone();
+        for (path, file) in &remote {
+            if !kept_home(path) {
+                expected_local.insert(path.clone(), (file.sha256.clone(), file.bytes));
+            }
+        }
+        for path in &deleted {
+            expected_local.remove(path);
+        }
+        let local_dirty = installed_local.riding.iter().any(|(path, (hash, _))| {
+            expected_local.get(path).map(|expected| &expected.0) != Some(hash)
+        }) || expected_local.iter().any(|(path, (hash, _))| {
+            installed_local.riding.get(path).map(|actual| &actual.0) != Some(hash)
+        });
+        let final_head = v2_verified_head(cfg, requested_brain)?
+            .ok_or_else(|| invalid_feed("v2 head disappeared during pull"))?;
+        if !same_v2_head(&head, &final_head) {
+            return Err(LinkError::RemoteAdvancedDuringSync);
+        }
+        accept_v2_head(cfg, &final_head)?;
+        save_v2_baseline(
             cfg,
-            &head,
-            remote.clone(),
-            remote_assets.clone(),
-            Some(&installed_local),
-        )?,
-    )?;
+            &head.brain_id,
+            &dest,
+            &v2_baseline_from_head(
+                cfg,
+                &head,
+                remote.clone(),
+                remote_assets.clone(),
+                Some(&installed_local),
+            )?,
+        )?;
+        complete_windows_v2_pull(&dest)?;
+        Ok(local_dirty)
+    })();
+    let local_dirty = match finalized {
+        Ok(value) => value,
+        Err(error) => {
+            if let Err(recovery) = recover_windows_v2_pull(cfg, &head.brain_id, &dest) {
+                return Err(LinkError::InvalidPack {
+                    message: format!("{error}; durable pull recovery also failed: {recovery}"),
+                });
+            }
+            return Err(error);
+        }
+    };
+    cleanup_v2_download_cache(cfg, &head.brain_id, &cache_transaction);
     Ok(PullReport {
         brain: head.brain_id,
         slug: requested_brain.to_string(),
@@ -4758,7 +5770,7 @@ fn v2_asset_value(record: &crate::AssetRecord, disposition: &str) -> Value {
 }
 
 fn v2_riding_matches_remote(
-    local: &std::collections::BTreeMap<String, (String, Vec<u8>)>,
+    local: &std::collections::BTreeMap<String, (String, u64)>,
     remote: &std::collections::BTreeMap<String, V2BaselineFile>,
     keeps_home: impl Fn(&str) -> bool,
 ) -> bool {
@@ -4770,6 +5782,97 @@ fn v2_riding_matches_remote(
     })
 }
 
+#[derive(Debug, Clone)]
+struct V2ResolutionOverride {
+    expected_remote: Option<String>,
+    selected_local: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct V2UploadSource {
+    path: String,
+    bytes: u64,
+}
+
+fn verify_v2_upload_source(
+    store: &Store,
+    path: &str,
+    sha256: &str,
+    expected_bytes: u64,
+) -> LinkResult<()> {
+    let file = store.open_regular(Path::new(path))?;
+    if file.metadata()?.len() != expected_bytes || content_sha256_reader(file)? != sha256 {
+        return Err(LinkError::InvalidPack {
+            message: format!("local path `{path}` changed during sync planning"),
+        });
+    }
+    Ok(())
+}
+
+fn put_presigned_source(
+    cfg: &HubConfig,
+    raw: &str,
+    headers: &Value,
+    store: &Store,
+    source: &V2UploadSource,
+) -> LinkResult<()> {
+    let http = presigned_agent(cfg, raw)?;
+    let mut attempt = 0;
+    let result = loop {
+        let file = store.open_regular(Path::new(&source.path))?;
+        if file.metadata()?.len() != source.bytes {
+            return Err(LinkError::InvalidPack {
+                message: format!("local path `{}` changed before upload", source.path),
+            });
+        }
+        let mut req = http
+            .put(raw)
+            .set("Content-Length", &source.bytes.to_string());
+        if let Some(map) = headers.as_object() {
+            for (name, value) in map {
+                if let Some(value) = value.as_str() {
+                    req = req.set(name, value);
+                }
+            }
+        }
+        match req.send(file) {
+            Err(ureq::Error::Transport(error))
+                if is_pre_request_transport(error.kind()) && attempt + 1 < CONNECT_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    CONNECT_RETRY_BACKOFF_MS[attempt],
+                ));
+                attempt += 1;
+            }
+            result => break result,
+        }
+    };
+    match result {
+        Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+        Ok(response) => Err(LinkError::Http {
+            what: "v2 changed-byte upload",
+            status: response.status(),
+            message: "object store rejected the upload".to_string(),
+            code: None,
+            details: None,
+        }),
+        Err(error) => match error {
+            ureq::Error::Status(412, _) => Ok(()),
+            ureq::Error::Status(_, response) => Err(LinkError::Http {
+                what: "v2 changed-byte upload",
+                status: response.status(),
+                message: "object store rejected the upload".to_string(),
+                code: None,
+                details: None,
+            }),
+            ureq::Error::Transport(error) => Err(LinkError::Transport {
+                hub: "the object store".to_string(),
+                message: error.to_string(),
+            }),
+        },
+    }
+}
+
 fn v2_sync_push(
     cfg: &HubConfig,
     requested_brain: &str,
@@ -4777,6 +5880,7 @@ fn v2_sync_push(
     head: V2VerifiedHead,
     resume_local_policy: bool,
     bulk_confirmation: Option<&V2BulkConfirmation>,
+    resolution: Option<&std::collections::BTreeMap<String, V2ResolutionOverride>>,
 ) -> LinkResult<Value> {
     let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
     let head = v2_verified_head(cfg, requested_brain)?
@@ -4830,7 +5934,9 @@ fn v2_sync_push(
                 .collect::<Vec<_>>();
             if !conflicts.is_empty() {
                 conflicts.truncate(100);
-                return Err(LinkError::Conflict { paths: conflicts });
+                let (bundle, paths) =
+                    create_v2_conflict_bundle(cfg, store, &head, None, local, &remote, &conflicts)?;
+                return Err(LinkError::ConflictBundle { bundle, paths });
             }
             remote.clone()
         }
@@ -4843,8 +5949,7 @@ fn v2_sync_push(
         .collect::<std::collections::BTreeSet<_>>();
     let mut conflicts = Vec::new();
     let mut operations = Vec::new();
-    let mut blobs = Vec::new();
-    let mut upload_bytes = std::collections::BTreeMap::<String, Vec<u8>>::new();
+    let mut upload_sources = std::collections::BTreeMap::<String, V2UploadSource>::new();
     for path in all_paths {
         let base_hash = base.get(&path).map(|file| file.sha256.as_str());
         let remote_file = remote.get(&path);
@@ -4854,30 +5959,42 @@ fn v2_sync_push(
         if local_hash == base_hash {
             continue;
         }
+        if resolution.is_some_and(|allowed| !allowed.contains_key(&path)) {
+            continue;
+        }
         if local_view.policy.keeps_home(&path) {
             // Kept-home is a local transfer exclusion, never an implicit
             // delete of the company's already-hosted coordinate.
             continue;
         }
         if remote_hash != base_hash && local_hash != remote_hash {
-            conflicts.push(path);
-            continue;
+            let explicitly_resolved = resolution
+                .and_then(|allowed| allowed.get(&path))
+                .is_some_and(|selected| {
+                    selected.expected_remote.as_deref() == remote_hash
+                        && selected.selected_local.as_deref() == local_hash
+                });
+            if !explicitly_resolved {
+                conflicts.push(path);
+                continue;
+            }
         }
         match local_file {
-            Some((sha256, bytes)) => {
+            Some((sha256, byte_count)) => {
+                verify_v2_upload_source(store, &path, sha256, *byte_count)?;
                 operations.push(json!({
                     "op": "put",
                     "path": path,
                     "expected": v2_expected(remote_file),
                     "blob": sha256,
-                    "bytes": bytes.len(),
+                    "bytes": byte_count,
                 }));
-                blobs.push(json!({
-                    "sha256": sha256,
-                    "bytes": bytes.len(),
-                    "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-                }));
-                upload_bytes.insert(sha256.clone(), bytes.clone());
+                upload_sources
+                    .entry(sha256.clone())
+                    .or_insert_with(|| V2UploadSource {
+                        path: path.clone(),
+                        bytes: *byte_count,
+                    });
             }
             None => {
                 let Some(current) = remote_file else {
@@ -4890,6 +6007,19 @@ fn v2_sync_push(
                 }));
             }
         }
+    }
+    if !conflicts.is_empty() {
+        conflicts.truncate(100);
+        let (bundle, paths) = create_v2_conflict_bundle(
+            cfg,
+            store,
+            &head,
+            baseline.as_ref(),
+            local,
+            &remote,
+            &conflicts,
+        )?;
+        return Err(LinkError::ConflictBundle { bundle, paths });
     }
     let base_assets = match baseline.as_ref() {
         Some(state) => state.assets.clone(),
@@ -4940,13 +6070,8 @@ fn v2_sync_push(
             .map_err(|error| invalid_feed(error.to_string()))?;
         let kept_home = local_view.policy.keeps_home(&path);
         let raw = if matches!(store.regular_file_exists(Path::new(&path)), Ok(true)) {
-            let bytes = store.read_bounded(Path::new(&path), record.bytes)?;
-            if bytes.len() as u64 != record.bytes || content_sha256(&bytes) != record.sha256 {
-                return Err(LinkError::InvalidPack {
-                    message: format!("asset {path} differs from assets.jsonl"),
-                });
-            }
-            Some(bytes)
+            verify_v2_upload_source(store, &path, &record.sha256, record.bytes)?;
+            Some(())
         } else {
             None
         };
@@ -4979,13 +6104,13 @@ fn v2_sync_push(
             "asset": v2_asset_value(record, disposition),
         }));
         if disposition == "hosted" {
-            let bytes = raw.expect("hosted asset was checked present");
-            blobs.push(json!({
-                "sha256": record.sha256,
-                "bytes": bytes.len(),
-                "content_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            }));
-            upload_bytes.insert(record.sha256.clone(), bytes);
+            raw.expect("hosted asset was checked present");
+            upload_sources
+                .entry(record.sha256.clone())
+                .or_insert_with(|| V2UploadSource {
+                    path: path.clone(),
+                    bytes: record.bytes,
+                });
         }
     }
     if !conflicts.is_empty() {
@@ -5118,13 +6243,41 @@ fn v2_sync_push(
             _ => return Err(invalid_feed("dbmd generated an unsupported v2 operation")),
         }
     }
+    let changed_bytes = upload_sources.values().try_fold(0_u64, |total, source| {
+        total
+            .checked_add(source.bytes)
+            .ok_or_else(|| LinkError::PushTooLarge {
+                detail: "v2 changed-byte total overflow".to_string(),
+            })
+    })?;
+    let inline = changed_bytes <= 3 * 1024 * 1024;
+    let inline_blobs = if inline {
+        upload_sources
+            .iter()
+            .map(|(sha256, source)| {
+                let bytes = store.read_bounded(Path::new(&source.path), source.bytes)?;
+                if bytes.len() as u64 != source.bytes || content_sha256(&bytes) != *sha256 {
+                    return Err(LinkError::InvalidPack {
+                        message: format!("local path `{}` changed before upload", source.path),
+                    });
+                }
+                Ok(json!({
+                    "sha256": sha256,
+                    "bytes": source.bytes,
+                    "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }))
+            })
+            .collect::<LinkResult<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let mut body = json!({
         "mutation_id": mutation_id,
         "base": base_value,
         "rebase": rebase,
         "reason": "dbmd sync",
         "operations": operations,
-        "blobs": blobs,
+        "blobs": inline_blobs,
     });
     if let Some(confirmation) = bulk_confirmation {
         if !crate::ulid::is_ulid(&confirmation.id) || !is_sha256(&confirmation.digest) {
@@ -5140,14 +6293,7 @@ fn v2_sync_push(
         body["bulk_preview_id"] = Value::String(confirmation.id.clone());
         body["bulk_preview_digest"] = Value::String(confirmation.digest.clone());
     }
-    let changed_bytes = upload_bytes.values().try_fold(0_usize, |total, bytes| {
-        total
-            .checked_add(bytes.len())
-            .ok_or_else(|| LinkError::PushTooLarge {
-                detail: "v2 changed-byte total overflow".to_string(),
-            })
-    })?;
-    if changed_bytes > 3 * 1024 * 1024 || body.to_string().len() > MAX_PUSH_BYTES - 64 * 1024 {
+    if !inline || body.to_string().len() > MAX_PUSH_BYTES - 64 * 1024 {
         let mut coordinates_by_hash: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for operation in &operations {
             let Some(kind) = operation.get("op").and_then(Value::as_str) else {
@@ -5185,12 +6331,12 @@ fn v2_sync_push(
                 });
             }
         }
-        let declarations = upload_bytes
+        let declarations = upload_sources
             .iter()
-            .map(|(sha256, bytes)| {
+            .map(|(sha256, source)| {
                 json!({
                     "sha256": sha256,
-                    "bytes": bytes.len(),
+                    "bytes": source.bytes,
                     "coordinates": coordinates_by_hash
                         .get(sha256)
                         .into_iter()
@@ -5213,7 +6359,7 @@ fn v2_sync_push(
             .get("uploads")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid_feed("v2 upload reservation response has no items"))?;
-        if items.len() != upload_bytes.len() {
+        if items.len() != upload_sources.len() {
             return Err(invalid_feed(
                 "v2 upload reservation response changed the requested set",
             ));
@@ -5225,7 +6371,7 @@ fn v2_sync_push(
                 .get("sha256")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid_feed("v2 upload reservation has no hash"))?;
-            let bytes = upload_bytes
+            let source = upload_sources
                 .get(sha256)
                 .ok_or_else(|| invalid_feed("v2 upload reservation introduced a blob"))?;
             let declared_bytes = item
@@ -5243,7 +6389,7 @@ fn v2_sync_push(
                 .get("coordinates")
                 .and_then(Value::as_array)
                 .ok_or_else(|| invalid_feed("v2 upload reservation has no coordinates"))?;
-            if declared_bytes != bytes.len() as u64
+            if declared_bytes != source.bytes
                 || !crate::ulid::is_ulid(reservation_id)
                 || !seen.insert(sha256.to_string())
                 || returned_coordinates.len() != expected_coordinates.len()
@@ -5260,14 +6406,21 @@ fn v2_sync_push(
                         .get("url")
                         .and_then(Value::as_str)
                         .ok_or_else(|| invalid_feed("v2 upload reservation has no URL"))?;
-                    put_presigned(cfg, url, item.get("headers").unwrap_or(&Value::Null), bytes)?;
+                    put_presigned_source(
+                        cfg,
+                        url,
+                        item.get("headers").unwrap_or(&Value::Null),
+                        store,
+                        source,
+                    )?;
+                    verify_v2_upload_source(store, &source.path, sha256, source.bytes)?;
                 }
                 Some("already_present") => {}
                 _ => return Err(invalid_feed("v2 upload reservation has an unknown status")),
             }
             references.push(json!({
                 "sha256": sha256,
-                "bytes": bytes.len(),
+                "bytes": source.bytes,
                 "reservation_id": reservation_id,
             }));
         }
@@ -5461,8 +6614,33 @@ pub fn sync_push_incremental_with_options(
             head,
             resume_local_policy,
             bulk_confirmation,
+            None,
         );
     }
+    legacy_sync_push_incremental(cfg, brain, store, resume_local_policy, bulk_confirmation)
+}
+
+#[cfg(windows)]
+fn legacy_sync_push_incremental(
+    _cfg: &HubConfig,
+    _brain: &str,
+    _store: &Store,
+    _resume_local_policy: bool,
+    _bulk_confirmation: Option<&V2BulkConfirmation>,
+) -> LinkResult<Value> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "legacy v1 whole-snapshot push on Windows; upgrade the brain to link.md v2",
+    })
+}
+
+#[cfg(not(windows))]
+fn legacy_sync_push_incremental(
+    cfg: &HubConfig,
+    brain: &str,
+    store: &Store,
+    resume_local_policy: bool,
+    bulk_confirmation: Option<&V2BulkConfirmation>,
+) -> LinkResult<Value> {
     if resume_local_policy || bulk_confirmation.is_some() {
         return Err(LinkError::InvalidPack {
             message: "v2 sync options require a link.md v2 brain".to_string(),
@@ -5470,6 +6648,293 @@ pub fn sync_push_incremental_with_options(
     }
     let files = collect_push_files(store)?;
     sync_push(cfg, brain, &files)
+}
+
+/// One explicit resolution for a previously preserved private conflict bundle.
+#[derive(Debug, Clone)]
+pub enum V2ConflictChoice {
+    KeepLocal,
+    TakeRemote,
+    From(PathBuf),
+}
+
+fn load_v2_conflict_plan(store: &Store, bundle: &str) -> LinkResult<V2ConflictPlan> {
+    if !crate::ulid::is_ulid(bundle) {
+        return Err(LinkError::InvalidPack {
+            message: "conflict bundle must be a lowercase ULID".to_string(),
+        });
+    }
+    let bytes = store.read_bounded(&v2_conflict_relative(bundle, "plan.json"), 1024 * 1024)?;
+    let plan: V2ConflictPlan = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_feed("private conflict plan is corrupt"))?;
+    if plan.v != 2
+        || plan.class != "content_resolution_required"
+        || plan.bundle != bundle
+        || !crate::ulid::is_ulid(&plan.brain)
+        || plan.files.is_empty()
+        || plan.files.len() > 100
+        || plan.files.iter().any(|file| {
+            crate::linkmd_v2::normalize_path(&file.path).is_err()
+                || [&file.base, &file.local, &file.remote]
+                    .into_iter()
+                    .any(|coordinate| {
+                        coordinate
+                            .sha256
+                            .as_deref()
+                            .is_some_and(|hash| !is_sha256(hash))
+                            || coordinate.file.as_deref().is_some_and(|name| {
+                                name.starts_with('/')
+                                    || name
+                                        .split('/')
+                                        .any(|part| part.is_empty() || part == "." || part == "..")
+                            })
+                    })
+        })
+    {
+        return Err(invalid_feed("private conflict plan failed validation"));
+    }
+    Ok(plan)
+}
+
+/// Inspect or prune private conflict-control state. Ordinary pruning removes
+/// only expired completed bundles and interrupted bundles with no `plan.json`;
+/// corrupt completed plans fail closed. `all` is an explicit local discard of
+/// every well-addressed bundle and never changes hosted brain data.
+pub fn sync_conflicts(checkout: &Path, prune: bool, all: bool) -> LinkResult<Value> {
+    require_hardened_filesystem("private conflict maintenance")?;
+    if all && !prune {
+        return Err(LinkError::InvalidPack {
+            message: "discarding all conflict bundles requires prune=true".to_string(),
+        });
+    }
+    let store = Store::open_strict(checkout).map_err(|error| LinkError::InvalidPack {
+        message: format!("conflict checkout is not a valid db.md store: {error}"),
+    })?;
+    let _transaction = store.transaction()?;
+    let root = Path::new(".dbmd/conflicts");
+    let names = match store.directory_names(root) {
+        Ok(names) => names,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut bundles = Vec::new();
+    let mut pruned = 0_u64;
+    for name in names {
+        let Some(bundle) = name.to_str().filter(|value| crate::ulid::is_ulid(value)) else {
+            continue;
+        };
+        let plan_path = v2_conflict_relative(bundle, "plan.json");
+        let plan_exists = store.regular_file_exists(&plan_path)?;
+        let expired = if plan_exists {
+            match load_v2_conflict_plan(&store, bundle) {
+                Ok(plan) => plan.expires_unix < now,
+                Err(error) if all => {
+                    let _ = error;
+                    true
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            true
+        };
+        if prune && (all || expired) {
+            store.remove_private_tree(&v2_conflict_relative(bundle, ""))?;
+            pruned += 1;
+            continue;
+        }
+        bundles.push(json!({
+            "bundle": bundle,
+            "complete": plan_exists,
+            "expired": expired,
+        }));
+    }
+    Ok(json!({
+        "v": 2,
+        "class": "private_conflict_state",
+        "bundles": bundles.len(),
+        "pruned": pruned,
+        "items": bundles,
+    }))
+}
+
+/// Resolve one exact private conflict plan. Drift never lowers a precondition:
+/// the remote head/view and every original local coordinate are rechecked
+/// before either an explicit local install or a fresh normal commit.
+pub fn sync_resolve_conflict(
+    cfg: &HubConfig,
+    checkout: &Path,
+    bundle: &str,
+    choice: V2ConflictChoice,
+    bulk_confirmation: Option<&V2BulkConfirmation>,
+) -> LinkResult<Value> {
+    require_hardened_filesystem("conflict resolution")?;
+    let store = Store::open_strict(checkout).map_err(|error| LinkError::InvalidPack {
+        message: format!("conflict checkout is not a valid db.md store: {error}"),
+    })?;
+    let plan = load_v2_conflict_plan(&store, bundle)?;
+    if plan.origin != normalized_origin(&cfg.hub)? {
+        return Err(invalid_feed(
+            "conflict bundle belongs to another hub origin",
+        ));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now > plan.expires_unix {
+        return Err(LinkError::InvalidPack {
+            message: "conflict bundle expired; rerun sync to obtain current coordinates"
+                .to_string(),
+        });
+    }
+    let head = v2_verified_head(cfg, &plan.brain)?
+        .ok_or_else(|| invalid_feed("conflict brain no longer advertises v2"))?;
+    let pointer = head.pointer.as_ref();
+    if pointer.map_or(0, |value| value.seq) != plan.remote_seq
+        || pointer.map(|value| value.commit_hash.as_str()) != plan.remote_commit.as_deref()
+        || pointer.and_then(|value| value.content_root.as_deref())
+            != plan.remote_content_root.as_deref()
+        || head.view_kind != plan.view_kind
+        || head.view_revision != plan.view_revision
+    {
+        return Err(LinkError::RemoteAdvancedDuringSync);
+    }
+
+    // A resolution never overwrites a post-bundle local edit.
+    for file in &plan.files {
+        let actual = match store.regular_file_exists(Path::new(&file.path))? {
+            true => Some(content_sha256(&store.read_bounded(
+                Path::new(&file.path),
+                file.local.bytes.unwrap_or(MAX_STORE_BYTES),
+            )?)),
+            false => None,
+        };
+        if actual.as_deref() != file.local.sha256.as_deref() {
+            return Err(LinkError::InvalidPack {
+                message: format!(
+                    "local conflict path `{}` changed after the bundle was created",
+                    file.path
+                ),
+            });
+        }
+    }
+
+    let from_source = match &choice {
+        V2ConflictChoice::From(source) => Some(source.clone()),
+        _ => None,
+    };
+    let result = match choice {
+        V2ConflictChoice::TakeRemote => {
+            if bulk_confirmation.is_some() {
+                return Err(LinkError::InvalidPack {
+                    message: "bulk confirmation applies to keep-local/from commits, not a local take-remote install".to_string(),
+                });
+            }
+            let mut remote_files = std::collections::BTreeMap::new();
+            let mut deleted = Vec::new();
+            for file in &plan.files {
+                match (&file.remote.sha256, file.remote.bytes) {
+                    (Some(sha256), Some(bytes)) => {
+                        remote_files.insert(
+                            file.path.clone(),
+                            V2BaselineFile {
+                                sha256: sha256.clone(),
+                                bytes,
+                                proof: None,
+                            },
+                        );
+                    }
+                    (None, None) => deleted.push(file.path.clone()),
+                    _ => return Err(invalid_feed("conflict remote coordinate is incomplete")),
+                }
+            }
+            let staged = match head.pointer.as_ref() {
+                Some(pointer) => {
+                    stage_v2_blobs(cfg, &plan.brain, pointer, remote_files.iter().collect())?
+                }
+                None if remote_files.is_empty() => Vec::new(),
+                None => return Err(invalid_feed("conflict head has no content pointer")),
+            };
+            let baseline = load_v2_baseline(cfg, &plan.brain, checkout)?;
+            install_pulled_delta_sources(
+                checkout,
+                &staged,
+                &deleted,
+                true,
+                baseline.as_ref(),
+                &head,
+            )?;
+            complete_windows_v2_pull(checkout)?;
+            let refreshed = v2_verified_head(cfg, &plan.brain)?
+                .ok_or_else(|| invalid_feed("conflict brain disappeared during resolution"))?;
+            serde_json::to_value(v2_sync_pull(cfg, &plan.brain, refreshed, Some(checkout))?)
+                .map_err(|_| invalid_feed("could not serialize conflict pull receipt"))?
+        }
+        V2ConflictChoice::KeepLocal | V2ConflictChoice::From(_) => {
+            if let Some(source) = from_source.as_ref() {
+                if plan.files.len() != 1 {
+                    return Err(LinkError::InvalidPack {
+                        message: "--from requires a bundle with exactly one conflict".to_string(),
+                    });
+                }
+                let candidate = crate::fsx::read_bounded_nofollow(source, MAX_STORE_BYTES)?;
+                if std::str::from_utf8(&candidate).is_err() {
+                    return Err(LinkError::NotUtf8 {
+                        path: source.display().to_string(),
+                    });
+                }
+                store.write_atomic(Path::new(&plan.files[0].path), &candidate)?;
+            }
+            let refreshed_store =
+                Store::open_strict(checkout).map_err(|error| LinkError::InvalidPack {
+                    message: format!("resolved checkout is not a valid db.md store: {error}"),
+                })?;
+            let mut overrides = std::collections::BTreeMap::new();
+            for file in &plan.files {
+                let selected_local = match refreshed_store
+                    .regular_file_exists(Path::new(&file.path))?
+                {
+                    true => Some(content_sha256(
+                        &refreshed_store.read_bounded(Path::new(&file.path), MAX_STORE_BYTES)?,
+                    )),
+                    false => None,
+                };
+                overrides.insert(
+                    file.path.clone(),
+                    V2ResolutionOverride {
+                        expected_remote: file.remote.sha256.clone(),
+                        selected_local,
+                    },
+                );
+            }
+            v2_sync_push(
+                cfg,
+                &plan.brain,
+                &refreshed_store,
+                head,
+                true,
+                bulk_confirmation,
+                Some(&overrides),
+            )?
+        }
+    };
+
+    if result.get("code").and_then(Value::as_str) != Some("proposal_queued") {
+        let installed = Store::open_strict(checkout).map_err(|error| LinkError::InvalidPack {
+            message: format!("resolved checkout is not a valid db.md store: {error}"),
+        })?;
+        installed.remove_private_tree(&v2_conflict_relative(bundle, ""))?;
+    }
+    Ok(json!({
+        "v": 2,
+        "class": "auto_converged",
+        "bundle": bundle,
+        "receipt": result,
+    }))
 }
 
 /// Converge one established permissioned-v2 checkout in both directions.
@@ -5520,6 +6985,7 @@ pub fn sync_converge_with_options(
         fresh,
         resume_local_policy,
         bulk_confirmation,
+        None,
     )?;
     if let Some(object) = result.as_object_mut() {
         object.insert("pulled_files".to_string(), json!(pulled.files));
@@ -5543,6 +7009,18 @@ pub fn sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult
     if let Some(head) = v2_verified_head(cfg, brain)? {
         return v2_sync_pull(cfg, brain, head, out);
     }
+    legacy_sync_pull(cfg, brain, out)
+}
+
+#[cfg(windows)]
+fn legacy_sync_pull(_cfg: &HubConfig, _brain: &str, _out: Option<&Path>) -> LinkResult<PullReport> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "legacy v1 whole-snapshot pull on Windows; upgrade the brain to link.md v2",
+    })
+}
+
+#[cfg(not(windows))]
+fn legacy_sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult<PullReport> {
     let remote = verified_remote_head(cfg, brain, false)?;
     if !remote.head.verified {
         return Err(invalid_feed(
@@ -6135,6 +7613,115 @@ fn write_pull_entries_beneath_dir(
 }
 
 #[cfg(unix)]
+fn write_pull_sources_beneath_dir(
+    root: &std::fs::File,
+    entries: &[V2StagedFile],
+) -> LinkResult<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    for entry in entries {
+        let path = &entry.path;
+        let components: Vec<&str> = path.split('/').collect();
+        let (leaf, parents) = components
+            .split_last()
+            .ok_or_else(|| LinkError::UnsafePath { path: path.clone() })?;
+        let mut directory = root.try_clone()?;
+        for component in parents {
+            let name = c_name(component.as_bytes(), path)?;
+            let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if made != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(error.into());
+                }
+            }
+            directory = open_dir_at(directory.as_raw_fd(), &name, path)?;
+        }
+        let leaf_name = c_name(leaf.as_bytes(), path)?;
+        let mut existing: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                leaf_name.as_ptr(),
+                &mut existing,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+            && (existing.st_mode & libc::S_IFMT) == libc::S_IFLNK
+        {
+            return Err(LinkError::UnsafePath { path: path.clone() });
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_name = format!(".dbmd-pull-{}-{nonce}", std::process::id());
+        let temp = c_name(temp_name.as_bytes(), path)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut input = crate::fsx::open_regular_nofollow(&entry.source)?;
+        let mut output = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut digest = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        let copied = (|| -> std::io::Result<()> {
+            loop {
+                let read = input.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                total = total.saturating_add(read as u64);
+                if total > entry.bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "staged sync source grew beyond its verified length",
+                    ));
+                }
+                digest.update(&buffer[..read]);
+                output.write_all(&buffer[..read])?;
+            }
+            output.sync_all()
+        })();
+        if let Err(error) = copied {
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+            return Err(error.into());
+        }
+        drop(output);
+        if total != entry.bytes || format!("{:x}", digest.finalize()) != entry.sha256 {
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+            return Err(invalid_feed(
+                "private staged sync source failed final integrity verification",
+            ));
+        }
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temp.as_ptr(),
+                directory.as_raw_fd(),
+                leaf_name.as_ptr(),
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+            return Err(error.into());
+        }
+        directory.sync_all()?;
+    }
+    root.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn remove_pull_paths_beneath_dir(root: &std::fs::File, paths: &[String]) -> LinkResult<()> {
     use std::os::fd::AsRawFd as _;
     for path in paths {
@@ -6285,10 +7872,606 @@ fn install_pulled_delta(
 }
 
 #[cfg(unix)]
+fn install_pulled_delta_sources(
+    dest: &Path,
+    entries: &[V2StagedFile],
+    deleted: &[String],
+    rebuild_indexes: bool,
+    _previous: Option<&V2SyncBaseline>,
+    _next: &V2VerifiedHead,
+) -> LinkResult<()> {
+    use ring::rand::SecureRandom as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest
+        .file_name()
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| LinkError::UnsafePath {
+            path: dest.display().to_string(),
+        })?;
+    let parent_dir = open_or_create_dir_nofollow(parent)?;
+    let dest_name = c_name(name.as_bytes(), &dest.display().to_string())?;
+    let dest_exists = match entry_is_dir_at(parent_dir.as_raw_fd(), &dest_name)? {
+        None => false,
+        Some(true) => true,
+        Some(false) => {
+            return Err(LinkError::UnsafePath {
+                path: dest.display().to_string(),
+            })
+        }
+    };
+    let mut nonce = [0_u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| invalid_feed("could not mint a pull staging name"))?;
+    let stage_label = format!(
+        ".{}.dbmd-pull-stage-{}",
+        name.to_string_lossy(),
+        URL_SAFE_NO_PAD.encode(nonce)
+    );
+    let stage_name = c_name(stage_label.as_bytes(), &dest.display().to_string())?;
+    let stage_dir = create_dir_exclusive_at(
+        parent_dir.as_raw_fd(),
+        &stage_name,
+        &dest.display().to_string(),
+    )?;
+    let prepared = (|| -> LinkResult<()> {
+        if dest_exists {
+            let live = open_dir_at(
+                parent_dir.as_raw_fd(),
+                &dest_name,
+                &dest.display().to_string(),
+            )?;
+            clone_tree_contents(&live, &stage_dir, &dest.display().to_string())?;
+        }
+        remove_pull_paths_beneath_dir(&stage_dir, deleted)?;
+        write_pull_sources_beneath_dir(&stage_dir, entries)?;
+        if rebuild_indexes {
+            let stage_store =
+                Store::from_held_root_strict(&parent.join(&stage_label), stage_dir.try_clone()?)
+                    .map_err(|error| LinkError::InvalidPack {
+                        message: format!("v2 staging tree is not a valid db.md store: {error}"),
+                    })?;
+            crate::index::Index::rebuild_all(&stage_store).map_err(|error| {
+                LinkError::InvalidPack {
+                    message: format!("could not materialize v2 local catalogs: {error}"),
+                }
+            })?;
+        }
+        stage_dir.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        let _ = remove_tree_at(
+            parent_dir.as_raw_fd(),
+            &stage_name,
+            &dest.display().to_string(),
+        );
+        return Err(error);
+    }
+    if let Err(error) =
+        install_stage_at(parent_dir.as_raw_fd(), &stage_name, &dest_name, dest_exists)
+    {
+        let _ = remove_tree_at(
+            parent_dir.as_raw_fd(),
+            &stage_name,
+            &dest.display().to_string(),
+        );
+        return Err(error);
+    }
+    parent_dir.sync_all()?;
+    if dest_exists {
+        let _ = remove_tree_at(
+            parent_dir.as_raw_fd(),
+            &stage_name,
+            &dest.display().to_string(),
+        );
+        let _ = parent_dir.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct WindowsPullCoordinate {
+    head_seq: Option<u64>,
+    commit_hash: Option<String>,
+    view_kind: Option<String>,
+    view_revision: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct WindowsPullFileCoordinate {
+    sha256: String,
+    bytes: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct WindowsPullJournalEntry {
+    path: String,
+    old: Option<WindowsPullFileCoordinate>,
+    new: Option<WindowsPullFileCoordinate>,
+    backup: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WindowsPullPhase {
+    Preparing,
+    Ready,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct WindowsPullJournal {
+    v: u8,
+    phase: WindowsPullPhase,
+    brain: String,
+    previous: WindowsPullCoordinate,
+    next: WindowsPullCoordinate,
+    backup_dir: String,
+    entries: Vec<WindowsPullJournalEntry>,
+}
+
+#[cfg(windows)]
+const WINDOWS_PULL_JOURNAL: &str = ".dbmd/pull-journal.json";
+
+#[cfg(windows)]
+fn windows_baseline_coordinate(baseline: Option<&V2SyncBaseline>) -> WindowsPullCoordinate {
+    WindowsPullCoordinate {
+        head_seq: baseline.and_then(|value| value.head_seq),
+        commit_hash: baseline.and_then(|value| value.commit_hash.clone()),
+        view_kind: baseline.and_then(|value| value.view_kind.clone()),
+        view_revision: baseline.and_then(|value| value.view_revision.clone()),
+    }
+}
+
+#[cfg(windows)]
+fn windows_head_coordinate(head: &V2VerifiedHead) -> WindowsPullCoordinate {
+    WindowsPullCoordinate {
+        head_seq: head.pointer.as_ref().map(|value| value.seq),
+        commit_hash: head.pointer.as_ref().map(|value| value.commit_hash.clone()),
+        view_kind: Some(head.view_kind.clone()),
+        view_revision: Some(head.view_revision.clone()),
+    }
+}
+
+#[cfg(windows)]
+fn windows_pull_state(
+    store: &Store,
+    path: &str,
+    limit: u64,
+) -> LinkResult<Option<WindowsPullFileCoordinate>> {
+    let file = match store.open_regular(Path::new(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = file.metadata()?.len();
+    if bytes > limit || bytes > MAX_STORE_BYTES {
+        return Err(invalid_feed(
+            "pull transaction file exceeds its declared bound",
+        ));
+    }
+    Ok(Some(WindowsPullFileCoordinate {
+        sha256: content_sha256_reader(file)?,
+        bytes,
+    }))
+}
+
+#[cfg(windows)]
+fn windows_pull_journal_bytes(journal: &WindowsPullJournal) -> LinkResult<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(journal)
+        .map_err(|_| invalid_feed("could not serialize Windows pull journal"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn validate_windows_pull_journal(journal: &WindowsPullJournal) -> LinkResult<()> {
+    let backup_prefix = ".dbmd/pull-backup-";
+    let suffix = journal
+        .backup_dir
+        .strip_prefix(backup_prefix)
+        .ok_or_else(|| invalid_feed("Windows pull journal backup address is invalid"))?;
+    let mut paths = std::collections::BTreeSet::new();
+    if journal.v != 1
+        || !crate::ulid::is_ulid(&journal.brain)
+        || !crate::ulid::is_ulid(suffix)
+        || journal.entries.is_empty()
+        || journal.entries.len() > MAX_PUSH_FILES + 4
+        || journal.previous == journal.next
+    {
+        return Err(invalid_feed("Windows pull journal failed validation"));
+    }
+    for (index, entry) in journal.entries.iter().enumerate() {
+        if !safe_store_rel_path(&entry.path)
+            || entry.path == WINDOWS_PULL_JOURNAL
+            || entry.path.starts_with(backup_prefix)
+            || !paths.insert(entry.path.clone())
+            || (entry.old.is_none() && entry.new.is_none())
+            || entry
+                .old
+                .iter()
+                .chain(entry.new.iter())
+                .any(|value| !is_sha256(&value.sha256) || value.bytes > MAX_STORE_BYTES)
+            || entry.backup.as_deref()
+                != entry
+                    .old
+                    .as_ref()
+                    .map(|_| format!("{index:08x}"))
+                    .as_deref()
+        {
+            return Err(invalid_feed("Windows pull journal entry failed validation"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn load_windows_pull_journal(store: &Store) -> LinkResult<Option<WindowsPullJournal>> {
+    let bytes = match store.read_bounded(Path::new(WINDOWS_PULL_JOURNAL), 64 * 1024 * 1024) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let journal: WindowsPullJournal = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_feed("Windows pull journal is corrupt"))?;
+    validate_windows_pull_journal(&journal)?;
+    Ok(Some(journal))
+}
+
+#[cfg(windows)]
+fn cleanup_windows_pull_journal(store: &Store, journal: &WindowsPullJournal) -> LinkResult<()> {
+    // The journal is the only recovery authority. Remove it first only after
+    // rollback or baseline commit is durable; an orphan private backup is safe
+    // and can be pruned, while a journal without its backups is not recoverable.
+    match store.remove_file(Path::new(WINDOWS_PULL_JOURNAL)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match store.remove_private_tree(Path::new(&journal.backup_dir)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn prune_orphan_windows_pull_backups(store: &Store) -> LinkResult<()> {
+    let names = match store.directory_names(Path::new(".dbmd")) {
+        Ok(names) => names,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for name in names {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix("pull-backup-") else {
+            continue;
+        };
+        if crate::ulid::is_ulid(suffix) {
+            store.remove_private_tree(&Path::new(".dbmd").join(name))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn rollback_windows_pull(store: &Store, journal: &WindowsPullJournal) -> LinkResult<()> {
+    // Validate every live coordinate and every backup before the first restore.
+    for entry in &journal.entries {
+        let limit = entry
+            .old
+            .as_ref()
+            .into_iter()
+            .chain(entry.new.iter())
+            .map(|value| value.bytes)
+            .max()
+            .unwrap_or(0);
+        let current = windows_pull_state(store, &entry.path, limit)?;
+        if current != entry.old && current != entry.new {
+            return Err(LinkError::InvalidPack {
+                message: format!(
+                    "cannot recover interrupted pull because `{}` changed afterward",
+                    entry.path
+                ),
+            });
+        }
+        if let (Some(old), Some(backup)) = (&entry.old, &entry.backup) {
+            let path = Path::new(&journal.backup_dir).join(backup);
+            let file = store.open_regular(&path)?;
+            if file.metadata()?.len() != old.bytes || content_sha256_reader(file)? != old.sha256 {
+                return Err(invalid_feed(
+                    "Windows pull recovery backup failed verification",
+                ));
+            }
+        }
+    }
+    for entry in journal.entries.iter().rev() {
+        match (&entry.old, &entry.backup) {
+            (Some(old), Some(backup)) => {
+                let bytes =
+                    store.read_bounded(&Path::new(&journal.backup_dir).join(backup), old.bytes)?;
+                store.write_atomic(Path::new(&entry.path), &bytes)?;
+            }
+            (None, None) if store.regular_file_exists(Path::new(&entry.path))? => {
+                store.remove_file(Path::new(&entry.path))?;
+            }
+            (None, None) => {}
+            _ => return Err(invalid_feed("Windows pull recovery entry is inconsistent")),
+        }
+    }
+    crate::index::Index::rebuild_all(store).map_err(|error| LinkError::InvalidPack {
+        message: format!("could not rebuild catalogs after pull recovery: {error}"),
+    })?;
+    cleanup_windows_pull_journal(store, journal)
+}
+
+#[cfg(windows)]
+fn recover_windows_v2_pull(cfg: &HubConfig, brain: &str, dest: &Path) -> LinkResult<()> {
+    let Ok(store) = Store::open_strict(dest) else {
+        return Ok(());
+    };
+    if let Some(journal) = load_windows_pull_journal(&store)? {
+        if journal.brain != brain {
+            return Err(invalid_feed(
+                "Windows pull journal belongs to another brain",
+            ));
+        }
+        if journal.phase == WindowsPullPhase::Preparing {
+            cleanup_windows_pull_journal(&store, &journal)?;
+        } else {
+            let baseline = load_v2_baseline(cfg, brain, dest)?;
+            let current = windows_baseline_coordinate(baseline.as_ref());
+            if current == journal.next {
+                cleanup_windows_pull_journal(&store, &journal)?;
+            } else {
+                if current != journal.previous {
+                    return Err(invalid_feed(
+                        "cannot recover interrupted pull because its baseline changed afterward",
+                    ));
+                }
+                rollback_windows_pull(&store, &journal)?;
+            }
+        }
+    }
+    // Cleanup removes the journal first after the state is durably old or new.
+    // A hard kill in the tiny interval before deleting its backup directory can
+    // therefore leave only an inert, private orphan. The per-brain operation
+    // lock is held by the caller, so no live pull can own one here.
+    prune_orphan_windows_pull_backups(&store)
+}
+
+#[cfg(windows)]
+fn complete_windows_v2_pull(dest: &Path) -> LinkResult<()> {
+    let store = Store::open_strict(dest).map_err(|error| LinkError::InvalidPack {
+        message: format!("installed Windows checkout is not a valid db.md store: {error}"),
+    })?;
+    if let Some(journal) = load_windows_pull_journal(&store)? {
+        cleanup_windows_pull_journal(&store, &journal)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn recover_windows_v2_pull(_cfg: &HubConfig, _brain: &str, _dest: &Path) -> LinkResult<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn complete_windows_v2_pull(_dest: &Path) -> LinkResult<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_windows_initial_sources(
+    dest: &Path,
+    entries: &[V2StagedFile],
+    rebuild_indexes: bool,
+) -> LinkResult<()> {
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest.file_name().ok_or_else(|| LinkError::UnsafePath {
+        path: dest.display().to_string(),
+    })?;
+    let parent_capability = crate::fsx::open_or_create_directory_nofollow(parent)?;
+    if crate::fsx::directory_exists_beneath(&parent_capability, Path::new(name))? {
+        return Err(LinkError::UnsafePath {
+            path: dest.display().to_string(),
+        });
+    }
+    let stage_name = format!(
+        ".{}.dbmd-pull-stage-{}",
+        name.to_string_lossy(),
+        crate::ulid::mint()
+    );
+    let stage_path = parent.join(&stage_name);
+    let stage_capability =
+        crate::fsx::open_directory_beneath(&parent_capability, Path::new(&stage_name), true)?;
+    let stage = Store::from_root_and_config(&stage_path, crate::Config::default())?;
+    let prepared = (|| -> LinkResult<()> {
+        for entry in entries {
+            let bytes = crate::fsx::read_bounded_nofollow(&entry.source, entry.bytes)?;
+            if bytes.len() as u64 != entry.bytes || content_sha256(&bytes) != entry.sha256 {
+                return Err(invalid_feed(
+                    "private staged sync source failed final integrity verification",
+                ));
+            }
+            stage.write_atomic(Path::new(&entry.path), &bytes)?;
+        }
+        let strict = Store::from_held_root_strict(&stage_path, stage_capability.try_clone()?)
+            .map_err(|error| LinkError::InvalidPack {
+                message: format!("v2 staging tree is not a valid db.md store: {error}"),
+            })?;
+        if rebuild_indexes {
+            crate::index::Index::rebuild_all(&strict).map_err(|error| LinkError::InvalidPack {
+                message: format!("could not materialize v2 local catalogs: {error}"),
+            })?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        let _ = crate::fsx::remove_tree_beneath(&parent_capability, Path::new(&stage_name));
+        return Err(error);
+    }
+    crate::fsx::rename_directory_beneath(
+        &parent_capability,
+        Path::new(&stage_name),
+        Path::new(name),
+    )?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_pulled_delta_sources(
+    dest: &Path,
+    entries: &[V2StagedFile],
+    deleted: &[String],
+    rebuild_indexes: bool,
+    previous: Option<&V2SyncBaseline>,
+    next: &V2VerifiedHead,
+) -> LinkResult<()> {
+    let store = match Store::open_strict(dest) {
+        Ok(store) => store,
+        Err(_) => return install_windows_initial_sources(dest, entries, rebuild_indexes),
+    };
+    if load_windows_pull_journal(&store)?.is_some() {
+        return Err(invalid_feed(
+            "an interrupted Windows pull must be recovered before installing",
+        ));
+    }
+    let mut sources = std::collections::BTreeMap::new();
+    for entry in entries {
+        if sources.insert(entry.path.clone(), entry).is_some() || deleted.contains(&entry.path) {
+            return Err(invalid_feed("Windows pull mutation repeats a path"));
+        }
+    }
+    let mut paths = sources.keys().cloned().collect::<Vec<_>>();
+    paths.extend(deleted.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let backup_dir = format!(".dbmd/pull-backup-{}", crate::ulid::mint());
+    let mut journal = WindowsPullJournal {
+        v: 1,
+        phase: WindowsPullPhase::Preparing,
+        brain: next.brain_id.clone(),
+        previous: windows_baseline_coordinate(previous),
+        next: windows_head_coordinate(next),
+        backup_dir: backup_dir.clone(),
+        entries: Vec::with_capacity(paths.len()),
+    };
+    for (index, path) in paths.iter().enumerate() {
+        let old = windows_pull_state(&store, path, MAX_STORE_BYTES)?;
+        let new = sources.get(path).map(|entry| WindowsPullFileCoordinate {
+            sha256: entry.sha256.clone(),
+            bytes: entry.bytes,
+        });
+        journal.entries.push(WindowsPullJournalEntry {
+            path: path.clone(),
+            backup: old.as_ref().map(|_| format!("{index:08x}")),
+            old,
+            new,
+        });
+    }
+    validate_windows_pull_journal(&journal)?;
+    store.write_atomic_new(
+        Path::new(WINDOWS_PULL_JOURNAL),
+        &windows_pull_journal_bytes(&journal)?,
+    )?;
+    let prepared = (|| -> LinkResult<()> {
+        store.create_dir_all(Path::new(&backup_dir))?;
+        for entry in &journal.entries {
+            if let (Some(old), Some(backup)) = (&entry.old, &entry.backup) {
+                let bytes = store.read_bounded(Path::new(&entry.path), old.bytes)?;
+                if content_sha256(&bytes) != old.sha256 {
+                    return Err(invalid_feed("live pull source changed during backup"));
+                }
+                store.write_atomic_new(&Path::new(&backup_dir).join(backup), &bytes)?;
+            }
+        }
+        journal.phase = WindowsPullPhase::Ready;
+        store.write_atomic(
+            Path::new(WINDOWS_PULL_JOURNAL),
+            &windows_pull_journal_bytes(&journal)?,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        let cleanup = cleanup_windows_pull_journal(&store, &journal);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(LinkError::InvalidPack {
+                message: format!("{error}; recovery metadata cleanup also failed: {cleanup}"),
+            }),
+        };
+    }
+    let installed = (|| -> LinkResult<()> {
+        for entry in &journal.entries {
+            if windows_pull_state(&store, &entry.path, MAX_STORE_BYTES)? != entry.old {
+                return Err(LinkError::InvalidPack {
+                    message: format!("local path `{}` changed during pull", entry.path),
+                });
+            }
+            if let Some(source) = sources.get(&entry.path) {
+                let bytes = crate::fsx::read_bounded_nofollow(&source.source, source.bytes)?;
+                if bytes.len() as u64 != source.bytes || content_sha256(&bytes) != source.sha256 {
+                    return Err(invalid_feed(
+                        "private staged sync source failed final integrity verification",
+                    ));
+                }
+                store.write_atomic(Path::new(&entry.path), &bytes)?;
+            } else if entry.old.is_some() {
+                store.remove_file(Path::new(&entry.path))?;
+            }
+        }
+        if rebuild_indexes {
+            crate::index::Index::rebuild_all(&store).map_err(|error| LinkError::InvalidPack {
+                message: format!("could not materialize v2 local catalogs: {error}"),
+            })?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = installed {
+        return match rollback_windows_pull(&store, &journal) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(LinkError::InvalidPack {
+                message: format!("{error}; durable pull rollback also failed: {rollback}"),
+            }),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_pulled_delta_sources(
+    _dest: &Path,
+    _entries: &[V2StagedFile],
+    _deleted: &[String],
+    _rebuild_indexes: bool,
+    _previous: Option<&V2SyncBaseline>,
+    _next: &V2VerifiedHead,
+) -> LinkResult<()> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "atomic v2 pull install",
+    })
+}
+
+#[cfg(unix)]
 fn install_pulled_snapshot(dest: &Path, entries: &[(String, Vec<u8>)]) -> LinkResult<()> {
     install_pulled_delta(dest, entries, &[], false)
 }
 
+#[cfg(not(windows))]
 fn is_safe_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug.len() <= 63
@@ -7199,14 +9382,14 @@ fn verify_v2_proposal_value(
                     | "operator_recovery"
             )
         )
-        || !actor_root
+        || actor_root
             .get("principal")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
-        || !actor_root
+            .is_none_or(|value| value.is_empty())
+        || actor_root
             .get("credential")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
+            .is_none_or(|value| value.is_empty())
         || !optional_actor_field("organization")
         || !optional_actor_field("role")
         || !grants_are_canonical
@@ -7237,10 +9420,10 @@ fn verify_v2_proposal_value(
             .get("state")
             .and_then(Value::as_str)
             .is_some_and(|value| matches!(value, "pending" | "accepted" | "rejected" | "expired"))
-        || !proposal
+        || proposal
             .get("expires_at")
             .and_then(Value::as_str)
-            .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+            .is_none_or(|value| chrono::DateTime::parse_from_rfc3339(value).is_err())
         || proposal
             .get("proposer")
             .and_then(Value::as_object)
@@ -8459,7 +10642,7 @@ fn alias_file_name(cfg: &HubConfig, alias: &str) -> LinkResult<String> {
     Ok(format!("alias-{key}.json"))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct TrustLock {
     _file: std::fs::File,
 }
@@ -8491,7 +10674,14 @@ fn lock_trust_name(directory: &std::fs::File, state_name: &str) -> LinkResult<Tr
     Ok(TrustLock { _file: file })
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn lock_trust_name(directory: &std::fs::File, state_name: &str) -> LinkResult<TrustLock> {
+    let lock_name = format!(".{state_name}.lock");
+    let file = crate::fsx::lock_exclusive_beneath(directory, Path::new(&lock_name))?;
+    Ok(TrustLock { _file: file })
+}
+
+#[cfg(any(unix, windows))]
 fn lock_trust_many(
     cfg: &HubConfig,
     directory: &std::fs::File,
@@ -8509,7 +10699,7 @@ fn lock_trust_many(
         .collect()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn lock_trust_many(
     _cfg: &HubConfig,
     _directory: &TrustDirectory,
@@ -8520,10 +10710,10 @@ fn lock_trust_many(
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type TrustDirectory = std::fs::File;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 struct TrustDirectory;
 
 #[cfg(unix)]
@@ -8538,7 +10728,16 @@ fn open_trust_dir(cfg: &HubConfig) -> LinkResult<TrustDirectory> {
     Ok(directory)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_trust_dir(cfg: &HubConfig) -> LinkResult<TrustDirectory> {
+    let marker = cfg.state_dir.join("trust").join(".directory");
+    crate::fsx::write_atomic(&marker, b"link.md trust directory\n")?;
+    Ok(crate::fsx::open_directory_nofollow(
+        marker.parent().expect("trust marker has a parent"),
+    )?)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_trust_dir(_cfg: &HubConfig) -> LinkResult<TrustDirectory> {
     Err(LinkError::UnsupportedPlatform {
         operation: "verified link.md state",
@@ -8603,7 +10802,42 @@ fn load_trust_in(
     Ok(Some(state))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn load_trust_in(
+    cfg: &HubConfig,
+    directory: &TrustDirectory,
+    requested: &str,
+) -> LinkResult<Option<TrustState>> {
+    let name = trust_file_name(cfg, requested)?;
+    let mut reader = crate::fsx::BoundedDirReader::from_root(directory)?;
+    let bytes = match reader.read(Path::new(&name), 1024 * 1024) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(LinkError::UnsafePath { path: name }),
+    };
+    let mut state: TrustState = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_feed("local identity/feed checkpoint is corrupt"))?;
+    if !matches!(state.v, 1 | 2) || state.origin != normalized_origin(&cfg.hub)? {
+        return Err(invalid_feed(
+            "local identity/feed checkpoint does not match this hub and brain",
+        ));
+    }
+    if state.v == 1 {
+        if state.brain != requested {
+            return Err(invalid_feed(
+                "legacy checkpoint is not bound to the requested brain id",
+            ));
+        }
+        state.requested = requested.to_string();
+    } else if state.requested != requested {
+        return Err(invalid_feed(
+            "local identity/feed checkpoint is bound to a different requested ref",
+        ));
+    }
+    Ok(Some(state))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn load_trust_in(
     _cfg: &HubConfig,
     _directory: &TrustDirectory,
@@ -8614,7 +10848,7 @@ fn load_trust_in(
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 fn load_trust(cfg: &HubConfig, requested: &str) -> LinkResult<Option<TrustState>> {
     let directory = open_trust_dir(cfg)?;
     load_trust_in(cfg, &directory, requested)
@@ -8674,7 +10908,21 @@ fn save_trust_in(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn save_trust_in(
+    cfg: &HubConfig,
+    directory: &TrustDirectory,
+    state: &TrustState,
+) -> LinkResult<()> {
+    let name = trust_file_name(cfg, &state.requested)?;
+    let mut bytes = serde_json::to_vec(state)
+        .map_err(|_| invalid_feed("could not serialize local trust checkpoint"))?;
+    bytes.push(b'\n');
+    crate::fsx::write_atomic_beneath(directory, Path::new(&name), &bytes, false, true)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn save_trust_in(
     _cfg: &HubConfig,
     _directory: &TrustDirectory,
@@ -8729,7 +10977,31 @@ fn load_alias_in(
     Ok(Some(alias))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn load_alias_in(
+    cfg: &HubConfig,
+    directory: &TrustDirectory,
+    requested: &str,
+) -> LinkResult<Option<AliasBinding>> {
+    let name = alias_file_name(cfg, requested)?;
+    let mut reader = crate::fsx::BoundedDirReader::from_root(directory)?;
+    let bytes = match reader.read(Path::new(&name), 64 * 1024) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(LinkError::UnsafePath { path: name }),
+    };
+    let alias: AliasBinding = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_feed("local alias binding is corrupt"))?;
+    if alias.v != 1 || alias.origin != normalized_origin(&cfg.hub)? || alias.requested != requested
+    {
+        return Err(invalid_feed(
+            "local alias binding does not match this hub and requested ref",
+        ));
+    }
+    Ok(Some(alias))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn load_alias_in(
     _cfg: &HubConfig,
     _directory: &TrustDirectory,
@@ -8793,7 +11065,21 @@ fn save_alias_in(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn save_alias_in(
+    cfg: &HubConfig,
+    directory: &TrustDirectory,
+    alias: &AliasBinding,
+) -> LinkResult<()> {
+    let name = alias_file_name(cfg, &alias.requested)?;
+    let mut bytes = serde_json::to_vec(alias)
+        .map_err(|_| invalid_feed("could not serialize local alias binding"))?;
+    bytes.push(b'\n');
+    crate::fsx::write_atomic_beneath(directory, Path::new(&name), &bytes, false, true)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn save_alias_in(
     _cfg: &HubConfig,
     _directory: &TrustDirectory,
@@ -9537,9 +11823,17 @@ pub fn content_sha256_reader(mut reader: impl Read) -> std::io::Result<String> {
 /// out through an atomic directory exchange. Every stage, install, and cleanup
 /// operation is relative to one held no-follow parent-directory capability, so
 /// renaming an ancestor cannot redirect any write or deletion.
+#[cfg_attr(windows, allow(unreachable_code, unused_variables))]
 pub fn mirror(cfg: &HubConfig, brain: &str, dest: &Path) -> LinkResult<MirrorReport> {
     require_hardened_filesystem("mirror")?;
     require_safe_ref(brain)?;
+    #[cfg(windows)]
+    {
+        let _ = (cfg, dest);
+        return Err(LinkError::UnsupportedPlatform {
+            operation: "atomic whole-mirror replacement on Windows",
+        });
+    }
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     let name = dest
         .file_name()
@@ -12134,8 +14428,8 @@ mod tests {
     #[test]
     fn v2_final_barrier_refuses_to_advance_a_remote_ahead_checkout() {
         let mut local = std::collections::BTreeMap::new();
-        local.insert("records/a.md".to_string(), ("a".repeat(64), Vec::new()));
-        local.insert("records/b.md".to_string(), ("b".repeat(64), Vec::new()));
+        local.insert("records/a.md".to_string(), ("a".repeat(64), 0));
+        local.insert("records/b.md".to_string(), ("b".repeat(64), 0));
         let mut remote = std::collections::BTreeMap::new();
         remote.insert(
             "records/a.md".to_string(),
@@ -12222,6 +14516,7 @@ mod tests {
             v: 2,
             origin: "https://hub.example".to_string(),
             brain: TEST_BRAIN_ID.to_string(),
+            head_seq: Some(0),
             commit_hash: None,
             content_root: None,
             asset_root: None,
@@ -12466,5 +14761,357 @@ mod tests {
         assert!(destination.join("records/index.md").is_file());
         assert!(destination.join("records/contacts/index.md").is_file());
         assert!(destination.join("records/contacts/index.jsonl").is_file());
+    }
+
+    #[test]
+    fn v2_bulk_stream_is_exact_ordered_and_tamper_evident() {
+        let body = b"bounded bytes";
+        let path = "records/example.md".to_string();
+        let file = V2BaselineFile {
+            sha256: content_sha256(body),
+            bytes: body.len() as u64,
+            proof: None,
+        };
+        let header = serde_json::to_vec(&json!({
+            "bytes": body.len(),
+            "path": path,
+            "sha256": file.sha256,
+            "v": 2,
+        }))
+        .unwrap();
+        let mut stream = V2_BULK_STREAM_MAGIC.to_vec();
+        stream.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        stream.extend_from_slice(&header);
+        stream.extend_from_slice(body);
+        stream.extend_from_slice(&0_u32.to_be_bytes());
+        let parsed = parse_v2_bulk_stream(&stream, &[(&path, &file)]).unwrap();
+        assert_eq!(parsed, vec![(path.clone(), body.to_vec())]);
+
+        let mut tampered = stream.clone();
+        let body_offset = V2_BULK_STREAM_MAGIC.len() + 4 + header.len();
+        tampered[body_offset] ^= 1;
+        assert!(parse_v2_bulk_stream(&tampered, &[(&path, &file)]).is_err());
+
+        let mut trailing = stream;
+        trailing.push(0);
+        assert!(parse_v2_bulk_stream(&trailing, &[(&path, &file)]).is_err());
+    }
+
+    #[test]
+    fn conflict_cache_prunes_only_expired_or_incomplete_state_by_default() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let root = sandbox.path().join("brain");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("DB.md"),
+            b"---\ntype: db-md\nscope: company\n---\n\n# Test\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let incomplete = crate::ulid::mint();
+        store
+            .create_dir_all(&v2_conflict_relative(&incomplete, "files"))
+            .unwrap();
+        let expired = crate::ulid::mint();
+        store
+            .create_dir_all(&v2_conflict_relative(&expired, "files"))
+            .unwrap();
+        let plan = V2ConflictPlan {
+            v: 2,
+            class: "content_resolution_required".to_string(),
+            bundle: expired.clone(),
+            brain: TEST_BRAIN_ID.to_string(),
+            origin: "https://example.test".to_string(),
+            created_unix: 0,
+            expires_unix: 0,
+            base_seq: None,
+            base_commit: None,
+            remote_seq: 0,
+            remote_commit: None,
+            remote_content_root: None,
+            view_kind: "full".to_string(),
+            view_revision: "a".repeat(64),
+            files: vec![V2ConflictFile {
+                path: "records/value.md".to_string(),
+                base: V2ConflictCoordinate {
+                    sha256: None,
+                    bytes: None,
+                    file: None,
+                },
+                local: V2ConflictCoordinate {
+                    sha256: None,
+                    bytes: None,
+                    file: None,
+                },
+                remote: V2ConflictCoordinate {
+                    sha256: None,
+                    bytes: None,
+                    file: None,
+                },
+            }],
+        };
+        let mut bytes = serde_json::to_vec(&plan).unwrap();
+        bytes.push(b'\n');
+        store
+            .write_atomic_new(&v2_conflict_relative(&expired, "plan.json"), &bytes)
+            .unwrap();
+
+        let listed = sync_conflicts(&root, false, false).unwrap();
+        assert_eq!(listed["bundles"], 2);
+        assert_eq!(listed["pruned"], 0);
+        let pruned = sync_conflicts(&root, true, false).unwrap();
+        assert_eq!(pruned["bundles"], 0);
+        assert_eq!(pruned["pruned"], 2);
+        assert!(!root.join(".dbmd/conflicts").join(incomplete).exists());
+        assert!(!root.join(".dbmd/conflicts").join(expired).exists());
+    }
+
+    #[test]
+    fn corrupt_completed_conflict_state_requires_explicit_discard_all() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let root = sandbox.path().join("brain");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("DB.md"),
+            b"---\ntype: db-md\nscope: company\n---\n\n# Test\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let bundle = crate::ulid::mint();
+        store
+            .create_dir_all(&v2_conflict_relative(&bundle, "files"))
+            .unwrap();
+        store
+            .write_atomic_new(&v2_conflict_relative(&bundle, "plan.json"), b"not-json\n")
+            .unwrap();
+
+        assert!(sync_conflicts(&root, true, false).is_err());
+        assert!(sync_conflicts(&root, false, true).is_err());
+        let pruned = sync_conflicts(&root, true, true).unwrap();
+        assert_eq!(pruned["pruned"], 1);
+        assert!(!root.join(".dbmd/conflicts").join(bundle).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ready_pull_journal_rolls_back_exact_preimages() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let root = sandbox.path().join("brain");
+        std::fs::create_dir_all(root.join("records")).unwrap();
+        std::fs::write(
+            root.join("DB.md"),
+            b"---\ntype: db-md\nscope: company\n---\n\n# Test\n",
+        )
+        .unwrap();
+        let path = "records/value.md";
+        let old = b"---\ntype: note\n---\n\nold\n";
+        let new = b"---\ntype: note\n---\n\nnew\n";
+        std::fs::write(root.join(path), old).unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let bundle = crate::ulid::mint();
+        let backup_dir = format!(".dbmd/pull-backup-{bundle}");
+        store.create_dir_all(Path::new(&backup_dir)).unwrap();
+        store
+            .write_atomic_new(&Path::new(&backup_dir).join("00000000"), old)
+            .unwrap();
+        let journal = WindowsPullJournal {
+            v: 1,
+            phase: WindowsPullPhase::Ready,
+            brain: TEST_BRAIN_ID.to_string(),
+            previous: WindowsPullCoordinate {
+                head_seq: Some(1),
+                commit_hash: Some("a".repeat(64)),
+                view_kind: Some("full".to_string()),
+                view_revision: Some("b".repeat(64)),
+            },
+            next: WindowsPullCoordinate {
+                head_seq: Some(2),
+                commit_hash: Some("c".repeat(64)),
+                view_kind: Some("full".to_string()),
+                view_revision: Some("d".repeat(64)),
+            },
+            backup_dir: backup_dir.clone(),
+            entries: vec![WindowsPullJournalEntry {
+                path: path.to_string(),
+                old: Some(WindowsPullFileCoordinate {
+                    sha256: content_sha256(old),
+                    bytes: old.len() as u64,
+                }),
+                new: Some(WindowsPullFileCoordinate {
+                    sha256: content_sha256(new),
+                    bytes: new.len() as u64,
+                }),
+                backup: Some("00000000".to_string()),
+            }],
+        };
+        validate_windows_pull_journal(&journal).unwrap();
+        store
+            .write_atomic_new(
+                Path::new(WINDOWS_PULL_JOURNAL),
+                &windows_pull_journal_bytes(&journal).unwrap(),
+            )
+            .unwrap();
+        store.write_atomic(Path::new(path), new).unwrap();
+
+        let cfg = test_hub_config(
+            "https://example.test".to_string(),
+            sandbox.path().join("state"),
+        );
+        recover_windows_v2_pull(&cfg, TEST_BRAIN_ID, &root).unwrap();
+        assert_eq!(std::fs::read(root.join(path)).unwrap(), old);
+        assert!(!root.join(WINDOWS_PULL_JOURNAL).exists());
+        assert!(!root.join(backup_dir).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_preparing_pull_journal_discards_only_private_staging() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let root = sandbox.path().join("brain");
+        std::fs::create_dir_all(root.join(".dbmd")).unwrap();
+        std::fs::write(
+            root.join("DB.md"),
+            b"---\ntype: db-md\nscope: company\n---\n\n# Test\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let bundle = crate::ulid::mint();
+        let backup_dir = format!(".dbmd/pull-backup-{bundle}");
+        store.create_dir_all(Path::new(&backup_dir)).unwrap();
+        let journal = WindowsPullJournal {
+            v: 1,
+            phase: WindowsPullPhase::Preparing,
+            brain: TEST_BRAIN_ID.to_string(),
+            previous: WindowsPullCoordinate {
+                head_seq: None,
+                commit_hash: None,
+                view_kind: None,
+                view_revision: None,
+            },
+            next: WindowsPullCoordinate {
+                head_seq: Some(1),
+                commit_hash: Some("a".repeat(64)),
+                view_kind: Some("full".to_string()),
+                view_revision: Some("b".repeat(64)),
+            },
+            backup_dir: backup_dir.clone(),
+            entries: vec![WindowsPullJournalEntry {
+                path: "records/new.md".to_string(),
+                old: None,
+                new: Some(WindowsPullFileCoordinate {
+                    sha256: "c".repeat(64),
+                    bytes: 1,
+                }),
+                backup: None,
+            }],
+        };
+        store
+            .write_atomic_new(
+                Path::new(WINDOWS_PULL_JOURNAL),
+                &windows_pull_journal_bytes(&journal).unwrap(),
+            )
+            .unwrap();
+        let cfg = test_hub_config(
+            "https://example.test".to_string(),
+            sandbox.path().join("state"),
+        );
+
+        recover_windows_v2_pull(&cfg, TEST_BRAIN_ID, &root).unwrap();
+
+        assert!(root.join("DB.md").is_file());
+        assert!(!root.join(WINDOWS_PULL_JOURNAL).exists());
+        assert!(!root.join(backup_dir).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_committed_baseline_keeps_installed_bytes_and_prunes_orphans() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let root = sandbox.path().join("brain");
+        std::fs::create_dir_all(root.join("records")).unwrap();
+        std::fs::write(
+            root.join("DB.md"),
+            b"---\ntype: db-md\nscope: company\n---\n\n# Test\n",
+        )
+        .unwrap();
+        let new = b"---\ntype: note\n---\n\nnew\n";
+        std::fs::write(root.join("records/value.md"), new).unwrap();
+        let store = Store::open_strict(&root).unwrap();
+        let bundle = crate::ulid::mint();
+        let backup_dir = format!(".dbmd/pull-backup-{bundle}");
+        store.create_dir_all(Path::new(&backup_dir)).unwrap();
+        let orphan = format!(".dbmd/pull-backup-{}", crate::ulid::mint());
+        store.create_dir_all(Path::new(&orphan)).unwrap();
+        let next = WindowsPullCoordinate {
+            head_seq: Some(2),
+            commit_hash: Some("c".repeat(64)),
+            view_kind: Some("full".to_string()),
+            view_revision: Some("d".repeat(64)),
+        };
+        let journal = WindowsPullJournal {
+            v: 1,
+            phase: WindowsPullPhase::Ready,
+            brain: TEST_BRAIN_ID.to_string(),
+            previous: WindowsPullCoordinate {
+                head_seq: Some(1),
+                commit_hash: Some("a".repeat(64)),
+                view_kind: Some("full".to_string()),
+                view_revision: Some("b".repeat(64)),
+            },
+            next: next.clone(),
+            backup_dir: backup_dir.clone(),
+            entries: vec![WindowsPullJournalEntry {
+                path: "records/value.md".to_string(),
+                old: Some(WindowsPullFileCoordinate {
+                    sha256: "e".repeat(64),
+                    bytes: new.len() as u64,
+                }),
+                new: Some(WindowsPullFileCoordinate {
+                    sha256: content_sha256(new),
+                    bytes: new.len() as u64,
+                }),
+                backup: Some("00000000".to_string()),
+            }],
+        };
+        store
+            .write_atomic_new(
+                Path::new(WINDOWS_PULL_JOURNAL),
+                &windows_pull_journal_bytes(&journal).unwrap(),
+            )
+            .unwrap();
+        let cfg = test_hub_config(
+            "https://example.test".to_string(),
+            sandbox.path().join("state"),
+        );
+        save_v2_baseline(
+            &cfg,
+            TEST_BRAIN_ID,
+            &root,
+            &V2SyncBaseline {
+                v: 2,
+                origin: "https://example.test".to_string(),
+                brain: TEST_BRAIN_ID.to_string(),
+                head_seq: next.head_seq,
+                commit_hash: next.commit_hash.clone(),
+                content_root: Some("f".repeat(64)),
+                asset_root: None,
+                assets: Default::default(),
+                view_kind: next.view_kind.clone(),
+                view_revision: next.view_revision.clone(),
+                projection_sha256: None,
+                files: Default::default(),
+                local_policy_digest: None,
+                local_eligibility: Default::default(),
+                remote_copy_remains: Default::default(),
+            },
+        )
+        .unwrap();
+
+        recover_windows_v2_pull(&cfg, TEST_BRAIN_ID, &root).unwrap();
+
+        assert_eq!(std::fs::read(root.join("records/value.md")).unwrap(), new);
+        assert!(!root.join(WINDOWS_PULL_JOURNAL).exists());
+        assert!(!root.join(backup_dir).exists());
+        assert!(!root.join(orphan).exists());
     }
 }

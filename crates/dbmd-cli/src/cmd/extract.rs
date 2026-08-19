@@ -9,8 +9,11 @@
 
 use std::io::Read;
 use std::path::Path;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use dbmd_core::extract::{self, ExtractError};
 
@@ -56,11 +59,11 @@ fn sandbox_extract(args: &ExtractArgs) -> Result<extract::Extracted, CliError> {
     #[cfg(not(unix))]
     {
         let _ = args;
-        return Err(CliError::new(
+        Err(CliError::new(
             ExitCode::Runtime,
             "EXTRACT_SANDBOX_UNAVAILABLE",
             "document extraction is disabled because this platform build cannot enforce memory and CPU limits",
-        ));
+        ))
     }
 
     #[cfg(unix)]

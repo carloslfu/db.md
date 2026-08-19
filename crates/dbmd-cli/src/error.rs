@@ -241,6 +241,19 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::InvalidPack { .. } => CliError::new(ExitCode::Runtime, "INVALID_PACK", message),
             L::InvalidFeed { .. } => CliError::new(ExitCode::Runtime, "INVALID_FEED", message),
             L::Conflict { .. } => CliError::new(ExitCode::Runtime, "SYNC_CONFLICT", message),
+            L::ConflictBundle { bundle, paths } => CliError::new(
+                ExitCode::Runtime,
+                "SYNC_CONFLICT",
+                message,
+            )
+            .with_hint(
+                "inspect .dbmd/conflicts/<bundle>/plan.json, then run `dbmd sync resolve <bundle> --keep-local`, `--take-remote`, or `--from <safe-file>`",
+            )
+            .with_details(serde_json::json!({
+                "class": "content_resolution_required",
+                "bundle": bundle,
+                "paths": paths,
+            })),
             L::LocalPolicyTransition { .. } => {
                 CliError::new(ExitCode::Policy, "LOCAL_POLICY_RELAXED", message)
             }

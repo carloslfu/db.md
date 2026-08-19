@@ -1,8 +1,12 @@
 //! Capability-safe final install primitive used only by `scripts/install.sh`.
 
+#[cfg(unix)]
 use std::ffi::{CString, OsStr};
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::io::{Read as _, Write as _};
+#[cfg(unix)]
 use std::path::{Component, Path};
 
 use crate::cli::InstallVerifiedArgs;

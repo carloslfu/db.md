@@ -54,6 +54,17 @@ url = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Native capability-style traversal: hold directory handles without delete
+# sharing, reject reparse points, lock with LockFileEx, and publish with
+# MoveFileExW write-through. MIT OR Apache-2.0.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+] }
+
 [features]
 # `link` = the link.md client verbs (resolve / sync / grant / propose /
 # subscribe) — the `linkmd` module and its HTTP transport. Default-on so the

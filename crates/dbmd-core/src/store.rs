@@ -486,6 +486,12 @@ impl Store {
         crate::fsx::remove_file_beneath(&self.root_capability, relative)
     }
 
+    /// Remove a private directory tree beneath the held store capability.
+    pub(crate) fn remove_private_tree(&self, path: &Path) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::remove_tree_beneath(&self.root_capability, relative)
+    }
+
     /// List immediate regular-file basenames in a store-relative directory.
     /// Symlinks and nested-store paths are refused by descriptor traversal.
     pub fn regular_file_names(&self, directory: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {

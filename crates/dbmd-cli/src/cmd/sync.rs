@@ -19,14 +19,86 @@ use dbmd_core::linkmd;
 use dbmd_core::Store;
 use serde_json::Value;
 
-use crate::cli::SyncArgs;
+use crate::cli::{SyncAction, SyncArgs};
 use crate::context::Context;
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult, ExitCode};
 use crate::sanitize::sanitize_single_line;
 
 /// Run `dbmd sync`.
 pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
-    let brain = strip_sigil(&args.brain);
+    if let Some(SyncAction::Conflicts(conflicts)) = &args.action {
+        let body =
+            linkmd::sync_conflicts(Path::new(&conflicts.dir), conflicts.prune, conflicts.all)?;
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "{} conflict bundle{}, {} pruned",
+                body.get("bundles").and_then(Value::as_u64).unwrap_or(0),
+                if body.get("bundles").and_then(Value::as_u64) == Some(1) {
+                    ""
+                } else {
+                    "s"
+                },
+                body.get("pruned").and_then(Value::as_u64).unwrap_or(0),
+            );
+        }
+        return Ok(());
+    }
+    if let Some(SyncAction::Resolve(resolve)) = &args.action {
+        let cfg = linkmd::hub_config(resolve.hub.as_deref(), Path::new(&resolve.dir))?;
+        let confirmation = resolve
+            .confirm_bulk
+            .as_deref()
+            .map(linkmd::V2BulkConfirmation::parse)
+            .transpose()?;
+        let choice = if resolve.keep_local {
+            linkmd::V2ConflictChoice::KeepLocal
+        } else if resolve.take_remote {
+            linkmd::V2ConflictChoice::TakeRemote
+        } else {
+            linkmd::V2ConflictChoice::From(
+                resolve
+                    .from
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .expect("clap requires one conflict resolution choice"),
+            )
+        };
+        let body = linkmd::sync_resolve_conflict(
+            &cfg,
+            Path::new(&resolve.dir),
+            &resolve.bundle,
+            choice,
+            confirmation.as_ref(),
+        )?;
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "resolved conflict bundle {} [{}]",
+                sanitize_single_line(&resolve.bundle),
+                body.get("class")
+                    .and_then(Value::as_str)
+                    .map(sanitize_single_line)
+                    .unwrap_or_else(|| "completed".to_string())
+            );
+        }
+        return Ok(());
+    }
+    let brain = strip_sigil(args.brain.as_deref().ok_or_else(|| {
+        CliError::new(
+            ExitCode::Usage,
+            "MISSING_BRAIN",
+            "dbmd sync requires BRAIN or the `resolve`/`conflicts` action",
+        )
+    })?);
     let cfg = linkmd::hub_config(args.hub.as_deref(), Path::new(&args.dir))?;
     let bulk_confirmation = args
         .confirm_bulk
@@ -164,7 +236,6 @@ fn push(
     // Strict open: pushing from a non-store is the standard NOT_A_STORE exit.
     let store = Store::open_strict(Path::new(dir))?;
     let _transaction = store.transaction()?;
-    let sent = linkmd::collect_push_files(&store)?.len();
     let body = linkmd::sync_push_incremental_with_options(
         cfg,
         brain,
@@ -172,7 +243,6 @@ fn push(
         resume_local_policy,
         bulk_confirmation,
     )?;
-
     if ctx.json {
         println!(
             "{}",
@@ -192,6 +262,15 @@ fn push(
         );
         return Ok(());
     }
+
+    // A v2 receipt reports only the atomic operation count. Do not rescan and
+    // materialize the whole brain merely to print a success sentence after an
+    // incremental five-file change. Legacy v1 already had to assemble its
+    // whole snapshot, so retain the historical file-count wording there.
+    let sent = match body.get("applied").and_then(Value::as_u64) {
+        Some(value) => value,
+        None => linkmd::collect_push_files(&store)?.len() as u64,
+    };
 
     let head_seq = body
         .get("headSeq")

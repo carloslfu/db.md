@@ -981,7 +981,11 @@ pub struct SyncArgs {
     /// The brain to sync with: its id (lowercase ULID) or your slug for it.
     /// A leading `@` is accepted.
     #[arg(value_name = "BRAIN")]
-    pub brain: String,
+    pub brain: Option<String>,
+
+    /// Resolve or prune private sync-control state.
+    #[command(subcommand)]
+    pub action: Option<SyncAction>,
 
     /// Push local changes from `--dir` without installing remote changes first.
     /// `--push-only` is the descriptive alias; `--push` remains compatible.
@@ -1021,6 +1025,67 @@ pub struct SyncArgs {
     /// Defaults to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub dir: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SyncAction {
+    /// Resolve one exact private conflict bundle. This never acts as force.
+    Resolve(SyncResolveArgs),
+
+    /// Inspect or prune private conflict bundles.
+    Conflicts(SyncConflictsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SyncConflictsArgs {
+    /// Remove expired and interrupted bundles.
+    #[arg(long)]
+    pub prune: bool,
+
+    /// Also remove unexpired completed bundles. Requires `--prune`.
+    #[arg(long, requires = "prune")]
+    pub all: bool,
+
+    /// Checkout containing `.dbmd/conflicts/`.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncResolveArgs {
+    /// Bundle ULID from SYNC_CONFLICT details.
+    #[arg(value_name = "BUNDLE")]
+    pub bundle: String,
+
+    /// Author a fresh exact-head mutation from the unchanged working file.
+    #[arg(
+        long,
+        required_unless_present_any = ["take_remote", "from"],
+        conflicts_with_all = ["take_remote", "from"]
+    )]
+    pub keep_local: bool,
+
+    /// Install the bundle's verified remote result locally.
+    #[arg(long, conflicts_with = "from")]
+    pub take_remote: bool,
+
+    /// Use one bounded, no-follow UTF-8 file as the merged candidate. The
+    /// bundle must contain exactly one conflicting path.
+    #[arg(long, value_name = "SAFE_FILE")]
+    pub from: Option<String>,
+
+    /// Confirm an exact bulk preview returned by a preceding keep-local/from
+    /// resolution attempt.
+    #[arg(long, value_name = "ID:DIGEST")]
+    pub confirm_bulk: Option<String>,
+
+    /// Checkout containing `.dbmd/conflicts/<bundle>`.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+
+    /// Hub base URL for this invocation.
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
 }
 
 /// `dbmd grant <sub>` — the capability model, owner-side.
