@@ -2683,6 +2683,10 @@ struct V2SyncBaseline {
     commit_hash: Option<String>,
     content_root: Option<String>,
     #[serde(default)]
+    asset_root: Option<String>,
+    #[serde(default)]
+    assets: std::collections::BTreeMap<String, V2BaselineAsset>,
+    #[serde(default)]
     view_kind: Option<String>,
     #[serde(default)]
     view_revision: Option<String>,
@@ -2727,10 +2731,44 @@ struct V2ManifestPage {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2BaselineAsset {
+    blob_sha256: String,
+    bytes: u64,
+    media_type: String,
+    wrappers: Vec<String>,
+    required: bool,
+    disposition: String,
+    leaf_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2AssetManifestItem {
+    path: String,
+    blob_sha256: String,
+    bytes: u64,
+    media_type: String,
+    wrappers: Vec<String>,
+    required: bool,
+    disposition: String,
+    leaf_hash: String,
+    proof: crate::linkmd_v2::HamtProof,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2AssetManifestPage {
+    v: u8,
+    commit: String,
+    asset_root: Option<String>,
+    assets: Vec<V2AssetManifestItem>,
+    next_cursor: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct V2SigningCandidate {
     seq: u64,
     content_root: Option<String>,
+    asset_root: Option<String>,
     signing_bytes_base64: String,
     changes_base64: String,
     actor_claim_base64: String,
@@ -2745,6 +2783,8 @@ struct V2SigningCandidatePage {
     parent: V2SigningParent,
     candidate: V2SigningCandidate,
     files: Vec<V2ManifestFile>,
+    #[serde(default)]
+    assets: Vec<V2AssetManifestItem>,
     next_cursor: Option<String>,
     expires_at: String,
 }
@@ -2868,10 +2908,188 @@ fn v2_manifest(
     Ok(files)
 }
 
+fn verify_v2_asset_proof(root: &str, item: &V2AssetManifestItem) -> LinkResult<()> {
+    crate::linkmd_v2::normalize_path(&item.path)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    if !is_sha256(&item.blob_sha256)
+        || !is_sha256(&item.leaf_hash)
+        || item.wrappers.is_empty()
+        || !matches!(item.disposition.as_str(), "hosted" | "withheld")
+        || item
+            .wrappers
+            .iter()
+            .any(|wrapper| crate::linkmd_v2::normalize_path(wrapper).is_err())
+    {
+        return Err(invalid_feed("v2 asset manifest item is invalid"));
+    }
+    let leaf = json!({
+        "blob_sha256": item.blob_sha256,
+        "bytes": item.bytes,
+        "disposition": item.disposition,
+        "media_type": item.media_type,
+        "path": item.path,
+        "required": item.required,
+        "v": 2,
+        "wrappers": item.wrappers,
+    });
+    if crate::linkmd_v2::domain_hash("v2/asset-leaf", &leaf)
+        .map_err(|error| invalid_feed(error.to_string()))?
+        != item.leaf_hash
+        || !crate::linkmd_v2::verify_proof_with_domain(
+            root,
+            &item.path,
+            &item.proof,
+            crate::linkmd_v2::ASSET_TREE_HASH_DOMAIN,
+        )
+        .map_err(|error| invalid_feed(error.to_string()))?
+    {
+        return Err(invalid_feed("v2 asset inclusion proof failed"));
+    }
+    match &item.proof {
+        crate::linkmd_v2::HamtProof::Inclusion { entry, .. }
+            if entry.name == item.path
+                && entry.kind == crate::linkmd_v2::EntryKind::Blob
+                && entry.child_hash == item.leaf_hash
+                && entry.bytes == Some(item.bytes) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid_feed(
+            "v2 asset proof leaf differs from its manifest",
+        )),
+    }
+}
+
+fn v2_asset_manifest(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: Option<&V2PointerBody>,
+) -> LinkResult<std::collections::BTreeMap<String, V2BaselineAsset>> {
+    let Some(pointer) = pointer else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let Some(root) = pointer.asset_root.as_deref() else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let mut assets = std::collections::BTreeMap::new();
+    let mut after = String::new();
+    loop {
+        let encoded_after: String =
+            url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
+        let path = format!(
+            "/api/hub/brains/{brain}/v2/assets?commit={}&limit=500&after={encoded_after}",
+            pointer.commit_hash
+        );
+        let value = ensure_ok(
+            request_capped(
+                cfg,
+                "GET",
+                &path,
+                None,
+                Auth::Required,
+                MAX_FEED_RESPONSE_BYTES,
+            )?,
+            "v2 asset manifest",
+        )?;
+        let page: V2AssetManifestPage = serde_json::from_value(value)
+            .map_err(|_| invalid_feed("v2 asset manifest has an invalid shape"))?;
+        if page.v != 2
+            || page.commit != pointer.commit_hash
+            || page.asset_root.as_deref() != Some(root)
+            || page.assets.len() > 500
+        {
+            return Err(invalid_feed(
+                "v2 asset manifest is not bound to the verified head",
+            ));
+        }
+        for item in page.assets {
+            verify_v2_asset_proof(root, &item)?;
+            let path = item.path.clone();
+            if assets
+                .insert(
+                    path,
+                    V2BaselineAsset {
+                        blob_sha256: item.blob_sha256,
+                        bytes: item.bytes,
+                        media_type: item.media_type,
+                        wrappers: item.wrappers,
+                        required: item.required,
+                        disposition: item.disposition,
+                        leaf_hash: item.leaf_hash,
+                    },
+                )
+                .is_some()
+            {
+                return Err(invalid_feed("v2 asset manifest repeats a path"));
+            }
+            if assets.len() > MAX_PUSH_FILES {
+                return Err(invalid_feed(
+                    "v2 asset manifest exceeds the item-count bound",
+                ));
+            }
+        }
+        match page.next_cursor {
+            None => break,
+            Some(next) if next > after => after = next,
+            Some(_) => return Err(invalid_feed("v2 asset manifest cursor did not advance")),
+        }
+    }
+    Ok(assets)
+}
+
+fn v2_asset_record(asset: &V2BaselineAsset, path: &str) -> crate::AssetRecord {
+    crate::AssetRecord {
+        path: path.to_string(),
+        sha256: asset.blob_sha256.clone(),
+        bytes: asset.bytes,
+        media_type: asset.media_type.clone(),
+        wrappers: asset.wrappers.clone(),
+        required: asset.required,
+    }
+}
+
+fn v2_asset_manifest_bytes(
+    assets: &std::collections::BTreeMap<String, V2BaselineAsset>,
+) -> LinkResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for (path, asset) in assets {
+        serde_json::to_writer(&mut bytes, &v2_asset_record(asset, path))
+            .map_err(|_| invalid_feed("could not materialize v2 assets.jsonl"))?;
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+fn download_v2_asset(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    path: &str,
+    asset: &V2BaselineAsset,
+) -> LinkResult<Vec<u8>> {
+    if asset.disposition != "hosted" {
+        return Err(invalid_feed("withheld assets have no hosted bytes"));
+    }
+    let encoded_path: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+    let endpoint = format!(
+        "/api/hub/brains/{brain}/v2/assets/blob?commit={}&path={encoded_path}&sha256={}",
+        pointer.commit_hash, asset.blob_sha256
+    );
+    let bytes = ensure_raw_ok(
+        request_raw(cfg, "GET", &endpoint, None, Auth::Required, asset.bytes)?,
+        "v2 asset download",
+    )?;
+    if bytes.len() as u64 != asset.bytes || content_sha256(&bytes) != asset.blob_sha256 {
+        return Err(invalid_feed("v2 asset bytes failed integrity verification"));
+    }
+    Ok(bytes)
+}
+
 fn sign_verified_v2_candidate(
     cfg: &HubConfig,
     head: &V2VerifiedHead,
     expected: &std::collections::BTreeMap<String, V2BaselineFile>,
+    expected_assets: &std::collections::BTreeMap<String, V2BaselineAsset>,
     mutation_id: &str,
     request_body: &Value,
     challenge_value: &Value,
@@ -2924,6 +3142,7 @@ fn sign_verified_v2_candidate(
         String,
         String,
         Option<String>,
+        Option<String>,
         u64,
         Option<String>,
     )> = None;
@@ -2961,6 +3180,7 @@ fn sign_verified_v2_candidate(
             page.candidate.changes_base64.clone(),
             page.candidate.actor_claim_base64.clone(),
             page.candidate.content_root.clone(),
+            page.candidate.asset_root.clone(),
             page.parent.seq,
             page.parent.commit_hash.clone(),
         );
@@ -3019,8 +3239,105 @@ fn sign_verified_v2_candidate(
             "self-custody candidate contains an unexpected file mutation",
         ));
     }
-    let Some((request_hash, signing_b64, changes_b64, actor_b64, root, parent_seq, parent)) =
-        pinned
+    let mut assets = std::collections::BTreeMap::new();
+    after.clear();
+    loop {
+        let encoded_after: String =
+            url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
+        let path = format!("{expected_endpoint}?kind=assets&limit=500&after={encoded_after}");
+        let value = ensure_ok(
+            request_capped(
+                cfg,
+                "GET",
+                &path,
+                None,
+                Auth::Required,
+                MAX_FEED_RESPONSE_BYTES,
+            )?,
+            "v2 self-custody asset candidate",
+        )?;
+        let page: V2SigningCandidatePage = serde_json::from_value(value)
+            .map_err(|_| invalid_feed("self-custody asset candidate has an invalid shape"))?;
+        let coordinate = (
+            page.request_hash.clone(),
+            page.candidate.signing_bytes_base64.clone(),
+            page.candidate.changes_base64.clone(),
+            page.candidate.actor_claim_base64.clone(),
+            page.candidate.content_root.clone(),
+            page.candidate.asset_root.clone(),
+            page.parent.seq,
+            page.parent.commit_hash.clone(),
+        );
+        if page.v != 2
+            || page.challenge_id != challenge_id
+            || page.mutation_id != mutation_id
+            || page.assets.len() > 500
+            || pinned.as_ref() != Some(&coordinate)
+        {
+            return Err(invalid_feed(
+                "self-custody asset candidate changed or is not bound",
+            ));
+        }
+        let root = page.candidate.asset_root.as_deref();
+        if !page.assets.is_empty() && root.is_none() {
+            return Err(invalid_feed("asset candidate has no asset root"));
+        }
+        for item in page.assets {
+            verify_v2_asset_proof(root.expect("non-empty assets checked"), &item)?;
+            if assets
+                .insert(
+                    item.path.clone(),
+                    V2BaselineAsset {
+                        blob_sha256: item.blob_sha256,
+                        bytes: item.bytes,
+                        media_type: item.media_type,
+                        wrappers: item.wrappers,
+                        required: item.required,
+                        disposition: item.disposition,
+                        leaf_hash: item.leaf_hash,
+                    },
+                )
+                .is_some()
+            {
+                return Err(invalid_feed("self-custody candidate repeats an asset"));
+            }
+        }
+        match page.next_cursor {
+            None => break,
+            Some(next) if next > after => after = next,
+            Some(_) => {
+                return Err(invalid_feed(
+                    "self-custody asset candidate cursor did not advance",
+                ))
+            }
+        }
+    }
+    if assets.len() != expected_assets.len()
+        || assets.iter().any(|(path, asset)| {
+            expected_assets.get(path).is_none_or(|expected| {
+                asset.blob_sha256 != expected.blob_sha256
+                    || asset.bytes != expected.bytes
+                    || asset.media_type != expected.media_type
+                    || asset.wrappers != expected.wrappers
+                    || asset.required != expected.required
+                    || asset.disposition != expected.disposition
+            })
+        })
+    {
+        return Err(invalid_feed(
+            "self-custody candidate contains an unexpected asset mutation",
+        ));
+    }
+    let Some((
+        request_hash,
+        signing_b64,
+        changes_b64,
+        actor_b64,
+        root,
+        asset_root,
+        parent_seq,
+        parent,
+    )) = pinned
     else {
         return Err(invalid_feed("self-custody candidate has no manifest"));
     };
@@ -3098,6 +3415,7 @@ fn sign_verified_v2_candidate(
     let actor_der = verify_v2_spki_signature(actor_public_key, &actor_message, actor_signature)?;
     let expected_actor_signer = format!("{actor_fingerprint}:{actor_public_key}");
     let expected_actor_root = root.clone().map(Value::String).unwrap_or(Value::Null);
+    let expected_actor_asset_root = asset_root.clone().map(Value::String).unwrap_or(Value::Null);
     if format!("{:x}", Sha256::digest(&actor_der)) != actor_fingerprint
         || head
             .trust
@@ -3115,6 +3433,10 @@ fn sign_verified_v2_candidate(
             .get("candidate")
             .and_then(|candidate| candidate.get("state_root"))
             != Some(&expected_actor_root)
+        || actor_claim
+            .get("candidate")
+            .and_then(|candidate| candidate.get("asset_root"))
+            != Some(&expected_actor_asset_root)
         || actor_claim
             .get("candidate")
             .and_then(|candidate| candidate.get("control_revision"))
@@ -3153,10 +3475,12 @@ fn sign_verified_v2_candidate(
         .cloned()
         .unwrap_or(Value::Null);
     let expected_state_root = root.clone().map(Value::String).unwrap_or(Value::Null);
-    let expected_asset_root = pointer
-        .and_then(|value| value.asset_root.clone())
-        .map(Value::String)
+    let expected_parent_asset_root = request_body
+        .get("base")
+        .and_then(|base| base.get("asset_root"))
+        .cloned()
         .unwrap_or(Value::Null);
+    let expected_asset_root = asset_root.map(Value::String).unwrap_or(Value::Null);
     let expected_prev_entry = pointer
         .map(|value| Value::String(value.feed_hash.clone()))
         .unwrap_or(Value::Null);
@@ -3172,7 +3496,7 @@ fn sign_verified_v2_candidate(
         || signing_value.get("parent_commit") != Some(&expected_parent_commit)
         || signing_value.get("parent_root") != Some(&expected_parent_root)
         || signing_value.get("state_root") != Some(&expected_state_root)
-        || signing_value.get("parent_asset_root") != Some(&expected_asset_root)
+        || signing_value.get("parent_asset_root") != Some(&expected_parent_asset_root)
         || signing_value.get("asset_root") != Some(&expected_asset_root)
         || signing_value.get("materializer").and_then(Value::as_str) != Some(expected_materializer)
         || signing_value.get("changes_sha256").and_then(Value::as_str)
@@ -3235,6 +3559,7 @@ fn same_v2_head(left: &V2VerifiedHead, right: &V2VerifiedHead) -> bool {
                 left.seq == right.seq
                     && left.commit_hash == right.commit_hash
                     && left.content_root == right.content_root
+                    && left.asset_root == right.asset_root
                     && left.feed_hash == right.feed_hash
             }
             _ => false,
@@ -3421,6 +3746,10 @@ fn load_v2_baseline(
             .as_deref()
             .is_some_and(|hash| !is_sha256(hash))
         || baseline
+            .asset_root
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || baseline
             .local_policy_digest
             .as_deref()
             .is_some_and(|hash| !is_sha256(hash))
@@ -3439,12 +3768,25 @@ fn load_v2_baseline(
         || (baseline.view_kind.as_deref() == Some("scoped")
             && (baseline.view_revision.is_none() || baseline.projection_sha256.is_none()))
         || baseline.files.len() > MAX_PUSH_FILES
+        || baseline.assets.len() > MAX_PUSH_FILES
         || baseline.local_eligibility.len() > MAX_PUSH_FILES
         || baseline.remote_copy_remains.len() > MAX_PUSH_FILES
         || baseline.files.iter().any(|(path, file)| {
             crate::linkmd_v2::normalize_path(path).is_err()
                 || !is_sha256(&file.sha256)
                 || file.bytes > MAX_STORE_BYTES
+        })
+        || baseline.assets.iter().any(|(path, asset)| {
+            crate::linkmd_v2::normalize_path(path).is_err()
+                || !is_sha256(&asset.blob_sha256)
+                || !is_sha256(&asset.leaf_hash)
+                || asset.bytes > MAX_STORE_BYTES
+                || !matches!(asset.disposition.as_str(), "hosted" | "withheld")
+                || asset.wrappers.is_empty()
+                || asset
+                    .wrappers
+                    .iter()
+                    .any(|wrapper| crate::linkmd_v2::normalize_path(wrapper).is_err())
         })
         || baseline
             .local_eligibility
@@ -3546,6 +3888,7 @@ fn v2_baseline_from_head(
     cfg: &HubConfig,
     head: &V2VerifiedHead,
     files: std::collections::BTreeMap<String, V2BaselineFile>,
+    assets: std::collections::BTreeMap<String, V2BaselineAsset>,
     local: Option<&V2LocalView>,
 ) -> LinkResult<V2SyncBaseline> {
     let mut local_eligibility = local
@@ -3579,6 +3922,11 @@ fn v2_baseline_from_head(
             .pointer
             .as_ref()
             .and_then(|pointer| pointer.content_root.clone()),
+        asset_root: head
+            .pointer
+            .as_ref()
+            .and_then(|pointer| pointer.asset_root.clone()),
+        assets,
         view_kind: Some(head.view_kind.clone()),
         view_revision: Some(head.view_revision.clone()),
         projection_sha256: (head.view_kind == "scoped")
@@ -3593,6 +3941,11 @@ fn v2_baseline_from_head(
 fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
     let policy = crate::linkmd_sync_policy::load(store)
         .map_err(|message| LinkError::InvalidPack { message })?;
+    let asset_paths = crate::assets::read_manifest(store)
+        .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?
+        .into_iter()
+        .map(|asset| asset.path)
+        .collect::<std::collections::BTreeSet<_>>();
     let mut result = std::collections::BTreeMap::new();
     let mut eligibility = std::collections::BTreeMap::new();
     let mut total = 0_u64;
@@ -3602,6 +3955,9 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
         let path = relative.to_string_lossy().replace('\\', "/");
         // v2 catalogs and asset inventory are materialized/signed separately.
         if matches!(path.as_str(), "assets.jsonl" | "index.md" | "index.jsonl") {
+            continue;
+        }
+        if asset_paths.contains(&path) {
             continue;
         }
         crate::linkmd_v2::normalize_path(&path).map_err(|error| LinkError::UnsafePath {
@@ -3796,12 +4152,11 @@ fn v2_sync_pull(
         &head,
         v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
     );
+    let remote_assets = v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?;
     let baseline = load_v2_baseline(cfg, &head.brain_id, &dest)?;
     ensure_v2_view_compatible(&head, baseline.as_ref())?;
-    let mut local_view = match Store::open_strict(&dest) {
-        Ok(store) => Some(v2_local_files(&store)?),
-        Err(_) => None,
-    };
+    let local_store = Store::open_strict(&dest).ok();
+    let mut local_view = local_store.as_ref().map(v2_local_files).transpose()?;
     if head.view_kind == "scoped" && baseline.is_none() && local_view.is_some() {
         return Err(LinkError::ScopedViewChanged);
     }
@@ -3823,6 +4178,21 @@ fn v2_sync_pull(
         .map(|state| &state.files)
         .cloned()
         .unwrap_or_default();
+    let base_assets = baseline
+        .as_ref()
+        .map(|state| state.assets.clone())
+        .unwrap_or_default();
+    let local_assets = local_store
+        .as_ref()
+        .map(|store| {
+            crate::assets::read_manifest(store)
+                .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))
+        })
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|asset| (asset.path.clone(), asset))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let all_paths = base
         .keys()
         .chain(remote.keys())
@@ -3838,6 +4208,31 @@ fn v2_sync_pull(
         let remote_hash = remote.get(path).map(|file| file.sha256.as_str());
         let local_hash = local.get(path).map(|file| file.0.as_str());
         if local_hash != base_hash && remote_hash != base_hash && local_hash != remote_hash {
+            conflicts.push(path.clone());
+        }
+    }
+    if !conflicts.is_empty() {
+        conflicts.truncate(100);
+        return Err(LinkError::Conflict { paths: conflicts });
+    }
+    let asset_paths = base_assets
+        .keys()
+        .chain(remote_assets.keys())
+        .chain(local_assets.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in &asset_paths {
+        let base_record = base_assets
+            .get(path)
+            .map(|asset| v2_asset_record(asset, path));
+        let remote_record = remote_assets
+            .get(path)
+            .map(|asset| v2_asset_record(asset, path));
+        let local_record = local_assets.get(path).cloned();
+        if local_record != base_record
+            && remote_record != base_record
+            && local_record != remote_record
+        {
             conflicts.push(path.clone());
         }
     }
@@ -3862,7 +4257,7 @@ fn v2_sync_pull(
         )?,
         None => Vec::new(),
     };
-    let deleted = base
+    let mut deleted = base
         .iter()
         .filter(|(path, file)| {
             !remote.contains_key(*path)
@@ -3871,6 +4266,59 @@ fn v2_sync_pull(
         })
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
+    if local_assets
+        != remote_assets
+            .iter()
+            .map(|(path, asset)| (path.clone(), v2_asset_record(asset, path)))
+            .collect()
+    {
+        if remote_assets.is_empty() {
+            deleted.push("assets.jsonl".to_string());
+        } else {
+            changed.push((
+                "assets.jsonl".to_string(),
+                v2_asset_manifest_bytes(&remote_assets)?,
+            ));
+        }
+    }
+    if let Some(pointer) = pointer {
+        for (path, asset) in &remote_assets {
+            if asset.disposition != "hosted" || kept_home(path) {
+                continue;
+            }
+            let already_current = local_store.as_ref().is_some_and(|store| {
+                matches!(store.regular_file_exists(Path::new(path)), Ok(true))
+                    && store
+                        .read_bounded(Path::new(path), asset.bytes)
+                        .ok()
+                        .is_some_and(|bytes| {
+                            bytes.len() as u64 == asset.bytes
+                                && content_sha256(&bytes) == asset.blob_sha256
+                        })
+            });
+            if !already_current {
+                changed.push((
+                    path.clone(),
+                    download_v2_asset(cfg, &head.brain_id, pointer, path, asset)?,
+                ));
+            }
+        }
+    }
+    for (path, prior) in &base_assets {
+        if remote_assets.contains_key(path) || kept_home(path) {
+            continue;
+        }
+        let unchanged = local_store.as_ref().is_some_and(|store| {
+            matches!(store.regular_file_exists(Path::new(path)), Ok(true))
+                && store
+                    .read_bounded(Path::new(path), prior.bytes)
+                    .ok()
+                    .is_some_and(|bytes| content_sha256(&bytes) == prior.blob_sha256)
+        });
+        if unchanged {
+            deleted.push(path.clone());
+        }
+    }
     let extra_local = local
         .keys()
         .filter(|path| !remote.contains_key(*path) && !deleted.contains(path))
@@ -3914,13 +4362,19 @@ fn v2_sync_pull(
         cfg,
         &head.brain_id,
         &dest,
-        &v2_baseline_from_head(cfg, &head, remote.clone(), Some(&installed_local))?,
+        &v2_baseline_from_head(
+            cfg,
+            &head,
+            remote.clone(),
+            remote_assets.clone(),
+            Some(&installed_local),
+        )?,
     )?;
     Ok(PullReport {
         brain: head.brain_id,
         slug: requested_brain.to_string(),
         head_seq: pointer.map_or(0, |value| value.seq),
-        files: remote.len(),
+        files: remote.len() + remote_assets.len(),
         dest: dest.to_string_lossy().into_owned(),
         extra_local,
         sync_status: if local_dirty {
@@ -3936,6 +4390,24 @@ fn v2_expected(remote: Option<&V2BaselineFile>) -> Value {
         Some(file) => json!({ "kind": "blob", "hash": file.sha256 }),
         None => json!({ "kind": "absent" }),
     }
+}
+
+fn v2_asset_expected(remote: Option<&V2BaselineAsset>) -> Value {
+    match remote {
+        Some(asset) => json!({ "kind": "asset", "hash": asset.leaf_hash }),
+        None => json!({ "kind": "absent" }),
+    }
+}
+
+fn v2_asset_value(record: &crate::AssetRecord, disposition: &str) -> Value {
+    json!({
+        "blob_sha256": record.sha256,
+        "bytes": record.bytes,
+        "media_type": record.media_type,
+        "wrappers": record.wrappers,
+        "required": record.required,
+        "disposition": disposition,
+    })
 }
 
 fn v2_riding_matches_remote(
@@ -3965,6 +4437,7 @@ fn v2_sync_push(
         &head,
         v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
     );
+    let remote_assets = v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?;
     let baseline = load_v2_baseline(cfg, &head.brain_id, &store.root)?;
     ensure_v2_view_compatible(&head, baseline.as_ref())?;
     if head.view_kind == "scoped" && baseline.is_none() {
@@ -3973,6 +4446,11 @@ fn v2_sync_push(
     let mut local_view = v2_local_files(store)?;
     remove_scoped_projection(&head, baseline.as_ref(), &mut local_view)?;
     let local = &local_view.riding;
+    let local_assets = crate::assets::read_manifest(store)
+        .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?
+        .into_iter()
+        .map(|asset| (asset.path.clone(), asset))
+        .collect::<std::collections::BTreeMap<_, _>>();
     if let Some(previous) = baseline.as_ref() {
         if previous.local_policy_digest.as_deref() != Some(&local_view.policy.digest)
             && !resume_local_policy
@@ -4065,6 +4543,103 @@ fn v2_sync_push(
             }
         }
     }
+    let base_assets = match baseline.as_ref() {
+        Some(state) => state.assets.clone(),
+        None if remote_assets.is_empty() => std::collections::BTreeMap::new(),
+        None => {
+            let mismatched = remote_assets.iter().any(|(path, remote)| {
+                local_assets.get(path) != Some(&v2_asset_record(remote, path))
+            }) || local_assets.len() != remote_assets.len();
+            if mismatched {
+                return Err(LinkError::Conflict {
+                    paths: vec!["assets.jsonl".to_string()],
+                });
+            }
+            remote_assets.clone()
+        }
+    };
+    let asset_paths = base_assets
+        .keys()
+        .chain(remote_assets.keys())
+        .chain(local_assets.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in asset_paths {
+        let base_record = base_assets
+            .get(&path)
+            .map(|asset| v2_asset_record(asset, &path));
+        let remote = remote_assets.get(&path);
+        let remote_record = remote.map(|asset| v2_asset_record(asset, &path));
+        let local_record = local_assets.get(&path);
+        if local_record == base_record.as_ref() {
+            continue;
+        }
+        if remote_record != base_record && local_record != remote_record.as_ref() {
+            conflicts.push(path);
+            continue;
+        }
+        let Some(record) = local_record else {
+            if let Some(remote) = remote {
+                operations.push(json!({
+                    "op": "asset_delete",
+                    "path": path,
+                    "expected": v2_asset_expected(Some(remote)),
+                }));
+            }
+            continue;
+        };
+        crate::linkmd_v2::normalize_path(&record.path)
+            .map_err(|error| invalid_feed(error.to_string()))?;
+        let kept_home = local_view.policy.keeps_home(&path);
+        let raw = if matches!(store.regular_file_exists(Path::new(&path)), Ok(true)) {
+            let bytes = store.read_bounded(Path::new(&path), record.bytes)?;
+            if bytes.len() as u64 != record.bytes || content_sha256(&bytes) != record.sha256 {
+                return Err(LinkError::InvalidPack {
+                    message: format!("asset {path} differs from assets.jsonl"),
+                });
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let disposition = if kept_home || raw.is_none() {
+            "withheld"
+        } else {
+            "hosted"
+        };
+        if raw.is_none() && record.required && !kept_home {
+            return Err(LinkError::InvalidPack {
+                message: format!("required asset {path} is missing"),
+            });
+        }
+        let op = if remote.is_some_and(|asset| {
+            asset.disposition == "withheld"
+                && disposition == "hosted"
+                && v2_asset_record(asset, &path) == *record
+        }) {
+            if !resume_local_policy {
+                continue;
+            }
+            "asset_resume"
+        } else {
+            "asset_put"
+        };
+        operations.push(json!({
+            "op": op,
+            "path": path,
+            "expected": v2_asset_expected(remote),
+            "asset": v2_asset_value(record, disposition),
+        }));
+        if disposition == "hosted" {
+            let bytes = raw.expect("hosted asset was checked present");
+            blobs.push(json!({
+                "sha256": record.sha256,
+                "bytes": bytes.len(),
+                "content_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }));
+            upload_bytes.insert(record.sha256.clone(), bytes);
+        }
+    }
     if !conflicts.is_empty() {
         conflicts.truncate(100);
         return Err(LinkError::Conflict { paths: conflicts });
@@ -4081,7 +4656,7 @@ fn v2_sync_push(
         let remote_ahead = !v2_riding_matches_remote(&final_local.riding, &remote, |path| {
             final_local.policy.keeps_home(path)
         });
-        let next = v2_baseline_from_head(cfg, &head, remote, Some(&final_local))?;
+        let next = v2_baseline_from_head(cfg, &head, remote, remote_assets, Some(&final_local))?;
         let split_count = next.remote_copy_remains.len();
         accept_v2_head(cfg, &final_head)?;
         if !local_changed && !remote_ahead {
@@ -4112,6 +4687,7 @@ fn v2_sync_push(
             "seq": pointer.seq,
             "commit_hash": pointer.commit_hash,
             "content_root": pointer.content_root,
+            "asset_root": pointer.asset_root,
         })
     });
     // The mutation coordinate is stable for the exact observed base and local
@@ -4126,6 +4702,7 @@ fn v2_sync_push(
     );
     let mutation_id = format!("dbmd-{}", content_sha256(entropy.as_bytes()));
     let mut expected_candidate = remote.clone();
+    let mut expected_candidate_assets = remote_assets.clone();
     for operation in &operations {
         match operation.get("op").and_then(Value::as_str) {
             Some("put") => {
@@ -4156,6 +4733,39 @@ fn v2_sync_push(
                     .and_then(Value::as_str)
                     .ok_or_else(|| invalid_feed("v2 delete has no path"))?;
                 expected_candidate.remove(path);
+            }
+            Some("asset_delete") => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 asset delete has no path"))?;
+                expected_candidate_assets.remove(path);
+            }
+            Some("asset_put" | "asset_resume") => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 asset write has no path"))?;
+                let record = local_assets
+                    .get(path)
+                    .ok_or_else(|| invalid_feed("v2 asset write has no local record"))?;
+                let disposition = operation
+                    .get("asset")
+                    .and_then(|asset| asset.get("disposition"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 asset write has no disposition"))?;
+                expected_candidate_assets.insert(
+                    path.to_string(),
+                    V2BaselineAsset {
+                        blob_sha256: record.sha256.clone(),
+                        bytes: record.bytes,
+                        media_type: record.media_type.clone(),
+                        wrappers: record.wrappers.clone(),
+                        required: record.required,
+                        disposition: disposition.to_string(),
+                        leaf_hash: String::new(),
+                    },
+                );
             }
             _ => return Err(invalid_feed("dbmd generated an unsupported v2 operation")),
         }
@@ -4270,6 +4880,7 @@ fn v2_sync_push(
             cfg,
             &head,
             &expected_candidate,
+            &expected_candidate_assets,
             &mutation_id,
             &body,
             challenge,
@@ -4306,13 +4917,20 @@ fn v2_sync_push(
         &refreshed,
         v2_manifest(cfg, &refreshed.brain_id, refreshed.pointer.as_ref())?,
     );
+    let refreshed_assets = v2_asset_manifest(cfg, &refreshed.brain_id, refreshed.pointer.as_ref())?;
     let mut final_local = v2_local_files(store)?;
     remove_scoped_projection(&refreshed, baseline.as_ref(), &mut final_local)?;
     let local_dirty = final_local.riding != local_view.riding
         || !v2_riding_matches_remote(&final_local.riding, &refreshed_files, |path| {
             final_local.policy.keeps_home(path)
         });
-    let next = v2_baseline_from_head(cfg, &refreshed, refreshed_files, Some(&final_local))?;
+    let next = v2_baseline_from_head(
+        cfg,
+        &refreshed,
+        refreshed_files,
+        refreshed_assets,
+        Some(&final_local),
+    )?;
     let split_count = next.remote_copy_remains.len();
     accept_v2_head(cfg, &refreshed)?;
     if !local_dirty {
@@ -6264,7 +6882,9 @@ pub fn proposal_accept_exact(
         &head,
         v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
     );
+    let remote_assets = v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?;
     let mut expected_candidate = remote.clone();
+    let mut expected_candidate_assets = remote_assets;
     for operation in &operations {
         let op = operation
             .get("op")
@@ -6336,6 +6956,80 @@ pub fn proposal_accept_exact(
                     },
                 );
             }
+            "asset_delete" => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal asset delete has no path"))?;
+                expected_candidate_assets.remove(path);
+            }
+            "asset_withdraw" => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal asset withdrawal has no path"))?;
+                let asset = expected_candidate_assets
+                    .get_mut(path)
+                    .ok_or_else(|| invalid_feed("proposal withdraws an unknown asset"))?;
+                asset.disposition = "withheld".to_string();
+                asset.leaf_hash.clear();
+            }
+            "asset_put" | "asset_resume" => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal asset write has no path"))?;
+                let asset = operation
+                    .get("asset")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| invalid_feed("proposal asset write has no value"))?;
+                let blob_sha256 = asset
+                    .get("blob_sha256")
+                    .and_then(Value::as_str)
+                    .filter(|hash| is_sha256(hash))
+                    .ok_or_else(|| invalid_feed("proposal asset has no blob hash"))?;
+                let bytes = asset
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_feed("proposal asset has no byte count"))?;
+                let media_type = asset
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal asset has no media type"))?;
+                let wrappers = asset
+                    .get("wrappers")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| invalid_feed("proposal asset has no wrappers"))?
+                    .iter()
+                    .map(|wrapper| {
+                        wrapper
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| invalid_feed("proposal asset wrapper is invalid"))
+                    })
+                    .collect::<LinkResult<Vec<_>>>()?;
+                let required = asset
+                    .get("required")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| invalid_feed("proposal asset required flag is invalid"))?;
+                let disposition = asset
+                    .get("disposition")
+                    .and_then(Value::as_str)
+                    .filter(|value| matches!(*value, "hosted" | "withheld"))
+                    .ok_or_else(|| invalid_feed("proposal asset disposition is invalid"))?;
+                expected_candidate_assets.insert(
+                    path.to_string(),
+                    V2BaselineAsset {
+                        blob_sha256: blob_sha256.to_string(),
+                        bytes,
+                        media_type: media_type.to_string(),
+                        wrappers,
+                        required,
+                        disposition: disposition.to_string(),
+                        leaf_hash: String::new(),
+                    },
+                );
+            }
             _ => return Err(invalid_feed("proposal operation kind is unsupported")),
         }
     }
@@ -6344,6 +7038,7 @@ pub fn proposal_accept_exact(
             "seq": pointer.seq,
             "commit_hash": pointer.commit_hash,
             "content_root": pointer.content_root,
+            "asset_root": pointer.asset_root,
         })
     });
     let mut body = json!({
@@ -6445,6 +7140,7 @@ pub fn proposal_accept_exact(
             cfg,
             &head,
             &expected_candidate,
+            &expected_candidate_assets,
             mutation_id,
             &body,
             challenge,
@@ -10523,6 +11219,8 @@ mod tests {
             brain: TEST_BRAIN_ID.to_string(),
             commit_hash: None,
             content_root: None,
+            asset_root: None,
+            assets: std::collections::BTreeMap::new(),
             view_kind: Some("scoped".to_string()),
             view_revision: Some(revision.to_string()),
             projection_sha256: Some(scoped_projection_sha256(TEST_BRAIN_ID)),

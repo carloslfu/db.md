@@ -15,7 +15,8 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_PATH_BYTES: usize = 1_024;
 pub const MAX_COMPONENT_BYTES: usize = 255;
-const NODE_DOMAIN: &str = "v2/content-tree-node";
+pub const CONTENT_TREE_HASH_DOMAIN: &str = "v2/content-tree-node";
+pub const ASSET_TREE_HASH_DOMAIN: &str = "v2/asset-tree-node";
 
 #[derive(Debug, thiserror::Error)]
 pub enum V2Error {
@@ -231,7 +232,11 @@ pub fn encode_node(node: &HamtNode) -> V2Result<Vec<u8>> {
 }
 
 pub fn hash_node(node: &HamtNode) -> V2Result<String> {
-    domain_hash(NODE_DOMAIN, &node_value(node))
+    hash_node_with_domain(node, CONTENT_TREE_HASH_DOMAIN)
+}
+
+pub fn hash_node_with_domain(node: &HamtNode, domain: &str) -> V2Result<String> {
+    domain_hash(domain, &node_value(node))
 }
 
 pub fn decode_node(bytes: &[u8]) -> V2Result<HamtNode> {
@@ -724,6 +729,15 @@ pub fn create_proof(
 }
 
 pub fn verify_proof(root: &str, name: &str, proof: &HamtProof) -> V2Result<bool> {
+    verify_proof_with_domain(root, name, proof, CONTENT_TREE_HASH_DOMAIN)
+}
+
+pub fn verify_proof_with_domain(
+    root: &str,
+    name: &str,
+    proof: &HamtProof,
+    domain: &str,
+) -> V2Result<bool> {
     let normalized = name.nfc().collect::<String>();
     let route = sha256_hex(normalized.as_bytes());
     let (mut current, frames) = match proof {
@@ -736,10 +750,13 @@ pub fn verify_proof(root: &str, name: &str, proof: &HamtProof) -> V2Result<bool>
                 return Ok(false);
             }
             (
-                hash_node(&HamtNode::Leaf {
-                    route: route.clone(),
-                    entry: entry.clone(),
-                })?,
+                hash_node_with_domain(
+                    &HamtNode::Leaf {
+                        route: route.clone(),
+                        entry: entry.clone(),
+                    },
+                    domain,
+                )?,
                 frames,
             )
         }
@@ -757,11 +774,14 @@ pub fn verify_proof(root: &str, name: &str, proof: &HamtProof) -> V2Result<bool>
                     if route[*depth..*depth + run.len()] == *run {
                         return Ok(false);
                     }
-                    hash_node(&HamtNode::Compressed {
-                        depth: *depth,
-                        run: run.clone(),
-                        child: child.clone(),
-                    })?
+                    hash_node_with_domain(
+                        &HamtNode::Compressed {
+                            depth: *depth,
+                            run: run.clone(),
+                            child: child.clone(),
+                        },
+                        domain,
+                    )?
                 }
                 NonInclusionTerminal::EmptyBranch {
                     depth,
@@ -773,10 +793,13 @@ pub fn verify_proof(root: &str, name: &str, proof: &HamtProof) -> V2Result<bool>
                     if wanted != *slot || siblings.iter().any(|(candidate, _)| candidate == slot) {
                         return Ok(false);
                     }
-                    hash_node(&HamtNode::Branch {
-                        depth: *depth,
-                        children: siblings.clone(),
-                    })?
+                    hash_node_with_domain(
+                        &HamtNode::Branch {
+                            depth: *depth,
+                            children: siblings.clone(),
+                        },
+                        domain,
+                    )?
                 }
             };
             (hash, frames)
@@ -784,11 +807,14 @@ pub fn verify_proof(root: &str, name: &str, proof: &HamtProof) -> V2Result<bool>
     };
     for frame in frames.iter().rev() {
         current = match frame {
-            ProofFrame::Compressed { depth, run } => hash_node(&HamtNode::Compressed {
-                depth: *depth,
-                run: run.clone(),
-                child: current,
-            })?,
+            ProofFrame::Compressed { depth, run } => hash_node_with_domain(
+                &HamtNode::Compressed {
+                    depth: *depth,
+                    run: run.clone(),
+                    child: current,
+                },
+                domain,
+            )?,
             ProofFrame::Branch {
                 depth,
                 slot,
@@ -800,10 +826,13 @@ pub fn verify_proof(root: &str, name: &str, proof: &HamtProof) -> V2Result<bool>
                 if children.windows(2).any(|window| window[0].0 == window[1].0) {
                     return Ok(false);
                 }
-                hash_node(&HamtNode::Branch {
-                    depth: *depth,
-                    children,
-                })?
+                hash_node_with_domain(
+                    &HamtNode::Branch {
+                        depth: *depth,
+                        children,
+                    },
+                    domain,
+                )?
             }
         }
     }
