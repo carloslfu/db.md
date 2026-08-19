@@ -132,9 +132,6 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 
 ### Interconnect (the link.md client)
 
-Unreleased: these five verbs are on `main` and not yet in the released
-v0.6.2 binary; they ship with the next toolkit release.
-
 One binary, two specs: `dbmd` also speaks the link.md client verbs
 against a hub — a server that hosts, indexes, and serves db.md stores.
 The db.md FORMAT is untouched (SPEC.md reserves only the `@brain/id`
@@ -153,10 +150,12 @@ zero telemetry: network I/O happens only when a verb is explicitly invoked.
   (metadata + index stats); `@brain/<record-id>` (the reserved address
   shape; a `@brain/<store-path>.md` form also works) returns the full
   record, frontmatter + body
-- `dbmd sync @brain [--out DIR]` — pull the granted slice as plain
-  files (never deletes local files; divergence is reported); `--push` sends the local store as a
-  whole-store snapshot (content `.md` + `DB.md` + `assets.jsonl`;
-  derived catalogs and local history stay local)
+- `dbmd sync @brain [--out DIR]` — reconcile the granted slice as plain
+  files. Permissioned v2 pulls verify incremental manifests and install them
+  atomically; v2 pushes send only changed operations/blobs with exact
+  preconditions and baseline-safe deletes. A scoped/self-custodied writer is
+  queued as a proposal and reports `proposal_pending` without advancing the
+  local baseline. Legacy v1 hubs retain whole-snapshot push behavior.
 - `dbmd grant issue|list|revoke` — the capability model, owner-side:
   grant read or write to a principal (by email in v0), scoped to an
   optional store-path prefix, with an optional `--until` expiry
@@ -164,6 +163,12 @@ zero telemetry: network I/O happens only when a verb is explicitly invoked.
   trust: submit evidence to a published site's inbox; it lands in the
   owner's `sources/inbox/` for their curator to accept or reject
   (unauthenticated by design)
+- `dbmd proposal list|show|accept|reject @brain …` — operate the permissioned
+  encrypted change queue. Show/accept independently verify the signed
+  submission claim, canonical descriptor, pinned hub signer, blob declarations,
+  and origin-bound endpoints. Exact acceptance rechecks and downloads only the
+  declared changed blobs; self-custodied acceptance signs the complete verified
+  candidate with `DBMD_BRAIN_KEY_FILE`.
 - `dbmd subscribe @brain [--once] [--since N] [--interval S]` — follow
   the brain's feed head; emits one event line per advance (NDJSON under
   `--json`), `--once` for a single head read

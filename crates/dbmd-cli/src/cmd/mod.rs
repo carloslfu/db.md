@@ -33,6 +33,7 @@ pub mod link;
 pub mod log;
 pub mod mirror;
 pub mod outline;
+pub mod proposal;
 pub mod propose;
 pub mod query;
 pub mod rename;

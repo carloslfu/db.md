@@ -4114,15 +4114,14 @@ fn v2_sync_push(
             "content_root": pointer.content_root,
         })
     });
+    // The mutation coordinate is stable for the exact observed base and local
+    // operation set. A lost response can therefore be retried without a
+    // duplicate commit/proposal even across process restarts.
     let entropy = format!(
-        "{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}",
         normalized_origin(&cfg.hub)?,
         head.brain_id,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
+        serde_json::to_string(&base_value).unwrap_or_default(),
         serde_json::to_string(&operations).unwrap_or_default()
     );
     let mutation_id = format!("dbmd-{}", content_sha256(entropy.as_bytes()));
@@ -4254,6 +4253,15 @@ fn v2_sync_push(
         request(cfg, "POST", &path, Some(&body), Auth::Required)?,
         "v2 sync push",
     )?;
+    if result.get("code").and_then(Value::as_str) == Some("proposal_queued") {
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "sync_status".to_string(),
+                Value::String("proposal_pending".to_string()),
+            );
+        }
+        return Ok(result);
+    }
     if result.get("code").and_then(Value::as_str) == Some("brain_signature_required") {
         let challenge = result
             .get("signing_challenge")
@@ -5851,6 +5859,621 @@ pub fn grant_revoke(cfg: &HubConfig, brain: &str, grant_id: &str) -> LinkResult<
         request(cfg, "DELETE", &path, None, Auth::Required)?,
         "grant revoke",
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// permissioned v2 proposals — inspect, accept, reject
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct VerifiedV2Proposal {
+    value: Value,
+    changes: Value,
+    blobs: Vec<(String, u64, String)>,
+}
+
+fn require_proposal_id(id: &str) -> LinkResult<()> {
+    if crate::ulid::is_ulid(id) {
+        Ok(())
+    } else {
+        Err(invalid_feed("proposal id is not a lowercase ULID"))
+    }
+}
+
+fn verified_v2_proposal(
+    cfg: &HubConfig,
+    head: &V2VerifiedHead,
+    proposal_id: &str,
+) -> LinkResult<VerifiedV2Proposal> {
+    require_proposal_id(proposal_id)?;
+    if head.view_kind != "full" {
+        return Err(invalid_feed(
+            "proposal review requires a full readable view",
+        ));
+    }
+    let path = format!(
+        "/api/hub/brains/{}/v2/proposals/{proposal_id}",
+        head.brain_id
+    );
+    let value = ensure_ok(
+        request_capped(
+            cfg,
+            "GET",
+            &path,
+            None,
+            Auth::Required,
+            MAX_FEED_RESPONSE_BYTES,
+        )?,
+        "v2 proposal",
+    )?;
+    verify_v2_proposal_value(head, proposal_id, value)
+}
+
+fn verify_v2_proposal_value(
+    head: &V2VerifiedHead,
+    proposal_id: &str,
+    value: Value,
+) -> LinkResult<VerifiedV2Proposal> {
+    if value.get("v").and_then(Value::as_u64) != Some(2) {
+        return Err(invalid_feed("proposal response has an invalid version"));
+    }
+    let proposal = value
+        .get("proposal")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_feed("proposal response has no proposal"))?;
+    if proposal.get("id").and_then(Value::as_str) != Some(proposal_id) {
+        return Err(invalid_feed("proposal response changed its id"));
+    }
+    let payload_hash = proposal
+        .get("payload_sha256")
+        .and_then(Value::as_str)
+        .filter(|hash| is_sha256(hash))
+        .ok_or_else(|| invalid_feed("proposal has no payload address"))?;
+    let clear_hash = proposal
+        .get("clear_sha256")
+        .and_then(Value::as_str)
+        .filter(|hash| is_sha256(hash))
+        .ok_or_else(|| invalid_feed("proposal has no clear payload digest"))?;
+    let submission_hash = proposal
+        .get("submission_claim_sha256")
+        .and_then(Value::as_str)
+        .filter(|hash| is_sha256(hash))
+        .ok_or_else(|| invalid_feed("proposal has no submission claim address"))?;
+    let submission = STANDARD
+        .decode(
+            proposal
+                .get("submission_claim_base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_feed("proposal has no submission claim"))?,
+        )
+        .map_err(|_| invalid_feed("proposal submission claim is not base64"))?;
+    let submission_value: Value = serde_json::from_slice(&submission)
+        .map_err(|_| invalid_feed("proposal submission claim is not JSON"))?;
+    if crate::linkmd_v2::canonical_bytes(&submission_value)
+        .map_err(|error| invalid_feed(error.to_string()))?
+        != submission
+        || crate::linkmd_v2::domain_hash_bytes("v2/proposal-claim", &submission)
+            .map_err(|error| invalid_feed(error.to_string()))?
+            != submission_hash
+    {
+        return Err(invalid_feed(
+            "proposal submission claim is not canonical or addressed",
+        ));
+    }
+    let envelope = submission_value
+        .as_object()
+        .ok_or_else(|| invalid_feed("proposal submission claim is not an object"))?;
+    let claim = envelope
+        .get("claim")
+        .ok_or_else(|| invalid_feed("proposal submission claim body is missing"))?;
+    let claim_object = claim
+        .as_object()
+        .ok_or_else(|| invalid_feed("proposal submission claim body is not an object"))?;
+    let actor_root = claim_object
+        .get("actor_root")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_feed("proposal submission actor root is missing"))?;
+    let public_key = envelope
+        .get("public_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("proposal submission signer is missing"))?;
+    let fingerprint = envelope
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("proposal submission fingerprint is missing"))?;
+    let signature = envelope
+        .get("sig")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("proposal submission signature is missing"))?;
+    let claim_bytes = crate::linkmd_v2::canonical_bytes(claim)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    let der = verify_v2_spki_signature(public_key, &claim_bytes, signature)?;
+    let signer = format!("{fingerprint}:{public_key}");
+    let actor_class = actor_root.get("actor_class").and_then(Value::as_str);
+    let grants = actor_root.get("grants").and_then(Value::as_array);
+    let grants_are_canonical = grants.is_some_and(|items| {
+        let mut prior: Option<&str> = None;
+        items.iter().all(|item| {
+            let Some(grant) = item.as_str() else {
+                return false;
+            };
+            if !crate::ulid::is_ulid(grant) || prior.is_some_and(|value| value >= grant) {
+                return false;
+            }
+            prior = Some(grant);
+            true
+        })
+    });
+    let optional_actor_field = |name: &str| {
+        actor_root.get(name).is_some_and(|value| {
+            value.is_null() || value.as_str().is_some_and(|text| !text.is_empty())
+        })
+    };
+    let submitted_at = claim_object.get("submitted_at").and_then(Value::as_str);
+    if claim_object.get("v").and_then(Value::as_u64) != Some(2)
+        || format!("{:x}", Sha256::digest(&der)) != fingerprint
+        || head
+            .trust
+            .hub_signer
+            .as_ref()
+            .is_some_and(|known| known != &signer)
+        || !matches!(
+            actor_class,
+            Some(
+                "user"
+                    | "owned_agent"
+                    | "foreign_key"
+                    | "curation"
+                    | "inbox"
+                    | "restore"
+                    | "migration"
+                    | "operator_recovery"
+            )
+        )
+        || !actor_root
+            .get("principal")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        || !actor_root
+            .get("credential")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        || !optional_actor_field("organization")
+        || !optional_actor_field("role")
+        || !grants_are_canonical
+        || claim.get("brain").and_then(Value::as_str) != Some(head.brain_id.as_str())
+        || claim.get("proposal_id").and_then(Value::as_str) != Some(proposal_id)
+        || !claim_object
+            .get("mutation_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && value.chars().enumerate().all(|(index, char)| {
+                        char.is_ascii_alphanumeric()
+                            || (index > 0 && matches!(char, '.' | '_' | ':' | '-'))
+                    })
+            })
+        || claim.get("payload_sha256").and_then(Value::as_str) != Some(payload_hash)
+        || claim.get("clear_sha256").and_then(Value::as_str) != Some(clear_hash)
+        || !claim_object
+            .get("control_revision")
+            .and_then(Value::as_str)
+            .is_some_and(is_sha256)
+        || submitted_at.is_none_or(|value| {
+            chrono::DateTime::parse_from_rfc3339(value).is_err()
+                || proposal.get("submitted_at").and_then(Value::as_str) != Some(value)
+        })
+        || !proposal
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "pending" | "accepted" | "rejected" | "expired"))
+        || !proposal
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+        || proposal
+            .get("proposer")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("class"))
+            .and_then(Value::as_str)
+            != actor_class
+    {
+        return Err(invalid_feed(
+            "proposal submission claim does not bind the verified proposal",
+        ));
+    }
+    let changes_b64 = proposal
+        .get("changes_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("proposal has no changeset"))?;
+    let changes_bytes = STANDARD
+        .decode(changes_b64)
+        .map_err(|_| invalid_feed("proposal changeset is not base64"))?;
+    let changes: Value = serde_json::from_slice(&changes_bytes)
+        .map_err(|_| invalid_feed("proposal changeset is not JSON"))?;
+    if crate::linkmd_v2::canonical_bytes(&changes)
+        .map_err(|error| invalid_feed(error.to_string()))?
+        != changes_bytes
+        || changes.get("v").and_then(Value::as_u64) != Some(2)
+        || !changes.get("operations").is_some_and(Value::is_array)
+    {
+        return Err(invalid_feed("proposal changeset is not canonical v2"));
+    }
+    let blob_values = proposal
+        .get("blobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_feed("proposal has no blob declarations"))?;
+    let mut blobs = Vec::with_capacity(blob_values.len());
+    let mut descriptor_blobs = Vec::with_capacity(blob_values.len());
+    let mut prior_hash: Option<String> = None;
+    for item in blob_values {
+        let hash = item
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|hash| is_sha256(hash))
+            .ok_or_else(|| invalid_feed("proposal blob has no address"))?;
+        let bytes = item
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .filter(|bytes| *bytes <= MAX_STORE_BYTES)
+            .ok_or_else(|| invalid_feed("proposal blob has an invalid size"))?;
+        if prior_hash.as_deref().is_some_and(|prior| prior >= hash) {
+            return Err(invalid_feed(
+                "proposal blob declarations are not unique and sorted",
+            ));
+        }
+        prior_hash = Some(hash.to_string());
+        let endpoint = item
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_feed("proposal blob has no endpoint"))?;
+        let expected_endpoint = format!(
+            "/api/hub/brains/{}/v2/proposals/{proposal_id}/blob?sha256={hash}",
+            head.brain_id
+        );
+        if endpoint != expected_endpoint {
+            return Err(invalid_feed("proposal blob endpoint is not origin-bound"));
+        }
+        descriptor_blobs.push(json!({ "bytes": bytes, "sha256": hash }));
+        blobs.push((hash.to_string(), bytes, endpoint.to_string()));
+    }
+    let descriptor = json!({
+        "base": proposal.get("base").cloned().unwrap_or(Value::Null),
+        "blobs": descriptor_blobs,
+        "changes_base64": changes_b64,
+        "rebase": proposal.get("rebase").cloned().unwrap_or(Value::Null),
+        "v": 2,
+    });
+    let descriptor_bytes = crate::linkmd_v2::canonical_bytes(&descriptor)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    if content_sha256(&descriptor_bytes) != clear_hash {
+        return Err(invalid_feed(
+            "proposal clear payload differs from its signed submission claim",
+        ));
+    }
+    Ok(VerifiedV2Proposal {
+        value,
+        changes,
+        blobs,
+    })
+}
+
+pub fn proposal_list(
+    cfg: &HubConfig,
+    brain: &str,
+    state: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
+    if !matches!(state, "pending" | "accepted" | "rejected" | "expired") {
+        return Err(invalid_feed("proposal state is invalid"));
+    }
+    if after.is_some_and(|value| !crate::ulid::is_ulid(value)) {
+        return Err(invalid_feed("proposal cursor is invalid"));
+    }
+    let head = v2_verified_head(cfg, brain)?
+        .ok_or_else(|| invalid_feed("brain does not advertise link.md v2"))?;
+    let path = format!(
+        "/api/hub/brains/{}/v2/proposals?state={state}&limit={}{}",
+        head.brain_id,
+        limit.clamp(1, 100),
+        after.map_or_else(String::new, |value| format!("&after={value}"))
+    );
+    ensure_ok(
+        request_capped(
+            cfg,
+            "GET",
+            &path,
+            None,
+            Auth::Required,
+            MAX_FEED_RESPONSE_BYTES,
+        )?,
+        "v2 proposal list",
+    )
+}
+
+pub fn proposal_show(cfg: &HubConfig, brain: &str, proposal_id: &str) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
+    let head = v2_verified_head(cfg, brain)?
+        .ok_or_else(|| invalid_feed("brain does not advertise link.md v2"))?;
+    Ok(verified_v2_proposal(cfg, &head, proposal_id)?.value)
+}
+
+pub fn proposal_reject(
+    cfg: &HubConfig,
+    brain: &str,
+    proposal_id: &str,
+    mutation_id: &str,
+    reason: &str,
+) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
+    require_proposal_id(proposal_id)?;
+    let head = v2_verified_head(cfg, brain)?
+        .ok_or_else(|| invalid_feed("brain does not advertise link.md v2"))?;
+    let _ = verified_v2_proposal(cfg, &head, proposal_id)?;
+    let body = json!({
+        "mutation_id": mutation_id,
+        "control_revision": head.view_revision,
+        "reason": reason,
+    });
+    let path = format!(
+        "/api/hub/brains/{}/v2/proposals/{proposal_id}",
+        head.brain_id
+    );
+    ensure_ok(
+        request(cfg, "DELETE", &path, Some(&body), Auth::Required)?,
+        "v2 proposal rejection",
+    )
+}
+
+pub fn proposal_accept_exact(
+    cfg: &HubConfig,
+    brain: &str,
+    proposal_id: &str,
+    mutation_id: &str,
+    reason: &str,
+) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
+    require_proposal_id(proposal_id)?;
+    let head = v2_verified_head(cfg, brain)?
+        .ok_or_else(|| invalid_feed("brain does not advertise link.md v2"))?;
+    let proposal = verified_v2_proposal(cfg, &head, proposal_id)?;
+    let operations = proposal
+        .changes
+        .get("operations")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| invalid_feed("proposal changeset has no operations"))?;
+    if operations.is_empty() || operations.len() > MAX_PUSH_FILES {
+        return Err(invalid_feed("proposal operation count is invalid"));
+    }
+    let mut downloaded = std::collections::BTreeMap::new();
+    for (hash, bytes, endpoint) in &proposal.blobs {
+        let body = ensure_raw_ok(
+            request_raw(cfg, "GET", endpoint, None, Auth::Required, *bytes)?,
+            "v2 proposal blob",
+        )?;
+        if body.len() as u64 != *bytes || content_sha256(&body) != *hash {
+            return Err(invalid_feed("proposal blob does not match its declaration"));
+        }
+        downloaded.insert(hash.clone(), body);
+    }
+    let remote = files_for_v2_view(
+        &head,
+        v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+    );
+    let mut expected_candidate = remote.clone();
+    for operation in &operations {
+        let op = operation
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_feed("proposal operation has no kind"))?;
+        match op {
+            "put" | "restore" => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal write has no path"))?;
+                crate::linkmd_v2::normalize_path(path)
+                    .map_err(|error| invalid_feed(error.to_string()))?;
+                let hash = operation
+                    .get("blob")
+                    .and_then(Value::as_str)
+                    .filter(|hash| is_sha256(hash))
+                    .ok_or_else(|| invalid_feed("proposal write has no blob"))?;
+                let bytes = operation
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_feed("proposal write has no size"))?;
+                expected_candidate.insert(
+                    path.to_string(),
+                    V2BaselineFile {
+                        sha256: hash.to_string(),
+                        bytes,
+                        proof: None,
+                    },
+                );
+            }
+            "delete" | "withdraw_from_hosting" => {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal removal has no path"))?;
+                crate::linkmd_v2::normalize_path(path)
+                    .map_err(|error| invalid_feed(error.to_string()))?;
+                expected_candidate.remove(path);
+            }
+            "rename" => {
+                let from = operation
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal rename has no source"))?;
+                let to = operation
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal rename has no destination"))?;
+                crate::linkmd_v2::normalize_path(from)
+                    .and_then(|_| crate::linkmd_v2::normalize_path(to))
+                    .map_err(|error| invalid_feed(error.to_string()))?;
+                let hash = operation
+                    .get("blob")
+                    .and_then(Value::as_str)
+                    .filter(|hash| is_sha256(hash))
+                    .ok_or_else(|| invalid_feed("proposal rename has no blob"))?;
+                let bytes = operation
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_feed("proposal rename has no size"))?;
+                expected_candidate.remove(from);
+                expected_candidate.insert(
+                    to.to_string(),
+                    V2BaselineFile {
+                        sha256: hash.to_string(),
+                        bytes,
+                        proof: None,
+                    },
+                );
+            }
+            _ => return Err(invalid_feed("proposal operation kind is unsupported")),
+        }
+    }
+    let base = head.pointer.as_ref().map(|pointer| {
+        json!({
+            "seq": pointer.seq,
+            "commit_hash": pointer.commit_hash,
+            "content_root": pointer.content_root,
+        })
+    });
+    let mut body = json!({
+        "mutation_id": mutation_id,
+        "base": base,
+        "rebase": "strict",
+        "reason": reason,
+        "operations": operations,
+        "blobs": downloaded
+            .iter()
+            .map(|(sha256, bytes)| json!({
+                "sha256": sha256,
+                "bytes": bytes.len(),
+                "content_base64": STANDARD.encode(bytes),
+            }))
+            .collect::<Vec<_>>(),
+        "proposal_id": proposal_id,
+        "proposal_mode": "exact",
+    });
+    let changed_bytes = downloaded.values().try_fold(0_usize, |total, bytes| {
+        total
+            .checked_add(bytes.len())
+            .ok_or_else(|| LinkError::PushTooLarge {
+                detail: "proposal changed-byte total overflow".to_string(),
+            })
+    })?;
+    if changed_bytes > 3 * 1024 * 1024 || body.to_string().len() > MAX_PUSH_BYTES - 64 * 1024 {
+        let declarations = downloaded
+            .iter()
+            .map(|(sha256, bytes)| json!({ "sha256": sha256, "bytes": bytes.len() }))
+            .collect::<Vec<_>>();
+        let reserved = ensure_ok(
+            request(
+                cfg,
+                "POST",
+                &format!("/api/hub/brains/{}/v2/uploads", head.brain_id),
+                Some(&json!({ "blobs": declarations })),
+                Auth::Required,
+            )?,
+            "prepare proposal blob transport",
+        )?;
+        let items = reserved
+            .get("uploads")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_feed("proposal upload reservation has no items"))?;
+        if items.len() != downloaded.len() {
+            return Err(invalid_feed("proposal upload reservation changed the set"));
+        }
+        let mut references = Vec::with_capacity(items.len());
+        for item in items {
+            let hash = item
+                .get("sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_feed("proposal upload reservation has no hash"))?;
+            let bytes = downloaded
+                .get(hash)
+                .ok_or_else(|| invalid_feed("proposal upload reservation introduced a blob"))?;
+            let reservation_id = item
+                .get("reservation_id")
+                .and_then(Value::as_str)
+                .filter(|id| crate::ulid::is_ulid(id))
+                .ok_or_else(|| invalid_feed("proposal upload reservation has no id"))?;
+            match item.get("status").and_then(Value::as_str) {
+                Some("upload") => put_presigned(
+                    cfg,
+                    item.get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| invalid_feed("proposal upload has no URL"))?,
+                    item.get("headers").unwrap_or(&Value::Null),
+                    bytes,
+                )?,
+                Some("already_present") => {}
+                _ => return Err(invalid_feed("proposal upload status is invalid")),
+            }
+            references.push(json!({
+                "sha256": hash,
+                "bytes": bytes.len(),
+                "reservation_id": reservation_id,
+            }));
+        }
+        body["blobs"] = Value::Array(references);
+    }
+    if body.to_string().len() > MAX_PUSH_BYTES {
+        return Err(LinkError::PushTooLarge {
+            detail: "proposal operation metadata exceeds the commit request cap".to_string(),
+        });
+    }
+    let path = format!("/api/hub/brains/{}/v2/commits", head.brain_id);
+    let mut result = ensure_ok(
+        request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+        "exact proposal acceptance",
+    )?;
+    let mut candidate_hub_signer = None;
+    if result.get("code").and_then(Value::as_str) == Some("brain_signature_required") {
+        let challenge = result
+            .get("signing_challenge")
+            .ok_or_else(|| invalid_feed("proposal acceptance has no signing challenge"))?;
+        let (challenge_id, signature, actor_signer) = sign_verified_v2_candidate(
+            cfg,
+            &head,
+            &expected_candidate,
+            mutation_id,
+            &body,
+            challenge,
+        )?;
+        body["signing_challenge_id"] = Value::String(challenge_id);
+        body["signature_base64url"] = Value::String(signature);
+        candidate_hub_signer = Some(actor_signer);
+        result = ensure_ok(
+            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            "signed exact proposal acceptance",
+        )?;
+    }
+    let refreshed = v2_verified_head(cfg, brain)?
+        .ok_or_else(|| invalid_feed("v2 head disappeared after proposal acceptance"))?;
+    if candidate_hub_signer
+        .as_ref()
+        .is_some_and(|expected| refreshed.trust.hub_signer.as_ref() != Some(expected))
+        || refreshed
+            .pointer
+            .as_ref()
+            .map(|pointer| pointer.commit_hash.as_str())
+            != result.get("commit_hash").and_then(Value::as_str)
+        || result.get("proposal_id").and_then(Value::as_str) != Some(proposal_id)
+        || result.get("proposal_state").and_then(Value::as_str) != Some("accepted")
+    {
+        return Err(LinkError::RemoteAdvancedDuringSync);
+    }
+    accept_v2_head(cfg, &refreshed)?;
+    Ok(result)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -9987,6 +10610,136 @@ mod tests {
         .unwrap();
         let altered = Store::open_strict(directory.path()).unwrap();
         assert!(!has_verified_local_scoped_view(&altered));
+    }
+
+    fn signed_proposal_fixture() -> (V2VerifiedHead, String, Value) {
+        use ring::signature::KeyPair as _;
+
+        let proposal_id = "01k2r7bm9w5x6e8nq3tjhv4cya".to_string();
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_der = [ED25519_SPKI_PREFIX.as_slice(), pair.public_key().as_ref()].concat();
+        let public_key = URL_SAFE_NO_PAD.encode(&public_der);
+        let fingerprint = format!("{:x}", Sha256::digest(&public_der));
+        let blob = b"new";
+        let blob_hash = content_sha256(blob);
+        let changes = json!({
+            "mutation_id": "sync:proposal-fixture",
+            "operations": [{
+                "blob": blob_hash,
+                "bytes": blob.len(),
+                "expected": null,
+                "op": "put",
+                "path": "records/new.md",
+            }],
+            "reason": "fixture",
+            "v": 2,
+        });
+        let changes_bytes = crate::linkmd_v2::canonical_bytes(&changes).unwrap();
+        let changes_base64 = STANDARD.encode(&changes_bytes);
+        let descriptor = json!({
+            "base": null,
+            "blobs": [{ "bytes": blob.len(), "sha256": blob_hash }],
+            "changes_base64": changes_base64,
+            "rebase": "strict",
+            "v": 2,
+        });
+        let clear_hash = content_sha256(&crate::linkmd_v2::canonical_bytes(&descriptor).unwrap());
+        let payload_hash = "b".repeat(64);
+        let submitted_at = "2026-08-19T12:00:00.000Z";
+        let claim = json!({
+            "actor_root": {
+                "actor_class": "foreign_key",
+                "credential": "ed25519:fixture",
+                "grants": ["01k2r7bm9w5x6e8nq3tjhv4cyb"],
+                "organization": "01k2r7bm9w5x6e8nq3tjhv4cyc",
+                "principal": "key:fixture",
+                "role": null,
+            },
+            "brain": TEST_BRAIN_ID,
+            "clear_sha256": clear_hash,
+            "control_revision": "c".repeat(64),
+            "mutation_id": "sync:proposal-fixture",
+            "payload_sha256": payload_hash,
+            "proposal_id": proposal_id,
+            "submitted_at": submitted_at,
+            "v": 2,
+        });
+        let claim_bytes = crate::linkmd_v2::canonical_bytes(&claim).unwrap();
+        let envelope = json!({
+            "claim": claim,
+            "fingerprint": fingerprint,
+            "public_key": public_key,
+            "sig": URL_SAFE_NO_PAD.encode(pair.sign(&claim_bytes).as_ref()),
+        });
+        let envelope_bytes = crate::linkmd_v2::canonical_bytes(&envelope).unwrap();
+        let submission_hash =
+            crate::linkmd_v2::domain_hash_bytes("v2/proposal-claim", &envelope_bytes).unwrap();
+        let mut head = scoped_test_head(&"c".repeat(64));
+        head.view_kind = "full".to_string();
+        head.trust.hub_signer = Some(format!("{fingerprint}:{public_key}"));
+        let value = json!({
+            "proposal": {
+                "base": null,
+                "blobs": [{
+                    "bytes": blob.len(),
+                    "endpoint": format!(
+                        "/api/hub/brains/{TEST_BRAIN_ID}/v2/proposals/{proposal_id}/blob?sha256={blob_hash}"
+                    ),
+                    "sha256": blob_hash,
+                }],
+                "changes_base64": changes_base64,
+                "clear_sha256": clear_hash,
+                "expires_at": "2026-08-26T12:00:00.000Z",
+                "id": proposal_id,
+                "payload_sha256": payload_hash,
+                "proposer": { "class": "foreign_key" },
+                "rebase": "strict",
+                "state": "pending",
+                "submission_claim_base64": STANDARD.encode(envelope_bytes),
+                "submission_claim_sha256": submission_hash,
+                "submitted_at": submitted_at,
+            },
+            "v": 2,
+        });
+        (head, proposal_id, value)
+    }
+
+    #[test]
+    fn v2_proposal_verifier_accepts_exact_signed_payload() {
+        let (head, proposal_id, value) = signed_proposal_fixture();
+        let verified = verify_v2_proposal_value(&head, &proposal_id, value).unwrap();
+        assert_eq!(verified.blobs.len(), 1);
+        assert_eq!(verified.changes["operations"][0]["path"], "records/new.md");
+    }
+
+    #[test]
+    fn v2_proposal_verifier_refuses_payload_endpoint_and_signature_tampering() {
+        let (head, proposal_id, value) = signed_proposal_fixture();
+
+        let mut changed = value.clone();
+        changed["proposal"]["changes_base64"] = Value::String(STANDARD.encode(b"{}"));
+        assert!(verify_v2_proposal_value(&head, &proposal_id, changed).is_err());
+
+        let mut redirected = value.clone();
+        redirected["proposal"]["blobs"][0]["endpoint"] =
+            Value::String("https://attacker.example/blob".to_string());
+        assert!(verify_v2_proposal_value(&head, &proposal_id, redirected).is_err());
+
+        let mut forged = value;
+        let encoded = forged["proposal"]["submission_claim_base64"]
+            .as_str()
+            .unwrap();
+        let mut envelope: Value =
+            serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        envelope["sig"] = Value::String(URL_SAFE_NO_PAD.encode([0_u8; 64]));
+        let bytes = crate::linkmd_v2::canonical_bytes(&envelope).unwrap();
+        forged["proposal"]["submission_claim_base64"] = Value::String(STANDARD.encode(&bytes));
+        forged["proposal"]["submission_claim_sha256"] = Value::String(
+            crate::linkmd_v2::domain_hash_bytes("v2/proposal-claim", &bytes).unwrap(),
+        );
+        assert!(verify_v2_proposal_value(&head, &proposal_id, forged).is_err());
     }
 
     #[cfg(unix)]

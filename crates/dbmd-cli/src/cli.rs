@@ -191,6 +191,11 @@ pub enum Command {
     /// their curator to accept or reject. Unauthenticated by design.
     Propose(ProposeArgs),
 
+    /// Review the encrypted change queue for a self-custodied brain. Listing
+    /// and showing require a full readable view plus `review_proposals`;
+    /// accepting also requires the matching local brain key.
+    Proposal(ProposalArgs),
+
     /// Follow a brain's feed head: poll the hub and emit an event line each
     /// time the feed advances (one JSON object per line under `--json`).
     /// `--once` reads the current head and exits.
@@ -1136,6 +1141,71 @@ pub struct ProposeArgs {
 
     /// Directory whose `.dbmd/config` supplies the hub URL when the flag and
     /// env var are absent. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd proposal <sub>` — drain a self-custodied brain's change queue.
+#[derive(Debug, Args)]
+pub struct ProposalArgs {
+    #[command(subcommand)]
+    pub command: ProposalCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProposalCommand {
+    /// List proposal envelopes without downloading their changed blobs.
+    List(ProposalListArgs),
+    /// Verify and show one proposal's canonical changeset and blob manifest.
+    Show(ProposalTargetArgs),
+    /// Accept the exact proposed operations against the current head and sign
+    /// the independently verified candidate with `DBMD_BRAIN_KEY_FILE`.
+    Accept(ProposalDecisionArgs),
+    /// Reject a proposal with an auditable, idempotent reason.
+    Reject(ProposalDecisionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProposalListArgs {
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+    #[arg(long, default_value = "pending", value_name = "STATE")]
+    pub state: String,
+    #[arg(long, value_name = "CURSOR")]
+    pub after: Option<String>,
+    #[arg(long, default_value_t = 50, value_name = "N")]
+    pub limit: usize,
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProposalTargetArgs {
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+    #[arg(value_name = "PROPOSAL_ID")]
+    pub proposal_id: String,
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProposalDecisionArgs {
+    #[arg(value_name = "BRAIN")]
+    pub brain: String,
+    #[arg(value_name = "PROPOSAL_ID")]
+    pub proposal_id: String,
+    /// Stable idempotency key. Reuse it only when retrying the same decision.
+    #[arg(long, value_name = "ID")]
+    pub mutation_id: String,
+    #[arg(long, value_name = "TEXT")]
+    pub reason: String,
+    #[arg(long, value_name = "URL")]
+    pub hub: Option<String>,
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub dir: String,
 }

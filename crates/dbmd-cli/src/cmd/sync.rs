@@ -95,6 +95,18 @@ fn push(
         return Ok(());
     }
 
+    if body.get("code").and_then(Value::as_str) == Some("proposal_queued") {
+        println!(
+            "queued proposal {} for review; local changes remain uncommitted",
+            sanitize_single_line(
+                body.get("proposal_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unknown)")
+            )
+        );
+        return Ok(());
+    }
+
     let head_seq = body
         .get("headSeq")
         .or_else(|| body.get("seq"))

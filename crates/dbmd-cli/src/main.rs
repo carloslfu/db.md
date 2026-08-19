@@ -125,6 +125,7 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Sync(args) => cmd::sync::run(ctx, args),
         Command::Grant(args) => cmd::grant::run(ctx, args),
         Command::Propose(args) => cmd::propose::run(ctx, args),
+        Command::Proposal(args) => cmd::proposal::run(ctx, args),
         Command::Subscribe(args) => cmd::subscribe::run(ctx, args),
         Command::Key(args) => cmd::key::run(ctx, args),
         Command::InstallVerified(args) => cmd::install_verified::run(args),

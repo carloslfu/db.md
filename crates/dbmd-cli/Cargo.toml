@@ -41,6 +41,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+base64 = { workspace = true }
 # `dbmd fm`/`dbmd log` build a `dbmd_core::LogEntry`, parse user RFC3339/date
 # timestamps, and render frontmatter YAML scalars (`fm get`). chrono + serde_norway
 # are the minimal glue for that — already `dbmd-core` deps, so MIT OR Apache-2.0
@@ -63,7 +64,6 @@ libc = { workspace = true }
 tempfile = { workspace = true }
 insta = { workspace = true }
 ring = { workspace = true }
-base64 = { workspace = true }
 zip = { workspace = true }
 # Integration-test driver for the `dbmd` binary (spawn, assert exit code +
 # stdout/stderr). Dev-only — never shipped in the binary. MIT OR Apache-2.0
