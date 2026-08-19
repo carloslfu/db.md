@@ -975,7 +975,7 @@ pub struct ResolveArgs {
     pub dir: String,
 }
 
-/// `dbmd sync <BRAIN>` — pull the granted slice; `--push` sends the local store.
+/// `dbmd sync <BRAIN>` — clone a new checkout or converge an established one.
 #[derive(Debug, Args)]
 pub struct SyncArgs {
     /// The brain to sync with: its id (lowercase ULID) or your slug for it.
@@ -983,21 +983,28 @@ pub struct SyncArgs {
     #[arg(value_name = "BRAIN")]
     pub brain: String,
 
-    /// Push local changes from `--dir` instead of pulling remote changes.
-    /// Permissioned v2 transfers changed blobs and explicit deletes only;
-    /// legacy v1 hubs retain whole-store snapshot semantics.
-    #[arg(long)]
+    /// Push local changes from `--dir` without installing remote changes first.
+    /// `--push-only` is the descriptive alias; `--push` remains compatible.
+    #[arg(long, alias = "push-only")]
     pub push: bool,
+
+    /// Install remote changes without sending local changes afterwards.
+    #[arg(long, conflicts_with = "push")]
+    pub pull_only: bool,
 
     /// Approve the exact local paths newly made eligible by a `.sevralocal`
     /// change. Without this flag they remain quarantined from upload.
-    #[arg(long, requires = "push")]
+    #[arg(long, conflicts_with = "pull_only")]
     pub resume_local_policy: bool,
 
     /// Pull destination directory. Defaults to `./<slug>` (created if
     /// missing). Permissioned v2 applies remote changes atomically and removes
     /// only clean files whose hosted deletion matches the private baseline.
-    #[arg(long, value_name = "DIR", conflicts_with = "push")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["push", "resume_local_policy"]
+    )]
     pub out: Option<String>,
 
     /// Hub base URL for this invocation (beats `DBMD_HUB_URL` and `.dbmd/config`).

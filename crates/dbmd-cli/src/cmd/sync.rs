@@ -4,8 +4,8 @@
 //! permissioned brain, with the legacy whole-snapshot protocol retained only
 //! for v1 hubs.
 //!
-//! Thin wrapper over [`dbmd_core::linkmd::sync_pull`] /
-//! [`dbmd_core::linkmd::sync_push`]. Push opens the store strictly
+//! Thin wrapper over the one-shot convergence engine, with explicit pull-only
+//! and push-only policies. Push opens the store strictly
 //! (`Store::open_strict`) so pushing from
 //!   a non-store exits with the standard `NOT_A_STORE` contract (exit `3`).
 //! Pull deliberately does not run a second path-based index rebuild after the
@@ -31,9 +31,62 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
 
     if args.push {
         push(ctx, &cfg, brain, &args.dir, args.resume_local_policy)
+    } else if args.pull_only || args.out.is_some() {
+        pull(ctx, &cfg, brain, args.out.as_deref())
+    } else if Store::open_strict(Path::new(&args.dir)).is_ok() {
+        converge(ctx, &cfg, brain, &args.dir, args.resume_local_policy)
     } else {
         pull(ctx, &cfg, brain, args.out.as_deref())
     }
+}
+
+fn converge(
+    ctx: &Context,
+    cfg: &linkmd::HubConfig,
+    brain: &str,
+    dir: &str,
+    resume_local_policy: bool,
+) -> CliResult {
+    let body = linkmd::sync_converge(cfg, brain, Path::new(dir), resume_local_policy)?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    if body.get("code").and_then(Value::as_str) == Some("proposal_queued") {
+        println!(
+            "queued proposal {} for review; remote changes were installed and local changes remain uncommitted",
+            sanitize_single_line(
+                body.get("proposal_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unknown)")
+            )
+        );
+        return Ok(());
+    }
+    let pulled = body
+        .get("pulled_files")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let status = body
+        .get("sync_status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let seq = body
+        .get("headSeq")
+        .or_else(|| body.get("seq"))
+        .and_then(Value::as_u64);
+    print!(
+        "reconciled {pulled} remote file{}",
+        if pulled == 1 { "" } else { "s" }
+    );
+    if let Some(seq) = seq {
+        print!(", feed seq {seq}");
+    }
+    println!(" [{}]", sanitize_single_line(status));
+    Ok(())
 }
 
 fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) -> CliResult {

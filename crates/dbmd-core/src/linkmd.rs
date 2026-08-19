@@ -4981,6 +4981,48 @@ pub fn sync_push_incremental_with_policy(
     sync_push(cfg, brain, &files)
 }
 
+/// Converge one established permissioned-v2 checkout in both directions.
+///
+/// The pull half first performs the ordinary three-way conflict check and
+/// crash-safe install against the accepted baseline. The push half then opens
+/// that exact installed checkout, takes its local transaction guard, computes
+/// a fresh three-way delta, and submits it with mandatory preconditions. A
+/// remote movement between halves is therefore a normal rebase/conflict input,
+/// never a blind overwrite. Legacy v1 remains explicit pull-only/push-only so
+/// its whole-pack replacement semantics are never presented as granular
+/// convergence.
+pub fn sync_converge(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+    resume_local_policy: bool,
+) -> LinkResult<Value> {
+    require_hardened_filesystem("bidirectional sync")?;
+    require_safe_ref(brain)?;
+    let head = v2_verified_head(cfg, brain)?.ok_or_else(|| LinkError::InvalidPack {
+        message:
+            "bidirectional sync requires link.md v2; use --pull-only or --push-only for a legacy brain"
+                .to_string(),
+    })?;
+    let pulled = v2_sync_pull(cfg, brain, head, Some(checkout))?;
+    let store = Store::open_strict(checkout).map_err(|error| LinkError::InvalidPack {
+        message: format!("installed v2 checkout is not a valid db.md store: {error}"),
+    })?;
+    let _transaction = store.transaction()?;
+    let fresh = v2_verified_head(cfg, brain)?
+        .ok_or_else(|| invalid_feed("v2 head disappeared between sync phases"))?;
+    let mut result = v2_sync_push(cfg, brain, &store, fresh, resume_local_policy)?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("pulled_files".to_string(), json!(pulled.files));
+        object.insert("checkout".to_string(), Value::String(pulled.dest));
+        object.insert(
+            "mode".to_string(),
+            Value::String("bidirectional".to_string()),
+        );
+    }
+    Ok(result)
+}
+
 /// Pull the granted slice of `brain` to `out` (default: `./<slug>`). Every
 /// exported path is safety-gated before it touches disk; files are written
 /// atomically; nothing local is ever deleted (locals the export lacks are

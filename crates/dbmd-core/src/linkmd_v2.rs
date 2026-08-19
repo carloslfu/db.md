@@ -843,6 +843,14 @@ pub fn verify_proof_with_domain(
 mod tests {
     use super::*;
 
+    #[derive(Deserialize)]
+    struct PathCorpus {
+        v: u8,
+        valid: Vec<String>,
+        invalid: Vec<String>,
+        invalid_sets: Vec<Vec<String>>,
+    }
+
     fn nonce_sequence() -> impl FnMut() -> String {
         let mut value = 0u128;
         move || {
@@ -892,5 +900,84 @@ mod tests {
         assert!(validate_path_set(["Records/a.md", "records/a.md"]).is_err());
         assert!(validate_path_set(["records", "records/a.md"]).is_err());
         assert!(normalize_path("CON").is_err());
+        assert!(validate_path_set(["Å.md", "å.md"]).is_err());
+        for path in [
+            "/absolute",
+            "a/../b",
+            "a\\b",
+            "a:b",
+            "nul.txt",
+            "folder/COM9.log",
+            "folder/LPT1",
+            "a.",
+            "a ",
+            "e\u{301}.md",
+            "control\u{1}.md",
+        ] {
+            assert!(normalize_path(path).is_err(), "accepted {path:?}");
+        }
+        for path in [
+            "é.md",
+            ".hidden.md",
+            "records/COM0.md",
+            "records/LPT10.md",
+            "records/emoji-🦓.md",
+        ] {
+            assert_eq!(normalize_path(path).unwrap(), path);
+        }
+        assert!(normalize_path(&format!("{}.md", "a".repeat(256))).is_err());
+        assert!(normalize_path(&format!("{}x.md", "a/".repeat(512))).is_err());
+    }
+
+    #[test]
+    fn shared_portable_path_corpus_matches_rust() {
+        let corpus: PathCorpus = serde_json::from_str(include_str!(
+            "../../../tests/vectors/linkmd-v2-portable-paths.json"
+        ))
+        .unwrap();
+        assert_eq!(corpus.v, 1);
+        for path in corpus.valid {
+            assert_eq!(normalize_path(&path).unwrap(), path);
+        }
+        for path in corpus.invalid {
+            assert!(normalize_path(&path).is_err(), "accepted {path:?}");
+        }
+        for paths in corpus.invalid_sets {
+            assert!(validate_path_set(paths.iter().map(String::as_str)).is_err());
+        }
+    }
+
+    #[test]
+    fn randomized_map_build_is_order_independent() {
+        let mut random_state = 0x51e7_9b3d_u32;
+        let mut random = || {
+            random_state = random_state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            random_state
+        };
+        let mut model = BTreeMap::from([("DB.md".to_string(), b"contract".to_vec())]);
+        for step in 0..400 {
+            let path = format!("records/property/{:02}.md", random() % 64);
+            if model.contains_key(&path) && random() % 4 == 0 {
+                model.remove(&path);
+            } else {
+                model.insert(path, format!("value:{step}:{}", random()).into_bytes());
+            }
+            let files = model
+                .iter()
+                .map(|(path, bytes)| file(path, bytes))
+                .collect::<Vec<_>>();
+            let mut forward_nonces = nonce_sequence();
+            let forward = build_content_tree(&files, None, &mut forward_nonces).unwrap();
+            let mut reverse_files = files.clone();
+            reverse_files.reverse();
+            let mut reverse_nonces = nonce_sequence();
+            let reverse = build_content_tree(&reverse_files, None, &mut reverse_nonces).unwrap();
+            assert_eq!(forward.root, reverse.root);
+            let root = forward.root.as_deref().unwrap();
+            let proof = create_proof(root, "records", &forward.nodes).unwrap();
+            assert!(verify_proof(root, "records", &proof).unwrap());
+        }
     }
 }

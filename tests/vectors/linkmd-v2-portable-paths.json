@@ -1,0 +1,29 @@
+{
+  "v": 1,
+  "valid": [
+    "é.md",
+    ".hidden.md",
+    "records/COM0.md",
+    "records/LPT10.md",
+    "records/emoji-🦓.md"
+  ],
+  "invalid": [
+    "/absolute",
+    "a/../b",
+    "a\\b",
+    "a:b",
+    "CON",
+    "nul.txt",
+    "folder/COM9.log",
+    "folder/LPT1",
+    "a.",
+    "a ",
+    "é.md",
+    "control\u0001.md"
+  ],
+  "invalid_sets": [
+    ["Records/a.md", "records/a.md"],
+    ["records", "records/a.md"],
+    ["Å.md", "å.md"]
+  ]
+}
