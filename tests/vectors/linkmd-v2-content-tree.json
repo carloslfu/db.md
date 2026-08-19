@@ -9,5 +9,29 @@
   ],
   "expected_root": "82bcc02847453aac64310ad0ab83a2cce3f79ec7bac7664f0e6760cb38bc3d53",
   "proof_target": "visible.md",
-  "privacy_forbidden_strings": ["secret.md", "00000000000000000000000000000001"]
+  "privacy_forbidden_strings": ["secret.md", "00000000000000000000000000000001"],
+  "changed_sibling": {
+    "before_files": [
+      { "path": "DB.md", "content_base64": "ZGI=" },
+      { "path": "secret.md", "content_base64": "b2xkIHNlY3JldA==" },
+      { "path": "visible.md", "content_base64": "dmlzaWJsZQ==" }
+    ],
+    "before_root": "df65cb7019b83d162de41814b98a1bd07cf36be1dfc2ee80ac20ce23aebbecaa",
+    "after_files": [
+      { "path": "DB.md", "content_base64": "ZGI=" },
+      { "path": "secret.md", "content_base64": "bmV3IHNlY3JldA==" },
+      { "path": "visible.md", "content_base64": "dmlzaWJsZQ==" }
+    ],
+    "after_nonce_start_hex": "f0",
+    "after_root": "ad3b8958548ecfcee9dd0f7f78627364755994290df60562ab5cd6fb08d0795e",
+    "changed_path": "secret.md",
+    "old_nonce": "00000000000000000000000000000001",
+    "new_nonce": "000000000000000000000000000000f0",
+    "proof_target": "visible.md",
+    "privacy_forbidden_strings": [
+      "secret.md",
+      "00000000000000000000000000000001",
+      "000000000000000000000000000000f0"
+    ]
+  }
 }

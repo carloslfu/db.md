@@ -896,6 +896,58 @@ mod tests {
     }
 
     #[test]
+    fn changed_sibling_rotates_the_nonce_hidden_from_retained_readers() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/vectors/linkmd-v2-content-tree.json"
+        ))
+        .unwrap();
+        let privacy = &vector["changed_sibling"];
+        let mut before_nonces = nonce_sequence();
+        let before = build_content_tree(
+            &[
+                file("DB.md", b"db"),
+                file("secret.md", b"old secret"),
+                file("visible.md", b"visible"),
+            ],
+            None,
+            &mut before_nonces,
+        )
+        .unwrap();
+        assert_eq!(before.root.as_deref().unwrap(), privacy["before_root"]);
+        let changed_path = privacy["changed_path"].as_str().unwrap();
+        let old_nonce = before.entries[changed_path].entry.nonce.clone();
+        let mut value =
+            u128::from_str_radix(privacy["after_nonce_start_hex"].as_str().unwrap(), 16).unwrap();
+        let mut after_nonces = move || {
+            let nonce = format!("{value:032x}");
+            value += 1;
+            nonce
+        };
+        let after = build_content_tree(
+            &[
+                file("DB.md", b"db"),
+                file("secret.md", b"new secret"),
+                file("visible.md", b"visible"),
+            ],
+            Some(&before),
+            &mut after_nonces,
+        )
+        .unwrap();
+        assert_eq!(after.root.as_deref().unwrap(), privacy["after_root"]);
+        let new_nonce = &after.entries[changed_path].entry.nonce;
+        assert_eq!(old_nonce, privacy["old_nonce"].as_str().unwrap());
+        assert_eq!(new_nonce, privacy["new_nonce"].as_str().unwrap());
+        let root = after.root.as_deref().unwrap();
+        let proof_target = privacy["proof_target"].as_str().unwrap();
+        let proof = create_proof(root, proof_target, &after.nodes).unwrap();
+        assert!(verify_proof(root, proof_target, &proof).unwrap());
+        let encoded = serde_json::to_string(&proof).unwrap();
+        for forbidden in privacy["privacy_forbidden_strings"].as_array().unwrap() {
+            assert!(!encoded.contains(forbidden.as_str().unwrap()));
+        }
+    }
+
+    #[test]
     fn rejects_portability_collisions() {
         assert!(validate_path_set(["Records/a.md", "records/a.md"]).is_err());
         assert!(validate_path_set(["records", "records/a.md"]).is_err());
