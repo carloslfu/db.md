@@ -997,13 +997,19 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "pull_only")]
     pub resume_local_policy: bool,
 
+    /// Confirm the exact permissioned bulk preview returned by the preceding
+    /// sync attempt. The value is `<bulk_preview_id>:<bulk_preview_digest>`;
+    /// changing the head, files, permissions, or principal invalidates it.
+    #[arg(long, value_name = "ID:DIGEST", conflicts_with = "pull_only")]
+    pub confirm_bulk: Option<String>,
+
     /// Pull destination directory. Defaults to `./<slug>` (created if
     /// missing). Permissioned v2 applies remote changes atomically and removes
     /// only clean files whose hosted deletion matches the private baseline.
     #[arg(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["push", "resume_local_policy"]
+        conflicts_with_all = ["push", "resume_local_policy", "confirm_bulk"]
     )]
     pub out: Option<String>,
 

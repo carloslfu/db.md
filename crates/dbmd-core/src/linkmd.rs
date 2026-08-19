@@ -348,6 +348,18 @@ pub enum LinkError {
         paths: Vec<String>,
     },
 
+    /// The exact mutation crosses a permissioned bulk-impact boundary. The
+    /// hub has not committed it; `preview` is the bounded, permission-filtered
+    /// receipt an agent must inspect before explicitly confirming the same
+    /// request.
+    #[error(
+        "bulk change requires explicit confirmation — review the preview and retry the same sync with --confirm-bulk <id>:<digest>"
+    )]
+    BulkPreviewRequired {
+        /// Stable structured preview returned by the hub.
+        preview: Value,
+    },
+
     /// A scoped checkout's generated store marker was edited or removed.
     /// It is local projection metadata and is never accepted as brain data.
     #[error(
@@ -396,6 +408,38 @@ pub enum LinkError {
 
 /// Result alias for link.md client operations.
 pub type LinkResult<T> = std::result::Result<T, LinkError>;
+
+/// Exact approval token returned by a permissioned v2 bulk preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2BulkConfirmation {
+    /// Opaque preview receipt id.
+    pub id: String,
+    /// Digest binding the receipt to principal, head, control revision, and
+    /// the exact strict mutation.
+    pub digest: String,
+}
+
+impl V2BulkConfirmation {
+    /// Parse the CLI/wire handoff form `<id>:<digest>` and reject anything
+    /// outside the protocol's exact lowercase shapes before network I/O.
+    pub fn parse(value: &str) -> LinkResult<Self> {
+        let (id, digest) = value
+            .split_once(':')
+            .ok_or_else(|| LinkError::InvalidPack {
+                message: "bulk confirmation must be <id>:<digest>".to_string(),
+            })?;
+        if !crate::ulid::is_ulid(id) || !is_sha256(digest) {
+            return Err(LinkError::InvalidPack {
+                message: "bulk confirmation must contain a lowercase ULID and SHA-256 digest"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            id: id.to_string(),
+            digest: digest.to_string(),
+        })
+    }
+}
 
 /// Security-sensitive link.md state and destination writes rely on Unix
 /// `openat`/`O_NOFOLLOW` semantics. Native Windows is not an official release
@@ -3695,6 +3739,28 @@ fn sign_verified_v2_candidate(
     let expected_actor_signer = format!("{actor_fingerprint}:{actor_public_key}");
     let expected_actor_root = root.clone().map(Value::String).unwrap_or(Value::Null);
     let expected_actor_asset_root = asset_root.clone().map(Value::String).unwrap_or(Value::Null);
+    let impact = actor_claim
+        .get("result")
+        .and_then(|result| result.get("impact"))
+        .and_then(Value::as_object);
+    let impact_fields = [
+        "creates",
+        "updates",
+        "deletes",
+        "withdrawals",
+        "renames",
+        "restores",
+        "asset_changes",
+        "public_expansions",
+        "executable_activations",
+    ];
+    let impact_is_valid = impact.is_some_and(|impact| {
+        impact.len() == impact_fields.len() + 1
+            && impact.get("v").and_then(Value::as_u64) == Some(1)
+            && impact_fields
+                .iter()
+                .all(|field| impact.get(*field).and_then(Value::as_u64).is_some())
+    });
     if format!("{:x}", Sha256::digest(&actor_der)) != actor_fingerprint
         || head
             .trust
@@ -3721,6 +3787,7 @@ fn sign_verified_v2_candidate(
             .and_then(|candidate| candidate.get("control_revision"))
             .and_then(Value::as_str)
             != Some(head.view_revision.as_str())
+        || !impact_is_valid
     {
         return Err(invalid_feed(
             "self-custody actor claim does not bind the verified authority",
@@ -4709,6 +4776,7 @@ fn v2_sync_push(
     store: &Store,
     head: V2VerifiedHead,
     resume_local_policy: bool,
+    bulk_confirmation: Option<&V2BulkConfirmation>,
 ) -> LinkResult<Value> {
     let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
     let head = v2_verified_head(cfg, requested_brain)?
@@ -5058,6 +5126,20 @@ fn v2_sync_push(
         "operations": operations,
         "blobs": blobs,
     });
+    if let Some(confirmation) = bulk_confirmation {
+        if !crate::ulid::is_ulid(&confirmation.id) || !is_sha256(&confirmation.digest) {
+            return Err(LinkError::InvalidPack {
+                message: "bulk confirmation must contain a lowercase ULID and SHA-256 digest"
+                    .to_string(),
+            });
+        }
+        // A preview is bound to the exact observed head. Confirmation can
+        // therefore never use disjoint rebase semantics, even when the normal
+        // small-mutation path could.
+        body["rebase"] = Value::String("strict".to_string());
+        body["bulk_preview_id"] = Value::String(confirmation.id.clone());
+        body["bulk_preview_digest"] = Value::String(confirmation.digest.clone());
+    }
     let changed_bytes = upload_bytes.values().try_fold(0_usize, |total, bytes| {
         total
             .checked_add(bytes.len())
@@ -5198,10 +5280,61 @@ fn v2_sync_push(
     }
     let path = format!("/api/hub/brains/{requested_brain}/v2/commits");
     let mut candidate_hub_signer: Option<String> = None;
-    let mut result = ensure_ok(
-        request(cfg, "POST", &path, Some(&body), Auth::Required)?,
-        "v2 sync push",
-    )?;
+    let mut response = request(cfg, "POST", &path, Some(&body), Auth::Required)?;
+    let bulk_preview_required = !(200..300).contains(&response.status)
+        && response.body.as_ref().is_some_and(|value| {
+            value.get("code").and_then(Value::as_str) == Some("bulk_preview_required")
+                || value
+                    .get("details")
+                    .and_then(|details| details.get("code"))
+                    .and_then(Value::as_str)
+                    == Some("bulk_preview_required")
+        });
+    if bulk_preview_required && bulk_confirmation.is_none() {
+        body["rebase"] = Value::String("strict".to_string());
+        body["preview_only"] = Value::Bool(true);
+        let preview = ensure_ok(
+            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            "v2 bulk preview",
+        )?;
+        let preview_code = preview.get("code").and_then(Value::as_str);
+        let required = preview.get("required").and_then(Value::as_bool);
+        if preview.get("v").and_then(Value::as_u64) != Some(2)
+            || preview.get("mutation_id").and_then(Value::as_str) != Some(mutation_id.as_str())
+            || !matches!(
+                preview_code,
+                Some("bulk_preview_created" | "bulk_preview_not_required")
+            )
+            || required.is_none()
+        {
+            return Err(invalid_feed(
+                "bulk preview response is not bound to the requested mutation",
+            ));
+        }
+        if required == Some(true) {
+            let preview_id = preview.get("bulk_preview_id").and_then(Value::as_str);
+            let preview_digest = preview.get("bulk_preview_digest").and_then(Value::as_str);
+            if preview_code != Some("bulk_preview_created")
+                || preview_id.is_none_or(|value| !crate::ulid::is_ulid(value))
+                || preview_digest.is_none_or(|value| !is_sha256(value))
+                || preview.get("expires_at").and_then(Value::as_str).is_none()
+                || !preview.get("impact").is_some_and(Value::is_object)
+            {
+                return Err(invalid_feed("bulk preview receipt is malformed"));
+            }
+            return Err(LinkError::BulkPreviewRequired { preview });
+        }
+        if preview_code != Some("bulk_preview_not_required") {
+            return Err(invalid_feed("bulk preview requirement is inconsistent"));
+        }
+        // The rolling activity window can expire between the refusal and
+        // preview. Retry once, still pinned strictly to the observed head.
+        body.as_object_mut()
+            .expect("v2 commit request is an object")
+            .remove("preview_only");
+        response = request(cfg, "POST", &path, Some(&body), Auth::Required)?;
+    }
+    let mut result = ensure_ok(response, "v2 sync push")?;
     if result.get("code").and_then(Value::as_str) == Some("proposal_queued") {
         if let Some(object) = result.as_object_mut() {
             object.insert(
@@ -5307,13 +5440,32 @@ pub fn sync_push_incremental_with_policy(
     store: &Store,
     resume_local_policy: bool,
 ) -> LinkResult<Value> {
+    sync_push_incremental_with_options(cfg, brain, store, resume_local_policy, None)
+}
+
+/// Incremental push with both local-policy adoption and an optional exact
+/// permissioned bulk-preview confirmation.
+pub fn sync_push_incremental_with_options(
+    cfg: &HubConfig,
+    brain: &str,
+    store: &Store,
+    resume_local_policy: bool,
+    bulk_confirmation: Option<&V2BulkConfirmation>,
+) -> LinkResult<Value> {
     require_safe_ref(brain)?;
     if let Some(head) = v2_verified_head(cfg, brain)? {
-        return v2_sync_push(cfg, brain, store, head, resume_local_policy);
+        return v2_sync_push(
+            cfg,
+            brain,
+            store,
+            head,
+            resume_local_policy,
+            bulk_confirmation,
+        );
     }
-    if resume_local_policy {
+    if resume_local_policy || bulk_confirmation.is_some() {
         return Err(LinkError::InvalidPack {
-            message: "--resume-local-policy requires a link.md v2 brain".to_string(),
+            message: "v2 sync options require a link.md v2 brain".to_string(),
         });
     }
     let files = collect_push_files(store)?;
@@ -5336,6 +5488,17 @@ pub fn sync_converge(
     checkout: &Path,
     resume_local_policy: bool,
 ) -> LinkResult<Value> {
+    sync_converge_with_options(cfg, brain, checkout, resume_local_policy, None)
+}
+
+/// Bidirectional convergence with optional exact bulk-preview confirmation.
+pub fn sync_converge_with_options(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+    resume_local_policy: bool,
+    bulk_confirmation: Option<&V2BulkConfirmation>,
+) -> LinkResult<Value> {
     require_hardened_filesystem("bidirectional sync")?;
     require_safe_ref(brain)?;
     let head = v2_verified_head(cfg, brain)?.ok_or_else(|| LinkError::InvalidPack {
@@ -5350,7 +5513,14 @@ pub fn sync_converge(
     let _transaction = store.transaction()?;
     let fresh = v2_verified_head(cfg, brain)?
         .ok_or_else(|| invalid_feed("v2 head disappeared between sync phases"))?;
-    let mut result = v2_sync_push(cfg, brain, &store, fresh, resume_local_policy)?;
+    let mut result = v2_sync_push(
+        cfg,
+        brain,
+        &store,
+        fresh,
+        resume_local_policy,
+        bulk_confirmation,
+    )?;
     if let Some(object) = result.as_object_mut() {
         object.insert("pulled_files".to_string(), json!(pulled.files));
         object.insert("checkout".to_string(), Value::String(pulled.dest));
@@ -10076,6 +10246,31 @@ mod tests {
                 .join(",")
         );
         assert!(serde_json::from_str::<FeedEntry>(&oversized_entry).is_err());
+    }
+
+    #[test]
+    fn bulk_confirmation_parser_accepts_only_the_exact_wire_shape() {
+        let id = "01arz3ndektsv4rrffq69g5fav";
+        let digest = "a".repeat(64);
+        assert_eq!(
+            V2BulkConfirmation::parse(&format!("{id}:{digest}")).unwrap(),
+            V2BulkConfirmation {
+                id: id.to_string(),
+                digest,
+            }
+        );
+        for invalid in [
+            "",
+            "01arz3ndektsv4rrffq69g5fav",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "01arz3ndektsv4rrffq69g5fav:ABCDEF",
+            "01arz3ndektsv4rrffq69g5fav:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(matches!(
+                V2BulkConfirmation::parse(invalid),
+                Err(LinkError::InvalidPack { .. })
+            ));
+        }
     }
 
     fn scripted_json_hub(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<()>) {

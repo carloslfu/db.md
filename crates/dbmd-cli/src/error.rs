@@ -244,6 +244,15 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::LocalPolicyTransition { .. } => {
                 CliError::new(ExitCode::Policy, "LOCAL_POLICY_RELAXED", message)
             }
+            L::BulkPreviewRequired { preview } => CliError::new(
+                ExitCode::Policy,
+                "BULK_PREVIEW_REQUIRED",
+                message,
+            )
+            .with_hint(
+                "review error.details, then retry the same sync with --confirm-bulk <bulk_preview_id>:<bulk_preview_digest>",
+            )
+            .with_details(preview),
             L::ScopedProjectionModified => {
                 CliError::new(ExitCode::Policy, "SCOPED_PROJECTION_MODIFIED", message)
             }
@@ -303,5 +312,23 @@ mod tests {
         });
         assert_eq!(error.exit, ExitCode::Policy);
         assert_eq!(error.code, "AUTHORIZATION_REFUSED");
+    }
+
+    #[test]
+    fn bulk_preview_refusal_preserves_the_exact_structured_receipt() {
+        let preview = serde_json::json!({
+            "v": 2,
+            "code": "bulk_preview_created",
+            "bulk_preview_id": "01arz3ndektsv4rrffq69g5fav",
+            "bulk_preview_digest": "a".repeat(64),
+            "impact": { "deletes": 26 }
+        });
+        let error = CliError::from(dbmd_core::linkmd::LinkError::BulkPreviewRequired {
+            preview: preview.clone(),
+        });
+        assert_eq!(error.exit, ExitCode::Policy);
+        assert_eq!(error.code, "BULK_PREVIEW_REQUIRED");
+        assert_eq!(error.to_json()["error"]["details"], preview);
+        assert!(error.hint.as_deref().unwrap().contains("--confirm-bulk"));
     }
 }

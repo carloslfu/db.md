@@ -28,13 +28,32 @@ use crate::sanitize::sanitize_single_line;
 pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
     let brain = strip_sigil(&args.brain);
     let cfg = linkmd::hub_config(args.hub.as_deref(), Path::new(&args.dir))?;
+    let bulk_confirmation = args
+        .confirm_bulk
+        .as_deref()
+        .map(linkmd::V2BulkConfirmation::parse)
+        .transpose()?;
 
     if args.push {
-        push(ctx, &cfg, brain, &args.dir, args.resume_local_policy)
+        push(
+            ctx,
+            &cfg,
+            brain,
+            &args.dir,
+            args.resume_local_policy,
+            bulk_confirmation.as_ref(),
+        )
     } else if args.pull_only || args.out.is_some() {
         pull(ctx, &cfg, brain, args.out.as_deref())
     } else if Store::open_strict(Path::new(&args.dir)).is_ok() {
-        converge(ctx, &cfg, brain, &args.dir, args.resume_local_policy)
+        converge(
+            ctx,
+            &cfg,
+            brain,
+            &args.dir,
+            args.resume_local_policy,
+            bulk_confirmation.as_ref(),
+        )
     } else {
         pull(ctx, &cfg, brain, args.out.as_deref())
     }
@@ -46,8 +65,15 @@ fn converge(
     brain: &str,
     dir: &str,
     resume_local_policy: bool,
+    bulk_confirmation: Option<&linkmd::V2BulkConfirmation>,
 ) -> CliResult {
-    let body = linkmd::sync_converge(cfg, brain, Path::new(dir), resume_local_policy)?;
+    let body = linkmd::sync_converge_with_options(
+        cfg,
+        brain,
+        Path::new(dir),
+        resume_local_policy,
+        bulk_confirmation,
+    )?;
     if ctx.json {
         println!(
             "{}",
@@ -133,12 +159,19 @@ fn push(
     brain: &str,
     dir: &str,
     resume_local_policy: bool,
+    bulk_confirmation: Option<&linkmd::V2BulkConfirmation>,
 ) -> CliResult {
     // Strict open: pushing from a non-store is the standard NOT_A_STORE exit.
     let store = Store::open_strict(Path::new(dir))?;
     let _transaction = store.transaction()?;
     let sent = linkmd::collect_push_files(&store)?.len();
-    let body = linkmd::sync_push_incremental_with_policy(cfg, brain, &store, resume_local_policy)?;
+    let body = linkmd::sync_push_incremental_with_options(
+        cfg,
+        brain,
+        &store,
+        resume_local_policy,
+        bulk_confirmation,
+    )?;
 
     if ctx.json {
         println!(
