@@ -2328,21 +2328,169 @@ fn verified_v2_commit_object(
         .remove("sig")
         .and_then(|value| value.as_str().map(str::to_string))
         .ok_or_else(|| invalid_feed("v2 commit has no signature"))?;
+    const FIELDS: [&str; 18] = [
+        "actor_ref",
+        "asset_root",
+        "brain",
+        "changes_sha256",
+        "control_revision",
+        "materializer",
+        "op",
+        "parent_asset_root",
+        "parent_commit",
+        "parent_root",
+        "prev_entry_hash",
+        "public_key",
+        "seq",
+        "signer_epoch",
+        "state_root",
+        "ts",
+        "v",
+        "v1_bridge",
+    ];
+    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+        return Err(invalid_feed("v2 commit has a non-normative field set"));
+    }
+    let seq = object
+        .get("seq")
+        .and_then(Value::as_u64)
+        .filter(|seq| *seq > 0)
+        .ok_or_else(|| invalid_feed("v2 commit has an invalid sequence"))?;
+    let signer_epoch = object
+        .get("signer_epoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch > 0)
+        .ok_or_else(|| invalid_feed("v2 commit has an invalid signer epoch"))?;
+    let hash_or_null = |field: &str| {
+        object
+            .get(field)
+            .is_some_and(|value| value.is_null() || value.as_str().is_some_and(is_sha256))
+    };
+    if object.get("v").and_then(Value::as_u64) != Some(2)
+        || object.get("op").and_then(Value::as_str) != Some("changeset")
+        || !object
+            .get("changes_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(is_sha256)
+        || !object
+            .get("actor_ref")
+            .and_then(Value::as_str)
+            .is_some_and(is_sha256)
+        || !object
+            .get("control_revision")
+            .and_then(Value::as_str)
+            .is_some_and(is_sha256)
+        || !object
+            .get("state_root")
+            .and_then(Value::as_str)
+            .is_some_and(is_sha256)
+        || !hash_or_null("parent_commit")
+        || !hash_or_null("parent_root")
+        || !hash_or_null("parent_asset_root")
+        || !hash_or_null("asset_root")
+        || !hash_or_null("prev_entry_hash")
+        || !object
+            .get("materializer")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.len() <= 128)
+        || !object
+            .get("ts")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() == 24 && value.ends_with('Z'))
+    {
+        return Err(invalid_feed("v2 commit fields are invalid"));
+    }
+    if (seq == 1
+        && [
+            "parent_commit",
+            "parent_root",
+            "parent_asset_root",
+            "prev_entry_hash",
+        ]
+        .iter()
+        .any(|field| !object.get(*field).is_some_and(Value::is_null)))
+        || (seq > 1
+            && ["parent_commit", "parent_root", "prev_entry_hash"]
+                .iter()
+                .any(|field| object.get(*field).and_then(Value::as_str).is_none()))
+    {
+        return Err(invalid_feed("v2 commit parent shape is invalid"));
+    }
+    match object.get("v1_bridge") {
+        Some(Value::Null) => {}
+        Some(Value::Object(bridge))
+            if seq == 1
+                && bridge.len() == 3
+                && bridge
+                    .get("head_seq")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|v| v > 0)
+                && bridge
+                    .get("feed_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256)
+                && bridge
+                    .get("pack_sha256")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256) => {}
+        _ => return Err(invalid_feed("v2 commit has an invalid v1 bridge")),
+    }
     let public_key = object
         .get("public_key")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_feed("v2 commit has no public key"))?;
-    if public_key != identity.public_key_spki {
-        return Err(invalid_feed("v2 commit uses an unrecognized brain key"));
-    }
     let der = URL_SAFE_NO_PAD
         .decode(public_key)
         .map_err(|_| invalid_feed("v2 brain public key is not base64url"))?;
     let expected_multikey = format!("ed25519:{}", URL_SAFE_NO_PAD.encode(Sha256::digest(&der)));
-    if object.get("brain").and_then(Value::as_str) != Some(expected_multikey.as_str())
-        || identity.fingerprint != expected_multikey.trim_start_matches("ed25519:")
-    {
+    if object.get("brain").and_then(Value::as_str) != Some(expected_multikey.as_str()) {
         return Err(invalid_feed("v2 commit brain identity mismatch"));
+    }
+    // Verify the old-key-signed chain before trusting any prior public key.
+    verify_identity_chain(&v2_identity(identity), None)?;
+    // Old commits remain verifiable after brain-key rotation. `previous` is
+    // newest-first, while signer epochs and rotation statements are oldest-first.
+    let mut chain: Vec<(&str, &str)> = identity
+        .previous
+        .iter()
+        .rev()
+        .map(|previous| {
+            (
+                previous.fingerprint.as_str(),
+                previous.public_key_spki.as_str(),
+            )
+        })
+        .collect();
+    chain.push((&identity.fingerprint, &identity.public_key_spki));
+    let signer_index = chain.iter().position(|(fingerprint, spki)| {
+        *fingerprint == expected_multikey.trim_start_matches("ed25519:") && *spki == public_key
+    });
+    let Some(signer_index) = signer_index else {
+        return Err(invalid_feed("v2 commit uses an unrecognized brain key"));
+    };
+    if signer_epoch != signer_index as u64 + 1 {
+        return Err(invalid_feed("v2 commit signer epoch differs from its key"));
+    }
+    let lower_boundary = if signer_index == 0 {
+        None
+    } else {
+        let prior: RotationStatement = serde_json::from_str(&identity.rotations[signer_index - 1])
+            .map_err(|_| invalid_feed("v2 rotation statement did not parse"))?;
+        Some(prior.prior_head_seq)
+    };
+    let upper_boundary = if signer_index == identity.rotations.len() {
+        None
+    } else {
+        let next: RotationStatement = serde_json::from_str(&identity.rotations[signer_index])
+            .map_err(|_| invalid_feed("v2 rotation statement did not parse"))?;
+        Some(next.prior_head_seq)
+    };
+    if lower_boundary.is_some_and(|boundary| seq <= boundary)
+        || upper_boundary.is_some_and(|boundary| seq > boundary)
+    {
+        return Err(invalid_feed(
+            "v2 commit signer is outside its authenticated rotation epoch",
+        ));
     }
     let unsigned = crate::linkmd_v2::canonical_bytes(&Value::Object(object.clone()))
         .map_err(|error| invalid_feed(error.to_string()))?;
@@ -2466,6 +2614,125 @@ fn replay_v2_feed(
     Ok(())
 }
 
+fn verify_v1_to_v2_bridge(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    identity: &V2HeadIdentity,
+    checkpoint: &TrustState,
+) -> LinkResult<()> {
+    let value = ensure_ok(
+        request_capped(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{brain}/v2/feed?after=0&limit=1"),
+            None,
+            Auth::Required,
+            MAX_FEED_RESPONSE_BYTES,
+        )?,
+        "v2 genesis bridge",
+    )?;
+    let page: V2FeedPage = serde_json::from_value(value)
+        .map_err(|_| invalid_feed("v2 genesis bridge page has an invalid shape"))?;
+    if page.v != 2
+        || page.head_seq != pointer.seq
+        || page.head_commit_hash != pointer.commit_hash
+        || page.head_feed_hash != pointer.feed_hash
+        || page.entries.len() != 1
+        || page.entries[0].seq != 1
+        || !is_sha256(&page.entries[0].commit_hash)
+        || !is_sha256(&page.entries[0].feed_hash)
+    {
+        return Err(invalid_feed(
+            "v2 genesis bridge page differs from the signed head",
+        ));
+    }
+    let first = &page.entries[0];
+    let raw = STANDARD
+        .decode(&first.bytes_base64)
+        .map_err(|_| invalid_feed("v2 genesis bridge bytes are not canonical base64"))?;
+    if crate::linkmd_v2::domain_hash_bytes("v2/commit", &raw)
+        .map_err(|error| invalid_feed(error.to_string()))?
+        != first.commit_hash
+        || content_sha256(&raw) != first.feed_hash
+    {
+        return Err(invalid_feed("v2 genesis bridge address mismatch"));
+    }
+    let object = verified_v2_commit_object(&raw, identity)?;
+    if checkpoint.head_seq == 0 {
+        if checkpoint.feed_hash.is_some() || object.get("v1_bridge") != Some(&Value::Null) {
+            return Err(invalid_feed(
+                "empty v1 checkpoint did not transition through an empty v2 genesis",
+            ));
+        }
+        return Ok(());
+    }
+    let bridge = object
+        .get("v1_bridge")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_feed("v2 genesis omitted the pinned v1 boundary"))?;
+    let checkpoint_feed = checkpoint
+        .feed_hash
+        .as_deref()
+        .ok_or_else(|| invalid_feed("non-empty v1 checkpoint has no feed hash"))?;
+    if bridge.get("head_seq").and_then(Value::as_u64) != Some(checkpoint.head_seq)
+        || bridge.get("feed_hash").and_then(Value::as_str) != Some(checkpoint_feed)
+    {
+        return Err(invalid_feed(
+            "v2 genesis bridge differs from the pinned v1 checkpoint",
+        ));
+    }
+    let legacy_raw = ensure_raw_ok(
+        request_raw(
+            cfg,
+            "GET",
+            &format!(
+                "/api/hub/brains/{brain}/feed?after={}&limit=1",
+                checkpoint.head_seq - 1
+            ),
+            None,
+            Auth::Required,
+            MAX_FEED_RESPONSE_BYTES,
+        )?,
+        "v1 bridge boundary",
+    )?;
+    let legacy: FeedResponse = serde_json::from_slice(&legacy_raw)
+        .map_err(|_| invalid_feed("v1 bridge boundary has an invalid feed shape"))?;
+    let legacy_identity = legacy
+        .identity
+        .ok_or_else(|| invalid_feed("v1 bridge boundary has no identity"))?;
+    let item = legacy
+        .entries
+        .first()
+        .filter(|_| legacy.entries.len() == 1)
+        .ok_or_else(|| invalid_feed("v1 bridge boundary did not return one exact entry"))?;
+    if legacy.scope_limited
+        || legacy.head_seq != checkpoint.head_seq
+        || legacy.feed_hash.as_deref() != Some(checkpoint_feed)
+        || item.entry.seq != checkpoint.head_seq
+        || item.hash != checkpoint_feed
+        || &legacy_identity != &v2_identity(identity)
+        || bridge.get("pack_sha256").and_then(Value::as_str)
+            != Some(item.entry.pack_sha256.as_str())
+    {
+        return Err(invalid_feed(
+            "v1 bridge boundary differs from its signed legacy head",
+        ));
+    }
+    let anchor = verify_identity_chain(&legacy_identity, Some(checkpoint))?;
+    if anchor != checkpoint.anchor {
+        return Err(invalid_feed("v1 bridge changed the pinned identity anchor"));
+    }
+    verify_feed_item(item, &legacy_identity)?;
+    verify_rotation_feed_boundaries(
+        &legacy_identity,
+        Some(checkpoint),
+        std::slice::from_ref(item),
+        checkpoint.head_seq,
+    )?;
+    Ok(())
+}
+
 fn verify_v2_commit(
     cfg: &HubConfig,
     brain: &str,
@@ -2498,7 +2765,7 @@ fn verify_v2_commit(
     {
         return Err(invalid_feed("v2 commit fields differ from the pointer"));
     }
-    if let Some(checkpoint) = pinned {
+    if let Some(checkpoint) = pinned.filter(|checkpoint| accepted_as_v2(checkpoint)) {
         if pointer.seq == checkpoint.head_seq + 1
             && object.get("prev_entry_hash").and_then(Value::as_str)
                 != checkpoint.feed_hash.as_deref()
@@ -2517,8 +2784,13 @@ fn verify_v2_commit(
                 checkpoint.feed_hash.clone(),
             );
         }
-    } else if pointer.seq > 1 {
-        return replay_v2_feed(cfg, brain, pointer, identity, 0, None);
+    } else {
+        if let Some(checkpoint) = pinned {
+            verify_v1_to_v2_bridge(cfg, brain, pointer, identity, checkpoint)?;
+        }
+        if pointer.seq > 1 {
+            return replay_v2_feed(cfg, brain, pointer, identity, 0, None);
+        }
     }
     Ok(())
 }
@@ -2589,7 +2861,7 @@ fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2Verifie
                     "v2 hub pointer signer changed without a trust transition",
                 ));
             }
-            if let Some(checkpoint) = &pinned {
+            if let Some(checkpoint) = pinned.as_ref().filter(|state| accepted_as_v2(state)) {
                 if signed.pointer.seq < checkpoint.head_seq
                     || (signed.pointer.seq == checkpoint.head_seq
                         && checkpoint.feed_hash.as_deref()
@@ -2643,16 +2915,21 @@ fn accept_v2_head(cfg: &HubConfig, head: &V2VerifiedHead) -> LinkResult<()> {
     let _locks = lock_trust_many(cfg, &directory, &[&head.requested, &head.brain_id])?;
     let (current, alias) = load_canonical_pin(cfg, &directory, &head.requested, &head.brain_id)?;
     if let Some(current) = current {
-        if head.trust.head_seq < current.head_seq
-            || (head.trust.head_seq == current.head_seq
-                && head.trust.feed_hash != current.feed_hash)
-            || head.trust.anchor != current.anchor
-            || !head.trust.rotations.starts_with(&current.rotations)
-            || current
-                .hub_signer
-                .as_ref()
-                .is_some_and(|known| head.trust.hub_signer.as_ref() != Some(known))
-        {
+        let common_invalid = head.trust.anchor != current.anchor
+            || !head.trust.rotations.starts_with(&current.rotations);
+        let profile_invalid = if accepted_as_v2(&current) {
+            head.trust.head_seq < current.head_seq
+                || (head.trust.head_seq == current.head_seq
+                    && head.trust.feed_hash != current.feed_hash)
+                || current
+                    .hub_signer
+                    .as_ref()
+                    .is_some_and(|known| head.trust.hub_signer.as_ref() != Some(known))
+        } else {
+            head.trust.protocol_profile.as_deref() != Some("link-v2")
+                || head.trust.hub_signer.is_none()
+        };
+        if common_invalid || profile_invalid {
             return Err(invalid_feed(
                 "v2 head cannot advance the currently accepted trust checkpoint",
             ));
@@ -3374,6 +3651,7 @@ fn sign_verified_v2_candidate(
         "changes_sha256": changes_hash,
         "rebase": request_body.get("rebase").cloned().unwrap_or(Value::Null),
         "v": 2,
+        "v1_bridge": Value::Null,
     });
     let expected_request_hash = crate::linkmd_v2::domain_hash("v2/request", &request_value)
         .map_err(|error| invalid_feed(error.to_string()))?;
@@ -3508,6 +3786,7 @@ fn sign_verified_v2_candidate(
             .and_then(Value::as_str)
             != Some(head.view_revision.as_str())
         || signing_value.get("prev_entry_hash") != Some(&expected_prev_entry)
+        || signing_value.get("v1_bridge") != Some(&Value::Null)
         || signing_value.get("op").and_then(Value::as_str) != Some("changeset")
     {
         return Err(invalid_feed(
@@ -10555,6 +10834,371 @@ mod tests {
         let mut tampered = item;
         tampered.entry.pack_sha256 = "c".repeat(64);
         assert!(verify_feed_item(&tampered, &identity).is_err());
+    }
+
+    #[test]
+    fn v2_commit_requires_exact_fields_and_a_valid_genesis_bridge() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let (spki, multikey) = public_identity_for(&pair);
+        let identity = V2HeadIdentity {
+            custody: "self".to_string(),
+            fingerprint: multikey.trim_start_matches("ed25519:").to_string(),
+            public_key_spki: spki.clone(),
+            previous: Vec::new(),
+            rotations: Vec::new(),
+        };
+        let unsigned = json!({
+            "actor_ref": "a".repeat(64),
+            "asset_root": Value::Null,
+            "brain": multikey,
+            "changes_sha256": "b".repeat(64),
+            "control_revision": "c".repeat(64),
+            "materializer": "dbmd-projection-v1",
+            "op": "changeset",
+            "parent_asset_root": Value::Null,
+            "parent_commit": Value::Null,
+            "parent_root": Value::Null,
+            "prev_entry_hash": Value::Null,
+            "public_key": spki,
+            "seq": 1,
+            "signer_epoch": 1,
+            "state_root": "d".repeat(64),
+            "ts": "2026-08-19T12:00:00.000Z",
+            "v": 2,
+            "v1_bridge": {
+                "feed_hash": "e".repeat(64),
+                "head_seq": 7,
+                "pack_sha256": "f".repeat(64),
+            },
+        });
+        let sign_value = |value: Value| {
+            let message = crate::linkmd_v2::canonical_bytes(&value).unwrap();
+            let mut object = value.as_object().unwrap().clone();
+            object.insert(
+                "sig".to_string(),
+                Value::String(URL_SAFE_NO_PAD.encode(pair.sign(&message).as_ref())),
+            );
+            crate::linkmd_v2::canonical_bytes(&Value::Object(object)).unwrap()
+        };
+        assert!(verified_v2_commit_object(&sign_value(unsigned.clone()), &identity).is_ok());
+
+        let mut extra = unsigned.clone();
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), Value::Bool(true));
+        assert!(verified_v2_commit_object(&sign_value(extra), &identity).is_err());
+
+        let mut missing = unsigned.clone();
+        missing.as_object_mut().unwrap().remove("v1_bridge");
+        assert!(verified_v2_commit_object(&sign_value(missing), &identity).is_err());
+
+        let mut invalid_bridge = unsigned;
+        invalid_bridge.as_object_mut().unwrap().insert(
+            "v1_bridge".to_string(),
+            json!({"feed_hash": "e".repeat(64), "head_seq": 0, "pack_sha256": "f".repeat(64)}),
+        );
+        assert!(verified_v2_commit_object(&sign_value(invalid_bridge), &identity).is_err());
+    }
+
+    #[test]
+    fn shared_v2_commit_bridge_vector_matches_the_typescript_signer() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../../../tests/vectors/linkmd-v2-commit-bridge.json"
+        ))
+        .unwrap();
+        let identity_value = vector.get("identity").unwrap();
+        let identity = V2HeadIdentity {
+            custody: "self".to_string(),
+            fingerprint: identity_value
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string(),
+            public_key_spki: identity_value
+                .get("public_key_spki")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string(),
+            previous: Vec::new(),
+            rotations: Vec::new(),
+        };
+        let private = URL_SAFE_NO_PAD
+            .decode(
+                identity_value
+                    .get("private_key_pkcs8")
+                    .and_then(Value::as_str)
+                    .unwrap(),
+            )
+            .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&private)
+            .or_else(|_| ring::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&private))
+            .unwrap();
+        let base = vector.get("body").unwrap().as_object().unwrap();
+
+        for item in vector.get("valid").unwrap().as_array().unwrap() {
+            let mut body = base.clone();
+            body.insert(
+                "v1_bridge".to_string(),
+                item.get("v1_bridge").unwrap().clone(),
+            );
+            body.insert(
+                "sig".to_string(),
+                item.get("signature_base64url").unwrap().clone(),
+            );
+            let signed = crate::linkmd_v2::canonical_bytes(&Value::Object(body)).unwrap();
+            assert!(verified_v2_commit_object(&signed, &identity).is_ok());
+            assert_eq!(
+                crate::linkmd_v2::domain_hash_bytes("v2/commit", &signed).unwrap(),
+                item.get("commit_hash").and_then(Value::as_str).unwrap()
+            );
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&signed)),
+                item.get("feed_hash").and_then(Value::as_str).unwrap()
+            );
+        }
+
+        for item in vector.get("invalid").unwrap().as_array().unwrap() {
+            let mut body = base.clone();
+            if let Some(remove) = item.get("remove").and_then(Value::as_array) {
+                for field in remove {
+                    body.remove(field.as_str().unwrap());
+                }
+            }
+            if let Some(set) = item.get("set").and_then(Value::as_object) {
+                for (field, value) in set {
+                    body.insert(field.clone(), value.clone());
+                }
+            }
+            let message = crate::linkmd_v2::canonical_bytes(&Value::Object(body.clone())).unwrap();
+            body.insert(
+                "sig".to_string(),
+                Value::String(URL_SAFE_NO_PAD.encode(pair.sign(&message).as_ref())),
+            );
+            let signed = crate::linkmd_v2::canonical_bytes(&Value::Object(body)).unwrap();
+            assert!(
+                verified_v2_commit_object(&signed, &identity).is_err(),
+                "accepted invalid shared vector {}",
+                item.get("reason").and_then(Value::as_str).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn v2_profile_transition_reverifies_the_exact_signed_v1_bridge() {
+        let remote = signed_remote_fixture();
+        let legacy: FeedResponse = serde_json::from_str(&remote.feed).unwrap();
+        let legacy_item = legacy.entries.first().unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&remote.key.pkcs8).unwrap();
+        let body = json!({
+            "actor_ref": "a".repeat(64),
+            "asset_root": Value::Null,
+            "brain": remote.key.multikey,
+            "changes_sha256": "b".repeat(64),
+            "control_revision": "c".repeat(64),
+            "materializer": "dbmd-projection-v1",
+            "op": "changeset",
+            "parent_asset_root": Value::Null,
+            "parent_commit": Value::Null,
+            "parent_root": Value::Null,
+            "prev_entry_hash": Value::Null,
+            "public_key": remote.key.public_key_spki,
+            "seq": 1,
+            "signer_epoch": 1,
+            "state_root": "d".repeat(64),
+            "ts": "2026-08-19T12:00:00.000Z",
+            "v": 2,
+            "v1_bridge": {
+                "feed_hash": legacy_item.hash,
+                "head_seq": legacy_item.entry.seq,
+                "pack_sha256": legacy_item.entry.pack_sha256,
+            },
+        });
+        let message = crate::linkmd_v2::canonical_bytes(&body).unwrap();
+        let mut signed = body.as_object().unwrap().clone();
+        signed.insert(
+            "sig".to_string(),
+            Value::String(URL_SAFE_NO_PAD.encode(pair.sign(&message).as_ref())),
+        );
+        let raw = crate::linkmd_v2::canonical_bytes(&Value::Object(signed)).unwrap();
+        let commit_hash = crate::linkmd_v2::domain_hash_bytes("v2/commit", &raw).unwrap();
+        let feed_hash = content_sha256(&raw);
+        let pointer = V2PointerBody {
+            v: 2,
+            brain: TEST_BRAIN_ID.to_string(),
+            seq: 1,
+            commit_hash: commit_hash.clone(),
+            feed_hash: feed_hash.clone(),
+            content_root: Some("d".repeat(64)),
+            asset_root: None,
+            materializer: "dbmd-projection-v1".to_string(),
+            signer_epoch: 1,
+            control_revision: "c".repeat(64),
+            backup_preparation: "e".repeat(64),
+            prior_pointer_hash: None,
+            signed_at: "2026-08-19T12:00:00.000Z".to_string(),
+        };
+        let v2_page = json!({
+            "v": 2,
+            "head_seq": 1,
+            "head_commit_hash": commit_hash,
+            "head_feed_hash": feed_hash,
+            "entries": [{
+                "seq": 1,
+                "commit_hash": pointer.commit_hash,
+                "feed_hash": pointer.feed_hash,
+                "bytes_base64": STANDARD.encode(&raw),
+            }],
+            "next_after": 1,
+            "complete": true,
+        })
+        .to_string();
+        let identity = V2HeadIdentity {
+            custody: "self".to_string(),
+            fingerprint: remote.identity.fingerprint.clone(),
+            public_key_spki: remote.identity.public_key_spki.clone(),
+            previous: Vec::new(),
+            rotations: Vec::new(),
+        };
+        let checkpoint = TrustState {
+            v: 2,
+            origin: "unused".to_string(),
+            requested: TEST_BRAIN_ID.to_string(),
+            brain: TEST_BRAIN_ID.to_string(),
+            home: None,
+            anchor: remote.key.multikey.clone(),
+            current: remote.key.multikey,
+            head_seq: legacy_item.entry.seq,
+            feed_hash: Some(legacy_item.hash.clone()),
+            rotations: Vec::new(),
+            hub_signer: None,
+            protocol_profile: None,
+        };
+        let (hub, server) = scripted_json_hub(vec![(200, v2_page), (200, remote.feed)]);
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(hub, state.path().to_path_buf());
+        verify_v1_to_v2_bridge(&cfg, TEST_BRAIN_ID, &pointer, &identity, &checkpoint).unwrap();
+        server.join().unwrap();
+
+        let mut wrong = checkpoint;
+        wrong.feed_hash = Some("0".repeat(64));
+        let (hub, server) = scripted_json_hub(vec![(
+            200,
+            json!({
+                "v": 2,
+                "head_seq": 1,
+                "head_commit_hash": pointer.commit_hash,
+                "head_feed_hash": pointer.feed_hash,
+                "entries": [{
+                    "seq": 1,
+                    "commit_hash": pointer.commit_hash,
+                    "feed_hash": pointer.feed_hash,
+                    "bytes_base64": STANDARD.encode(&raw),
+                }],
+                "next_after": 1,
+                "complete": true,
+            })
+            .to_string(),
+        )]);
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(hub, state.path().to_path_buf());
+        assert!(verify_v1_to_v2_bridge(&cfg, TEST_BRAIN_ID, &pointer, &identity, &wrong,).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn v2_commit_signer_epoch_follows_the_authenticated_rotation_boundary() {
+        let rng = ring::rand::SystemRandom::new();
+        let old_pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let old = ring::signature::Ed25519KeyPair::from_pkcs8(old_pkcs8.as_ref()).unwrap();
+        let new_pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let new = ring::signature::Ed25519KeyPair::from_pkcs8(new_pkcs8.as_ref()).unwrap();
+        let (old_spki, old_multikey) = public_identity_for(&old);
+        let (new_spki, new_multikey) = public_identity_for(&new);
+        let rotation_unsigned = serde_json::to_string(&UnsignedRotation {
+            v: 1,
+            op: "rotate",
+            brain: &old_multikey,
+            public_key: &old_spki,
+            new_brain: &new_multikey,
+            new_public_key: &new_spki,
+            prior_head_seq: 1,
+            prior_feed_hash: Some(&"9".repeat(64)),
+            ts: "2026-08-19T12:01:00.000Z".to_string(),
+        })
+        .unwrap();
+        let rotation_sig = URL_SAFE_NO_PAD.encode(old.sign(rotation_unsigned.as_bytes()).as_ref());
+        let rotation = format!(
+            "{},\"sig\":\"{}\"}}",
+            &rotation_unsigned[..rotation_unsigned.len() - 1],
+            rotation_sig
+        );
+        let identity = V2HeadIdentity {
+            custody: "self".to_string(),
+            fingerprint: new_multikey.trim_start_matches("ed25519:").to_string(),
+            public_key_spki: new_spki.clone(),
+            previous: vec![V2PreviousIdentity {
+                fingerprint: old_multikey.trim_start_matches("ed25519:").to_string(),
+                public_key_spki: old_spki.clone(),
+            }],
+            rotations: vec![rotation],
+        };
+        let commit = |seq: u64,
+                      epoch: u64,
+                      multikey: &str,
+                      spki: &str,
+                      pair: &ring::signature::Ed25519KeyPair| {
+            let value = json!({
+                "actor_ref": "a".repeat(64),
+                "asset_root": Value::Null,
+                "brain": multikey,
+                "changes_sha256": "b".repeat(64),
+                "control_revision": "c".repeat(64),
+                "materializer": "dbmd-projection-v1",
+                "op": "changeset",
+                "parent_asset_root": Value::Null,
+                "parent_commit": if seq == 1 { Value::Null } else { Value::String("d".repeat(64)) },
+                "parent_root": if seq == 1 { Value::Null } else { Value::String("e".repeat(64)) },
+                "prev_entry_hash": if seq == 1 { Value::Null } else { Value::String("f".repeat(64)) },
+                "public_key": spki,
+                "seq": seq,
+                "signer_epoch": epoch,
+                "state_root": "1".repeat(64),
+                "ts": "2026-08-19T12:00:00.000Z",
+                "v": 2,
+                "v1_bridge": Value::Null,
+            });
+            let message = crate::linkmd_v2::canonical_bytes(&value).unwrap();
+            let mut object = value.as_object().unwrap().clone();
+            object.insert(
+                "sig".to_string(),
+                Value::String(URL_SAFE_NO_PAD.encode(pair.sign(&message).as_ref())),
+            );
+            crate::linkmd_v2::canonical_bytes(&Value::Object(object)).unwrap()
+        };
+
+        assert!(verified_v2_commit_object(
+            &commit(1, 1, &old_multikey, &old_spki, &old),
+            &identity,
+        )
+        .is_ok());
+        assert!(verified_v2_commit_object(
+            &commit(2, 2, &new_multikey, &new_spki, &new),
+            &identity,
+        )
+        .is_ok());
+        assert!(verified_v2_commit_object(
+            &commit(2, 1, &old_multikey, &old_spki, &old),
+            &identity,
+        )
+        .is_err());
+        assert!(verified_v2_commit_object(
+            &commit(1, 2, &new_multikey, &new_spki, &new),
+            &identity,
+        )
+        .is_err());
     }
 
     #[test]
