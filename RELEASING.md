@@ -49,7 +49,9 @@ back exactly. A killed controller leaves no deploy key or environment secret.
 The controller also asserts GitHub release immutability before it creates the
 tag. Before approval it downloads the four CI artifacts, rebuilds both Darwin
 targets with normalized Mach-O build metadata and both musl targets in
-digest-pinned `cross` images, and byte-compares each binary plus legal files.
+digest-pinned Linux builder images. Linux inputs use the same canonical
+`/project`, `/cargo`, and `/rust` paths as CI before each binary and its legal
+files are compared byte-for-byte.
 After CI completes it verifies the tag-to-SHA binding, exact five-asset set,
 SHA256 manifest, every provenance attestation, exact local-vs-crates.io package
 checksums, and the resulting tap formula.

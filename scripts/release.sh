@@ -22,6 +22,7 @@ TAP_REPO="${DBMD_TAP_REPO:-carloslfu/homebrew-tap}"
 RELEASE_WORKFLOW="${DBMD_RELEASE_WORKFLOW:-release.yml}"
 RELEASE_ENV="${DBMD_RELEASE_ENV:-release-publishing}"
 RUST_TOOLCHAIN="${DBMD_RELEASE_RUST_TOOLCHAIN:-1.88.0}"
+LINUX_RUST_TOOLCHAIN="${RUST_TOOLCHAIN}-x86_64-unknown-linux-gnu"
 DARWIN_DEVELOPER_DIR="$(
     printf '%s\n' "${DBMD_RELEASE_DARWIN_DEVELOPER_DIR:-$(xcode-select -p)}"
 )"
@@ -31,7 +32,7 @@ die() {
     exit 1
 }
 
-for command_name in git gh jq shasum cargo rustup cross docker tar xcode-select xcodebuild xcrun codesign lipo realpath readlink pkgutil cmp curl find sort xargs openssl; do
+for command_name in git gh jq shasum cargo rustup docker tar xcode-select xcodebuild xcrun codesign lipo realpath readlink pkgutil cmp curl find sort xargs openssl; do
     command -v "$command_name" >/dev/null 2>&1 ||
         die "required command not found: $command_name"
 done
@@ -111,7 +112,8 @@ test -d "$release_git_dir" ||
     die "could not resolve the private Git directory for release scratch space"
 # The trusted macOS controller runs Linux rebuilds in Colima. Colima shares
 # the repository's /Users path but not the host's /tmp, so an external TMPDIR
-# turns Cross's source/target mounts into an unwritable container path. Keep
+# turns the Linux builder's source/target mounts into an unwritable container
+# path. Keep
 # the exact-source scratch tree private and invisible inside .git instead.
 release_tmp="$(mktemp -d "$release_git_dir/dbmd-release.XXXXXXXX")"
 chmod 700 "$release_tmp"
@@ -133,13 +135,10 @@ mkdir -p "$release_source"
 git archive --format=tar "$source_sha" | tar -xf - -C "$release_source"
 
 # Prove that every trusted local builder input is present before the first
-# remote mutation. In particular, `cross` discovers a missing container engine
-# only when it starts the Linux rebuild; doing that after the tag push would
-# strand an otherwise valid version behind an unapprovable release run.
+# remote mutation. In particular, Linux reproduction needs a non-host Rust
+# toolchain and a running container engine; discovering either gap after the
+# tag push would strand an otherwise valid version behind an unapprovable run.
 preflight_release_builder() {
-    cross --version 2>/dev/null | sed -n '1p' |
-        grep -Eq '^cross 0\.2\.5 ' ||
-        die "cross 0.2.5 is required for Linux release reproduction"
     docker info >/dev/null 2>&1 ||
         die "the Docker daemon is required for Linux release reproduction"
 
@@ -150,6 +149,8 @@ preflight_release_builder() {
     rustup target add \
         --toolchain "$RUST_TOOLCHAIN" \
         x86_64-apple-darwin aarch64-apple-darwin >/dev/null
+    rustup toolchain install "$LINUX_RUST_TOOLCHAIN" \
+        --profile minimal --force-non-host >/dev/null
 
     for builder_image in \
         'ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99' \
@@ -162,11 +163,64 @@ preflight_release_builder() {
         test "$(
             docker image inspect \
                 --format '{{.Architecture}}' "$builder_image"
-        )" = amd64 || die "cross builder image is not linux/amd64: $builder_image"
+        )" = amd64 || die "Linux builder image is not linux/amd64: $builder_image"
     done
 }
 
 preflight_release_builder
+
+linux_builder_image() {
+    case "$1" in
+        x86_64-unknown-linux-musl)
+            printf '%s\n' 'ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99'
+            ;;
+        aarch64-unknown-linux-musl)
+            printf '%s\n' 'ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4'
+            ;;
+        *) die "unsupported Linux release target: $1" ;;
+    esac
+}
+
+build_linux_release_target() {
+    rust_target="$1"
+    target_dir="$2"
+    builder_image="$(linux_builder_image "$rust_target")"
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    linux_rustc="$(
+        rustup which --toolchain "$LINUX_RUST_TOOLCHAIN" rustc
+    )"
+    linux_rust_sysroot="$(dirname "$(dirname "$linux_rustc")")"
+    test -d "$cargo_home" || die "Cargo home not found: $cargo_home"
+    test -x "$linux_rustc" || die "Linux rustc not found: $linux_rustc"
+    mkdir -p "$target_dir"
+
+    # Cross mounts these three inputs at host-specific absolute paths. That is
+    # harmless for compilation but makes the independent macOS rebuild differ
+    # from CI because Rust embeds those paths. Invoke the same reviewed image
+    # directly with the exact canonical paths Cross uses on GitHub Actions.
+    # This is not post-build normalization: both builders compile the same
+    # source, registry, and sysroot paths and must produce identical bytes.
+    docker run --rm --platform linux/amd64 \
+        --user "$(id -u):$(id -g)" \
+        --env CARGO_HOME=/cargo \
+        --env CARGO_TARGET_DIR=/target \
+        --env CROSS_RUST_SYSROOT=/rust \
+        --env USER=dbmd-builder \
+        --volume "$release_source:/project:ro" \
+        --volume "$cargo_home:/cargo" \
+        --volume "$linux_rust_sysroot:/rust:ro" \
+        --volume "$target_dir:/target" \
+        --workdir /project \
+        "$builder_image" \
+        sh -c "export PATH=/rust/bin:\$PATH; cargo build --release --locked --target $rust_target -p dbmd-cli"
+
+    binary="$target_dir/$rust_target/release/dbmd"
+    if LC_ALL=C grep -aFq "$release_source" "$binary" ||
+        LC_ALL=C grep -aFq "$cargo_home" "$binary" ||
+        LC_ALL=C grep -aFq "$linux_rust_sysroot" "$binary"; then
+        die "Linux rebuild retained a builder-specific absolute path"
+    fi
+}
 
 # Immutable release enforcement is repository state, not workflow convention.
 if ! gh api \
@@ -332,9 +386,7 @@ rebuild_and_compare() {
 
         for rust_target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             target_dir="$rebuilt_dir/$rust_target"
-            CARGO_TARGET_DIR="$target_dir" \
-            RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" \
-                cross build --release --locked --target "$rust_target" -p dbmd-cli
+            build_linux_release_target "$rust_target" "$target_dir"
         done
     )
 
