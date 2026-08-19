@@ -162,6 +162,10 @@ const READ_TIMEOUT_SECS: u64 = 120;
 const OVERALL_REQUEST_TIMEOUT_SECS: u64 = 120;
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
+/// Cold checkouts may need every visible blob, but short-lived direct object
+/// capabilities must not create an unbounded connection storm. Keep the
+/// verified downloads inside this fixed worker count.
+const V2_BLOB_DOWNLOAD_WORKERS: usize = 16;
 
 /// Everything that can go wrong on the wire or at its edges. Each variant maps
 /// onto one stable CLI error code; messages are single-line and never echo the
@@ -231,6 +235,8 @@ pub enum LinkError {
         message: String,
         /// The hub's machine `code` field when it sent one.
         code: Option<String>,
+        /// Permission-filtered structured refusal details, when supplied.
+        details: Option<Value>,
     },
 
     /// A 2xx whose body is not JSON — a captive portal, a proxy, or a wrong
@@ -318,6 +324,52 @@ pub enum LinkError {
         /// The failed integrity condition, without untrusted secret material.
         message: String,
     },
+
+    /// Local and remote both changed one or more coordinates since the last
+    /// verified sync baseline. No side was overwritten.
+    #[error("sync conflict on {paths:?} — resolve the named files and retry")]
+    Conflict {
+        /// Bounded, portable paths safe to show to the agent/operator.
+        paths: Vec<String>,
+    },
+
+    /// `.sevralocal` newly made paths eligible to ride. Uploading them is an
+    /// explicit adoption boundary, never an accidental side effect of editing
+    /// or removing a local policy file.
+    #[error(
+        "local sync policy newly exposes {paths:?} — review and retry with --resume-local-policy"
+    )]
+    LocalPolicyTransition {
+        /// Bounded local-only paths. They are never sent in telemetry.
+        paths: Vec<String>,
+    },
+
+    /// A scoped checkout's generated store marker was edited or removed.
+    /// It is local projection metadata and is never accepted as brain data.
+    #[error(
+        "the generated DB.md for this scoped view was modified — clone a fresh scoped checkout"
+    )]
+    ScopedProjectionModified,
+
+    /// The effective permission slice changed after this checkout was pinned.
+    /// Reusing the directory could conceal removals or accidentally adopt files
+    /// revealed by a wider grant, so a new checkout is required.
+    #[error(
+        "the checkout's permission scope changed — clone into a new directory to accept the new view"
+    )]
+    ScopedViewChanged,
+
+    /// A v2 identity/head was previously accepted for this ref, but the hub
+    /// now hides it. Never reinterpret that as a v1 downgrade.
+    #[error("the previously verified brain is unavailable — access may have been revoked or the brain removed")]
+    BrainUnavailable,
+
+    /// The verified remote head advanced while a pull or post-commit barrier
+    /// was in flight. The old baseline is deliberately retained.
+    #[error(
+        "the remote brain advanced during sync — retry to converge from the new verified head"
+    )]
+    RemoteAdvancedDuringSync,
 
     /// This build cannot provide the no-follow, directory-handle-relative
     /// filesystem semantics required for trust/key/snapshot state.
@@ -1222,6 +1274,19 @@ fn request_raw(
     auth: Auth,
     max_response_bytes: u64,
 ) -> LinkResult<RawHubResponse> {
+    let http = hub_agent(cfg)?;
+    request_raw_with_agent(cfg, &http, method, path, body, auth, max_response_bytes)
+}
+
+fn request_raw_with_agent(
+    cfg: &HubConfig,
+    http: &ureq::Agent,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: Auth,
+    max_response_bytes: u64,
+) -> LinkResult<RawHubResponse> {
     let url = format!("{}{}", cfg.hub, path);
     let encoded_body = body.map(Value::to_string);
     let origin = normalized_origin(&cfg.hub)?;
@@ -1244,7 +1309,6 @@ fn request_raw(
         },
         Auth::None => None,
     };
-    let http = hub_agent(cfg)?;
     let result = with_connect_retries(|| {
         let mut req = http.request(method, &url);
         if let Some(value) = &credential {
@@ -1411,13 +1475,20 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
             status: resp.status(),
             message: "object store rejected the upload".to_string(),
             code: None,
+            details: None,
         }),
         Err(error) => match *error {
+            // Immutable uploads use If-None-Match. A concurrent writer may
+            // win the same content address; the commit/confirm endpoint reads
+            // and hashes that object before accepting it, so 412 safely means
+            // "continue to verification", never "trust the upload".
+            ureq::Error::Status(412, _) => Ok(()),
             ureq::Error::Status(_, resp) => Err(LinkError::Http {
                 what: "pack upload",
                 status: resp.status(),
                 message: "object store rejected the upload".to_string(),
                 code: None,
+                details: None,
             }),
             ureq::Error::Transport(err) => Err(LinkError::Transport {
                 hub: "the object store".to_string(),
@@ -1447,6 +1518,7 @@ fn get_presigned(cfg: &HubConfig, raw: &str) -> LinkResult<Vec<u8>> {
                     status: resp.status(),
                     message: "object store rejected the download".to_string(),
                     code: None,
+                    details: None,
                 });
             }
             ureq::Error::Transport(err) => {
@@ -1463,6 +1535,7 @@ fn get_presigned(cfg: &HubConfig, raw: &str) -> LinkResult<Vec<u8>> {
             status: resp.status(),
             message: "object store rejected the download".to_string(),
             code: None,
+            details: None,
         });
     }
     let mut bytes = Vec::new();
@@ -1495,11 +1568,13 @@ fn ensure_ok(r: HubResponse, what: &'static str) -> LinkResult<Value> {
             .and_then(|b| b.get("code"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let details = r.body.as_ref().and_then(|b| b.get("details")).cloned();
         return Err(LinkError::Http {
             what,
             status: r.status,
             message,
             code,
+            details,
         });
     }
     r.body.ok_or(LinkError::NotJson {
@@ -1673,6 +1748,7 @@ fn get_json_absolute(url: &str) -> LinkResult<Value> {
                     status,
                     message: "the home node rejected the card request".to_string(),
                     code: None,
+                    details: None,
                 });
             }
             ureq::Error::Transport(err) => {
@@ -1689,6 +1765,7 @@ fn get_json_absolute(url: &str) -> LinkResult<Value> {
             status: resp.status(),
             message: "the home node returned a redirect or error".to_string(),
             code: None,
+            details: None,
         });
     }
     let mut buf = Vec::new();
@@ -1833,6 +1910,8 @@ pub fn resolve_registry(cfg: &HubConfig, handle: &str) -> LinkResult<Option<Valu
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.feed_hash.clone()),
             rotations: identity.rotations.clone(),
+            hub_signer: None,
+            protocol_profile: None,
         },
         Some(&registry_alias),
     )?;
@@ -1883,6 +1962,7 @@ pub fn resolve(cfg: &HubConfig, addr: &Address) -> LinkResult<Value> {
                 status: 404,
                 message: "record not found".to_string(),
                 code: Some("NOT_FOUND".to_string()),
+                details: None,
             });
         }
         let brain = remote.head.brain.clone();
@@ -1979,6 +2059,7 @@ fn resolve_from_verified_pack(
         status: 404,
         message: "record not found".to_string(),
         code: Some("NOT_FOUND".to_string()),
+        details: None,
     })?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| invalid_feed(format!("signed snapshot record `{path}` is not UTF-8")))?;
@@ -2029,6 +2110,9 @@ pub struct PullReport {
     /// caller sees divergence; nothing is ever deleted locally.
     #[serde(rename = "extraLocal")]
     pub extra_local: Vec<String>,
+    /// Exact convergence result from the post-install barrier.
+    #[serde(rename = "syncStatus")]
+    pub sync_status: String,
 }
 
 fn download_verified_snapshot_pack(
@@ -2085,6 +2169,1767 @@ fn download_verified_snapshot_pack(
     Ok(bytes)
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2PointerBody {
+    v: u8,
+    brain: String,
+    seq: u64,
+    commit_hash: String,
+    feed_hash: String,
+    content_root: Option<String>,
+    asset_root: Option<String>,
+    materializer: String,
+    signer_epoch: u64,
+    control_revision: String,
+    backup_preparation: String,
+    prior_pointer_hash: Option<String>,
+    signed_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V2SignedPointer {
+    pointer: V2PointerBody,
+    hub_public_key: String,
+    hub_fingerprint: String,
+    sig: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V2HeadIdentity {
+    fingerprint: String,
+    public_key_spki: String,
+    #[serde(default)]
+    previous: Vec<V2PreviousIdentity>,
+    #[serde(default)]
+    rotations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V2PreviousIdentity {
+    fingerprint: String,
+    public_key_spki: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2HeadResponse {
+    v: u8,
+    brain_id: String,
+    profile: String,
+    view: Option<V2HeadView>,
+    pointer: Option<V2SignedPointer>,
+    identity: Option<V2HeadIdentity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V2HeadView {
+    kind: String,
+    control_revision: String,
+}
+
+#[derive(Debug, Clone)]
+struct V2VerifiedHead {
+    requested: String,
+    brain_id: String,
+    view_kind: String,
+    view_revision: String,
+    pointer: Option<V2PointerBody>,
+    trust: TrustState,
+    alias: Option<AliasBinding>,
+}
+
+fn verify_v2_spki_signature(
+    public_key: &str,
+    message: &[u8],
+    signature: &str,
+) -> LinkResult<Vec<u8>> {
+    let der = URL_SAFE_NO_PAD
+        .decode(public_key)
+        .map_err(|_| invalid_feed("v2 signer public key is not base64url"))?;
+    if der.len() != ED25519_SPKI_PREFIX.len() + 32 || !der.starts_with(&ED25519_SPKI_PREFIX) {
+        return Err(invalid_feed("v2 signer public key is not Ed25519 SPKI"));
+    }
+    let sig = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| invalid_feed("v2 signature is not base64url"))?;
+    UnparsedPublicKey::new(&ED25519, &der[ED25519_SPKI_PREFIX.len()..])
+        .verify(message, &sig)
+        .map_err(|_| invalid_feed("v2 Ed25519 signature failed"))?;
+    Ok(der)
+}
+
+fn verify_v2_pointer(pointer: &V2SignedPointer, expected_brain: &str) -> LinkResult<String> {
+    if pointer.pointer.v != 2
+        || pointer.pointer.brain != expected_brain
+        || pointer.pointer.seq == 0
+        || !is_sha256(&pointer.pointer.commit_hash)
+        || !is_sha256(&pointer.pointer.feed_hash)
+        || pointer
+            .pointer
+            .content_root
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || !is_sha256(&pointer.pointer.backup_preparation)
+    {
+        return Err(invalid_feed("v2 pointer fields are invalid"));
+    }
+    let value = serde_json::to_value(&pointer.pointer)
+        .map_err(|_| invalid_feed("v2 pointer could not be canonicalized"))?;
+    let message = crate::linkmd_v2::canonical_bytes(&value)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    let der = verify_v2_spki_signature(&pointer.hub_public_key, &message, &pointer.sig)?;
+    let fingerprint = format!("{:x}", Sha256::digest(&der));
+    if fingerprint != pointer.hub_fingerprint {
+        return Err(invalid_feed("v2 hub signer fingerprint mismatch"));
+    }
+    Ok(format!(
+        "{}:{}",
+        pointer.hub_fingerprint, pointer.hub_public_key
+    ))
+}
+
+fn v2_identity(identity: &V2HeadIdentity) -> FeedIdentity {
+    FeedIdentity {
+        fingerprint: identity.fingerprint.clone(),
+        public_key_spki: identity.public_key_spki.clone(),
+        previous: identity
+            .previous
+            .iter()
+            .map(|previous| PreviousIdentity {
+                fingerprint: previous.fingerprint.clone(),
+                public_key_spki: previous.public_key_spki.clone(),
+            })
+            .collect(),
+        rotations: identity.rotations.clone(),
+    }
+}
+
+fn verified_v2_commit_object(
+    raw: &[u8],
+    identity: &V2HeadIdentity,
+) -> LinkResult<serde_json::Map<String, Value>> {
+    let mut value: Value =
+        serde_json::from_slice(raw).map_err(|_| invalid_feed("v2 commit is not JSON"))?;
+    let canonical = crate::linkmd_v2::canonical_bytes(&value)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    if canonical != raw {
+        return Err(invalid_feed("v2 commit is not canonical JSON"));
+    }
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| invalid_feed("v2 commit is not an object"))?;
+    let sig = object
+        .remove("sig")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .ok_or_else(|| invalid_feed("v2 commit has no signature"))?;
+    let public_key = object
+        .get("public_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("v2 commit has no public key"))?;
+    if public_key != identity.public_key_spki {
+        return Err(invalid_feed("v2 commit uses an unrecognized brain key"));
+    }
+    let der = URL_SAFE_NO_PAD
+        .decode(public_key)
+        .map_err(|_| invalid_feed("v2 brain public key is not base64url"))?;
+    let expected_multikey = format!("ed25519:{}", URL_SAFE_NO_PAD.encode(Sha256::digest(&der)));
+    if object.get("brain").and_then(Value::as_str) != Some(expected_multikey.as_str())
+        || identity.fingerprint != expected_multikey.trim_start_matches("ed25519:")
+    {
+        return Err(invalid_feed("v2 commit brain identity mismatch"));
+    }
+    let unsigned = crate::linkmd_v2::canonical_bytes(&Value::Object(object.clone()))
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    verify_v2_spki_signature(public_key, &unsigned, &sig)?;
+    Ok(object.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct V2FeedWireEntry {
+    seq: u64,
+    commit_hash: String,
+    feed_hash: String,
+    bytes_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2FeedPage {
+    v: u8,
+    head_seq: u64,
+    head_commit_hash: String,
+    head_feed_hash: String,
+    entries: Vec<V2FeedWireEntry>,
+    next_after: u64,
+    complete: bool,
+}
+
+fn replay_v2_feed(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    identity: &V2HeadIdentity,
+    start_after: u64,
+    start_feed: Option<String>,
+) -> LinkResult<()> {
+    let mut after = start_after;
+    let mut prior_feed = start_feed;
+    let mut final_object = None;
+    let mut replayed_entries = 0_u64;
+    let mut replayed_bytes = 0_u64;
+    while after < pointer.seq {
+        let path = format!("/api/hub/brains/{brain}/v2/feed?after={after}&limit=100");
+        let value = ensure_ok(
+            request_capped(
+                cfg,
+                "GET",
+                &path,
+                None,
+                Auth::Required,
+                MAX_FEED_REPLAY_BYTES,
+            )?,
+            "v2 feed replay",
+        )?;
+        let page: V2FeedPage = serde_json::from_value(value)
+            .map_err(|_| invalid_feed("v2 feed page has an invalid shape"))?;
+        if page.v != 2
+            || page.head_seq != pointer.seq
+            || page.head_commit_hash != pointer.commit_hash
+            || page.head_feed_hash != pointer.feed_hash
+            || page.entries.is_empty()
+            || page.entries.len() > FEED_PAGE_LIMIT
+        {
+            return Err(invalid_feed("v2 feed page differs from the signed head"));
+        }
+        for entry in page.entries {
+            if entry.seq != after + 1
+                || !is_sha256(&entry.commit_hash)
+                || !is_sha256(&entry.feed_hash)
+            {
+                return Err(invalid_feed("v2 feed sequence is not contiguous"));
+            }
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(&entry.bytes_base64)
+                .map_err(|_| invalid_feed("v2 feed bytes are not canonical base64"))?;
+            replayed_entries = replayed_entries
+                .checked_add(1)
+                .ok_or_else(|| invalid_feed("v2 feed replay count overflow"))?;
+            replayed_bytes = replayed_bytes
+                .checked_add(raw.len() as u64)
+                .ok_or_else(|| invalid_feed("v2 feed replay byte count overflow"))?;
+            if replayed_entries > MAX_FEED_REPLAY_ENTRIES || replayed_bytes > MAX_FEED_REPLAY_BYTES
+            {
+                return Err(invalid_feed("v2 feed replay exceeds its safety bound"));
+            }
+            if crate::linkmd_v2::domain_hash_bytes("v2/commit", &raw)
+                .map_err(|error| invalid_feed(error.to_string()))?
+                != entry.commit_hash
+                || content_sha256(&raw) != entry.feed_hash
+            {
+                return Err(invalid_feed("v2 feed entry address mismatch"));
+            }
+            let object = verified_v2_commit_object(&raw, identity)?;
+            if object.get("seq").and_then(Value::as_u64) != Some(entry.seq)
+                || object.get("prev_entry_hash").and_then(Value::as_str) != prior_feed.as_deref()
+            {
+                return Err(invalid_feed(
+                    "v2 feed entry does not extend its predecessor",
+                ));
+            }
+            after = entry.seq;
+            prior_feed = Some(entry.feed_hash);
+            final_object = Some((entry.commit_hash, object));
+        }
+        if page.next_after != after || (page.complete != (after == pointer.seq)) {
+            return Err(invalid_feed("v2 feed page cursor is inconsistent"));
+        }
+    }
+    let (final_hash, object) =
+        final_object.ok_or_else(|| invalid_feed("v2 feed replay made no progress"))?;
+    if final_hash != pointer.commit_hash
+        || prior_feed.as_deref() != Some(pointer.feed_hash.as_str())
+        || object.get("state_root").and_then(Value::as_str) != pointer.content_root.as_deref()
+        || object.get("asset_root").and_then(Value::as_str) != pointer.asset_root.as_deref()
+        || object.get("control_revision").and_then(Value::as_str)
+            != Some(pointer.control_revision.as_str())
+        || object.get("materializer").and_then(Value::as_str) != Some(pointer.materializer.as_str())
+    {
+        return Err(invalid_feed(
+            "v2 replay did not converge on the signed pointer",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_v2_commit(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    identity: &V2HeadIdentity,
+    pinned: Option<&TrustState>,
+) -> LinkResult<()> {
+    let path = format!(
+        "/api/hub/brains/{brain}/v2/commit?commit={}",
+        pointer.commit_hash
+    );
+    let raw = ensure_raw_ok(
+        request_raw(cfg, "GET", &path, None, Auth::Required, MAX_RESPONSE_BYTES)?,
+        "v2 commit",
+    )?;
+    if crate::linkmd_v2::domain_hash_bytes("v2/commit", &raw)
+        .map_err(|error| invalid_feed(error.to_string()))?
+        != pointer.commit_hash
+        || content_sha256(&raw) != pointer.feed_hash
+    {
+        return Err(invalid_feed("v2 commit address differs from the pointer"));
+    }
+    let object = verified_v2_commit_object(&raw, identity)?;
+    if object.get("seq").and_then(Value::as_u64) != Some(pointer.seq)
+        || object.get("state_root").and_then(Value::as_str) != pointer.content_root.as_deref()
+        || object.get("asset_root").and_then(Value::as_str) != pointer.asset_root.as_deref()
+        || object.get("control_revision").and_then(Value::as_str)
+            != Some(pointer.control_revision.as_str())
+        || object.get("materializer").and_then(Value::as_str) != Some(pointer.materializer.as_str())
+    {
+        return Err(invalid_feed("v2 commit fields differ from the pointer"));
+    }
+    if let Some(checkpoint) = pinned {
+        if pointer.seq == checkpoint.head_seq + 1
+            && object.get("prev_entry_hash").and_then(Value::as_str)
+                != checkpoint.feed_hash.as_deref()
+        {
+            return Err(invalid_feed(
+                "v2 commit does not extend the pinned feed hash",
+            ));
+        }
+        if pointer.seq > checkpoint.head_seq + 1 {
+            return replay_v2_feed(
+                cfg,
+                brain,
+                pointer,
+                identity,
+                checkpoint.head_seq,
+                checkpoint.feed_hash.clone(),
+            );
+        }
+    } else if pointer.seq > 1 {
+        return replay_v2_feed(cfg, brain, pointer, identity, 0, None);
+    }
+    Ok(())
+}
+
+fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2VerifiedHead>> {
+    require_hardened_filesystem("verified link.md v2 state")?;
+    require_safe_ref(brain)?;
+    let path = format!("/api/hub/brains/{brain}/v2/head");
+    let response = request(cfg, "GET", &path, None, Auth::Required)?;
+    if response.status == 404 {
+        if has_accepted_v2_ref(cfg, brain)? {
+            return Err(LinkError::BrainUnavailable);
+        }
+        return Ok(None);
+    }
+    let body = ensure_ok(response, "v2 head")?;
+    let head: V2HeadResponse = serde_json::from_value(body)
+        .map_err(|_| invalid_feed("v2 head response has an invalid shape"))?;
+    if head.v != 2 || !crate::ulid::is_ulid(&head.brain_id) {
+        return Err(invalid_feed("v2 head has no canonical brain id"));
+    }
+    if crate::ulid::is_ulid(brain) && head.brain_id != brain {
+        return Err(invalid_feed("v2 head resolved a different brain id"));
+    }
+    if head.profile == "v1" {
+        return Ok(None);
+    }
+    if head.profile != "v2" && head.profile != "v2-empty" {
+        return Err(invalid_feed("v2 head advertised an unknown profile"));
+    }
+    let view = head
+        .view
+        .as_ref()
+        .ok_or_else(|| invalid_feed("v2 head has no permission view"))?;
+    if !matches!(view.kind.as_str(), "full" | "scoped") || !is_sha256(&view.control_revision) {
+        return Err(invalid_feed("v2 head has an invalid permission view"));
+    }
+    let view_kind = view.kind.clone();
+    let view_revision = view.control_revision.clone();
+    let identity = head
+        .identity
+        .as_ref()
+        .ok_or_else(|| invalid_feed("v2 head has no brain identity"))?;
+    let trust_directory = open_trust_dir(cfg)?;
+    let _trust_locks = lock_trust_many(cfg, &trust_directory, &[brain, &head.brain_id])?;
+    let (pinned, alias_binding) = load_canonical_pin(cfg, &trust_directory, brain, &head.brain_id)?;
+    let feed_identity = v2_identity(identity);
+    let anchor = verify_identity_chain(&feed_identity, pinned.as_ref())?;
+    let (seq, feed_hash, hub_signer) = match &head.pointer {
+        None => {
+            if head.profile != "v2-empty" {
+                return Err(invalid_feed("initialized v2 head has no pointer"));
+            }
+            (
+                0,
+                None,
+                pinned.as_ref().and_then(|state| state.hub_signer.clone()),
+            )
+        }
+        Some(signed) => {
+            let signer = verify_v2_pointer(signed, &head.brain_id)?;
+            if pinned
+                .as_ref()
+                .and_then(|state| state.hub_signer.as_ref())
+                .is_some_and(|known| known != &signer)
+            {
+                return Err(invalid_feed(
+                    "v2 hub pointer signer changed without a trust transition",
+                ));
+            }
+            if let Some(checkpoint) = &pinned {
+                if signed.pointer.seq < checkpoint.head_seq
+                    || (signed.pointer.seq == checkpoint.head_seq
+                        && checkpoint.feed_hash.as_deref()
+                            != Some(signed.pointer.feed_hash.as_str()))
+                {
+                    return Err(invalid_feed("v2 pointer rolled back or equivocated"));
+                }
+            }
+            verify_v2_commit(
+                cfg,
+                &head.brain_id,
+                &signed.pointer,
+                identity,
+                pinned.as_ref(),
+            )?;
+            (
+                signed.pointer.seq,
+                Some(signed.pointer.feed_hash.clone()),
+                Some(signer),
+            )
+        }
+    };
+    let trust = TrustState {
+        v: 2,
+        origin: normalized_origin(&cfg.hub)?,
+        requested: head.brain_id.clone(),
+        brain: head.brain_id.clone(),
+        home: None,
+        anchor,
+        current: format!("ed25519:{}", identity.fingerprint),
+        head_seq: seq,
+        feed_hash,
+        rotations: identity.rotations.clone(),
+        hub_signer,
+        protocol_profile: Some("link-v2".to_string()),
+    };
+    Ok(Some(V2VerifiedHead {
+        requested: brain.to_string(),
+        brain_id: head.brain_id,
+        view_kind,
+        view_revision,
+        pointer: head.pointer.map(|signed| signed.pointer),
+        trust,
+        alias: alias_binding,
+    }))
+}
+
+fn accept_v2_head(cfg: &HubConfig, head: &V2VerifiedHead) -> LinkResult<()> {
+    let directory = open_trust_dir(cfg)?;
+    let _locks = lock_trust_many(cfg, &directory, &[&head.requested, &head.brain_id])?;
+    let (current, alias) = load_canonical_pin(cfg, &directory, &head.requested, &head.brain_id)?;
+    if let Some(current) = current {
+        if head.trust.head_seq < current.head_seq
+            || (head.trust.head_seq == current.head_seq
+                && head.trust.feed_hash != current.feed_hash)
+            || head.trust.anchor != current.anchor
+            || !head.trust.rotations.starts_with(&current.rotations)
+            || current
+                .hub_signer
+                .as_ref()
+                .is_some_and(|known| head.trust.hub_signer.as_ref() != Some(known))
+        {
+            return Err(invalid_feed(
+                "v2 head cannot advance the currently accepted trust checkpoint",
+            ));
+        }
+    }
+    save_canonical_pin_and_alias(
+        cfg,
+        &directory,
+        &head.requested,
+        &head.brain_id,
+        head.trust.clone(),
+        alias.as_ref().or(head.alias.as_ref()),
+    )
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2BaselineFile {
+    sha256: String,
+    bytes: u64,
+    #[serde(skip)]
+    proof: Option<Vec<V2ProofStep>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2SyncBaseline {
+    v: u8,
+    origin: String,
+    brain: String,
+    commit_hash: Option<String>,
+    content_root: Option<String>,
+    #[serde(default)]
+    view_kind: Option<String>,
+    #[serde(default)]
+    view_revision: Option<String>,
+    #[serde(default)]
+    projection_sha256: Option<String>,
+    files: std::collections::BTreeMap<String, V2BaselineFile>,
+    #[serde(default)]
+    local_policy_digest: Option<String>,
+    #[serde(default)]
+    local_eligibility: std::collections::BTreeMap<String, bool>,
+    #[serde(default)]
+    remote_copy_remains: std::collections::BTreeMap<String, String>,
+}
+
+struct V2LocalView {
+    riding: std::collections::BTreeMap<String, (String, Vec<u8>)>,
+    eligibility: std::collections::BTreeMap<String, bool>,
+    policy: crate::linkmd_sync_policy::SyncPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct V2ProofStep {
+    directory_root: String,
+    component: String,
+    proof: crate::linkmd_v2::HamtProof,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2ManifestFile {
+    path: String,
+    sha256: String,
+    bytes: u64,
+    proof: Vec<V2ProofStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2ManifestPage {
+    v: u8,
+    commit: String,
+    content_root: Option<String>,
+    files: Vec<V2ManifestFile>,
+    next_cursor: Option<String>,
+}
+
+fn verify_v2_file_proof(root: &str, file: &V2ManifestFile) -> LinkResult<()> {
+    let normalized = crate::linkmd_v2::normalize_path(&file.path)
+        .map_err(|error| invalid_feed(error.to_string()))?;
+    let components = normalized.split('/').collect::<Vec<_>>();
+    if components.len() != file.proof.len() || !is_sha256(&file.sha256) {
+        return Err(invalid_feed("v2 file proof has the wrong shape"));
+    }
+    let mut directory_root = root.to_string();
+    for (index, step) in file.proof.iter().enumerate() {
+        if step.directory_root != directory_root || step.component != components[index] {
+            return Err(invalid_feed(
+                "v2 file proof path chain differs from its manifest",
+            ));
+        }
+        if !crate::linkmd_v2::verify_proof(&directory_root, &step.component, &step.proof)
+            .map_err(|error| invalid_feed(error.to_string()))?
+        {
+            return Err(invalid_feed("v2 file proof failed verification"));
+        }
+        let entry = match &step.proof {
+            crate::linkmd_v2::HamtProof::Inclusion { entry, .. } => entry,
+            crate::linkmd_v2::HamtProof::NonInclusion { .. } => {
+                return Err(invalid_feed("v2 manifest carried a non-inclusion proof"));
+            }
+        };
+        if index + 1 == components.len() {
+            if entry.kind != crate::linkmd_v2::EntryKind::Blob
+                || entry.child_hash != file.sha256
+                || entry.bytes != Some(file.bytes)
+            {
+                return Err(invalid_feed("v2 file proof leaf differs from its manifest"));
+            }
+        } else if entry.kind != crate::linkmd_v2::EntryKind::Tree {
+            return Err(invalid_feed("v2 file proof traversed a non-directory"));
+        } else {
+            directory_root = entry.child_hash.clone();
+        }
+    }
+    Ok(())
+}
+
+fn v2_manifest(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: Option<&V2PointerBody>,
+) -> LinkResult<std::collections::BTreeMap<String, V2BaselineFile>> {
+    let Some(pointer) = pointer else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let Some(root) = pointer.content_root.as_deref() else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let mut files = std::collections::BTreeMap::new();
+    let mut after = String::new();
+    loop {
+        let encoded_after: String =
+            url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
+        let path = format!(
+            "/api/hub/brains/{brain}/v2/files?commit={}&limit=500&after={encoded_after}",
+            pointer.commit_hash
+        );
+        let value = ensure_ok(
+            request_capped(
+                cfg,
+                "GET",
+                &path,
+                None,
+                Auth::Required,
+                MAX_FEED_RESPONSE_BYTES,
+            )?,
+            "v2 file manifest",
+        )?;
+        let page: V2ManifestPage = serde_json::from_value(value)
+            .map_err(|_| invalid_feed("v2 file manifest has an invalid shape"))?;
+        if page.v != 2
+            || page.commit != pointer.commit_hash
+            || page.content_root.as_deref() != Some(root)
+            || page.files.len() > 500
+        {
+            return Err(invalid_feed(
+                "v2 file manifest is not bound to the verified head",
+            ));
+        }
+        for file in page.files {
+            verify_v2_file_proof(root, &file)?;
+            if files
+                .insert(
+                    file.path.clone(),
+                    V2BaselineFile {
+                        sha256: file.sha256,
+                        bytes: file.bytes,
+                        proof: Some(file.proof),
+                    },
+                )
+                .is_some()
+            {
+                return Err(invalid_feed("v2 file manifest repeats a path"));
+            }
+            if files.len() > MAX_PUSH_FILES {
+                return Err(invalid_feed(
+                    "v2 file manifest exceeds the file-count bound",
+                ));
+            }
+        }
+        match page.next_cursor {
+            None => break,
+            Some(next) if next > after => after = next,
+            Some(_) => return Err(invalid_feed("v2 file manifest cursor did not advance")),
+        }
+    }
+    Ok(files)
+}
+
+fn v2_baseline_name(cfg: &HubConfig, brain: &str, checkout: &Path) -> LinkResult<String> {
+    let origin = normalized_origin(&cfg.hub)?;
+    let absolute = if checkout.is_absolute() {
+        checkout.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(checkout)
+    };
+    Ok(format!(
+        "sync-{}.json",
+        content_sha256(format!("{origin}\0{brain}\0{}", absolute.display()).as_bytes())
+    ))
+}
+
+#[cfg(unix)]
+fn lock_v2_sync_operation(cfg: &HubConfig, brain: &str) -> LinkResult<TrustLock> {
+    let directory = open_trust_dir(cfg)?;
+    let origin = normalized_origin(&cfg.hub)?;
+    let name = format!(
+        "operation-{}.lock",
+        content_sha256(format!("{origin}\0{brain}").as_bytes())
+    );
+    lock_trust_name(&directory, &name)
+}
+
+#[cfg(not(unix))]
+fn lock_v2_sync_operation(_cfg: &HubConfig, _brain: &str) -> LinkResult<()> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "serialized link.md v2 sync",
+    })
+}
+
+fn same_v2_head(left: &V2VerifiedHead, right: &V2VerifiedHead) -> bool {
+    left.brain_id == right.brain_id
+        && left.view_kind == right.view_kind
+        && left.view_revision == right.view_revision
+        && match (&left.pointer, &right.pointer) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.seq == right.seq
+                    && left.commit_hash == right.commit_hash
+                    && left.content_root == right.content_root
+                    && left.feed_hash == right.feed_hash
+            }
+            _ => false,
+        }
+}
+
+fn scoped_projection_bytes(brain: &str) -> Vec<u8> {
+    format!(
+        "---\ntype: db-md\nscope: company\nowner: link.md scoped view\n---\n\n# Scoped brain view\n\nThis DB.md is generated locally by dbmd. It is not the brain's canonical contract and is never uploaded.\n\nCanonical brain: @{brain}\n"
+    )
+    .into_bytes()
+}
+
+fn scoped_projection_sha256(brain: &str) -> String {
+    content_sha256(&scoped_projection_bytes(brain))
+}
+
+#[derive(Deserialize)]
+struct LocalScopedViewMarker {
+    v: u8,
+    kind: String,
+    authoritative: bool,
+    brain: String,
+    projection_sha256: String,
+}
+
+/// True only when this store carries the exact generated marker for a local
+/// link.md scoped view. This is presentation context, never authorization;
+/// the hub remains the only authority for reads and writes.
+pub fn has_verified_local_scoped_view(store: &Store) -> bool {
+    let marker = store
+        .read_bounded(Path::new(".dbmd/view.json"), 64 * 1024)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LocalScopedViewMarker>(&bytes).ok());
+    let Some(marker) = marker else {
+        return false;
+    };
+    if marker.v != 1
+        || marker.kind != "link.md-scoped-view"
+        || marker.authoritative
+        || !crate::ulid::is_ulid(&marker.brain)
+        || marker.projection_sha256 != scoped_projection_sha256(&marker.brain)
+    {
+        return false;
+    }
+    store
+        .read_bounded(Path::new("DB.md"), crate::parser::MAX_DBMD_FILE_BYTES)
+        .is_ok_and(|bytes| content_sha256(&bytes) == marker.projection_sha256)
+}
+
+fn scoped_view_metadata(head: &V2VerifiedHead, files: usize) -> LinkResult<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&json!({
+        "v": 1,
+        "kind": "link.md-scoped-view",
+        "authoritative": false,
+        "brain": head.brain_id,
+        "view_revision": head.view_revision,
+        "head_seq": head.pointer.as_ref().map_or(0, |pointer| pointer.seq),
+        "commit_hash": head.pointer.as_ref().map(|pointer| &pointer.commit_hash),
+        "content_root": head.pointer.as_ref().and_then(|pointer| pointer.content_root.as_ref()),
+        "visible_files": files,
+        "projection_sha256": scoped_projection_sha256(&head.brain_id),
+    }))
+    .map_err(|_| invalid_feed("could not serialize scoped view metadata"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn refresh_scoped_view_marker(
+    store: &Store,
+    head: &V2VerifiedHead,
+    files: usize,
+) -> LinkResult<()> {
+    if head.view_kind == "scoped" {
+        store.write_atomic(
+            Path::new(".dbmd/view.json"),
+            &scoped_view_metadata(head, files)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_v2_view_compatible(
+    head: &V2VerifiedHead,
+    baseline: Option<&V2SyncBaseline>,
+) -> LinkResult<()> {
+    let Some(baseline) = baseline else {
+        return Ok(());
+    };
+    match (
+        baseline.view_kind.as_deref(),
+        baseline.view_revision.as_deref(),
+    ) {
+        (None, None) if head.view_kind == "full" => Ok(()),
+        (Some(kind), Some(revision))
+            if kind == head.view_kind && revision == head.view_revision =>
+        {
+            Ok(())
+        }
+        _ => Err(LinkError::ScopedViewChanged),
+    }
+}
+
+fn remove_scoped_projection(
+    head: &V2VerifiedHead,
+    baseline: Option<&V2SyncBaseline>,
+    view: &mut V2LocalView,
+) -> LinkResult<()> {
+    if head.view_kind != "scoped" {
+        return Ok(());
+    }
+    let expected = scoped_projection_sha256(&head.brain_id);
+    if baseline
+        .and_then(|state| state.projection_sha256.as_deref())
+        .is_some_and(|pinned| pinned != expected)
+    {
+        return Err(LinkError::ScopedViewChanged);
+    }
+    if view.riding.get("DB.md").map(|(sha256, _)| sha256.as_str()) != Some(expected.as_str()) {
+        return Err(LinkError::ScopedProjectionModified);
+    }
+    view.riding.remove("DB.md");
+    view.eligibility.remove("DB.md");
+    Ok(())
+}
+
+fn files_for_v2_view(
+    head: &V2VerifiedHead,
+    mut files: std::collections::BTreeMap<String, V2BaselineFile>,
+) -> std::collections::BTreeMap<String, V2BaselineFile> {
+    if head.view_kind == "scoped" {
+        // Even when a grant explicitly includes canonical DB.md, a partial
+        // checkout uses a generated marker. Canonical validation remains a
+        // server-side operation over the complete brain.
+        files.remove("DB.md");
+    }
+    files
+}
+
+#[cfg(unix)]
+fn load_v2_baseline(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+) -> LinkResult<Option<V2SyncBaseline>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let directory = open_trust_dir(cfg)?;
+    let name_string = v2_baseline_name(cfg, brain, checkout)?;
+    let _lock = lock_trust_name(&directory, &name_string)?;
+    let name = c_name(name_string.as_bytes(), &name_string)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(LinkError::UnsafePath { path: name_string })
+        };
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    file.take(MAX_FEED_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FEED_RESPONSE_BYTES {
+        return Err(invalid_feed("v2 sync baseline is oversized"));
+    }
+    let baseline: V2SyncBaseline =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_feed("v2 sync baseline is corrupt"))?;
+    if baseline.v != 2
+        || baseline.origin != normalized_origin(&cfg.hub)?
+        || baseline.brain != brain
+        || baseline
+            .commit_hash
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || baseline
+            .content_root
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || baseline
+            .local_policy_digest
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || baseline
+            .view_kind
+            .as_deref()
+            .is_some_and(|kind| !matches!(kind, "full" | "scoped"))
+        || baseline
+            .view_revision
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || baseline
+            .projection_sha256
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || (baseline.view_kind.as_deref() == Some("scoped")
+            && (baseline.view_revision.is_none() || baseline.projection_sha256.is_none()))
+        || baseline.files.len() > MAX_PUSH_FILES
+        || baseline.local_eligibility.len() > MAX_PUSH_FILES
+        || baseline.remote_copy_remains.len() > MAX_PUSH_FILES
+        || baseline.files.iter().any(|(path, file)| {
+            crate::linkmd_v2::normalize_path(path).is_err()
+                || !is_sha256(&file.sha256)
+                || file.bytes > MAX_STORE_BYTES
+        })
+        || baseline
+            .local_eligibility
+            .keys()
+            .chain(baseline.remote_copy_remains.keys())
+            .any(|path| crate::linkmd_v2::normalize_path(path).is_err())
+        || baseline
+            .remote_copy_remains
+            .values()
+            .any(|hash| !is_sha256(hash))
+    {
+        return Err(invalid_feed("v2 sync baseline failed validation"));
+    }
+    Ok(Some(baseline))
+}
+
+#[cfg(not(unix))]
+fn load_v2_baseline(
+    _cfg: &HubConfig,
+    _brain: &str,
+    _checkout: &Path,
+) -> LinkResult<Option<V2SyncBaseline>> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "verified link.md v2 baseline",
+    })
+}
+
+#[cfg(unix)]
+fn save_v2_baseline(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+    baseline: &V2SyncBaseline,
+) -> LinkResult<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let directory = open_trust_dir(cfg)?;
+    let name_string = v2_baseline_name(cfg, brain, checkout)?;
+    let _lock = lock_trust_name(&directory, &name_string)?;
+    let name = c_name(name_string.as_bytes(), &name_string)?;
+    let mut bytes = serde_json::to_vec(baseline)
+        .map_err(|_| invalid_feed("could not serialize v2 sync baseline"))?;
+    bytes.push(b'\n');
+    let temp_string = format!(
+        ".{name_string}.tmp.{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temp = c_name(temp_string.as_bytes(), &temp_string)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    drop(file);
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            directory.as_raw_fd(),
+            name.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    directory.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn save_v2_baseline(
+    _cfg: &HubConfig,
+    _brain: &str,
+    _checkout: &Path,
+    _baseline: &V2SyncBaseline,
+) -> LinkResult<()> {
+    Err(LinkError::UnsupportedPlatform {
+        operation: "verified link.md v2 baseline",
+    })
+}
+
+fn v2_baseline_from_head(
+    cfg: &HubConfig,
+    head: &V2VerifiedHead,
+    files: std::collections::BTreeMap<String, V2BaselineFile>,
+    local: Option<&V2LocalView>,
+) -> LinkResult<V2SyncBaseline> {
+    let mut local_eligibility = local
+        .map(|view| view.eligibility.clone())
+        .unwrap_or_default();
+    if let Some(view) = local {
+        for path in files.keys() {
+            local_eligibility
+                .entry(path.clone())
+                .or_insert_with(|| !view.policy.keeps_home(path));
+        }
+    }
+    let remote_copy_remains = local_eligibility
+        .iter()
+        .filter(|(_, riding)| !**riding)
+        .filter_map(|(path, _)| {
+            files
+                .get(path)
+                .map(|file| (path.clone(), file.sha256.clone()))
+        })
+        .collect();
+    Ok(V2SyncBaseline {
+        v: 2,
+        origin: normalized_origin(&cfg.hub)?,
+        brain: head.brain_id.clone(),
+        commit_hash: head
+            .pointer
+            .as_ref()
+            .map(|pointer| pointer.commit_hash.clone()),
+        content_root: head
+            .pointer
+            .as_ref()
+            .and_then(|pointer| pointer.content_root.clone()),
+        view_kind: Some(head.view_kind.clone()),
+        view_revision: Some(head.view_revision.clone()),
+        projection_sha256: (head.view_kind == "scoped")
+            .then(|| scoped_projection_sha256(&head.brain_id)),
+        files,
+        local_policy_digest: local.map(|view| view.policy.digest.clone()),
+        local_eligibility,
+        remote_copy_remains,
+    })
+}
+
+fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
+    let policy = crate::linkmd_sync_policy::load(store)
+        .map_err(|message| LinkError::InvalidPack { message })?;
+    let mut result = std::collections::BTreeMap::new();
+    let mut eligibility = std::collections::BTreeMap::new();
+    let mut total = 0_u64;
+    let mut paths = vec![PathBuf::from("DB.md")];
+    paths.extend(store.walk()?);
+    for relative in paths {
+        let path = relative.to_string_lossy().replace('\\', "/");
+        // v2 catalogs and asset inventory are materialized/signed separately.
+        if matches!(path.as_str(), "assets.jsonl" | "index.md" | "index.jsonl") {
+            continue;
+        }
+        crate::linkmd_v2::normalize_path(&path).map_err(|error| LinkError::UnsafePath {
+            path: error.to_string(),
+        })?;
+        let riding = !policy.keeps_home(&path);
+        eligibility.insert(path.clone(), riding);
+        if !riding {
+            continue;
+        }
+        let remaining = MAX_STORE_BYTES.saturating_sub(total);
+        let bytes = store.read_bounded(&relative, remaining)?;
+        total = total
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| LinkError::PushTooLarge {
+                detail: "v2 local byte count overflow".to_string(),
+            })?;
+        if total > MAX_STORE_BYTES {
+            return Err(LinkError::PushTooLarge {
+                detail: format!("{total} uncompressed bytes"),
+            });
+        }
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(LinkError::NotUtf8 { path });
+        }
+        result.insert(path, (content_sha256(&bytes), bytes));
+    }
+    Ok(V2LocalView {
+        riding: result,
+        eligibility,
+        policy,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct V2DownloadItem {
+    path: String,
+    sha256: String,
+    bytes: u64,
+    url: String,
+    method: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2DownloadWindow {
+    v: u8,
+    commit: String,
+    downloads: Vec<V2DownloadItem>,
+}
+
+fn prepare_v2_downloads(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    pending: &[(&String, &V2BaselineFile)],
+) -> LinkResult<Vec<V2DownloadItem>> {
+    let mut result = Vec::with_capacity(pending.len());
+    for chunk in pending.chunks(128) {
+        let claims = chunk
+            .iter()
+            .map(|(path, file)| {
+                Ok(json!({
+                    "path": path,
+                    "sha256": file.sha256,
+                    "bytes": file.bytes,
+                    "proof": file.proof.as_ref().ok_or_else(|| {
+                        invalid_feed("v2 manifest omitted a download proof")
+                    })?,
+                }))
+            })
+            .collect::<LinkResult<Vec<_>>>()?;
+        let value = ensure_ok(
+            request_capped(
+                cfg,
+                "POST",
+                &format!("/api/hub/brains/{brain}/v2/downloads"),
+                Some(&json!({
+                    "commit": pointer.commit_hash,
+                    "files": claims,
+                })),
+                Auth::Required,
+                MAX_FEED_RESPONSE_BYTES,
+            )?,
+            "prepare v2 blob downloads",
+        )?;
+        let window: V2DownloadWindow = serde_json::from_value(value)
+            .map_err(|_| invalid_feed("v2 download window has an invalid shape"))?;
+        if window.v != 2
+            || window.commit != pointer.commit_hash
+            || window.downloads.len() != chunk.len()
+        {
+            return Err(invalid_feed(
+                "v2 download window is not bound to the requested files",
+            ));
+        }
+        let mut by_path = window
+            .downloads
+            .into_iter()
+            .map(|item| (item.path.clone(), item))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if by_path.len() != chunk.len() {
+            return Err(invalid_feed("v2 download window repeats a path"));
+        }
+        for (path, file) in chunk {
+            let item = by_path
+                .remove(*path)
+                .ok_or_else(|| invalid_feed("v2 download window omitted a path"))?;
+            if item.method != "GET"
+                || item.sha256 != file.sha256
+                || item.bytes != file.bytes
+                || item.url.is_empty()
+            {
+                return Err(invalid_feed(
+                    "v2 download capability differs from its proven file",
+                ));
+            }
+            result.push(item);
+        }
+    }
+    Ok(result)
+}
+
+fn download_v2_blob(cfg: &HubConfig, item: &V2DownloadItem) -> LinkResult<Vec<u8>> {
+    let bytes = get_presigned(cfg, &item.url)?;
+    if bytes.len() as u64 != item.bytes || content_sha256(&bytes) != item.sha256 {
+        return Err(invalid_feed("v2 blob differs from its proven path entry"));
+    }
+    Ok(bytes)
+}
+
+fn download_v2_blobs(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    pending: Vec<(&String, &V2BaselineFile)>,
+) -> LinkResult<Vec<(String, Vec<u8>)>> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let downloads = prepare_v2_downloads(cfg, brain, pointer, &pending)?;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let worker_count = downloads.len().min(V2_BLOB_DOWNLOAD_WORKERS);
+    let mut results = std::iter::repeat_with(|| None)
+        .take(downloads.len())
+        .collect::<Vec<Option<LinkResult<(String, Vec<u8>)>>>>();
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let downloads = &downloads;
+            let next = &next;
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = downloads.get(index) else {
+                    break;
+                };
+                let result = download_v2_blob(cfg, item).map(|bytes| (item.path.clone(), bytes));
+                if sender.send((index, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+        for (index, result) in receiver {
+            results[index] = Some(result);
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| {
+            result.ok_or_else(|| LinkError::Transport {
+                hub: cfg.hub.clone(),
+                message: "a bounded v2 blob worker stopped before reporting its result".to_string(),
+            })?
+        })
+        .collect()
+}
+
+fn v2_sync_pull(
+    cfg: &HubConfig,
+    requested_brain: &str,
+    head: V2VerifiedHead,
+    out: Option<&Path>,
+) -> LinkResult<PullReport> {
+    let dest = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(requested_brain));
+    let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
+    let head = v2_verified_head(cfg, requested_brain)?
+        .ok_or_else(|| invalid_feed("v2 head disappeared while waiting for the checkout lock"))?;
+    let remote = files_for_v2_view(
+        &head,
+        v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+    );
+    let baseline = load_v2_baseline(cfg, &head.brain_id, &dest)?;
+    ensure_v2_view_compatible(&head, baseline.as_ref())?;
+    let mut local_view = match Store::open_strict(&dest) {
+        Ok(store) => Some(v2_local_files(&store)?),
+        Err(_) => None,
+    };
+    if head.view_kind == "scoped" && baseline.is_none() && local_view.is_some() {
+        return Err(LinkError::ScopedViewChanged);
+    }
+    if let Some(view) = local_view.as_mut() {
+        remove_scoped_projection(&head, baseline.as_ref(), view)?;
+    }
+    let local = local_view
+        .as_ref()
+        .map(|view| &view.riding)
+        .cloned()
+        .unwrap_or_default();
+    let kept_home = |path: &str| {
+        local_view
+            .as_ref()
+            .is_some_and(|view| view.policy.keeps_home(path))
+    };
+    let base = baseline
+        .as_ref()
+        .map(|state| &state.files)
+        .cloned()
+        .unwrap_or_default();
+    let all_paths = base
+        .keys()
+        .chain(remote.keys())
+        .chain(local.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut conflicts = Vec::new();
+    for path in &all_paths {
+        if kept_home(path) {
+            continue;
+        }
+        let base_hash = base.get(path).map(|file| file.sha256.as_str());
+        let remote_hash = remote.get(path).map(|file| file.sha256.as_str());
+        let local_hash = local.get(path).map(|file| file.0.as_str());
+        if local_hash != base_hash && remote_hash != base_hash && local_hash != remote_hash {
+            conflicts.push(path.clone());
+        }
+    }
+    if !conflicts.is_empty() {
+        conflicts.truncate(100);
+        return Err(LinkError::Conflict { paths: conflicts });
+    }
+    let pointer = head.pointer.as_ref();
+    let mut changed = match pointer {
+        Some(pointer) => download_v2_blobs(
+            cfg,
+            &head.brain_id,
+            pointer,
+            remote
+                .iter()
+                .filter(|(path, file)| {
+                    !kept_home(path)
+                        && local.get(*path).map(|value| value.0.as_str())
+                            != Some(file.sha256.as_str())
+                })
+                .collect(),
+        )?,
+        None => Vec::new(),
+    };
+    let deleted = base
+        .iter()
+        .filter(|(path, file)| {
+            !remote.contains_key(*path)
+                && !kept_home(path)
+                && local.get(*path).map(|value| value.0.as_str()) == Some(file.sha256.as_str())
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let extra_local = local
+        .keys()
+        .filter(|path| !remote.contains_key(*path) && !deleted.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if head.view_kind == "scoped" {
+        changed.push(("DB.md".to_string(), scoped_projection_bytes(&head.brain_id)));
+        changed.push((
+            ".dbmd/view.json".to_string(),
+            scoped_view_metadata(&head, remote.len())?,
+        ));
+    }
+    #[cfg(unix)]
+    install_pulled_delta(&dest, &changed, &deleted, true)?;
+    let installed_store = Store::open_strict(&dest).map_err(|error| LinkError::InvalidPack {
+        message: format!("installed v2 checkout is not a valid db.md store: {error}"),
+    })?;
+    let mut installed_local = v2_local_files(&installed_store)?;
+    remove_scoped_projection(&head, baseline.as_ref(), &mut installed_local)?;
+    let mut expected_local = local.clone();
+    for (path, file) in &remote {
+        if !kept_home(path) {
+            expected_local.insert(path.clone(), (file.sha256.clone(), Vec::new()));
+        }
+    }
+    for path in &deleted {
+        expected_local.remove(path);
+    }
+    let local_dirty = installed_local.riding.iter().any(|(path, (hash, _))| {
+        expected_local.get(path).map(|expected| &expected.0) != Some(hash)
+    }) || expected_local.iter().any(|(path, (hash, _))| {
+        installed_local.riding.get(path).map(|actual| &actual.0) != Some(hash)
+    });
+    let final_head = v2_verified_head(cfg, requested_brain)?
+        .ok_or_else(|| invalid_feed("v2 head disappeared during pull"))?;
+    if !same_v2_head(&head, &final_head) {
+        return Err(LinkError::RemoteAdvancedDuringSync);
+    }
+    accept_v2_head(cfg, &final_head)?;
+    save_v2_baseline(
+        cfg,
+        &head.brain_id,
+        &dest,
+        &v2_baseline_from_head(cfg, &head, remote.clone(), Some(&installed_local))?,
+    )?;
+    Ok(PullReport {
+        brain: head.brain_id,
+        slug: requested_brain.to_string(),
+        head_seq: pointer.map_or(0, |value| value.seq),
+        files: remote.len(),
+        dest: dest.to_string_lossy().into_owned(),
+        extra_local,
+        sync_status: if local_dirty {
+            "local_dirty_after_install".to_string()
+        } else {
+            "synced".to_string()
+        },
+    })
+}
+
+fn v2_expected(remote: Option<&V2BaselineFile>) -> Value {
+    match remote {
+        Some(file) => json!({ "kind": "blob", "hash": file.sha256 }),
+        None => json!({ "kind": "absent" }),
+    }
+}
+
+fn v2_riding_matches_remote(
+    local: &std::collections::BTreeMap<String, (String, Vec<u8>)>,
+    remote: &std::collections::BTreeMap<String, V2BaselineFile>,
+    keeps_home: impl Fn(&str) -> bool,
+) -> bool {
+    remote.iter().all(|(path, file)| {
+        keeps_home(path)
+            || local.get(path).map(|value| value.0.as_str()) == Some(file.sha256.as_str())
+    }) && local.iter().all(|(path, (hash, _))| {
+        remote.get(path).map(|file| file.sha256.as_str()) == Some(hash.as_str())
+    })
+}
+
+fn v2_sync_push(
+    cfg: &HubConfig,
+    requested_brain: &str,
+    store: &Store,
+    head: V2VerifiedHead,
+    resume_local_policy: bool,
+) -> LinkResult<Value> {
+    let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
+    let head = v2_verified_head(cfg, requested_brain)?
+        .ok_or_else(|| invalid_feed("v2 head disappeared while waiting for the checkout lock"))?;
+    let remote = files_for_v2_view(
+        &head,
+        v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+    );
+    let baseline = load_v2_baseline(cfg, &head.brain_id, &store.root)?;
+    ensure_v2_view_compatible(&head, baseline.as_ref())?;
+    if head.view_kind == "scoped" && baseline.is_none() {
+        return Err(LinkError::ScopedViewChanged);
+    }
+    let mut local_view = v2_local_files(store)?;
+    remove_scoped_projection(&head, baseline.as_ref(), &mut local_view)?;
+    let local = &local_view.riding;
+    if let Some(previous) = baseline.as_ref() {
+        if previous.local_policy_digest.as_deref() != Some(&local_view.policy.digest)
+            && !resume_local_policy
+        {
+            let mut newly_eligible = previous
+                .local_eligibility
+                .iter()
+                .filter(|(path, riding)| !**riding && !local_view.policy.keeps_home(path))
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            if !newly_eligible.is_empty() {
+                newly_eligible.truncate(100);
+                return Err(LinkError::LocalPolicyTransition {
+                    paths: newly_eligible,
+                });
+            }
+        }
+    }
+    let base = match baseline {
+        Some(ref state) => state.files.clone(),
+        None if remote.is_empty() => std::collections::BTreeMap::new(),
+        None => {
+            let mut conflicts = remote
+                .iter()
+                .filter(|(path, file)| {
+                    local.get(*path).map(|value| value.0.as_str()) != Some(file.sha256.as_str())
+                })
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            if !conflicts.is_empty() {
+                conflicts.truncate(100);
+                return Err(LinkError::Conflict { paths: conflicts });
+            }
+            remote.clone()
+        }
+    };
+    let all_paths = base
+        .keys()
+        .chain(remote.keys())
+        .chain(local.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut conflicts = Vec::new();
+    let mut operations = Vec::new();
+    let mut blobs = Vec::new();
+    let mut upload_bytes = std::collections::BTreeMap::<String, Vec<u8>>::new();
+    for path in all_paths {
+        let base_hash = base.get(&path).map(|file| file.sha256.as_str());
+        let remote_file = remote.get(&path);
+        let remote_hash = remote_file.map(|file| file.sha256.as_str());
+        let local_file = local.get(&path);
+        let local_hash = local_file.map(|file| file.0.as_str());
+        if local_hash == base_hash {
+            continue;
+        }
+        if local_view.policy.keeps_home(&path) {
+            // Kept-home is a local transfer exclusion, never an implicit
+            // delete of the company's already-hosted coordinate.
+            continue;
+        }
+        if remote_hash != base_hash && local_hash != remote_hash {
+            conflicts.push(path);
+            continue;
+        }
+        match local_file {
+            Some((sha256, bytes)) => {
+                operations.push(json!({
+                    "op": "put",
+                    "path": path,
+                    "expected": v2_expected(remote_file),
+                    "blob": sha256,
+                    "bytes": bytes.len(),
+                }));
+                blobs.push(json!({
+                    "sha256": sha256,
+                    "bytes": bytes.len(),
+                    "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }));
+                upload_bytes.insert(sha256.clone(), bytes.clone());
+            }
+            None => {
+                let Some(current) = remote_file else {
+                    continue;
+                };
+                operations.push(json!({
+                    "op": "delete",
+                    "path": path,
+                    "expected": { "kind": "blob", "hash": current.sha256 },
+                }));
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        conflicts.truncate(100);
+        return Err(LinkError::Conflict { paths: conflicts });
+    }
+    if operations.is_empty() {
+        let final_head = v2_verified_head(cfg, requested_brain)?
+            .ok_or_else(|| invalid_feed("v2 head disappeared during sync"))?;
+        if !same_v2_head(&head, &final_head) {
+            return Err(LinkError::RemoteAdvancedDuringSync);
+        }
+        let mut final_local = v2_local_files(store)?;
+        remove_scoped_projection(&head, baseline.as_ref(), &mut final_local)?;
+        let local_changed = final_local.riding != local_view.riding;
+        let remote_ahead = !v2_riding_matches_remote(&final_local.riding, &remote, |path| {
+            final_local.policy.keeps_home(path)
+        });
+        let next = v2_baseline_from_head(cfg, &head, remote, Some(&final_local))?;
+        let split_count = next.remote_copy_remains.len();
+        accept_v2_head(cfg, &final_head)?;
+        if !local_changed && !remote_ahead {
+            refresh_scoped_view_marker(store, &head, next.files.len())?;
+            save_v2_baseline(cfg, &head.brain_id, &store.root, &next)?;
+        }
+        return Ok(json!({
+            "v": 2,
+            "outcome": if local_changed { "local_dirty" } else if remote_ahead { "remote_ahead" } else { "no_change" },
+            "sync_status": if local_changed { "local_dirty" } else if remote_ahead { "remote_ahead" } else { "synced" },
+            "seq": head.pointer.as_ref().map_or(0, |pointer| pointer.seq),
+            "commit_hash": head.pointer.as_ref().map(|pointer| &pointer.commit_hash),
+            "local_policy": {
+                "remote_copy_remains": split_count,
+            },
+        }));
+    }
+    let includes_contract = operations
+        .iter()
+        .any(|operation| operation.get("path").and_then(Value::as_str) == Some("DB.md"));
+    let rebase = if head.pointer.is_none() || includes_contract {
+        "strict"
+    } else {
+        "disjoint"
+    };
+    let base_value = head.pointer.as_ref().map(|pointer| {
+        json!({
+            "seq": pointer.seq,
+            "commit_hash": pointer.commit_hash,
+            "content_root": pointer.content_root,
+        })
+    });
+    let entropy = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        normalized_origin(&cfg.hub)?,
+        head.brain_id,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        serde_json::to_string(&operations).unwrap_or_default()
+    );
+    let mutation_id = format!("dbmd-{}", content_sha256(entropy.as_bytes()));
+    let mut body = json!({
+        "mutation_id": mutation_id,
+        "base": base_value,
+        "rebase": rebase,
+        "reason": "dbmd sync",
+        "operations": operations,
+        "blobs": blobs,
+    });
+    let changed_bytes = upload_bytes.values().try_fold(0_usize, |total, bytes| {
+        total
+            .checked_add(bytes.len())
+            .ok_or_else(|| LinkError::PushTooLarge {
+                detail: "v2 changed-byte total overflow".to_string(),
+            })
+    })?;
+    if changed_bytes > 3 * 1024 * 1024 || body.to_string().len() > MAX_PUSH_BYTES - 64 * 1024 {
+        let declarations = upload_bytes
+            .iter()
+            .map(|(sha256, bytes)| json!({ "sha256": sha256, "bytes": bytes.len() }))
+            .collect::<Vec<_>>();
+        let reserved = ensure_ok(
+            request(
+                cfg,
+                "POST",
+                &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
+                Some(&json!({ "blobs": declarations })),
+                Auth::Required,
+            )?,
+            "prepare v2 changed-byte uploads",
+        )?;
+        let items = reserved
+            .get("uploads")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_feed("v2 upload reservation response has no items"))?;
+        if items.len() != upload_bytes.len() {
+            return Err(invalid_feed(
+                "v2 upload reservation response changed the requested set",
+            ));
+        }
+        let mut references = Vec::with_capacity(items.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for item in items {
+            let sha256 = item
+                .get("sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_feed("v2 upload reservation has no hash"))?;
+            let bytes = upload_bytes
+                .get(sha256)
+                .ok_or_else(|| invalid_feed("v2 upload reservation introduced a blob"))?;
+            let declared_bytes = item
+                .get("bytes")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid_feed("v2 upload reservation has no byte length"))?;
+            let reservation_id = item
+                .get("reservation_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_feed("v2 upload reservation has no opaque id"))?;
+            if declared_bytes != bytes.len() as u64
+                || !crate::ulid::is_ulid(reservation_id)
+                || !seen.insert(sha256.to_string())
+            {
+                return Err(invalid_feed("v2 upload reservation item is inconsistent"));
+            }
+            match item.get("status").and_then(Value::as_str) {
+                Some("upload") => {
+                    let url = item
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| invalid_feed("v2 upload reservation has no URL"))?;
+                    put_presigned(cfg, url, item.get("headers").unwrap_or(&Value::Null), bytes)?;
+                }
+                Some("already_present") => {}
+                _ => return Err(invalid_feed("v2 upload reservation has an unknown status")),
+            }
+            references.push(json!({
+                "sha256": sha256,
+                "bytes": bytes.len(),
+                "reservation_id": reservation_id,
+            }));
+        }
+        body["blobs"] = Value::Array(references);
+    }
+    if body.to_string().len() > MAX_PUSH_BYTES {
+        return Err(LinkError::PushTooLarge {
+            detail: "v2 operation metadata exceeds the bounded commit request".to_string(),
+        });
+    }
+    let path = format!("/api/hub/brains/{requested_brain}/v2/commits");
+    let mut result = ensure_ok(
+        request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+        "v2 sync push",
+    )?;
+    let refreshed = v2_verified_head(cfg, requested_brain)?
+        .ok_or_else(|| invalid_feed("v2 head disappeared after commit"))?;
+    let accepted_hash = result.get("commit_hash").and_then(Value::as_str);
+    if refreshed
+        .pointer
+        .as_ref()
+        .map(|pointer| pointer.commit_hash.as_str())
+        != accepted_hash
+    {
+        return Err(LinkError::RemoteAdvancedDuringSync);
+    }
+    ensure_v2_view_compatible(&refreshed, baseline.as_ref())?;
+    let refreshed_files = files_for_v2_view(
+        &refreshed,
+        v2_manifest(cfg, &refreshed.brain_id, refreshed.pointer.as_ref())?,
+    );
+    let mut final_local = v2_local_files(store)?;
+    remove_scoped_projection(&refreshed, baseline.as_ref(), &mut final_local)?;
+    let local_dirty = final_local.riding != local_view.riding
+        || !v2_riding_matches_remote(&final_local.riding, &refreshed_files, |path| {
+            final_local.policy.keeps_home(path)
+        });
+    let next = v2_baseline_from_head(cfg, &refreshed, refreshed_files, Some(&final_local))?;
+    let split_count = next.remote_copy_remains.len();
+    accept_v2_head(cfg, &refreshed)?;
+    if !local_dirty {
+        refresh_scoped_view_marker(store, &refreshed, next.files.len())?;
+        save_v2_baseline(cfg, &refreshed.brain_id, &store.root, &next)?;
+    }
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "local_policy".to_string(),
+            json!({ "remote_copy_remains": split_count }),
+        );
+        object.insert(
+            "sync_status".to_string(),
+            Value::String(if local_dirty {
+                "remote_committed_local_dirty".to_string()
+            } else {
+                "synced".to_string()
+            }),
+        );
+    }
+    Ok(result)
+}
+
+/// Negotiate v2 and send only local changes. A v1 hub retains the existing
+/// whole-snapshot behavior until its brain advertises the new profile.
+pub fn sync_push_incremental(cfg: &HubConfig, brain: &str, store: &Store) -> LinkResult<Value> {
+    sync_push_incremental_with_policy(cfg, brain, store, false)
+}
+
+/// The explicit `.sevralocal` adoption form. Ordinary sync never uploads a
+/// path that became eligible because local policy was weakened or removed.
+pub fn sync_push_incremental_with_policy(
+    cfg: &HubConfig,
+    brain: &str,
+    store: &Store,
+    resume_local_policy: bool,
+) -> LinkResult<Value> {
+    require_safe_ref(brain)?;
+    if let Some(head) = v2_verified_head(cfg, brain)? {
+        return v2_sync_push(cfg, brain, store, head, resume_local_policy);
+    }
+    if resume_local_policy {
+        return Err(LinkError::InvalidPack {
+            message: "--resume-local-policy requires a link.md v2 brain".to_string(),
+        });
+    }
+    let files = collect_push_files(store)?;
+    sync_push(cfg, brain, &files)
+}
+
 /// Pull the granted slice of `brain` to `out` (default: `./<slug>`). Every
 /// exported path is safety-gated before it touches disk; files are written
 /// atomically; nothing local is ever deleted (locals the export lacks are
@@ -2093,6 +3938,9 @@ fn download_verified_snapshot_pack(
 pub fn sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult<PullReport> {
     require_hardened_filesystem("sync pull")?;
     require_safe_ref(brain)?;
+    if let Some(head) = v2_verified_head(cfg, brain)? {
+        return v2_sync_pull(cfg, brain, head, out);
+    }
     let remote = verified_remote_head(cfg, brain, false)?;
     if !remote.head.verified {
         return Err(invalid_feed(
@@ -2243,6 +4091,7 @@ pub fn sync_pull(cfg: &HubConfig, brain: &str, out: Option<&Path>) -> LinkResult
         files: entries.len(),
         dest: dest.to_string_lossy().into_owned(),
         extra_local,
+        sync_status: "synced".to_string(),
     })
 }
 
@@ -2684,7 +4533,56 @@ fn write_pull_entries_beneath_dir(
 }
 
 #[cfg(unix)]
-fn install_pulled_snapshot(dest: &Path, entries: &[(String, Vec<u8>)]) -> LinkResult<()> {
+fn remove_pull_paths_beneath_dir(root: &std::fs::File, paths: &[String]) -> LinkResult<()> {
+    use std::os::fd::AsRawFd as _;
+    for path in paths {
+        if !safe_store_rel_path(path) {
+            return Err(LinkError::UnsafePath { path: path.clone() });
+        }
+        let components = path.split('/').collect::<Vec<_>>();
+        let Some((leaf, parents)) = components.split_last() else {
+            return Err(LinkError::UnsafePath { path: path.clone() });
+        };
+        let mut directory = root.try_clone()?;
+        let mut missing = false;
+        for component in parents {
+            let name = c_name(component.as_bytes(), path)?;
+            match entry_is_dir_at(directory.as_raw_fd(), &name)? {
+                None => {
+                    missing = true;
+                    break;
+                }
+                Some(false) => return Err(LinkError::UnsafePath { path: path.clone() }),
+                Some(true) => {
+                    directory = open_dir_at(directory.as_raw_fd(), &name, path)?;
+                }
+            }
+        }
+        if missing {
+            continue;
+        }
+        let leaf = c_name(leaf.as_bytes(), path)?;
+        match entry_is_dir_at(directory.as_raw_fd(), &leaf)? {
+            None => {}
+            Some(true) => return Err(LinkError::UnsafePath { path: path.clone() }),
+            Some(false) => {
+                if unsafe { libc::unlinkat(directory.as_raw_fd(), leaf.as_ptr(), 0) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                directory.sync_all()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_pulled_delta(
+    dest: &Path,
+    entries: &[(String, Vec<u8>)],
+    deleted: &[String],
+    rebuild_indexes: bool,
+) -> LinkResult<()> {
     use ring::rand::SecureRandom as _;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -2733,7 +4631,20 @@ fn install_pulled_snapshot(dest: &Path, entries: &[(String, Vec<u8>)]) -> LinkRe
             )?;
             clone_tree_contents(&live, &stage_dir, &dest.display().to_string())?;
         }
+        remove_pull_paths_beneath_dir(&stage_dir, deleted)?;
         write_pull_entries_beneath_dir(&stage_dir, entries)?;
+        if rebuild_indexes {
+            let stage_store =
+                Store::from_held_root_strict(&parent.join(&stage_label), stage_dir.try_clone()?)
+                    .map_err(|error| LinkError::InvalidPack {
+                        message: format!("v2 staging tree is not a valid db.md store: {error}"),
+                    })?;
+            crate::index::Index::rebuild_all(&stage_store).map_err(|error| {
+                LinkError::InvalidPack {
+                    message: format!("could not materialize v2 local catalogs: {error}"),
+                }
+            })?;
+        }
         stage_dir.sync_all()?;
         Ok(())
     })();
@@ -2769,6 +4680,11 @@ fn install_pulled_snapshot(dest: &Path, entries: &[(String, Vec<u8>)]) -> LinkRe
         let _ = parent_dir.sync_all();
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn install_pulled_snapshot(dest: &Path, entries: &[(String, Vec<u8>)]) -> LinkResult<()> {
+    install_pulled_delta(dest, entries, &[], false)
 }
 
 fn is_safe_slug(slug: &str) -> bool {
@@ -3786,6 +5702,29 @@ struct TrustState {
     /// subsequently served identity chain.
     #[serde(default)]
     rotations: Vec<String>,
+    /// Hub pointer-signing identity pinned on first v2 observation. This is
+    /// separate from the brain key, which signs commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_signer: Option<String>,
+    /// Explicit transport profile. Older accepted non-empty v2 checkpoints
+    /// are recognized by their pinned hub signer during one-way migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol_profile: Option<String>,
+}
+
+fn accepted_as_v2(state: &TrustState) -> bool {
+    state.protocol_profile.as_deref() == Some("link-v2") || state.hub_signer.is_some()
+}
+
+fn has_accepted_v2_ref(cfg: &HubConfig, requested: &str) -> LinkResult<bool> {
+    let directory = open_trust_dir(cfg)?;
+    if load_trust_in(cfg, &directory, requested)?.is_some_and(|state| accepted_as_v2(&state)) {
+        return Ok(true);
+    }
+    let Some(alias) = load_alias_in(cfg, &directory, requested)? else {
+        return Ok(false);
+    };
+    Ok(load_trust_in(cfg, &directory, &alias.brain)?.is_some_and(|state| accepted_as_v2(&state)))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5408,6 +7347,8 @@ fn verified_remote_head(
                 head_seq: 0,
                 feed_hash: None,
                 rotations: identity.rotations.clone(),
+                hub_signer: None,
+                protocol_profile: None,
             },
             alias_binding.as_ref(),
         )?;
@@ -5600,6 +7541,10 @@ fn verified_remote_head(
             head_seq: seq,
             feed_hash: advertised_hash.clone(),
             rotations: identity.rotations.clone(),
+            hub_signer: pinned.as_ref().and_then(|state| state.hub_signer.clone()),
+            protocol_profile: pinned
+                .as_ref()
+                .and_then(|state| state.protocol_profile.clone()),
         },
         alias_binding.as_ref(),
     )?;
@@ -6631,6 +8576,8 @@ mod tests {
             head_seq: 1,
             feed_hash: Some("a".repeat(64)),
             rotations: Vec::new(),
+            hub_signer: None,
+            protocol_profile: None,
         };
         assert_eq!(
             verify_identity_chain(&identity, Some(&pin)).unwrap(),
@@ -7275,5 +9222,203 @@ mod tests {
                 "resolve must refuse target {target:?}"
             );
         }
+    }
+
+    #[test]
+    fn v2_final_barrier_refuses_to_advance_a_remote_ahead_checkout() {
+        let mut local = std::collections::BTreeMap::new();
+        local.insert("records/a.md".to_string(), ("a".repeat(64), Vec::new()));
+        local.insert("records/b.md".to_string(), ("b".repeat(64), Vec::new()));
+        let mut remote = std::collections::BTreeMap::new();
+        remote.insert(
+            "records/a.md".to_string(),
+            V2BaselineFile {
+                sha256: "c".repeat(64),
+                bytes: 1,
+                proof: None,
+            },
+        );
+        remote.insert(
+            "records/b.md".to_string(),
+            V2BaselineFile {
+                sha256: "b".repeat(64),
+                bytes: 1,
+                proof: None,
+            },
+        );
+        assert!(!v2_riding_matches_remote(&local, &remote, |_| false));
+    }
+
+    #[test]
+    fn v2_final_barrier_ignores_only_explicit_kept_home_paths() {
+        let local = std::collections::BTreeMap::new();
+        let mut remote = std::collections::BTreeMap::new();
+        remote.insert(
+            "private/local.md".to_string(),
+            V2BaselineFile {
+                sha256: "d".repeat(64),
+                bytes: 1,
+                proof: None,
+            },
+        );
+        assert!(v2_riding_matches_remote(&local, &remote, |path| path == "private/local.md"));
+        assert!(!v2_riding_matches_remote(&local, &remote, |_| false));
+    }
+
+    fn scoped_test_head(revision: &str) -> V2VerifiedHead {
+        V2VerifiedHead {
+            requested: TEST_BRAIN_ID.to_string(),
+            brain_id: TEST_BRAIN_ID.to_string(),
+            view_kind: "scoped".to_string(),
+            view_revision: revision.to_string(),
+            pointer: None,
+            trust: TrustState {
+                v: 2,
+                origin: "https://hub.example".to_string(),
+                requested: TEST_BRAIN_ID.to_string(),
+                brain: TEST_BRAIN_ID.to_string(),
+                home: None,
+                anchor: "ed25519:test".to_string(),
+                current: "ed25519:test".to_string(),
+                head_seq: 0,
+                feed_hash: None,
+                rotations: Vec::new(),
+                hub_signer: None,
+                protocol_profile: Some("link-v2".to_string()),
+            },
+            alias: None,
+        }
+    }
+
+    #[test]
+    fn accepted_v2_checkpoint_never_downgrades_after_profile_migration() {
+        let mut trust = scoped_test_head(&"a".repeat(64)).trust;
+        assert!(accepted_as_v2(&trust));
+
+        trust.protocol_profile = None;
+        trust.hub_signer = Some("ed25519:hub".to_string());
+        assert!(accepted_as_v2(&trust));
+
+        trust.hub_signer = None;
+        assert!(!accepted_as_v2(&trust));
+    }
+
+    fn scoped_test_baseline(revision: &str) -> V2SyncBaseline {
+        V2SyncBaseline {
+            v: 2,
+            origin: "https://hub.example".to_string(),
+            brain: TEST_BRAIN_ID.to_string(),
+            commit_hash: None,
+            content_root: None,
+            view_kind: Some("scoped".to_string()),
+            view_revision: Some(revision.to_string()),
+            projection_sha256: Some(scoped_projection_sha256(TEST_BRAIN_ID)),
+            files: std::collections::BTreeMap::new(),
+            local_policy_digest: None,
+            local_eligibility: std::collections::BTreeMap::new(),
+            remote_copy_remains: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn scoped_projection_is_a_valid_local_store_marker_but_never_rides() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            scoped_projection_bytes(TEST_BRAIN_ID),
+        )
+        .unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        let head = scoped_test_head(&"a".repeat(64));
+        let baseline = scoped_test_baseline(&"a".repeat(64));
+        let mut view = v2_local_files(&store).unwrap();
+        remove_scoped_projection(&head, Some(&baseline), &mut view).unwrap();
+        assert!(!view.riding.contains_key("DB.md"));
+        assert!(!view.eligibility.contains_key("DB.md"));
+    }
+
+    #[test]
+    fn scoped_projection_edit_and_scope_transition_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\ntype: db-md\nscope: company\nowner: someone\n---\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        let head = scoped_test_head(&"a".repeat(64));
+        let baseline = scoped_test_baseline(&"a".repeat(64));
+        let mut view = v2_local_files(&store).unwrap();
+        assert!(matches!(
+            remove_scoped_projection(&head, Some(&baseline), &mut view),
+            Err(LinkError::ScopedProjectionModified)
+        ));
+
+        let changed = scoped_test_head(&"b".repeat(64));
+        assert!(matches!(
+            ensure_v2_view_compatible(&changed, Some(&baseline)),
+            Err(LinkError::ScopedViewChanged)
+        ));
+    }
+
+    #[test]
+    fn scoped_view_metadata_is_explicitly_non_authoritative() {
+        let head = scoped_test_head(&"a".repeat(64));
+        let value: Value =
+            serde_json::from_slice(&scoped_view_metadata(&head, 7).unwrap()).unwrap();
+        assert_eq!(value["kind"], "link.md-scoped-view");
+        assert_eq!(value["authoritative"], false);
+        assert_eq!(value["visible_files"], 7);
+        assert_eq!(value["brain"], TEST_BRAIN_ID);
+    }
+
+    #[test]
+    fn local_scoped_marker_requires_the_exact_generated_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".dbmd")).unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            scoped_projection_bytes(TEST_BRAIN_ID),
+        )
+        .unwrap();
+        let head = scoped_test_head(&"a".repeat(64));
+        std::fs::write(
+            directory.path().join(".dbmd/view.json"),
+            scoped_view_metadata(&head, 0).unwrap(),
+        )
+        .unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        assert!(has_verified_local_scoped_view(&store));
+
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\ntype: db-md\nscope: company\nowner: altered\n---\n",
+        )
+        .unwrap();
+        let altered = Store::open_strict(directory.path()).unwrap();
+        assert!(!has_verified_local_scoped_view(&altered));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_atomic_install_materializes_only_local_catalogs_before_swap() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let destination = sandbox.path().join("brain");
+        let entries = vec![
+            (
+                "DB.md".to_string(),
+                scoped_projection_bytes(TEST_BRAIN_ID),
+            ),
+            (
+                "records/contacts/a.md".to_string(),
+                b"---\ntype: contact\ncreated: 2026-08-19T00:00:00Z\nupdated: 2026-08-19T00:00:00Z\nsummary: Visible contact\n---\n\n# A\n"
+                    .to_vec(),
+            ),
+        ];
+        install_pulled_delta(&destination, &entries, &[], true).unwrap();
+        assert!(destination.join("index.md").is_file());
+        assert!(destination.join("records/index.md").is_file());
+        assert!(destination.join("records/contacts/index.md").is_file());
+        assert!(destination.join("records/contacts/index.jsonl").is_file());
     }
 }

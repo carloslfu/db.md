@@ -96,6 +96,8 @@ after any dependency change.
 - grep             0.3.x    MIT OR Unlicense    — embedded ripgrep search engine
 - ignore           0.4.x    MIT OR Unlicense    — embedded ripgrep dir walk / gitignore
 - walkdir          2.x      MIT OR Unlicense    — recursive store walk (sweep ops)
+- globset          0.4.x    MIT OR Apache-2.0   — deterministic `.sevralocal`
+                                                  local-policy path matching
 - unicode-normalization
                    0.1.x    MIT OR Apache-2.0   — Unicode NFC normalization of the
                                                   wiki-link edge comparison key

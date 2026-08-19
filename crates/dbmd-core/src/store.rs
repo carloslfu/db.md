@@ -186,6 +186,35 @@ fn absolute_store_locator(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 impl Store {
+    /// Construct a strict store from an already-held directory capability.
+    ///
+    /// Internal staging/recovery code uses this to preserve inode identity
+    /// across validation and derived-index work without reopening a mutable
+    /// pathname between checks.
+    pub(crate) fn from_held_root_strict(
+        display_path: &Path,
+        root_capability: File,
+    ) -> crate::Result<Store> {
+        if !crate::fsx::directory_contains_exact_regular(&root_capability, "DB.md".as_ref())? {
+            return Err(NotAStore {
+                path: display_path.to_path_buf(),
+            }
+            .into());
+        }
+        let mut reader = crate::fsx::BoundedDirReader::from_root(&root_capability)?;
+        let bytes = reader.read(Path::new("DB.md"), crate::parser::MAX_DBMD_FILE_BYTES)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let config = parse_db_md(&text, &display_path.join("DB.md"))?;
+        Ok(Store {
+            root: display_path.to_path_buf(),
+            root_locator: absolute_store_locator(display_path)?,
+            config,
+            root_capability: Arc::new(root_capability),
+            reader: Arc::new(Mutex::new(reader)),
+        })
+    }
+
     /// True if `path` is a db.md store root: an uppercase `DB.md` file exists
     /// at `path`. On case-sensitive filesystems a lowercase `db.md` must NOT
     /// count (the lowercase name refers to the project/spec, not the marker).

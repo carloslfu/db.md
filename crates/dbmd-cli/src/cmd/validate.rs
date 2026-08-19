@@ -38,14 +38,23 @@ pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
         Store::from_root_and_config(root, Config::default()).map_err(CliError::from)?
     };
 
-    let scope = if args.all { "all" } else { "working-set" };
+    let scoped_view = dbmd_core::linkmd::has_verified_local_scoped_view(&store);
+    let scope = match (args.all, scoped_view) {
+        (true, true) => "scoped-all",
+        (false, true) => "scoped-working-set",
+        (true, false) => "all",
+        (false, false) => "working-set",
+    };
 
-    let issues = if args.all {
+    let mut issues = if args.all {
         validate_all(&store).map_err(CliError::from)?
     } else {
         let since = parse_since(args.since.as_deref())?;
         validate_working_set(&store, since).map_err(CliError::from)?
     };
+    if scoped_view {
+        make_scoped_link_findings_non_disclosing(&mut issues);
+    }
 
     let counts = Counts::of(&issues);
 
@@ -68,6 +77,23 @@ pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
         ));
     }
     Ok(())
+}
+
+fn make_scoped_link_findings_non_disclosing(issues: &mut [Issue]) {
+    for issue in issues {
+        if issue.code != dbmd_core::validate::codes::WIKI_LINK_BROKEN {
+            continue;
+        }
+        issue.severity = Severity::Info;
+        issue.code = "WIKI_LINK_SCOPED_UNRESOLVED";
+        issue.message =
+            "wiki-link leaves this materialized permission view; target existence is undisclosed"
+                .to_string();
+        issue.suggestion = Some(
+            "request a wider grant or inspect the link from a full-authority checkout".to_string(),
+        );
+        issue.related.clear();
+    }
 }
 
 /// Parse the optional `--since` cutoff. Accepts a full RFC3339 timestamp or a
@@ -242,5 +268,25 @@ mod tests {
         assert_eq!(json["file"], "records/bad\nfake\u{1b}[31m.md");
         assert_eq!(json["key"], "summary\tspoof\u{202e}");
         assert_eq!(json["message"], "first\nerror: forged\u{1b}]0;owned\u{7}");
+    }
+
+    #[test]
+    fn scoped_view_never_claims_an_unmaterialized_link_is_broken() {
+        let mut issues = vec![Issue {
+            severity: Severity::Error,
+            code: dbmd_core::validate::codes::WIKI_LINK_BROKEN,
+            file: PathBuf::from("records/contacts/a.md"),
+            line: Some(9),
+            key: Some("company".to_string()),
+            message: "wiki-link target `records/companies/secret` doesn't exist".to_string(),
+            suggestion: Some("create the target".to_string()),
+            related: vec![PathBuf::from("records/companies/secret.md")],
+        }];
+        make_scoped_link_findings_non_disclosing(&mut issues);
+        assert_eq!(issues[0].severity, Severity::Info);
+        assert_eq!(issues[0].code, "WIKI_LINK_SCOPED_UNRESOLVED");
+        assert!(!issues[0].message.contains("secret"));
+        assert!(issues[0].related.is_empty());
+        assert_eq!(Counts::of(&issues).errors, 0);
     }
 }

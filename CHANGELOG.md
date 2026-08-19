@@ -12,7 +12,37 @@ Two things version independently:
 
 ## Unreleased
 
+### Added
+
+- `dbmd-core` now contains the independent link.md v2 portable-path,
+  domain-separated hashing, persistent directory HAMT, and scoped proof
+  producer/verifier used by incremental brain synchronization. Cross-language
+  root and privacy vectors are pinned against the hub implementation.
+- `dbmd sync` now negotiates link.md v2 signed heads and proof-filtered
+  manifests, transfers only changed blobs, performs baseline-safe three-way
+  pull/push with atomic conflict refusal and remote deletions, preserves
+  `.sevralocal` overlays through explicit policy transitions, supports direct
+  upload reservations for large changed files, uses proof-carried permissioned
+  download windows for bounded cold checkouts, pins full-versus-scoped grant
+  views, and persists trust/baselines outside the brain checkout. Scoped views
+  receive an explicit non-authoritative local `DB.md` projection that never
+  uploads; projection edits and grant-boundary changes fail closed. Final
+  barriers retain the old baseline whenever concurrent remote work is not yet
+  installed locally. V2 pulls regenerate derived catalogs inside the same
+  private atomic stage, and `dbmd validate` reports links outside a verified
+  scoped projection as non-disclosing unresolved information instead of false
+  broken-link errors.
+
 ### Fixed
+
+- Scoped v2 pushes now refresh `.dbmd/view.json` to the exact accepted head;
+  generated projection and catalog files remain local-only and cannot create a
+  hosted version. Permission-filtered hub validation issues survive as
+  structured `VALIDATION_REFUSED` error details, and authorization refusals use
+  a stable policy exit instead of a generic runtime failure.
+- Once a client has accepted a link.md v2 checkpoint, a later hidden/404 head
+  is `BRAIN_UNAVAILABLE` (revoked or removed). It can never be reinterpreted as
+  a v1 profile downgrade or misleading feed rollback.
 
 - The trusted release controller now reproduces crates.io packages from an
   isolated Git checkout of the reviewed commit, preserving Cargo's committed

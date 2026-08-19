@@ -50,6 +50,10 @@ pub mod index;
 // client reads best module-qualified (`linkmd::HubConfig`).
 #[cfg(feature = "link")]
 pub mod linkmd;
+#[cfg(feature = "link")]
+mod linkmd_sync_policy;
+#[cfg(feature = "link")]
+pub mod linkmd_v2;
 pub mod log;
 pub mod parser;
 pub mod query;

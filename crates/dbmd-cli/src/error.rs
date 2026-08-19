@@ -74,6 +74,8 @@ pub struct CliError {
     pub message: String,
     /// Optional remediation hint (a command to run, a path to fix).
     pub hint: Option<String>,
+    /// Permission-filtered structured diagnostics supplied by the hub.
+    pub details: Option<serde_json::Value>,
 }
 
 impl CliError {
@@ -84,12 +86,19 @@ impl CliError {
             code,
             message: message.into(),
             hint: None,
+            details: None,
         }
     }
 
     /// Attach a remediation hint (chainable).
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Attach structured diagnostics (chainable).
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
         self
     }
 
@@ -125,6 +134,9 @@ impl CliError {
         );
         if let Some(hint) = &self.hint {
             obj.insert("hint".to_string(), serde_json::Value::String(hint.clone()));
+        }
+        if let Some(details) = &self.details {
+            obj.insert("details".to_string(), details.clone());
         }
         serde_json::json!({ "error": serde_json::Value::Object(obj) })
     }
@@ -189,11 +201,25 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::UnboundCredential => CliError::new(ExitCode::Runtime, "UNBOUND_CREDENTIAL", message),
             L::UnsafeHub { .. } => CliError::new(ExitCode::Runtime, "HUB_NOT_HTTPS", message),
             L::Transport { .. } => CliError::new(ExitCode::Runtime, "HUB_UNREACHABLE", message),
-            L::Http { code, .. } => {
-                let e = CliError::new(ExitCode::Runtime, "HUB_ERROR", message);
-                match code {
-                    Some(c) => e.with_hint(format!("hub error code: {c}")),
-                    None => e,
+            L::Http { code, details, .. } => {
+                let mut e = match code.as_deref() {
+                    Some("validation_refused") => {
+                        CliError::new(ExitCode::ValidationFailed, "VALIDATION_REFUSED", message)
+                    }
+                    Some("authorization_refused") => {
+                        CliError::new(ExitCode::Policy, "AUTHORIZATION_REFUSED", message)
+                    }
+                    _ => CliError::new(ExitCode::Runtime, "HUB_ERROR", message),
+                };
+                if let Some(details) = details {
+                    e = e.with_details(details);
+                }
+                match code.as_deref() {
+                    Some(c) if e.code == "HUB_ERROR" => e.with_hint(format!("hub error code: {c}")),
+                    Some("validation_refused") if e.details.is_some() => {
+                        e.with_hint("fix the permission-filtered issues in error.details and retry")
+                    }
+                    _ => e,
                 }
             }
             L::NotJson { .. } => CliError::new(ExitCode::Runtime, "HUB_NOT_JSON", message),
@@ -214,6 +240,18 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::NotUtf8 { .. } => CliError::new(ExitCode::Runtime, "NOT_UTF8", message),
             L::InvalidPack { .. } => CliError::new(ExitCode::Runtime, "INVALID_PACK", message),
             L::InvalidFeed { .. } => CliError::new(ExitCode::Runtime, "INVALID_FEED", message),
+            L::Conflict { .. } => CliError::new(ExitCode::Runtime, "SYNC_CONFLICT", message),
+            L::LocalPolicyTransition { .. } => {
+                CliError::new(ExitCode::Policy, "LOCAL_POLICY_RELAXED", message)
+            }
+            L::ScopedProjectionModified => {
+                CliError::new(ExitCode::Policy, "SCOPED_PROJECTION_MODIFIED", message)
+            }
+            L::ScopedViewChanged => CliError::new(ExitCode::Policy, "SCOPED_VIEW_CHANGED", message),
+            L::BrainUnavailable => CliError::new(ExitCode::Policy, "BRAIN_UNAVAILABLE", message),
+            L::RemoteAdvancedDuringSync => {
+                CliError::new(ExitCode::Runtime, "REMOTE_ADVANCED_DURING_SYNC", message)
+            }
             L::UnsupportedPlatform { .. } => {
                 CliError::new(ExitCode::Runtime, "UNSUPPORTED_PLATFORM", message)
             }
@@ -227,3 +265,43 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
 
 /// Convenience result alias for subcommand bodies.
 pub type CliResult = std::result::Result<(), CliError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_filtered_hub_validation_details_keep_a_stable_contract() {
+        let details = serde_json::json!({
+            "issues": [{
+                "code": "SCHEMA_MISSING_REQUIRED",
+                "file": "records/contacts/new.md",
+                "key": "email"
+            }]
+        });
+        let error = CliError::from(dbmd_core::linkmd::LinkError::Http {
+            what: "v2 sync push",
+            status: 422,
+            message: "mutation introduces db.md validation errors".to_string(),
+            code: Some("validation_refused".to_string()),
+            details: Some(details.clone()),
+        });
+        assert_eq!(error.exit, ExitCode::ValidationFailed);
+        assert_eq!(error.code, "VALIDATION_REFUSED");
+        assert_eq!(error.to_json()["error"]["details"], details);
+        assert!(error.hint.as_deref().unwrap().contains("error.details"));
+    }
+
+    #[test]
+    fn hub_authorization_refusal_is_a_policy_exit() {
+        let error = CliError::from(dbmd_core::linkmd::LinkError::Http {
+            what: "v2 sync push",
+            status: 403,
+            message: "mutation authority refused".to_string(),
+            code: Some("authorization_refused".to_string()),
+            details: None,
+        });
+        assert_eq!(error.exit, ExitCode::Policy);
+        assert_eq!(error.code, "AUTHORIZATION_REFUSED");
+    }
+}

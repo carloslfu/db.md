@@ -27,6 +27,7 @@ regex = { workspace = true }
 grep = { workspace = true }
 ignore = { workspace = true }
 walkdir = { workspace = true }
+globset = { workspace = true }
 # Unicode NFC normalization for the wiki-link edge comparison key (graph
 # matching). Deterministic Unicode algorithm — zero AI/LLM, zero embeddings.
 # MIT OR Apache-2.0; recorded in THIRD_PARTY_NOTICES.

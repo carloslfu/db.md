@@ -879,7 +879,12 @@ fn sync_pull_materializes_files_and_reports() {
         .as_str()
         .unwrap()
         .to_string();
-    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
+    let hub = MockHub::serve(vec![
+        (404, "{\"error\":\"v2 unavailable\"}".to_string()),
+        (200, card),
+        (200, feed),
+        (200, export),
+    ]);
     let work = tempfile::tempdir().unwrap();
     let dest = work.path().join("pulled");
 
@@ -911,7 +916,7 @@ fn sync_pull_materializes_files_and_reports() {
 
     let reqs = hub.finish();
     assert_eq!(
-        reqs[2].path,
+        reqs[3].path,
         format!("/api/hub/brains/{BRAIN_ID}/export?format=pack&atSeq=1&feedHash={feed_hash}")
     );
 }
@@ -922,7 +927,12 @@ fn sync_pull_refuses_hostile_paths_with_nothing_written() {
         ("DB.md", "---\ntype: db-md\n---\n# A\n"),
         ("../escape.md", "evil"),
     ]);
-    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
+    let hub = MockHub::serve(vec![
+        (404, "{\"error\":\"v2 unavailable\"}".to_string()),
+        (200, card),
+        (200, feed),
+        (200, export),
+    ]);
     let work = tempfile::tempdir().unwrap();
     let dest = work.path().join("pulled");
 
@@ -953,7 +963,12 @@ fn sync_pull_refuses_a_symlink_in_the_destination_ancestor_chain() {
 
     let db = "---\ntype: db-md\nscope: company\nname: Acme\n---\n\n# Acme\n";
     let (card, feed, export, _) = signed_inline_snapshot(&[("DB.md", db)]);
-    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
+    let hub = MockHub::serve(vec![
+        (404, "{\"error\":\"v2 unavailable\"}".to_string()),
+        (200, card),
+        (200, feed),
+        (200, export),
+    ]);
     let work = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     symlink(outside.path(), work.path().join("redirect")).unwrap();
@@ -984,7 +999,12 @@ fn sync_pull_conflict_leaves_every_live_file_unchanged() {
     let conflict = "---\ntype: note\nsummary: Conflict\n---\n\n# Remote\n";
     let (card, feed, export, _) =
         signed_inline_snapshot(&[("DB.md", new_db), ("records/conflict.md", conflict)]);
-    let hub = MockHub::serve(vec![(200, card), (200, feed), (200, export)]);
+    let hub = MockHub::serve(vec![
+        (404, "{\"error\":\"v2 unavailable\"}".to_string()),
+        (200, card),
+        (200, feed),
+        (200, export),
+    ]);
     let work = tempfile::tempdir().unwrap();
     let dest = work.path().join("pulled");
     std::fs::create_dir_all(dest.join("records/conflict.md")).unwrap();
@@ -1024,6 +1044,7 @@ fn sync_pull_conflict_leaves_every_live_file_unchanged() {
 #[test]
 fn sync_push_sends_owned_content_only_with_bearer() {
     let hub = MockHub::serve(vec![
+        (404, "{\"error\":\"v2 unavailable\"}".to_string()),
         (200, SIGNED_HEAD_CARD.to_string()),
         (200, SIGNED_HEAD_FEED.to_string()),
         (
@@ -1050,14 +1071,14 @@ fn sync_push_sends_owned_content_only_with_bearer() {
     );
 
     let reqs = hub.finish();
-    assert_eq!(reqs[2].method, "POST");
-    assert_eq!(reqs[2].path, format!("/api/hub/brains/{BRAIN_ID}/push"));
+    assert_eq!(reqs[3].method, "POST");
+    assert_eq!(reqs[3].path, format!("/api/hub/brains/{BRAIN_ID}/push"));
     assert_eq!(
-        reqs[2].header("authorization"),
+        reqs[3].header("authorization"),
         Some("Bearer vc_account_test")
     );
 
-    let body: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reqs[3].body).unwrap();
     let mut paths: Vec<&str> = body["files"]
         .as_array()
         .unwrap()

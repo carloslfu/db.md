@@ -37,6 +37,9 @@ regex = "1"
 grep = "0.3"
 ignore = "0.4"
 walkdir = "2"
+# `.sevralocal` is local sync policy: deterministic, case-sensitive glob
+# matching over portable store-relative paths. MIT OR Apache-2.0.
+globset = { version = "0.4", default-features = false }
 # Unicode NFC normalization for the wiki-link comparison key (graph edge
 # matching). Deterministic, table-driven Unicode algorithm — zero AI/LLM, zero
 # embeddings. MIT OR Apache-2.0 (permissive); its transitive `tinyvec`

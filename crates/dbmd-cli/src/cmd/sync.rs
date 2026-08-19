@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dbmd sync` — pull the granted slice of a hosted brain as plain files, or
-//! push the local store as a whole-store snapshot.
+//! `dbmd sync` — negotiate verified incremental v2 reconciliation for a
+//! permissioned brain, with the legacy whole-snapshot protocol retained only
+//! for v1 hubs.
 //!
 //! Thin wrapper over [`dbmd_core::linkmd::sync_pull`] /
 //! [`dbmd_core::linkmd::sync_push`]. Push opens the store strictly
@@ -29,7 +30,7 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
     let cfg = linkmd::hub_config(args.hub.as_deref(), Path::new(&args.dir))?;
 
     if args.push {
-        push(ctx, &cfg, brain, &args.dir)
+        push(ctx, &cfg, brain, &args.dir, args.resume_local_policy)
     } else {
         pull(ctx, &cfg, brain, args.out.as_deref())
     }
@@ -47,13 +48,14 @@ fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) 
     }
 
     println!(
-        "pulled {} file{} (feed seq {}) into {}",
+        "pulled {} file{} (feed seq {}) into {} [{}]",
         report.files,
         if report.files == 1 { "" } else { "s" },
         report.head_seq,
         // Without --out the destination derives from the hub's slug —
         // hub-authored, so terminal-sanitized.
         sanitize_single_line(&report.dest),
+        sanitize_single_line(&report.sync_status),
     );
     if !report.extra_local.is_empty() {
         println!(
@@ -72,13 +74,18 @@ fn pull(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, out: Option<&str>) 
     Ok(())
 }
 
-fn push(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, dir: &str) -> CliResult {
+fn push(
+    ctx: &Context,
+    cfg: &linkmd::HubConfig,
+    brain: &str,
+    dir: &str,
+    resume_local_policy: bool,
+) -> CliResult {
     // Strict open: pushing from a non-store is the standard NOT_A_STORE exit.
     let store = Store::open_strict(Path::new(dir))?;
     let _transaction = store.transaction()?;
-    let files = linkmd::collect_push_files(&store)?;
-    let sent = files.len();
-    let body = linkmd::sync_push(cfg, brain, &files)?;
+    let sent = linkmd::collect_push_files(&store)?.len();
+    let body = linkmd::sync_push_incremental_with_policy(cfg, brain, &store, resume_local_policy)?;
 
     if ctx.json {
         println!(
@@ -88,7 +95,10 @@ fn push(ctx: &Context, cfg: &linkmd::HubConfig, brain: &str, dir: &str) -> CliRe
         return Ok(());
     }
 
-    let head_seq = body.get("headSeq").and_then(Value::as_u64);
+    let head_seq = body
+        .get("headSeq")
+        .or_else(|| body.get("seq"))
+        .and_then(Value::as_u64);
     let durable = body
         .get("durable")
         .and_then(Value::as_bool)

@@ -432,6 +432,7 @@ dependencies = [
  "calamine",
  "chrono",
  "crc32fast",
+ "globset",
  "grep",
  "html2text",
  "ignore",

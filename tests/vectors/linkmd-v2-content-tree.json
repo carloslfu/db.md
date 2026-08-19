@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "hash_domain": "v2/content-tree-node",
+  "nonce_sequence": "u128-be-counter-rendered-as-32-lowercase-hex",
+  "files": [
+    { "path": "DB.md", "content_base64": "ZGI=" },
+    { "path": "secret.md", "content_base64": "c2VjcmV0" },
+    { "path": "visible.md", "content_base64": "dmlzaWJsZQ==" }
+  ],
+  "expected_root": "82bcc02847453aac64310ad0ab83a2cce3f79ec7bac7664f0e6760cb38bc3d53",
+  "proof_target": "visible.md",
+  "privacy_forbidden_strings": ["secret.md", "00000000000000000000000000000001"]
+}

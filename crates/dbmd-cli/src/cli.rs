@@ -174,11 +174,11 @@ pub enum Command {
     /// `@brain/<store-path>.md`) returns the full record, frontmatter + body.
     Resolve(ResolveArgs),
 
-    /// Pull the granted slice of a hosted brain to a local directory as plain
-    /// files (default), or `--push` the local store to the hub as a whole-store
-    /// snapshot. Pull never deletes local files (divergence is reported);
-    /// push replaces the hosted copy with the local one — pull first if the
-    /// hosted side may have records the local copy lacks.
+    /// Reconcile a granted hosted brain with a local plain-file checkout.
+    /// Pull is the default; `--push` publishes only locally changed files.
+    /// Permissioned v2 brains use verified incremental three-way sync with
+    /// exact conflicts and baseline-safe deletes. Legacy v1 hubs retain their
+    /// whole-snapshot behavior.
     Sync(SyncArgs),
 
     /// Issue, list, or revoke capability grants on a brain you own. v0 grants
@@ -978,14 +978,20 @@ pub struct SyncArgs {
     #[arg(value_name = "BRAIN")]
     pub brain: String,
 
-    /// Push the local store (at `--dir`) to the hub instead of pulling.
-    /// Whole-store snapshot semantics: the hosted copy becomes exactly the
-    /// local content set.
+    /// Push local changes from `--dir` instead of pulling remote changes.
+    /// Permissioned v2 transfers changed blobs and explicit deletes only;
+    /// legacy v1 hubs retain whole-store snapshot semantics.
     #[arg(long)]
     pub push: bool,
 
+    /// Approve the exact local paths newly made eligible by a `.sevralocal`
+    /// change. Without this flag they remain quarantined from upload.
+    #[arg(long, requires = "push")]
+    pub resume_local_policy: bool,
+
     /// Pull destination directory. Defaults to `./<slug>` (created if
-    /// missing); existing files are overwritten, never deleted.
+    /// missing). Permissioned v2 applies remote changes atomically and removes
+    /// only clean files whose hosted deletion matches the private baseline.
     #[arg(long, value_name = "DIR", conflicts_with = "push")]
     pub out: Option<String>,
 
