@@ -57,6 +57,7 @@
 //! monotonic feed checkpoint, snapshot token, and content-addressed pack before
 //! untrusted bytes touch their destination.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -4786,9 +4787,56 @@ fn v2_sync_push(
             })
     })?;
     if changed_bytes > 3 * 1024 * 1024 || body.to_string().len() > MAX_PUSH_BYTES - 64 * 1024 {
+        let mut coordinates_by_hash: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for operation in &operations {
+            let Some(kind) = operation.get("op").and_then(Value::as_str) else {
+                return Err(invalid_feed("v2 upload operation has no kind"));
+            };
+            let hash = match kind {
+                "put" | "restore" | "rename" => operation.get("blob").and_then(Value::as_str),
+                "asset_put" | "asset_resume" => operation
+                    .get("asset")
+                    .and_then(|asset| asset.get("blob_sha256"))
+                    .and_then(Value::as_str),
+                _ => None,
+            };
+            let Some(hash) = hash else { continue };
+            let coordinates = coordinates_by_hash.entry(hash.to_string()).or_default();
+            if kind == "rename" {
+                for field in ["from", "to"] {
+                    coordinates.insert(
+                        operation
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| invalid_feed("v2 rename upload has no coordinate"))?
+                            .to_string(),
+                    );
+                }
+            } else {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 upload has no coordinate"))?;
+                coordinates.insert(if kind.starts_with("asset_") {
+                    format!("assets/{path}")
+                } else {
+                    path.to_string()
+                });
+            }
+        }
         let declarations = upload_bytes
             .iter()
-            .map(|(sha256, bytes)| json!({ "sha256": sha256, "bytes": bytes.len() }))
+            .map(|(sha256, bytes)| {
+                json!({
+                    "sha256": sha256,
+                    "bytes": bytes.len(),
+                    "coordinates": coordinates_by_hash
+                        .get(sha256)
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                })
+            })
             .collect::<Vec<_>>();
         let reserved = ensure_ok(
             request(
@@ -4827,9 +4875,21 @@ fn v2_sync_push(
                 .get("reservation_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid_feed("v2 upload reservation has no opaque id"))?;
+            let expected_coordinates = coordinates_by_hash
+                .get(sha256)
+                .ok_or_else(|| invalid_feed("v2 upload reservation has no coordinate binding"))?;
+            let returned_coordinates = item
+                .get("coordinates")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_feed("v2 upload reservation has no coordinates"))?;
             if declared_bytes != bytes.len() as u64
                 || !crate::ulid::is_ulid(reservation_id)
                 || !seen.insert(sha256.to_string())
+                || returned_coordinates.len() != expected_coordinates.len()
+                || returned_coordinates
+                    .iter()
+                    .zip(expected_coordinates)
+                    .any(|(actual, expected)| actual.as_str() != Some(expected.as_str()))
             {
                 return Err(invalid_feed("v2 upload reservation item is inconsistent"));
             }
@@ -7108,9 +7168,56 @@ pub fn proposal_accept_exact(
             })
     })?;
     if changed_bytes > 3 * 1024 * 1024 || body.to_string().len() > MAX_PUSH_BYTES - 64 * 1024 {
+        let mut coordinates_by_hash: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for operation in &operations {
+            let Some(kind) = operation.get("op").and_then(Value::as_str) else {
+                return Err(invalid_feed("proposal upload operation has no kind"));
+            };
+            let hash = match kind {
+                "put" | "restore" | "rename" => operation.get("blob").and_then(Value::as_str),
+                "asset_put" | "asset_resume" => operation
+                    .get("asset")
+                    .and_then(|asset| asset.get("blob_sha256"))
+                    .and_then(Value::as_str),
+                _ => None,
+            };
+            let Some(hash) = hash else { continue };
+            let coordinates = coordinates_by_hash.entry(hash.to_string()).or_default();
+            if kind == "rename" {
+                for field in ["from", "to"] {
+                    coordinates.insert(
+                        operation
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| invalid_feed("proposal rename has no coordinate"))?
+                            .to_string(),
+                    );
+                }
+            } else {
+                let path = operation
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal upload has no coordinate"))?;
+                coordinates.insert(if kind.starts_with("asset_") {
+                    format!("assets/{path}")
+                } else {
+                    path.to_string()
+                });
+            }
+        }
         let declarations = downloaded
             .iter()
-            .map(|(sha256, bytes)| json!({ "sha256": sha256, "bytes": bytes.len() }))
+            .map(|(sha256, bytes)| {
+                json!({
+                    "sha256": sha256,
+                    "bytes": bytes.len(),
+                    "coordinates": coordinates_by_hash
+                        .get(sha256)
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                })
+            })
             .collect::<Vec<_>>();
         let reserved = ensure_ok(
             request(
@@ -7143,6 +7250,23 @@ pub fn proposal_accept_exact(
                 .and_then(Value::as_str)
                 .filter(|id| crate::ulid::is_ulid(id))
                 .ok_or_else(|| invalid_feed("proposal upload reservation has no id"))?;
+            let expected_coordinates = coordinates_by_hash
+                .get(hash)
+                .ok_or_else(|| invalid_feed("proposal upload has no coordinate binding"))?;
+            let returned_coordinates = item
+                .get("coordinates")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_feed("proposal upload reservation has no coordinates"))?;
+            if returned_coordinates.len() != expected_coordinates.len()
+                || returned_coordinates
+                    .iter()
+                    .zip(expected_coordinates)
+                    .any(|(actual, expected)| actual.as_str() != Some(expected.as_str()))
+            {
+                return Err(invalid_feed(
+                    "proposal upload reservation changed its coordinates",
+                ));
+            }
             match item.get("status").and_then(Value::as_str) {
                 Some("upload") => put_presigned(
                     cfg,
