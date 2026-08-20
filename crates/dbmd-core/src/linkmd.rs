@@ -5353,6 +5353,44 @@ struct V2ConflictPlan {
     files: Vec<V2ConflictFile>,
 }
 
+fn v2_take_remote_selection(
+    files: &[V2ConflictFile],
+    current: &std::collections::BTreeMap<String, V2BaselineFile>,
+) -> LinkResult<(
+    std::collections::BTreeMap<String, V2BaselineFile>,
+    Vec<String>,
+)> {
+    let mut selected = std::collections::BTreeMap::new();
+    let mut deleted = Vec::new();
+    for file in files {
+        match (&file.remote.sha256, file.remote.bytes) {
+            (Some(sha256), Some(bytes)) => {
+                let proven = current.get(&file.path).ok_or_else(|| {
+                    invalid_feed("conflict remote coordinate disappeared from the exact head")
+                })?;
+                if proven.sha256 != *sha256 || proven.bytes != bytes {
+                    return Err(invalid_feed(
+                        "conflict remote coordinate differs from the exact head",
+                    ));
+                }
+                if selected.insert(file.path.clone(), proven.clone()).is_some() {
+                    return Err(invalid_feed("conflict plan repeats a remote coordinate"));
+                }
+            }
+            (None, None) => {
+                if current.contains_key(&file.path) {
+                    return Err(invalid_feed(
+                        "conflict remote deletion differs from the exact head",
+                    ));
+                }
+                deleted.push(file.path.clone());
+            }
+            _ => return Err(invalid_feed("conflict remote coordinate is incomplete")),
+        }
+    }
+    Ok((selected, deleted))
+}
+
 fn v2_conflict_relative(bundle: &str, suffix: &str) -> PathBuf {
     PathBuf::from(".dbmd")
         .join("conflicts")
@@ -6120,7 +6158,27 @@ fn v2_sync_push(
         let remote = remote_assets.get(&path);
         let remote_record = remote.map(|asset| v2_asset_record(asset, &path));
         let local_record = local_assets.get(&path);
-        if local_record == base_record.as_ref() {
+        let mut raw_present = false;
+        let mut disposition = "withheld";
+        let mut resumes_hosting = false;
+        if let Some(record) = local_record {
+            crate::linkmd_v2::normalize_path(&record.path)
+                .map_err(|error| invalid_feed(error.to_string()))?;
+            let kept_home = local_view.policy.keeps_home(&path);
+            raw_present = matches!(store.regular_file_exists(Path::new(&path)), Ok(true));
+            disposition = if kept_home || !raw_present {
+                "withheld"
+            } else {
+                "hosted"
+            };
+            if !raw_present && record.required && !kept_home {
+                return Err(LinkError::InvalidPack {
+                    message: format!("required asset {path} is missing"),
+                });
+            }
+            resumes_hosting = v2_asset_resumes_hosting(remote, &path, record, disposition);
+        }
+        if local_record == base_record.as_ref() && !resumes_hosting {
             continue;
         }
         if remote_record != base_record && local_record != remote_record.as_ref() {
@@ -6137,26 +6195,13 @@ fn v2_sync_push(
             }
             continue;
         };
-        crate::linkmd_v2::normalize_path(&record.path)
-            .map_err(|error| invalid_feed(error.to_string()))?;
-        let kept_home = local_view.policy.keeps_home(&path);
-        let raw = if matches!(store.regular_file_exists(Path::new(&path)), Ok(true)) {
+        let raw = if raw_present {
             verify_v2_upload_source(store, &path, &record.sha256, record.bytes)?;
             Some(())
         } else {
             None
         };
-        let disposition = if kept_home || raw.is_none() {
-            "withheld"
-        } else {
-            "hosted"
-        };
-        if raw.is_none() && record.required && !kept_home {
-            return Err(LinkError::InvalidPack {
-                message: format!("required asset {path} is missing"),
-            });
-        }
-        let op = if v2_asset_resumes_hosting(remote, &path, record, disposition) {
+        let op = if resumes_hosting {
             if !resume_local_policy {
                 asset_policy_transitions.push(path);
                 continue;
@@ -6912,24 +6957,12 @@ pub fn sync_resolve_conflict(
                     message: "bulk confirmation applies to keep-local/from commits, not a local take-remote install".to_string(),
                 });
             }
-            let mut remote_files = std::collections::BTreeMap::new();
-            let mut deleted = Vec::new();
-            for file in &plan.files {
-                match (&file.remote.sha256, file.remote.bytes) {
-                    (Some(sha256), Some(bytes)) => {
-                        remote_files.insert(
-                            file.path.clone(),
-                            V2BaselineFile {
-                                sha256: sha256.clone(),
-                                bytes,
-                                proof: None,
-                            },
-                        );
-                    }
-                    (None, None) => deleted.push(file.path.clone()),
-                    _ => return Err(invalid_feed("conflict remote coordinate is incomplete")),
-                }
-            }
+            // Re-read the exact current manifest so every selected remote byte
+            // retains its signed inclusion proof. The private bundle is useful
+            // for inspection, but is never promoted into live state as trust.
+            let current_remote =
+                files_for_v2_view(&head, v2_manifest(cfg, &plan.brain, head.pointer.as_ref())?);
+            let (remote_files, deleted) = v2_take_remote_selection(&plan.files, &current_remote)?;
             let staged = match head.pointer.as_ref() {
                 Some(pointer) => {
                     stage_v2_blobs(cfg, &plan.brain, pointer, remote_files.iter().collect())?
@@ -12521,6 +12554,70 @@ mod tests {
             "hosted"
         ));
         assert!(!v2_asset_resumes_hosting(None, path, &record, "hosted"));
+    }
+
+    #[test]
+    fn take_remote_resolution_rebinds_to_the_exact_current_manifest() {
+        let path = "records/team/alpha.md".to_string();
+        let deleted_path = "records/team/deleted.md".to_string();
+        let coordinate = |sha256: Option<String>, bytes: Option<u64>| V2ConflictCoordinate {
+            sha256,
+            bytes,
+            file: None,
+        };
+        let files = vec![
+            V2ConflictFile {
+                path: path.clone(),
+                base: coordinate(None, None),
+                local: coordinate(Some("b".repeat(64)), Some(7)),
+                remote: coordinate(Some("a".repeat(64)), Some(5)),
+            },
+            V2ConflictFile {
+                path: deleted_path.clone(),
+                base: coordinate(Some("c".repeat(64)), Some(9)),
+                local: coordinate(Some("d".repeat(64)), Some(11)),
+                remote: coordinate(None, None),
+            },
+        ];
+        let proven = V2BaselineFile {
+            sha256: "a".repeat(64),
+            bytes: 5,
+            proof: None,
+        };
+        let current = [(path.clone(), proven.clone())]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let (selected, deleted) = v2_take_remote_selection(&files, &current).unwrap();
+        assert_eq!(selected.get(&path).unwrap().sha256, proven.sha256);
+        assert_eq!(deleted, vec![deleted_path.clone()]);
+
+        let changed = [(
+            path.clone(),
+            V2BaselineFile {
+                sha256: "e".repeat(64),
+                bytes: 5,
+                proof: None,
+            },
+        )]
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(v2_take_remote_selection(&files, &changed).is_err());
+
+        let resurrected = [
+            (path, proven),
+            (
+                deleted_path,
+                V2BaselineFile {
+                    sha256: "f".repeat(64),
+                    bytes: 13,
+                    proof: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(v2_take_remote_selection(&files, &resurrected).is_err());
     }
 
     #[cfg(target_os = "linux")]

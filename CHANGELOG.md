@@ -26,9 +26,13 @@ Two things version independently:
   post-commit barriers now include asset records when deciding whether a
   checkout is clean enough to advance its verified baseline.
 - Making a previously withheld asset eligible for hosting now refuses with
-  `LOCAL_POLICY_TRANSITION` until the agent retries with the explicit
+  `LOCAL_POLICY_RELAXED` until the agent retries with the explicit
   `--resume-local-policy` intent. The safe default no longer reports a silent
   no-op while bytes remain quarantined.
+- Taking the remote side of a conflict now rebinds every selected coordinate
+  to its proof in the current signed manifest before downloading or installing
+  bytes. Conflict-bundle metadata can no longer lose the bulk-stream inclusion
+  proof required by the verifier.
 - Windows now treats native closed-pipe error 109 as the same clean consumer
   exit as Unix `EPIPE`. The Windows release smoke builds a minimal valid store
   through the supported file contract instead of invoking a nonexistent
