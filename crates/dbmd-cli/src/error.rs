@@ -248,6 +248,19 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::NotUtf8 { .. } => CliError::new(ExitCode::Runtime, "NOT_UTF8", message),
             L::InvalidPack { .. } => CliError::new(ExitCode::Runtime, "INVALID_PACK", message),
             L::InvalidFeed { .. } => CliError::new(ExitCode::Runtime, "INVALID_FEED", message),
+            L::AliasRebindRequired { alias, from, to } => CliError::new(
+                ExitCode::Policy,
+                "ALIAS_REBIND_REQUIRED",
+                message,
+            )
+            .with_hint(format!(
+                "after verifying both canonical ids, run `dbmd sync {alias} rebind --from {from} --to {to}`"
+            ))
+            .with_details(serde_json::json!({
+                "alias": alias,
+                "from": from,
+                "to": to,
+            })),
             L::Conflict { .. } => CliError::new(ExitCode::Runtime, "SYNC_CONFLICT", message),
             L::ConflictBundle { bundle, paths } => CliError::new(
                 ExitCode::Runtime,

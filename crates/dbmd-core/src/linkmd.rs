@@ -342,6 +342,18 @@ pub enum LinkError {
         message: String,
     },
 
+    /// A mutable alias moved to another canonical brain. Ordinary sync fails
+    /// closed; only the exact old/new ids can authorize replacing that one
+    /// alias binding while preserving both canonical trust histories.
+    #[error(
+        "brain alias `{alias}` was pinned to `{from}` but now resolves to `{to}` — review both ids, then run `dbmd sync {alias} rebind --from {from} --to {to}`"
+    )]
+    AliasRebindRequired {
+        alias: String,
+        from: String,
+        to: String,
+    },
+
     /// Local and remote both changed one or more coordinates since the last
     /// verified sync baseline. No side was overwritten.
     #[error("sync conflict on {paths:?} — resolve the named files and retry")]
@@ -3062,6 +3074,8 @@ struct V2SyncBaseline {
     origin: String,
     brain: String,
     #[serde(default)]
+    checkout_id: Option<String>,
+    #[serde(default)]
     head_seq: Option<u64>,
     commit_hash: Option<String>,
     content_root: Option<String>,
@@ -3088,6 +3102,13 @@ struct V2LocalView {
     riding: std::collections::BTreeMap<String, (String, u64)>,
     eligibility: std::collections::BTreeMap<String, bool>,
     policy: crate::linkmd_sync_policy::SyncPolicy,
+    withheld_links: Vec<V2WithheldLink>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct V2WithheldLink {
+    source: String,
+    target: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3814,12 +3835,18 @@ fn sign_verified_v2_candidate(
     let changes = STANDARD
         .decode(changes_b64)
         .map_err(|_| invalid_feed("self-custody changeset is not base64"))?;
-    let expected_changes = json!({
+    let mut expected_changes = json!({
         "mutation_id": mutation_id,
         "operations": request_body.get("operations").cloned().unwrap_or(Value::Null),
         "reason": request_body.get("reason").cloned().unwrap_or(Value::Null),
         "v": 2,
     });
+    if let Some(withheld_links) = request_body.get("withheld_links") {
+        expected_changes["withheld_links"] = withheld_links.clone();
+    }
+    if let Some(checkout_id) = request_body.get("checkout_id") {
+        expected_changes["checkout_id"] = checkout_id.clone();
+    }
     let expected_changes_bytes = crate::linkmd_v2::canonical_bytes(&expected_changes)
         .map_err(|error| invalid_feed(error.to_string()))?;
     if changes != expected_changes_bytes {
@@ -4016,6 +4043,21 @@ fn v2_baseline_name(cfg: &HubConfig, brain: &str, checkout: &Path) -> LinkResult
         "sync-{}.json",
         content_sha256(format!("{origin}\0{brain}\0{}", absolute.display()).as_bytes())
     ))
+}
+
+fn v2_checkout_id(existing: Option<&str>) -> LinkResult<String> {
+    if let Some(value) = existing {
+        if !is_sha256(value) {
+            return Err(invalid_feed("v2 checkout pseudonym is invalid"));
+        }
+        return Ok(value.to_string());
+    }
+    use ring::rand::SecureRandom as _;
+    let mut random = [0_u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| invalid_feed("could not generate a checkout pseudonym"))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(any(unix, windows))]
@@ -4269,6 +4311,10 @@ fn parse_v2_baseline(cfg: &HubConfig, brain: &str, bytes: &[u8]) -> LinkResult<V
             .remote_copy_remains
             .values()
             .any(|hash| !is_sha256(hash))
+        || baseline
+            .checkout_id
+            .as_deref()
+            .is_some_and(|checkout_id| !is_sha256(checkout_id))
     {
         return Err(invalid_feed("v2 sync baseline failed validation"));
     }
@@ -4432,6 +4478,7 @@ fn v2_baseline_from_head(
     files: std::collections::BTreeMap<String, V2BaselineFile>,
     assets: std::collections::BTreeMap<String, V2BaselineAsset>,
     local: Option<&V2LocalView>,
+    checkout_id: Option<&str>,
 ) -> LinkResult<V2SyncBaseline> {
     let mut local_eligibility = local
         .map(|view| view.eligibility.clone())
@@ -4456,6 +4503,7 @@ fn v2_baseline_from_head(
         v: 2,
         origin: normalized_origin(&cfg.hub)?,
         brain: head.brain_id.clone(),
+        checkout_id: Some(v2_checkout_id(checkout_id)?),
         head_seq: Some(head.pointer.as_ref().map_or(0, |pointer| pointer.seq)),
         commit_hash: head
             .pointer
@@ -4491,6 +4539,7 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
         .collect::<std::collections::BTreeSet<_>>();
     let mut result = std::collections::BTreeMap::new();
     let mut eligibility = std::collections::BTreeMap::new();
+    let mut riding_links = Vec::<(String, Vec<String>)>::new();
     let mut total = 0_u64;
     let mut paths = vec![PathBuf::from("DB.md")];
     paths.extend(store.walk()?);
@@ -4526,12 +4575,35 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
         if std::str::from_utf8(&bytes).is_err() {
             return Err(LinkError::NotUtf8 { path });
         }
+        let text = std::str::from_utf8(&bytes).expect("UTF-8 was checked");
+        riding_links.push((path.clone(), crate::store::extract_edge_targets(text)));
         result.insert(path, (content_sha256(&bytes), bytes.len() as u64));
     }
+    let kept_home = eligibility
+        .iter()
+        .filter(|(_, riding)| !**riding)
+        .map(|(path, _)| path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut withheld_links = riding_links
+        .into_iter()
+        .flat_map(|(source, targets)| {
+            let kept_home = &kept_home;
+            targets.into_iter().filter_map(move |target| {
+                let target = format!("{target}.md");
+                kept_home.contains(&target).then_some(V2WithheldLink {
+                    source: source.clone(),
+                    target,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    withheld_links.sort();
+    withheld_links.dedup();
     Ok(V2LocalView {
         riding: result,
         eligibility,
         policy,
+        withheld_links,
     })
 }
 
@@ -5917,6 +5989,9 @@ fn v2_sync_pull_with_resolution(
                 remote.clone(),
                 remote_assets.clone(),
                 Some(&installed_local),
+                baseline
+                    .as_ref()
+                    .and_then(|current| current.checkout_id.as_deref()),
             )?,
         )?;
         complete_v2_pull(&dest)?;
@@ -5980,6 +6055,74 @@ fn v2_asset_expected(remote: Option<&V2BaselineAsset>) -> Value {
     }
 }
 
+fn v2_content_withdrawal_operation(
+    store: &Store,
+    local_view: &V2LocalView,
+    remote: &std::collections::BTreeMap<String, V2BaselineFile>,
+    path: &str,
+    reason: &str,
+) -> LinkResult<Value> {
+    if (!(path.starts_with("records/") || path.starts_with("sources/")) || !path.ends_with(".md"))
+        || path == "DB.md"
+    {
+        return Err(LinkError::InvalidPack {
+            message: format!("content withdrawal path `{path}` is not a record or source"),
+        });
+    }
+    if !local_view.policy.keeps_home(path)
+        || !matches!(store.regular_file_exists(Path::new(path)), Ok(true))
+    {
+        return Err(LinkError::InvalidPack {
+            message: format!(
+                "withdrawal path `{path}` must be an existing regular file kept home by .sevralocal"
+            ),
+        });
+    }
+    let current = remote.get(path).ok_or_else(|| LinkError::InvalidPack {
+        message: format!("withdrawal path `{path}` has no readable hosted coordinate"),
+    })?;
+    verify_v2_upload_source(store, path, &current.sha256, current.bytes)?;
+    Ok(json!({
+        "op": "withdraw_from_hosting",
+        "path": path,
+        "expected": { "kind": "blob", "hash": current.sha256 },
+        "reason": reason,
+    }))
+}
+
+fn v2_asset_withdrawal_operation(
+    store: &Store,
+    local_view: &V2LocalView,
+    path: &str,
+    local: &crate::AssetRecord,
+    current: &V2BaselineAsset,
+    reason: &str,
+) -> LinkResult<Value> {
+    if !local_view.policy.keeps_home(path)
+        || !matches!(store.regular_file_exists(Path::new(path)), Ok(true))
+    {
+        return Err(LinkError::InvalidPack {
+            message: format!(
+                "asset withdrawal path `{path}` must be an existing regular file kept home by .sevralocal"
+            ),
+        });
+    }
+    verify_v2_upload_source(store, path, &local.sha256, local.bytes)?;
+    if current.disposition != "hosted" || v2_asset_record(current, path) != *local {
+        return Err(LinkError::InvalidPack {
+            message: format!(
+                "asset withdrawal path `{path}` must exactly match its currently hosted signed leaf"
+            ),
+        });
+    }
+    Ok(json!({
+        "op": "asset_withdraw",
+        "path": path,
+        "expected": v2_asset_expected(Some(current)),
+        "reason": reason,
+    }))
+}
+
 fn v2_asset_value(record: &crate::AssetRecord, disposition: &str) -> Value {
     json!({
         "blob_sha256": record.sha256,
@@ -6025,7 +6168,7 @@ fn apply_generated_v2_operations(
                     },
                 );
             }
-            Some("delete") => {
+            Some("delete" | "withdraw_from_hosting") => {
                 let path = operation
                     .get("path")
                     .and_then(Value::as_str)
@@ -6040,7 +6183,7 @@ fn apply_generated_v2_operations(
                 candidate_assets.remove(path);
                 asset_changed = true;
             }
-            Some("asset_put" | "asset_resume") => {
+            Some("asset_put" | "asset_resume" | "asset_withdraw") => {
                 let path = operation
                     .get("path")
                     .and_then(Value::as_str)
@@ -6048,11 +6191,16 @@ fn apply_generated_v2_operations(
                 let record = local_assets
                     .get(path)
                     .ok_or_else(|| invalid_feed("v2 asset write has no local record"))?;
-                let disposition = operation
-                    .get("asset")
-                    .and_then(|asset| asset.get("disposition"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| invalid_feed("v2 asset write has no disposition"))?;
+                let disposition =
+                    if operation.get("op").and_then(Value::as_str) == Some("asset_withdraw") {
+                        "withheld"
+                    } else {
+                        operation
+                            .get("asset")
+                            .and_then(|asset| asset.get("disposition"))
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| invalid_feed("v2 asset write has no disposition"))?
+                    };
                 candidate_assets.insert(
                     path.to_string(),
                     V2BaselineAsset {
@@ -6105,6 +6253,8 @@ struct V2SyncPushOptions<'a> {
     bulk_confirmation: Option<&'a V2BulkConfirmation>,
     resolution: Option<&'a std::collections::BTreeMap<String, V2ResolutionOverride>>,
     pulled: Option<V2PulledSnapshot>,
+    withdrawal_paths: &'a [String],
+    withdrawal_reason: Option<&'a str>,
 }
 
 fn verify_v2_upload_source(
@@ -6198,6 +6348,8 @@ fn v2_sync_push(
         bulk_confirmation,
         resolution,
         pulled,
+        withdrawal_paths,
+        withdrawal_reason,
     } = options;
     let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
     let head = v2_verified_head(cfg, requested_brain)?
@@ -6235,6 +6387,39 @@ fn v2_sync_push(
         Some(assets) => assets,
         None => v2_local_asset_records(store)?,
     };
+    if withdrawal_paths.len() > MAX_PUSH_FILES {
+        return Err(LinkError::PushTooLarge {
+            detail: "too many explicit withdrawal paths".to_string(),
+        });
+    }
+    let withdrawal_reason = if withdrawal_paths.is_empty() {
+        None
+    } else {
+        let reason = withdrawal_reason
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty() && reason.len() <= 1000)
+            .ok_or_else(|| LinkError::InvalidPack {
+                message: "explicit withdrawal requires a non-empty --withdraw-reason of at most 1000 bytes".to_string(),
+            })?;
+        Some(reason)
+    };
+    let mut withdrawals = withdrawal_paths
+        .iter()
+        .map(|path| {
+            crate::linkmd_v2::normalize_path(path).map_err(|error| LinkError::UnsafePath {
+                path: error.to_string(),
+            })
+        })
+        .collect::<LinkResult<Vec<_>>>()?;
+    withdrawals.sort();
+    withdrawals.dedup();
+    if withdrawals.len() != withdrawal_paths.len() {
+        return Err(LinkError::InvalidPack {
+            message: "explicit withdrawal paths must be unique".to_string(),
+        });
+    }
+    let withdrawal_set = withdrawals.iter().cloned().collect::<BTreeSet<_>>();
+    let mut consumed_withdrawals = BTreeSet::new();
     if let Some(previous) = baseline.as_ref() {
         if previous.local_policy_digest.as_deref() != Some(&local_view.policy.digest)
             && !resume_local_policy
@@ -6340,6 +6525,19 @@ fn v2_sync_push(
             }
         }
     }
+    for path in &withdrawals {
+        if local_assets.contains_key(path) {
+            continue;
+        }
+        operations.push(v2_content_withdrawal_operation(
+            store,
+            &local_view,
+            &remote,
+            path,
+            withdrawal_reason.expect("non-empty withdrawal set has a reason"),
+        )?);
+        consumed_withdrawals.insert(path.clone());
+    }
     if !conflicts.is_empty() {
         conflicts.truncate(100);
         let (bundle, paths) = create_v2_conflict_bundle(
@@ -6382,6 +6580,26 @@ fn v2_sync_push(
         let remote = remote_assets.get(&path);
         let remote_record = remote.map(|asset| v2_asset_record(asset, &path));
         let local_record = local_assets.get(&path);
+        if withdrawal_set.contains(&path) {
+            let record = local_record.ok_or_else(|| LinkError::InvalidPack {
+                message: format!("asset withdrawal path `{path}` is absent from assets.jsonl"),
+            })?;
+            let current = remote.ok_or_else(|| LinkError::InvalidPack {
+                message: format!(
+                    "asset withdrawal path `{path}` has no readable hosted coordinate"
+                ),
+            })?;
+            operations.push(v2_asset_withdrawal_operation(
+                store,
+                &local_view,
+                &path,
+                record,
+                current,
+                withdrawal_reason.expect("non-empty withdrawal set has a reason"),
+            )?);
+            consumed_withdrawals.insert(path.clone());
+            continue;
+        }
         let mut raw_present = false;
         let mut disposition = "withheld";
         let mut resumes_hosting = false;
@@ -6450,6 +6668,17 @@ fn v2_sync_push(
                 });
         }
     }
+    if consumed_withdrawals != withdrawal_set {
+        let missing = withdrawal_set
+            .difference(&consumed_withdrawals)
+            .next()
+            .expect("different withdrawal sets have one member");
+        return Err(LinkError::InvalidPack {
+            message: format!(
+                "withdrawal path `{missing}` is not a readable content or asset coordinate"
+            ),
+        });
+    }
     if !conflicts.is_empty() {
         conflicts.truncate(100);
         return Err(LinkError::Conflict { paths: conflicts });
@@ -6460,6 +6689,31 @@ fn v2_sync_push(
             paths: asset_policy_transitions,
         });
     }
+    let touched_sources = operations
+        .iter()
+        .filter_map(
+            |operation| match operation.get("op").and_then(Value::as_str) {
+                Some("put" | "restore") => operation.get("path").and_then(Value::as_str),
+                Some("rename") => operation.get("to").and_then(Value::as_str),
+                _ => None,
+            },
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    let withheld_links = local_view
+        .withheld_links
+        .iter()
+        .filter(|link| touched_sources.contains(link.source.as_str()))
+        .collect::<Vec<_>>();
+    let checkout_pseudonym = v2_checkout_id(
+        baseline
+            .as_ref()
+            .and_then(|current| current.checkout_id.as_deref()),
+    )?;
+    let checkout_id = if withheld_links.is_empty() {
+        None
+    } else {
+        Some(checkout_pseudonym.clone())
+    };
     if operations.is_empty() {
         let final_head = v2_verified_head(cfg, requested_brain)?
             .ok_or_else(|| invalid_feed("v2 head disappeared during sync"))?;
@@ -6473,7 +6727,14 @@ fn v2_sync_push(
         let remote_ahead = !v2_riding_matches_remote(&final_local.riding, &remote, |path| {
             final_local.policy.keeps_home(path)
         }) || !v2_asset_records_match_remote(&final_assets, &remote_assets);
-        let next = v2_baseline_from_head(cfg, &head, remote, remote_assets, Some(&final_local))?;
+        let next = v2_baseline_from_head(
+            cfg,
+            &head,
+            remote,
+            remote_assets,
+            Some(&final_local),
+            Some(&checkout_pseudonym),
+        )?;
         let split_count = next.remote_copy_remains.len();
         accept_v2_head(cfg, &final_head)?;
         if !local_changed && !remote_ahead {
@@ -6511,11 +6772,13 @@ fn v2_sync_push(
     // operation set. A lost response can therefore be retried without a
     // duplicate commit/proposal even across process restarts.
     let entropy = format!(
-        "{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}",
         normalized_origin(&cfg.hub)?,
         head.brain_id,
         serde_json::to_string(&base_value).unwrap_or_default(),
-        serde_json::to_string(&operations).unwrap_or_default()
+        serde_json::to_string(&operations).unwrap_or_default(),
+        serde_json::to_string(&withheld_links).unwrap_or_default(),
+        checkout_id.as_deref().unwrap_or("")
     );
     let mutation_id = format!("dbmd-{}", content_sha256(entropy.as_bytes()));
     let changed_bytes = upload_sources.values().try_fold(0_u64, |total, source| {
@@ -6554,6 +6817,12 @@ fn v2_sync_push(
         "operations": operations,
         "blobs": inline_blobs,
     });
+    if !withheld_links.is_empty() {
+        body["withheld_links"] = serde_json::to_value(&withheld_links)
+            .map_err(|_| invalid_feed("could not serialize withheld-link observations"))?;
+        body["checkout_id"] =
+            Value::String(checkout_id.expect("non-empty withheld links have a checkout pseudonym"));
+    }
     if let Some(confirmation) = bulk_confirmation {
         if !crate::ulid::is_ulid(&confirmation.id) || !is_sha256(&confirmation.digest) {
             return Err(LinkError::InvalidPack {
@@ -6864,6 +7133,7 @@ fn v2_sync_push(
         refreshed_files,
         refreshed_assets,
         Some(&final_local),
+        Some(&checkout_pseudonym),
     )?;
     let split_count = next.remote_copy_remains.len();
     accept_v2_head(cfg, &refreshed)?;
@@ -6914,6 +7184,27 @@ pub fn sync_push_incremental_with_options(
     resume_local_policy: bool,
     bulk_confirmation: Option<&V2BulkConfirmation>,
 ) -> LinkResult<Value> {
+    sync_push_incremental_with_controls(
+        cfg,
+        brain,
+        store,
+        resume_local_policy,
+        bulk_confirmation,
+        &[],
+        None,
+    )
+}
+
+/// Incremental push with explicit permissioned current-host withdrawal.
+pub fn sync_push_incremental_with_controls(
+    cfg: &HubConfig,
+    brain: &str,
+    store: &Store,
+    resume_local_policy: bool,
+    bulk_confirmation: Option<&V2BulkConfirmation>,
+    withdrawal_paths: &[String],
+    withdrawal_reason: Option<&str>,
+) -> LinkResult<Value> {
     require_safe_ref(brain)?;
     if let Some(head) = v2_verified_head(cfg, brain)? {
         return v2_sync_push(
@@ -6926,8 +7217,15 @@ pub fn sync_push_incremental_with_options(
                 bulk_confirmation,
                 resolution: None,
                 pulled: None,
+                withdrawal_paths,
+                withdrawal_reason,
             },
         );
+    }
+    if !withdrawal_paths.is_empty() {
+        return Err(LinkError::InvalidPack {
+            message: "explicit withdrawal requires a link.md v2 brain".to_string(),
+        });
     }
     legacy_sync_push_incremental(cfg, brain, store, resume_local_policy, bulk_confirmation)
 }
@@ -7224,6 +7522,8 @@ pub fn sync_resolve_conflict(
                     bulk_confirmation,
                     resolution: Some(&overrides),
                     pulled: None,
+                    withdrawal_paths: &[],
+                    withdrawal_reason: None,
                 },
             )?
         }
@@ -7270,6 +7570,27 @@ pub fn sync_converge_with_options(
     resume_local_policy: bool,
     bulk_confirmation: Option<&V2BulkConfirmation>,
 ) -> LinkResult<Value> {
+    sync_converge_with_controls(
+        cfg,
+        brain,
+        checkout,
+        resume_local_policy,
+        bulk_confirmation,
+        &[],
+        None,
+    )
+}
+
+/// Bidirectional convergence with optional exact withdrawal intents.
+pub fn sync_converge_with_controls(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+    resume_local_policy: bool,
+    bulk_confirmation: Option<&V2BulkConfirmation>,
+    withdrawal_paths: &[String],
+    withdrawal_reason: Option<&str>,
+) -> LinkResult<Value> {
     require_hardened_filesystem("bidirectional sync")?;
     require_safe_ref(brain)?;
     let head = v2_verified_head(cfg, brain)?.ok_or_else(|| LinkError::InvalidPack {
@@ -7294,6 +7615,8 @@ pub fn sync_converge_with_options(
             bulk_confirmation,
             resolution: None,
             pulled: Some(pulled),
+            withdrawal_paths,
+            withdrawal_reason,
         },
     )?;
     if let Some(object) = result.as_object_mut() {
@@ -11564,9 +11887,11 @@ fn load_canonical_pin(
     let mut alias = load_alias_in(cfg, directory, requested)?;
     if let Some(binding) = &alias {
         if binding.brain != resolved_brain {
-            return Err(invalid_feed(
-                "requested brain alias now resolves to a different canonical brain",
-            ));
+            return Err(LinkError::AliasRebindRequired {
+                alias: requested.to_string(),
+                from: binding.brain.clone(),
+                to: resolved_brain.to_string(),
+            });
         }
         return Ok((canonical, alias));
     }
@@ -11609,6 +11934,80 @@ fn load_canonical_pin(
         save_alias_in(cfg, directory, alias.as_ref().expect("alias just created"))?;
     }
     Ok((canonical, alias))
+}
+
+/// Explicitly replace one mutable alias binding after the operator reviews the
+/// exact deleted/re-created brain ids. Canonical checkpoints are never removed
+/// or rewritten, so old history remains pinned and the new brain establishes
+/// its own independently verified trust chain.
+pub fn rebind_v2_alias(cfg: &HubConfig, alias: &str, from: &str, to: &str) -> LinkResult<Value> {
+    require_hardened_filesystem("verified alias rebind")?;
+    require_safe_ref(alias)?;
+    require_safe_ref(from)?;
+    require_safe_ref(to)?;
+    if crate::ulid::is_ulid(alias)
+        || !crate::ulid::is_ulid(from)
+        || !crate::ulid::is_ulid(to)
+        || from == to
+    {
+        return Err(LinkError::InvalidPack {
+            message:
+                "alias rebind requires one non-ULID alias and two different exact canonical ULIDs"
+                    .to_string(),
+        });
+    }
+
+    let verified = v2_verified_head(cfg, to)?.ok_or_else(|| LinkError::InvalidPack {
+        message: "the proposed replacement is not a readable link.md v2 brain".to_string(),
+    })?;
+    accept_v2_head(cfg, &verified)?;
+
+    let alias_response = ensure_ok(
+        request(
+            cfg,
+            "GET",
+            &format!("/api/hub/brains/{alias}/v2/head"),
+            None,
+            Auth::Required,
+        )?,
+        "resolve alias for explicit rebind",
+    )?;
+    let resolved: V2HeadResponse = serde_json::from_value(alias_response)
+        .map_err(|_| invalid_feed("alias rebind response has an invalid shape"))?;
+    if resolved.v != 2 || resolved.brain_id != to {
+        return Err(LinkError::RemoteAdvancedDuringSync);
+    }
+
+    let directory = open_trust_dir(cfg)?;
+    let _locks = lock_trust_many(cfg, &directory, &[alias, from, to])?;
+    let binding = load_alias_in(cfg, &directory, alias)?.ok_or_else(|| LinkError::InvalidPack {
+        message: "the requested alias has no existing local binding to replace".to_string(),
+    })?;
+    if binding.brain != from {
+        return Err(LinkError::AliasRebindRequired {
+            alias: alias.to_string(),
+            from: binding.brain,
+            to: to.to_string(),
+        });
+    }
+    save_alias_in(
+        cfg,
+        &directory,
+        &AliasBinding {
+            v: 1,
+            origin: normalized_origin(&cfg.hub)?,
+            requested: alias.to_string(),
+            brain: to.to_string(),
+            home: binding.home,
+        },
+    )?;
+    Ok(json!({
+        "v": 2,
+        "alias": alias,
+        "from": from,
+        "to": to,
+        "outcome": "alias_rebound",
+    }))
 }
 
 fn save_canonical_pin_and_alias(
@@ -13505,6 +13904,45 @@ mod tests {
     }
 
     #[test]
+    fn moved_alias_requires_exact_explicit_rebind_without_rewriting_history() {
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(
+            "https://hub.example".to_string(),
+            state.path().to_path_buf(),
+        );
+        let directory = open_trust_dir(&cfg).unwrap();
+        let old = TEST_BRAIN_ID;
+        let new = "01j5qc3v9k4ym8rwbn2tqe6f7e";
+        save_alias_in(
+            &cfg,
+            &directory,
+            &AliasBinding {
+                v: 1,
+                origin: normalized_origin(&cfg.hub).unwrap(),
+                requested: "company-brain".to_string(),
+                brain: old.to_string(),
+                home: Some("company-brain".to_string()),
+            },
+        )
+        .unwrap();
+
+        let error = load_canonical_pin(&cfg, &directory, "company-brain", new).unwrap_err();
+        assert!(matches!(
+            error,
+            LinkError::AliasRebindRequired {
+                alias,
+                from,
+                to
+            } if alias == "company-brain" && from == old && to == new
+        ));
+        let unchanged = load_alias_in(&cfg, &directory, "company-brain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.brain, old);
+        assert_eq!(unchanged.home.as_deref(), Some("company-brain"));
+    }
+
+    #[test]
     fn concurrent_aliases_cannot_establish_conflicting_tofu_pins() {
         let alpha = signed_remote_fixture();
         let beta = signed_remote_fixture();
@@ -14132,6 +14570,33 @@ mod tests {
                 item.get("reason").and_then(Value::as_str).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn shared_v2_kept_home_changeset_vector_matches_the_typescript_hub() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../tests/vectors/linkmd-v2-changeset-withheld.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            vector.get("profile").and_then(Value::as_str),
+            Some("link.md-v2-changeset-withheld")
+        );
+        let canonical =
+            crate::linkmd_v2::canonical_bytes(vector.get("changeset").unwrap()).unwrap();
+        let expected = STANDARD
+            .decode(
+                vector
+                    .get("canonical_base64")
+                    .and_then(Value::as_str)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(canonical, expected);
+        assert_eq!(
+            crate::linkmd_v2::domain_hash_bytes("v2/changeset", &canonical).unwrap(),
+            vector.get("domain_hash").and_then(Value::as_str).unwrap()
+        );
     }
 
     #[test]
@@ -15176,6 +15641,7 @@ mod tests {
             v: 2,
             origin: "https://hub.example".to_string(),
             brain: TEST_BRAIN_ID.to_string(),
+            checkout_id: Some("c".repeat(64)),
             head_seq: Some(0),
             commit_hash: None,
             content_root: None,
@@ -15206,6 +15672,186 @@ mod tests {
         remove_scoped_projection(&head, Some(&baseline), &mut view).unwrap();
         assert!(!view.riding.contains_key("DB.md"));
         assert!(!view.eligibility.contains_key("DB.md"));
+    }
+
+    #[test]
+    fn v2_local_view_reports_only_exact_linked_kept_home_markdown() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("records/notes")).unwrap();
+        std::fs::create_dir_all(directory.path().join("sources/private")).unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\nname: Kept home test\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("records/notes/a.md"),
+            b"---\ntype: note\n---\nSee [[sources/private/secret]].\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("sources/private/secret.md"),
+            b"---\ntype: note\n---\nlocal only\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("sources/private/unlinked.md"),
+            b"---\ntype: note\n---\nnot disclosed\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(".sevralocal"),
+            b"sources/private/**\n",
+        )
+        .unwrap();
+
+        let store = Store::open_strict(directory.path()).unwrap();
+        let view = v2_local_files(&store).unwrap();
+        assert!(!view.riding.contains_key("sources/private/secret.md"));
+        assert_eq!(
+            view.withheld_links,
+            vec![V2WithheldLink {
+                source: "records/notes/a.md".to_string(),
+                target: "sources/private/secret.md".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn explicit_content_withdrawal_requires_exact_current_kept_home_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("sources/private")).unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\nname: Withdrawal test\n---\n",
+        )
+        .unwrap();
+        let source = b"---\ntype: note\n---\nlocal evidence\n";
+        std::fs::write(directory.path().join("sources/private/evidence.md"), source).unwrap();
+        std::fs::write(
+            directory.path().join(".sevralocal"),
+            b"sources/private/**\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        let view = v2_local_files(&store).unwrap();
+        let mut remote = std::collections::BTreeMap::new();
+        remote.insert(
+            "sources/private/evidence.md".to_string(),
+            V2BaselineFile {
+                sha256: content_sha256(source),
+                bytes: source.len() as u64,
+                proof: None,
+            },
+        );
+        assert_eq!(
+            v2_content_withdrawal_operation(
+                &store,
+                &view,
+                &remote,
+                "sources/private/evidence.md",
+                "approved retention change",
+            )
+            .unwrap(),
+            json!({
+                "op": "withdraw_from_hosting",
+                "path": "sources/private/evidence.md",
+                "expected": { "kind": "blob", "hash": content_sha256(source) },
+                "reason": "approved retention change",
+            })
+        );
+
+        std::fs::write(
+            directory.path().join("sources/private/evidence.md"),
+            b"changed after review",
+        )
+        .unwrap();
+        assert!(matches!(
+            v2_content_withdrawal_operation(
+                &store,
+                &view,
+                &remote,
+                "sources/private/evidence.md",
+                "approved retention change",
+            ),
+            Err(LinkError::InvalidPack { .. })
+        ));
+    }
+
+    #[test]
+    fn explicit_asset_withdrawal_requires_the_exact_hosted_leaf_and_local_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("sources/files")).unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\nname: Asset withdrawal test\n---\n",
+        )
+        .unwrap();
+        let bytes = b"private binary";
+        std::fs::write(directory.path().join("sources/files/private.pdf"), bytes).unwrap();
+        std::fs::write(
+            directory.path().join(".sevralocal"),
+            b"sources/files/private.pdf\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        let view = v2_local_files(&store).unwrap();
+        let local = crate::AssetRecord {
+            path: "sources/files/private.pdf".to_string(),
+            sha256: content_sha256(bytes),
+            bytes: bytes.len() as u64,
+            media_type: "application/pdf".to_string(),
+            wrappers: vec!["sources/files/private.md".to_string()],
+            required: true,
+        };
+        let current = V2BaselineAsset {
+            blob_sha256: local.sha256.clone(),
+            bytes: local.bytes,
+            media_type: local.media_type.clone(),
+            wrappers: local.wrappers.clone(),
+            required: local.required,
+            disposition: "hosted".to_string(),
+            leaf_hash: "d".repeat(64),
+        };
+        assert_eq!(
+            v2_asset_withdrawal_operation(
+                &store,
+                &view,
+                &local.path,
+                &local,
+                &current,
+                "approved retention change",
+            )
+            .unwrap(),
+            json!({
+                "op": "asset_withdraw",
+                "path": local.path,
+                "expected": { "kind": "asset", "hash": "d".repeat(64) },
+                "reason": "approved retention change",
+            })
+        );
+
+        let mut mismatched = current.clone();
+        mismatched.required = false;
+        assert!(matches!(
+            v2_asset_withdrawal_operation(
+                &store,
+                &view,
+                &local.path,
+                &local,
+                &mismatched,
+                "approved retention change",
+            ),
+            Err(LinkError::InvalidPack { .. })
+        ));
+    }
+
+    #[test]
+    fn checkout_pseudonym_is_random_then_stable_from_private_baseline() {
+        let first = v2_checkout_id(None).unwrap();
+        assert_eq!(first, v2_checkout_id(Some(&first)).unwrap());
+        assert_ne!(first, v2_checkout_id(None).unwrap());
+        assert!(is_sha256(&first));
     }
 
     #[test]
@@ -15970,6 +16616,7 @@ mod tests {
                 v: 2,
                 origin: "https://example.test".to_string(),
                 brain: TEST_BRAIN_ID.to_string(),
+                checkout_id: Some("c".repeat(64)),
                 head_seq: next.head_seq,
                 commit_hash: next.commit_hash.clone(),
                 content_root: Some("f".repeat(64)),

@@ -24,8 +24,40 @@ use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 use crate::sanitize::sanitize_single_line;
 
+struct SyncWriteControls<'a> {
+    resume_local_policy: bool,
+    bulk_confirmation: Option<&'a linkmd::V2BulkConfirmation>,
+    withdrawal_paths: &'a [String],
+    withdrawal_reason: Option<&'a str>,
+}
+
 /// Run `dbmd sync`.
 pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
+    if let Some(SyncAction::Rebind(rebind)) = &args.action {
+        let alias = strip_sigil(args.brain.as_deref().ok_or_else(|| {
+            CliError::new(
+                ExitCode::Usage,
+                "MISSING_BRAIN",
+                "dbmd sync rebind requires the mutable alias before the subcommand",
+            )
+        })?);
+        let cfg = linkmd::hub_config(args.hub.as_deref(), Path::new(&args.dir))?;
+        let body = linkmd::rebind_v2_alias(&cfg, alias, &rebind.from, &rebind.to)?;
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "rebound alias {} from {} to {}; both canonical trust histories remain pinned",
+                sanitize_single_line(alias),
+                sanitize_single_line(&rebind.from),
+                sanitize_single_line(&rebind.to)
+            );
+        }
+        return Ok(());
+    }
     if let Some(SyncAction::Conflicts(conflicts)) = &args.action {
         let body =
             linkmd::sync_conflicts(Path::new(&conflicts.dir), conflicts.prune, conflicts.all)?;
@@ -105,34 +137,26 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
         .as_deref()
         .map(linkmd::V2BulkConfirmation::parse)
         .transpose()?;
+    let controls = SyncWriteControls {
+        resume_local_policy: args.resume_local_policy,
+        bulk_confirmation: bulk_confirmation.as_ref(),
+        withdrawal_paths: &args.withdraw_from_hosting,
+        withdrawal_reason: args.withdraw_reason.as_deref(),
+    };
 
     let checkout = Path::new(&args.dir);
     let strict_store_open = Store::open_strict(checkout).is_ok();
     let established_v2 = !strict_store_open && linkmd::has_v2_sync_baseline(&cfg, brain, checkout)?;
 
     if args.push {
-        push(
-            ctx,
-            &cfg,
-            brain,
-            &args.dir,
-            args.resume_local_policy,
-            bulk_confirmation.as_ref(),
-        )
+        push(ctx, &cfg, brain, &args.dir, &controls)
     } else if args.out.is_some() {
         pull(ctx, &cfg, brain, args.out.as_deref())
     } else if args.pull_only {
         let destination = (strict_store_open || established_v2).then_some(args.dir.as_str());
         pull(ctx, &cfg, brain, destination)
     } else if strict_store_open || established_v2 {
-        converge(
-            ctx,
-            &cfg,
-            brain,
-            &args.dir,
-            args.resume_local_policy,
-            bulk_confirmation.as_ref(),
-        )
+        converge(ctx, &cfg, brain, &args.dir, &controls)
     } else {
         pull(ctx, &cfg, brain, args.out.as_deref())
     }
@@ -143,15 +167,16 @@ fn converge(
     cfg: &linkmd::HubConfig,
     brain: &str,
     dir: &str,
-    resume_local_policy: bool,
-    bulk_confirmation: Option<&linkmd::V2BulkConfirmation>,
+    controls: &SyncWriteControls<'_>,
 ) -> CliResult {
-    let body = linkmd::sync_converge_with_options(
+    let body = linkmd::sync_converge_with_controls(
         cfg,
         brain,
         Path::new(dir),
-        resume_local_policy,
-        bulk_confirmation,
+        controls.resume_local_policy,
+        controls.bulk_confirmation,
+        controls.withdrawal_paths,
+        controls.withdrawal_reason,
     )?;
     if ctx.json {
         println!(
@@ -237,18 +262,19 @@ fn push(
     cfg: &linkmd::HubConfig,
     brain: &str,
     dir: &str,
-    resume_local_policy: bool,
-    bulk_confirmation: Option<&linkmd::V2BulkConfirmation>,
+    controls: &SyncWriteControls<'_>,
 ) -> CliResult {
     // Strict open: pushing from a non-store is the standard NOT_A_STORE exit.
     let store = Store::open_strict(Path::new(dir))?;
     let _transaction = store.transaction()?;
-    let body = linkmd::sync_push_incremental_with_options(
+    let body = linkmd::sync_push_incremental_with_controls(
         cfg,
         brain,
         &store,
-        resume_local_policy,
-        bulk_confirmation,
+        controls.resume_local_policy,
+        controls.bulk_confirmation,
+        controls.withdrawal_paths,
+        controls.withdrawal_reason,
     )?;
     if ctx.json {
         println!(

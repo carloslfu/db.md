@@ -1,0 +1,31 @@
+{
+  "v": 1,
+  "profile": "link.md-v2-changeset-withheld",
+  "changeset": {
+    "v": 2,
+    "mutation_id": "vector-withheld-1",
+    "reason": "kept home",
+    "operations": [
+      {
+        "op": "put",
+        "path": "records/project.md",
+        "expected": {
+          "kind": "blob",
+          "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "blob": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bytes": 123
+      }
+    ],
+    "withheld_links": [
+      {
+        "source": "records/project.md",
+        "target": "sources/private.md"
+      }
+    ],
+    "checkout_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "canonical_base64": "eyJjaGVja291dF9pZCI6ImNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2MiLCJtdXRhdGlvbl9pZCI6InZlY3Rvci13aXRoaGVsZC0xIiwib3BlcmF0aW9ucyI6W3siYmxvYiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJieXRlcyI6MTIzLCJleHBlY3RlZCI6eyJoYXNoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImtpbmQiOiJibG9iIn0sIm9wIjoicHV0IiwicGF0aCI6InJlY29yZHMvcHJvamVjdC5tZCJ9XSwicmVhc29uIjoia2VwdCBob21lIiwidiI6Miwid2l0aGhlbGRfbGlua3MiOlt7InNvdXJjZSI6InJlY29yZHMvcHJvamVjdC5tZCIsInRhcmdldCI6InNvdXJjZXMvcHJpdmF0ZS5tZCJ9XX0K",
+  "domain": "v2/changeset",
+  "domain_hash": "0d877b4c87d47d8a5bbab3bdd75825960bfe956d71d983853ac7df46c2edacd3"
+}

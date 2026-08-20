@@ -8,9 +8,37 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.15**.
+  `Cargo.toml`, currently **v0.8.16**.
 
 ## Unreleased
+
+## [0.8.16] — 2026-08-20
+
+### Added
+
+- Permissioned v2 sync reports only exact kept-home Markdown targets linked by
+  a changed readable source. Reports carry a private 256-bit per-checkout
+  pseudonym and never disclose `.sevralocal`, unlinked filenames, target bytes,
+  or paths outside the current verified view.
+- Explicit `--withdraw-from-hosting` and `--withdrawal-reason` controls remove
+  exact current content, immutable sources, or assets through their typed
+  company permissions. Local exclusion by itself remains non-destructive, and
+  resumption stays an explicit `--resume-local-policy` operation.
+- `dbmd rebind` is the sole alias-reuse path. A checkout pinned to a deleted
+  brain refuses a same-slug replacement until the caller reviews and explicitly
+  rebinds the alias from the old canonical brain id to the independently
+  verified new id.
+
+### Fixed
+
+- Withheld-link changesets now use one strict canonical encoding shared with
+  link.md and the hub: observations are non-empty, safe, unique, sorted, and
+  paired with a lowercase 256-bit checkout id. Existing v2 changesets retain
+  their exact bytes.
+- Secret-vault adoption resolves and verifies the exact current source before
+  deciding whether an immutable-source rewrite is required.
+- Large-sync write controls are grouped without weakening the workspace's
+  strict Clippy policy.
 
 ## [0.8.15] — 2026-08-20
 

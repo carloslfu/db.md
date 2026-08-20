@@ -1007,13 +1007,40 @@ pub struct SyncArgs {
     #[arg(long, value_name = "ID:DIGEST", conflicts_with = "pull_only")]
     pub confirm_bulk: Option<String>,
 
+    /// Remove this exact currently hosted path while preserving its local
+    /// kept-home file. Repeat for multiple reviewed paths. Requires the path
+    /// to be covered by `.sevralocal` and an explicit audit reason.
+    #[arg(
+        long,
+        value_name = "PATH",
+        action = clap::ArgAction::Append,
+        requires = "withdraw_reason",
+        conflicts_with = "pull_only"
+    )]
+    pub withdraw_from_hosting: Vec<String>,
+
+    /// Bounded audit reason shared by this command's explicit withdrawals.
+    #[arg(
+        long,
+        value_name = "REASON",
+        requires = "withdraw_from_hosting",
+        conflicts_with = "pull_only"
+    )]
+    pub withdraw_reason: Option<String>,
+
     /// Pull destination directory. Defaults to `./<slug>` (created if
     /// missing). Permissioned v2 applies remote changes atomically and removes
     /// only clean files whose hosted deletion matches the private baseline.
     #[arg(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["push", "resume_local_policy", "confirm_bulk"]
+        conflicts_with_all = [
+            "push",
+            "resume_local_policy",
+            "confirm_bulk",
+            "withdraw_from_hosting",
+            "withdraw_reason"
+        ]
     )]
     pub out: Option<String>,
 
@@ -1030,11 +1057,26 @@ pub struct SyncArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SyncAction {
+    /// Replace one mutable alias binding after reviewing the exact old and new
+    /// canonical brain ids. Canonical trust history is preserved.
+    Rebind(SyncRebindArgs),
+
     /// Resolve one exact private conflict bundle. This never acts as force.
     Resolve(SyncResolveArgs),
 
     /// Inspect or prune private conflict bundles.
     Conflicts(SyncConflictsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SyncRebindArgs {
+    /// Exact canonical brain ULID currently pinned for the alias.
+    #[arg(long, value_name = "OLD_BRAIN_ULID")]
+    pub from: String,
+
+    /// Exact canonical brain ULID the alias currently resolves to.
+    #[arg(long, value_name = "NEW_BRAIN_ULID")]
+    pub to: String,
 }
 
 #[derive(Debug, Args)]
@@ -1407,4 +1449,68 @@ pub struct KeyRotateArgs {
     /// hub mutation and reused unchanged for safe retry/reconciliation.
     #[arg(long, value_name = "FILE")]
     pub out: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OLD: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";
+    const NEW: &str = "01j5qc3v9k4ym8rwbn2tqe6f7e";
+
+    #[test]
+    fn sync_parses_exact_withdrawal_intent_and_reason() {
+        let cli = Cli::try_parse_from([
+            "dbmd",
+            "sync",
+            "company",
+            "--push",
+            "--withdraw-from-hosting",
+            "sources/private/a.md",
+            "--withdraw-from-hosting",
+            "assets/private.pdf",
+            "--withdraw-reason",
+            "approved retention change",
+        ])
+        .unwrap();
+        let Command::Sync(args) = cli.command else {
+            panic!("expected sync");
+        };
+        assert_eq!(
+            args.withdraw_from_hosting,
+            ["sources/private/a.md", "assets/private.pdf"]
+        );
+        assert_eq!(
+            args.withdraw_reason.as_deref(),
+            Some("approved retention change")
+        );
+    }
+
+    #[test]
+    fn sync_withdrawal_requires_a_reason() {
+        assert!(Cli::try_parse_from([
+            "dbmd",
+            "sync",
+            "company",
+            "--withdraw-from-hosting",
+            "sources/private/a.md",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn sync_parses_the_fail_closed_alias_rebind_shape() {
+        let cli = Cli::try_parse_from([
+            "dbmd", "sync", "company", "rebind", "--from", OLD, "--to", NEW,
+        ])
+        .unwrap();
+        let Command::Sync(args) = cli.command else {
+            panic!("expected sync");
+        };
+        let Some(SyncAction::Rebind(rebind)) = args.action else {
+            panic!("expected rebind");
+        };
+        assert_eq!(rebind.from, OLD);
+        assert_eq!(rebind.to, NEW);
+    }
 }
