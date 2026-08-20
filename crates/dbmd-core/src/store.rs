@@ -365,6 +365,23 @@ impl Store {
         crate::fsx::write_atomic_beneath(&self.root_capability, relative, bytes, true, true)
     }
 
+    /// Atomically replace private control/recovery material. Unix forces mode
+    /// 0600; Windows retains the current user's inherited ACL.
+    pub(crate) fn write_private_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::write_private_atomic_beneath(&self.root_capability, relative, bytes, false)
+    }
+
+    /// Atomically create private control/recovery material without replacement.
+    pub(crate) fn write_private_atomic_new(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        crate::fsx::write_private_atomic_beneath(&self.root_capability, relative, bytes, true)
+    }
+
     /// Atomically replace a derived/rebuildable file beneath the held store
     /// root without forcing it to stable storage.
     pub fn write_atomic_nondurable(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -448,6 +465,22 @@ impl Store {
     pub fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
         let relative = self.capability_relative(path)?;
         crate::fsx::open_directory_beneath(&self.root_capability, relative, true).map(drop)
+    }
+
+    /// Ensure a private recovery directory exists. Unix narrows the final
+    /// directory to 0700 even when an earlier interrupted run widened it.
+    pub(crate) fn create_private_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        let relative = self.capability_relative(path)?;
+        let directory = crate::fsx::open_directory_beneath(&self.root_capability, relative, true)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            directory.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Immediate visible child directory names, no-follow and nested-store

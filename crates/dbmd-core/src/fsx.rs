@@ -1715,7 +1715,21 @@ pub(crate) fn write_atomic_beneath(
     durable: bool,
 ) -> std::io::Result<()> {
     let (directory, leaf) = open_parent_beneath(root, relative, true)?;
-    write_atomic_at(directory, leaf, bytes, create_new, durable)
+    write_atomic_at(directory, leaf, bytes, create_new, durable, None)
+}
+
+/// Atomically install private control/recovery material beneath a held root.
+/// Unix creates the temporary inode at 0600 and forces the installed file back
+/// to 0600 even if an interrupted/manual operation widened the destination.
+#[cfg(unix)]
+pub(crate) fn write_private_atomic_beneath(
+    root: &File,
+    relative: &Path,
+    bytes: &[u8],
+    create_new: bool,
+) -> std::io::Result<()> {
+    let (directory, leaf) = open_parent_beneath(root, relative, true)?;
+    write_atomic_at(directory, leaf, bytes, create_new, true, Some(0o600))
 }
 
 #[cfg(windows)]
@@ -1729,6 +1743,18 @@ pub(crate) fn write_atomic_beneath(
     windows_fs::atomic_write_beneath(root, relative, bytes, create_new, durable)
 }
 
+#[cfg(windows)]
+pub(crate) fn write_private_atomic_beneath(
+    root: &File,
+    relative: &Path,
+    bytes: &[u8],
+    create_new: bool,
+) -> std::io::Result<()> {
+    // Windows has no POSIX mode; the secure no-follow writer inherits the
+    // current user's ACL from the private checkout directory.
+    windows_fs::atomic_write_beneath(root, relative, bytes, create_new, true)
+}
+
 /// Atomically replace a rebuildable file beneath a held root without forcing
 /// the bytes or directory entry to stable storage.
 #[cfg(unix)]
@@ -1738,7 +1764,7 @@ pub(crate) fn write_atomic_nondurable_beneath(
     bytes: &[u8],
 ) -> std::io::Result<()> {
     let (directory, leaf) = open_parent_beneath(root, relative, true)?;
-    write_atomic_at(directory, leaf, bytes, false, false)
+    write_atomic_at(directory, leaf, bytes, false, false, None)
 }
 
 #[cfg(windows)]
@@ -2150,6 +2176,16 @@ pub(crate) fn write_atomic_beneath(
     Err(secure_filesystem_unsupported())
 }
 
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn write_private_atomic_beneath(
+    _root: &File,
+    _relative: &Path,
+    _bytes: &[u8],
+    _create_new: bool,
+) -> std::io::Result<()> {
+    Err(secure_filesystem_unsupported())
+}
+
 #[cfg(unix)]
 pub(crate) fn rename_beneath(root: &File, old: &Path, new: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -2346,7 +2382,7 @@ fn write_atomic_unix(
     durable: bool,
 ) -> std::io::Result<()> {
     let (directory, leaf) = open_parent_unix(path, true)?;
-    write_atomic_at(directory, leaf, bytes, create_new, durable)
+    write_atomic_at(directory, leaf, bytes, create_new, durable, None)
 }
 
 #[cfg(unix)]
@@ -2356,6 +2392,7 @@ fn write_atomic_at(
     bytes: &[u8],
     create_new: bool,
     durable: bool,
+    exact_mode: Option<libc::mode_t>,
 ) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
@@ -2377,7 +2414,7 @@ fn write_atomic_at(
                 directory.as_raw_fd(),
                 name.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0o666,
+                exact_mode.unwrap_or(0o666) as libc::c_uint,
             )
         };
         if fd >= 0 {
@@ -2428,7 +2465,8 @@ fn write_atomic_at(
                 "refusing a symlink destination",
             ));
         }
-        if unsafe { libc::fchmod(file.as_raw_fd(), stat.st_mode & 0o7777) } != 0 {
+        let mode = exact_mode.unwrap_or(stat.st_mode & 0o7777);
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
             let error = std::io::Error::last_os_error();
             let _ = cleanup(&temp);
             return Err(error);
@@ -2438,6 +2476,13 @@ fn write_atomic_at(
         if error.kind() != std::io::ErrorKind::NotFound {
             let _ = cleanup(&temp);
             return Err(error);
+        }
+        if let Some(mode) = exact_mode {
+            if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = cleanup(&temp);
+                return Err(error);
+            }
         }
     }
     drop(file);

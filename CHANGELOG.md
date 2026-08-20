@@ -12,10 +12,25 @@ Two things version independently:
 
 ## Unreleased
 
-## [0.8.15] — 2026-08-19
+## [0.8.15] — 2026-08-20
 
 ### Fixed
 
+- Established v2 checkouts now install only the proven changed coordinates
+  through one cross-platform durable pull journal. A hard kill before the ready
+  barrier discards private staging; a kill after it either rolls back exact
+  verified preimages or accepts the already-durable new baseline. Journal and
+  backup files are private and atomic, and Unix narrows them to `0600` inside
+  `0700` recovery directories.
+- Bidirectional sync carries its already verified pull manifest and local view
+  into the push phase, moves rather than clones whole-brain maps, and applies
+  an accepted unrebased operation set to that authenticated manifest. A
+  five-file update no longer downloads or duplicates a 50,000-path manifest a
+  second time; rebased commits and server-assigned asset leaves still perform
+  the required authoritative refresh.
+- The established no-op path avoids a redundant full rescan while retaining
+  the final local/remote convergence barrier. An editor race is therefore
+  reported as local dirty and never mislabeled as synchronized.
 - Bidirectional v2 sync now applies one true three-way merge rule to content
   files and asset records before installing a pull. A local-only add, edit, or
   deletion survives the pull half and reaches the incremental push; a
