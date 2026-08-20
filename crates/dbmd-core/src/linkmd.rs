@@ -3402,16 +3402,106 @@ fn v2_asset_record(asset: &V2BaselineAsset, path: &str) -> crate::AssetRecord {
     }
 }
 
-fn v2_asset_manifest_bytes(
-    assets: &std::collections::BTreeMap<String, V2BaselineAsset>,
+fn v2_asset_record_manifest_bytes(
+    assets: &std::collections::BTreeMap<String, crate::AssetRecord>,
 ) -> LinkResult<Vec<u8>> {
     let mut bytes = Vec::new();
     for (path, asset) in assets {
-        serde_json::to_writer(&mut bytes, &v2_asset_record(asset, path))
-            .map_err(|_| invalid_feed("could not materialize v2 assets.jsonl"))?;
+        if asset.path != *path {
+            return Err(invalid_feed(
+                "local asset manifest key differs from its record path",
+            ));
+        }
+        serde_json::to_writer(&mut bytes, asset)
+            .map_err(|_| invalid_feed("could not materialize merged v2 assets.jsonl"))?;
         bytes.push(b'\n');
     }
     Ok(bytes)
+}
+
+fn v2_local_asset_records(
+    store: &Store,
+) -> LinkResult<std::collections::BTreeMap<String, crate::AssetRecord>> {
+    Ok(crate::assets::read_manifest(store)
+        .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?
+        .into_iter()
+        .map(|asset| (asset.path.clone(), asset))
+        .collect())
+}
+
+fn v2_asset_records_match_remote(
+    local: &std::collections::BTreeMap<String, crate::AssetRecord>,
+    remote: &std::collections::BTreeMap<String, V2BaselineAsset>,
+) -> bool {
+    local.len() == remote.len()
+        && remote
+            .iter()
+            .all(|(path, asset)| local.get(path) == Some(&v2_asset_record(asset, path)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V2PulledMerge<T> {
+    records: std::collections::BTreeMap<String, T>,
+    accept_remote: std::collections::BTreeSet<String>,
+    conflicts: Vec<String>,
+}
+
+/// Compute the local checkout that a pull may install without discarding a
+/// local-only edit. Remote-only changes are accepted, identical concurrent
+/// changes converge, and divergent concurrent changes are reported. The
+/// caller can exempt kept-home coordinates from both remote installation and
+/// conflict disclosure.
+fn merge_v2_pulled_records<Base, Remote, Record, BaseRecord, RemoteRecord, KeepLocal>(
+    base: &std::collections::BTreeMap<String, Base>,
+    remote: &std::collections::BTreeMap<String, Remote>,
+    local: &std::collections::BTreeMap<String, Record>,
+    base_record: BaseRecord,
+    remote_record: RemoteRecord,
+    keep_local: KeepLocal,
+) -> V2PulledMerge<Record>
+where
+    Record: Clone + Eq,
+    BaseRecord: Fn(&Base, &str) -> Record,
+    RemoteRecord: Fn(&Remote, &str) -> Record,
+    KeepLocal: Fn(&str) -> bool,
+{
+    let paths = base
+        .keys()
+        .chain(remote.keys())
+        .chain(local.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut records = local.clone();
+    let mut accept_remote = std::collections::BTreeSet::new();
+    let mut conflicts = Vec::new();
+    for path in paths {
+        if keep_local(&path) {
+            continue;
+        }
+        let base_value = base.get(&path).map(|value| base_record(value, &path));
+        let remote_value = remote.get(&path).map(|value| remote_record(value, &path));
+        let local_value = local.get(&path).cloned();
+        if local_value != base_value && remote_value != base_value && local_value != remote_value {
+            conflicts.push(path);
+            continue;
+        }
+        if local_value == base_value || local_value == remote_value {
+            accept_remote.insert(path.clone());
+            match remote_value {
+                Some(value) => {
+                    records.insert(path, value);
+                }
+                None => {
+                    records.remove(&path);
+                }
+            }
+        }
+    }
+    V2PulledMerge {
+        records,
+        accept_remote,
+        conflicts,
+    }
 }
 
 fn sign_verified_v2_candidate(
@@ -5486,34 +5576,19 @@ fn v2_sync_pull(
         .unwrap_or_default();
     let local_assets = local_store
         .as_ref()
-        .map(|store| {
-            crate::assets::read_manifest(store)
-                .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))
-        })
+        .map(v2_local_asset_records)
         .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|asset| (asset.path.clone(), asset))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let all_paths = base
-        .keys()
-        .chain(remote.keys())
-        .chain(local.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut conflicts = Vec::new();
-    for path in &all_paths {
-        if kept_home(path) {
-            continue;
-        }
-        let base_hash = base.get(path).map(|file| file.sha256.as_str());
-        let remote_hash = remote.get(path).map(|file| file.sha256.as_str());
-        let local_hash = local.get(path).map(|file| file.0.as_str());
-        if local_hash != base_hash && remote_hash != base_hash && local_hash != remote_hash {
-            conflicts.push(path.clone());
-        }
-    }
-    if !conflicts.is_empty() {
+        .unwrap_or_default();
+    let content_merge = merge_v2_pulled_records(
+        &base,
+        &remote,
+        &local,
+        |file, _| (file.sha256.clone(), file.bytes),
+        |file, _| (file.sha256.clone(), file.bytes),
+        kept_home,
+    );
+    if !content_merge.conflicts.is_empty() {
+        let mut conflicts = content_merge.conflicts.clone();
         conflicts.truncate(100);
         if let Some(store) = local_store.as_ref() {
             let (bundle, paths) = create_v2_conflict_bundle(
@@ -5529,28 +5604,16 @@ fn v2_sync_pull(
         }
         return Err(LinkError::Conflict { paths: conflicts });
     }
-    let asset_paths = base_assets
-        .keys()
-        .chain(remote_assets.keys())
-        .chain(local_assets.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    for path in &asset_paths {
-        let base_record = base_assets
-            .get(path)
-            .map(|asset| v2_asset_record(asset, path));
-        let remote_record = remote_assets
-            .get(path)
-            .map(|asset| v2_asset_record(asset, path));
-        let local_record = local_assets.get(path).cloned();
-        if local_record != base_record
-            && remote_record != base_record
-            && local_record != remote_record
-        {
-            conflicts.push(path.clone());
-        }
-    }
-    if !conflicts.is_empty() {
+    let asset_merge = merge_v2_pulled_records(
+        &base_assets,
+        &remote_assets,
+        &local_assets,
+        v2_asset_record,
+        v2_asset_record,
+        |_| false,
+    );
+    if !asset_merge.conflicts.is_empty() {
+        let mut conflicts = asset_merge.conflicts.clone();
         conflicts.truncate(100);
         return Err(LinkError::Conflict { paths: conflicts });
     }
@@ -5568,7 +5631,7 @@ fn v2_sync_pull(
             remote
                 .iter()
                 .filter(|(path, file)| {
-                    !kept_home(path)
+                    content_merge.accept_remote.contains(*path)
                         && local.get(*path).map(|value| value.0.as_str())
                             != Some(file.sha256.as_str())
                 })
@@ -5576,25 +5639,17 @@ fn v2_sync_pull(
         )?,
         None => Vec::new(),
     };
-    let mut deleted = base
+    let mut deleted = content_merge
+        .accept_remote
         .iter()
-        .filter(|(path, file)| {
-            !remote.contains_key(*path)
-                && !kept_home(path)
-                && local.get(*path).map(|value| value.0.as_str()) == Some(file.sha256.as_str())
-        })
-        .map(|(path, _)| path.clone())
+        .filter(|path| !remote.contains_key(*path) && local.contains_key(*path))
+        .cloned()
         .collect::<Vec<_>>();
-    if local_assets
-        != remote_assets
-            .iter()
-            .map(|(path, asset)| (path.clone(), v2_asset_record(asset, path)))
-            .collect()
-    {
-        if remote_assets.is_empty() {
+    if local_assets != asset_merge.records {
+        if asset_merge.records.is_empty() {
             deleted.push("assets.jsonl".to_string());
         } else {
-            let bytes = v2_asset_manifest_bytes(&remote_assets)?;
+            let bytes = v2_asset_record_manifest_bytes(&asset_merge.records)?;
             let sha256 = content_sha256(&bytes);
             let source = cache_v2_blob_bytes(&cache_dir, &sha256, bytes.len() as u64, &bytes)?;
             changed.push(V2StagedFile {
@@ -5608,7 +5663,10 @@ fn v2_sync_pull(
     if let Some(pointer) = pointer {
         let mut pending_assets = Vec::new();
         for (path, asset) in &remote_assets {
-            if asset.disposition != "hosted" || kept_home(path) {
+            if asset.disposition != "hosted"
+                || kept_home(path)
+                || !asset_merge.accept_remote.contains(path)
+            {
                 continue;
             }
             let already_current = local_store.as_ref().is_some_and(|store| {
@@ -5637,7 +5695,10 @@ fn v2_sync_pull(
         }
     }
     for (path, prior) in &base_assets {
-        if remote_assets.contains_key(path) || kept_home(path) {
+        if remote_assets.contains_key(path)
+            || kept_home(path)
+            || !asset_merge.accept_remote.contains(path)
+        {
             continue;
         }
         let unchanged = local_store.as_ref().is_some_and(|store| {
@@ -5651,9 +5712,10 @@ fn v2_sync_pull(
             deleted.push(path.clone());
         }
     }
-    let extra_local = local
+    let extra_local = content_merge
+        .records
         .keys()
-        .filter(|path| !remote.contains_key(*path) && !deleted.contains(path))
+        .filter(|path| !remote.contains_key(*path))
         .cloned()
         .collect::<Vec<_>>();
     if head.view_kind == "scoped" {
@@ -5682,20 +5744,19 @@ fn v2_sync_pull(
             })?;
         let mut installed_local = v2_local_files(&installed_store)?;
         remove_scoped_projection(&head, baseline.as_ref(), &mut installed_local)?;
-        let mut expected_local = local.clone();
-        for (path, file) in &remote {
-            if !kept_home(path) {
-                expected_local.insert(path.clone(), (file.sha256.clone(), file.bytes));
-            }
+        if installed_local.riding != content_merge.records {
+            return Err(LinkError::InvalidPack {
+                message: "local content changed while installing the v2 pull".to_string(),
+            });
         }
-        for path in &deleted {
-            expected_local.remove(path);
+        let installed_assets = v2_local_asset_records(&installed_store)?;
+        if installed_assets != asset_merge.records {
+            return Err(LinkError::InvalidPack {
+                message: "local assets changed while installing the v2 pull".to_string(),
+            });
         }
-        let local_dirty = installed_local.riding.iter().any(|(path, (hash, _))| {
-            expected_local.get(path).map(|expected| &expected.0) != Some(hash)
-        }) || expected_local.iter().any(|(path, (hash, _))| {
-            installed_local.riding.get(path).map(|actual| &actual.0) != Some(hash)
-        });
+        let local_dirty = !v2_riding_matches_remote(&installed_local.riding, &remote, kept_home)
+            || !v2_asset_records_match_remote(&installed_assets, &remote_assets);
         let final_head = v2_verified_head(cfg, requested_brain)?
             .ok_or_else(|| invalid_feed("v2 head disappeared during pull"))?;
         if !same_v2_head(&head, &final_head) {
@@ -5898,11 +5959,7 @@ fn v2_sync_push(
     let mut local_view = v2_local_files(store)?;
     remove_scoped_projection(&head, baseline.as_ref(), &mut local_view)?;
     let local = &local_view.riding;
-    let local_assets = crate::assets::read_manifest(store)
-        .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?
-        .into_iter()
-        .map(|asset| (asset.path.clone(), asset))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let local_assets = v2_local_asset_records(store)?;
     if let Some(previous) = baseline.as_ref() {
         if previous.local_policy_digest.as_deref() != Some(&local_view.policy.digest)
             && !resume_local_policy
@@ -6125,10 +6182,11 @@ fn v2_sync_push(
         }
         let mut final_local = v2_local_files(store)?;
         remove_scoped_projection(&head, baseline.as_ref(), &mut final_local)?;
-        let local_changed = final_local.riding != local_view.riding;
+        let final_assets = v2_local_asset_records(store)?;
+        let local_changed = final_local.riding != local_view.riding || final_assets != local_assets;
         let remote_ahead = !v2_riding_matches_remote(&final_local.riding, &remote, |path| {
             final_local.policy.keeps_home(path)
-        });
+        }) || !v2_asset_records_match_remote(&final_assets, &remote_assets);
         let next = v2_baseline_from_head(cfg, &head, remote, remote_assets, Some(&final_local))?;
         let split_count = next.remote_copy_remains.len();
         accept_v2_head(cfg, &final_head)?;
@@ -6545,10 +6603,13 @@ fn v2_sync_push(
     let refreshed_assets = v2_asset_manifest(cfg, &refreshed.brain_id, refreshed.pointer.as_ref())?;
     let mut final_local = v2_local_files(store)?;
     remove_scoped_projection(&refreshed, baseline.as_ref(), &mut final_local)?;
+    let final_assets = v2_local_asset_records(store)?;
     let local_dirty = final_local.riding != local_view.riding
         || !v2_riding_matches_remote(&final_local.riding, &refreshed_files, |path| {
             final_local.policy.keeps_home(path)
-        });
+        })
+        || final_assets != local_assets
+        || !v2_asset_records_match_remote(&final_assets, &refreshed_assets);
     let next = v2_baseline_from_head(
         cfg,
         &refreshed,
@@ -12305,6 +12366,92 @@ mod tests {
     use super::*;
 
     const TEST_BRAIN_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";
+
+    fn merge_fixture(
+        base: Option<&str>,
+        remote: Option<&str>,
+        local: Option<&str>,
+        keep_local: bool,
+    ) -> V2PulledMerge<String> {
+        let map = |value: Option<&str>| {
+            value
+                .map(|value| [("records/a.md".to_string(), value.to_string())])
+                .into_iter()
+                .flatten()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        merge_v2_pulled_records(
+            &map(base),
+            &map(remote),
+            &map(local),
+            |value, _| value.clone(),
+            |value, _| value.clone(),
+            |_| keep_local,
+        )
+    }
+
+    #[test]
+    fn v2_pull_three_way_merge_never_discards_a_local_only_change() {
+        let path = "records/a.md".to_string();
+
+        let local_add = merge_fixture(None, None, Some("local"), false);
+        assert_eq!(
+            local_add.records.get(&path).map(String::as_str),
+            Some("local")
+        );
+        assert!(local_add.accept_remote.is_empty());
+        assert!(local_add.conflicts.is_empty());
+
+        let local_edit = merge_fixture(Some("old"), Some("old"), Some("local"), false);
+        assert_eq!(
+            local_edit.records.get(&path).map(String::as_str),
+            Some("local")
+        );
+        assert!(local_edit.accept_remote.is_empty());
+        assert!(local_edit.conflicts.is_empty());
+
+        let local_delete = merge_fixture(Some("old"), Some("old"), None, false);
+        assert!(!local_delete.records.contains_key(&path));
+        assert!(local_delete.accept_remote.is_empty());
+        assert!(local_delete.conflicts.is_empty());
+
+        let remote_edit = merge_fixture(Some("old"), Some("remote"), Some("old"), false);
+        assert_eq!(
+            remote_edit.records.get(&path).map(String::as_str),
+            Some("remote")
+        );
+        assert!(remote_edit.accept_remote.contains(&path));
+        assert!(remote_edit.conflicts.is_empty());
+
+        let remote_delete = merge_fixture(Some("old"), None, Some("old"), false);
+        assert!(!remote_delete.records.contains_key(&path));
+        assert!(remote_delete.accept_remote.contains(&path));
+        assert!(remote_delete.conflicts.is_empty());
+
+        let same_edit = merge_fixture(Some("old"), Some("same"), Some("same"), false);
+        assert_eq!(
+            same_edit.records.get(&path).map(String::as_str),
+            Some("same")
+        );
+        assert!(same_edit.accept_remote.contains(&path));
+        assert!(same_edit.conflicts.is_empty());
+
+        let conflict = merge_fixture(Some("old"), Some("remote"), Some("local"), false);
+        assert_eq!(conflict.conflicts, vec![path.clone()]);
+        assert_eq!(
+            conflict.records.get(&path).map(String::as_str),
+            Some("local")
+        );
+        assert!(conflict.accept_remote.is_empty());
+
+        let kept_home = merge_fixture(Some("old"), Some("remote"), Some("local"), true);
+        assert_eq!(
+            kept_home.records.get(&path).map(String::as_str),
+            Some("local")
+        );
+        assert!(kept_home.accept_remote.is_empty());
+        assert!(kept_home.conflicts.is_empty());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

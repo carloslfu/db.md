@@ -8,9 +8,23 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.14**.
+  `Cargo.toml`, currently **v0.8.15**.
 
 ## Unreleased
+
+## [0.8.15] — 2026-08-19
+
+### Fixed
+
+- Bidirectional v2 sync now applies one true three-way merge rule to content
+  files and asset records before installing a pull. A local-only add, edit, or
+  deletion survives the pull half and reaches the incremental push; a
+  remote-only change installs; identical concurrent changes converge; and
+  divergent concurrent changes refuse without modifying either side.
+- Pulls no longer replace a locally changed `assets.jsonl` with the remote
+  catalog or overwrite/delete its raw asset bytes. Post-install and
+  post-commit barriers now include asset records when deciding whether a
+  checkout is clean enough to advance its verified baseline.
 
 ## [0.8.14] — 2026-08-19
 
