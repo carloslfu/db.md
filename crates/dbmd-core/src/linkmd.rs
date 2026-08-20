@@ -2303,6 +2303,8 @@ struct V2HeadResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct V2HeadView {
     kind: String,
+    #[serde(default)]
+    id: Option<String>,
     control_revision: String,
 }
 
@@ -2311,7 +2313,10 @@ struct V2VerifiedHead {
     requested: String,
     brain_id: String,
     view_kind: String,
+    /// Stable identity of the exact current-content path projection.
     view_revision: String,
+    /// Use-time authority revision independently bound into writes/signatures.
+    control_revision: String,
     identity: V2HeadIdentity,
     pointer: Option<V2PointerBody>,
     trust: TrustState,
@@ -2899,11 +2904,20 @@ fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2Verifie
         .view
         .as_ref()
         .ok_or_else(|| invalid_feed("v2 head has no permission view"))?;
-    if !matches!(view.kind.as_str(), "full" | "scoped") || !is_sha256(&view.control_revision) {
+    if !matches!(view.kind.as_str(), "full" | "scoped")
+        || !is_sha256(&view.control_revision)
+        || view.id.as_deref().is_some_and(|id| !is_sha256(id))
+    {
         return Err(invalid_feed("v2 head has an invalid permission view"));
     }
     let view_kind = view.kind.clone();
-    let view_revision = view.control_revision.clone();
+    // `id` is the stable materialized namespace. Older v2 hubs did not expose
+    // it, so retain the fail-closed control-revision fallback for compatibility.
+    let view_revision = view
+        .id
+        .clone()
+        .unwrap_or_else(|| view.control_revision.clone());
+    let control_revision = view.control_revision.clone();
     let identity = head
         .identity
         .as_ref()
@@ -2977,6 +2991,7 @@ fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2Verifie
         brain_id: head.brain_id,
         view_kind,
         view_revision,
+        control_revision,
         identity: identity.clone(),
         pointer: head.pointer.map(|signed| signed.pointer),
         trust,
@@ -3897,7 +3912,7 @@ fn sign_verified_v2_candidate(
             .get("candidate")
             .and_then(|candidate| candidate.get("control_revision"))
             .and_then(Value::as_str)
-            != Some(head.view_revision.as_str())
+            != Some(head.control_revision.as_str())
         || !impact_is_valid
     {
         return Err(invalid_feed(
@@ -3962,7 +3977,7 @@ fn sign_verified_v2_candidate(
         || signing_value
             .get("control_revision")
             .and_then(Value::as_str)
-            != Some(head.view_revision.as_str())
+            != Some(head.control_revision.as_str())
         || signing_value.get("prev_entry_hash") != Some(&expected_prev_entry)
         || signing_value.get("v1_bridge") != Some(&Value::Null)
         || signing_value.get("op").and_then(Value::as_str) != Some("changeset")
@@ -4011,6 +4026,7 @@ fn same_v2_head(left: &V2VerifiedHead, right: &V2VerifiedHead) -> bool {
     left.brain_id == right.brain_id
         && left.view_kind == right.view_kind
         && left.view_revision == right.view_revision
+        && left.control_revision == right.control_revision
         && match (&left.pointer, &right.pointer) {
             (None, None) => true,
             (Some(left), Some(right)) => {
@@ -9707,7 +9723,7 @@ pub fn proposal_reject(
     let _ = verified_v2_proposal(cfg, &head, proposal_id)?;
     let body = json!({
         "mutation_id": mutation_id,
-        "control_revision": head.view_revision,
+        "control_revision": head.control_revision,
         "reason": reason,
     });
     let path = format!(
@@ -14815,6 +14831,7 @@ mod tests {
             brain_id: TEST_BRAIN_ID.to_string(),
             view_kind: "scoped".to_string(),
             view_revision: revision.to_string(),
+            control_revision: revision.to_string(),
             identity: V2HeadIdentity {
                 custody: "hub".to_string(),
                 fingerprint: "test".to_string(),
@@ -14913,6 +14930,11 @@ mod tests {
             ensure_v2_view_compatible(&changed, Some(&baseline)),
             Err(LinkError::ScopedViewChanged)
         ));
+
+        let mut same_view_new_control = head.clone();
+        same_view_new_control.control_revision = "c".repeat(64);
+        assert!(ensure_v2_view_compatible(&same_view_new_control, Some(&baseline)).is_ok());
+        assert!(!same_v2_head(&head, &same_view_new_control));
     }
 
     #[test]
