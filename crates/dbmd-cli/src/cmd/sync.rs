@@ -124,19 +124,17 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
     } else if args.pull_only {
         let destination = (strict_store_open || established_v2).then_some(args.dir.as_str());
         pull(ctx, &cfg, brain, destination)
+    } else if strict_store_open || established_v2 {
+        converge(
+            ctx,
+            &cfg,
+            brain,
+            &args.dir,
+            args.resume_local_policy,
+            bulk_confirmation.as_ref(),
+        )
     } else {
-        if strict_store_open || established_v2 {
-            converge(
-                ctx,
-                &cfg,
-                brain,
-                &args.dir,
-                args.resume_local_policy,
-                bulk_confirmation.as_ref(),
-            )
-        } else {
-            pull(ctx, &cfg, brain, args.out.as_deref())
-        }
+        pull(ctx, &cfg, brain, args.out.as_deref())
     }
 }
 
