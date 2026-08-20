@@ -209,6 +209,14 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
                     Some("authorization_refused") => {
                         CliError::new(ExitCode::Policy, "AUTHORIZATION_REFUSED", message)
                     }
+                    Some("source_coordinate_used") => CliError::new(
+                        ExitCode::Policy,
+                        "SOURCE_COORDINATE_USED",
+                        message,
+                    )
+                    .with_hint(
+                        "restore the exact historical source coordinate; do not re-append it as new evidence",
+                    ),
                     Some("v1_migration_required") => {
                         CliError::new(ExitCode::Policy, "V1_MIGRATION_REQUIRED", message)
                             .with_hint("an owner or brain administrator must complete the explicit v2 migration")
@@ -333,6 +341,20 @@ mod tests {
         assert_eq!(error.code, "VALIDATION_REFUSED");
         assert_eq!(error.to_json()["error"]["details"], details);
         assert!(error.hint.as_deref().unwrap().contains("error.details"));
+    }
+
+    #[test]
+    fn withdrawn_source_reuse_is_a_typed_policy_refusal() {
+        let error = CliError::from(dbmd_core::linkmd::LinkError::Http {
+            what: "v2 sync",
+            status: 409,
+            message: "a withdrawn source coordinate may only be restored from exact history".into(),
+            code: Some("source_coordinate_used".into()),
+            details: None,
+        });
+        assert_eq!(error.exit, ExitCode::Policy);
+        assert_eq!(error.code, "SOURCE_COORDINATE_USED");
+        assert!(error.hint.as_deref().unwrap().contains("exact historical"));
     }
 
     #[test]

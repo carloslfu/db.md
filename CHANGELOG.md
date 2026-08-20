@@ -37,6 +37,9 @@ Two things version independently:
   their exact bytes.
 - Secret-vault adoption resolves and verifies the exact current source before
   deciding whether an immutable-source rewrite is required.
+- Reusing a withdrawn immutable-source coordinate is surfaced as the typed
+  `SOURCE_COORDINATE_USED` policy refusal with an exact-history restore hint,
+  rather than a generic hub error.
 - Large-sync write controls are grouped without weakening the workspace's
   strict Clippy policy.
 
