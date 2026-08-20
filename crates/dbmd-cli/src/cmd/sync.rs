@@ -106,6 +106,10 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
         .map(linkmd::V2BulkConfirmation::parse)
         .transpose()?;
 
+    let checkout = Path::new(&args.dir);
+    let strict_store_open = Store::open_strict(checkout).is_ok();
+    let established_v2 = !strict_store_open && linkmd::has_v2_sync_baseline(&cfg, brain, checkout)?;
+
     if args.push {
         push(
             ctx,
@@ -115,19 +119,24 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
             args.resume_local_policy,
             bulk_confirmation.as_ref(),
         )
-    } else if args.pull_only || args.out.is_some() {
+    } else if args.out.is_some() {
         pull(ctx, &cfg, brain, args.out.as_deref())
-    } else if Store::open_strict(Path::new(&args.dir)).is_ok() {
-        converge(
-            ctx,
-            &cfg,
-            brain,
-            &args.dir,
-            args.resume_local_policy,
-            bulk_confirmation.as_ref(),
-        )
+    } else if args.pull_only {
+        let destination = (strict_store_open || established_v2).then_some(args.dir.as_str());
+        pull(ctx, &cfg, brain, destination)
     } else {
-        pull(ctx, &cfg, brain, args.out.as_deref())
+        if strict_store_open || established_v2 {
+            converge(
+                ctx,
+                &cfg,
+                brain,
+                &args.dir,
+                args.resume_local_policy,
+                bulk_confirmation.as_ref(),
+            )
+        } else {
+            pull(ctx, &cfg, brain, args.out.as_deref())
+        }
     }
 }
 

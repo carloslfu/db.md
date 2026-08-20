@@ -33,6 +33,16 @@ Two things version independently:
   to its proof in the current signed manifest before downloading or installing
   bytes. Conflict-bundle metadata can no longer lose the bulk-stream inclusion
   proof required by the verifier.
+- An established v2 checkout whose `DB.md` is edited, removed, or malformed is
+  no longer reinterpreted as an empty clone destination. In particular, editing
+  a scoped checkout's generated `DB.md` fails closed with
+  `SCOPED_PROJECTION_MODIFIED` instead of letting the pull half erase the local
+  evidence before permission enforcement, and CLI dispatch no longer ignores
+  the accepted checkout path to report a successful default clone elsewhere.
+- `dbmd sync --pull-only --dir <checkout>` now installs into that established
+  checkout. It no longer ignores `--dir` and writes a second copy under the
+  brain's default slug; an explicit `--out` remains the authoritative clone
+  destination.
 - Windows now treats native closed-pipe error 109 as the same clean consumer
   exit as Unix `EPIPE`. The Windows release smoke builds a minimal valid store
   through the supported file contract instead of invoking a nonexistent

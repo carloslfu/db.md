@@ -1021,8 +1021,9 @@ pub struct SyncArgs {
     #[arg(long, value_name = "URL")]
     pub hub: Option<String>,
 
-    /// Store root: the push source, and where `.dbmd/config` is read from.
-    /// Defaults to the current directory.
+    /// Store root: the push/convergence source, the pull-only destination for
+    /// an established checkout, and where `.dbmd/config` is read from. Defaults
+    /// to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub dir: String,
 }

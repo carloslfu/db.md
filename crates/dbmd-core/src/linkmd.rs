@@ -4121,6 +4121,22 @@ fn ensure_v2_view_compatible(
     }
 }
 
+fn ensure_established_v2_checkout_opened(
+    head: &V2VerifiedHead,
+    baseline: Option<&V2SyncBaseline>,
+    opened: bool,
+) -> LinkResult<()> {
+    if baseline.is_none() || opened {
+        return Ok(());
+    }
+    if head.view_kind == "scoped" {
+        return Err(LinkError::ScopedProjectionModified);
+    }
+    Err(LinkError::InvalidPack {
+        message: "the established v2 checkout is no longer a valid db.md store; repair its DB.md before syncing".to_string(),
+    })
+}
+
 fn remove_scoped_projection(
     head: &V2VerifiedHead,
     baseline: Option<&V2SyncBaseline>,
@@ -5599,6 +5615,11 @@ fn v2_sync_pull(
     let baseline = load_v2_baseline(cfg, &head.brain_id, &dest)?;
     ensure_v2_view_compatible(&head, baseline.as_ref())?;
     let local_store = Store::open_strict(&dest).ok();
+    // A baseline proves this path is an established checkout. Never reinterpret
+    // a damaged/edited store marker as an empty clone destination: doing so
+    // would let the pull half erase the local evidence before the push half can
+    // reject it (most importantly for the generated scoped-view DB.md).
+    ensure_established_v2_checkout_opened(&head, baseline.as_ref(), local_store.is_some())?;
     let mut local_view = local_store.as_ref().map(v2_local_files).transpose()?;
     if head.view_kind == "scoped" && baseline.is_none() && local_view.is_some() {
         return Err(LinkError::ScopedViewChanged);
@@ -6741,6 +6762,14 @@ pub fn sync_push_incremental_with_options(
         );
     }
     legacy_sync_push_incremental(cfg, brain, store, resume_local_policy, bulk_confirmation)
+}
+
+/// Whether this exact hub/brain/path coordinate has an accepted v2 sync
+/// baseline. CLI dispatch uses this to keep checkout identity sticky even when
+/// a damaged `DB.md` makes strict store-open fail.
+pub fn has_v2_sync_baseline(cfg: &HubConfig, brain: &str, checkout: &Path) -> LinkResult<bool> {
+    require_safe_ref(brain)?;
+    Ok(load_v2_baseline(cfg, brain, checkout)?.is_some())
 }
 
 #[cfg(windows)]
@@ -14884,6 +14913,31 @@ mod tests {
             ensure_v2_view_compatible(&changed, Some(&baseline)),
             Err(LinkError::ScopedViewChanged)
         ));
+    }
+
+    #[test]
+    fn established_checkout_never_becomes_an_empty_clone_when_db_md_is_invalid() {
+        let scoped = scoped_test_head(&"a".repeat(64));
+        let scoped_baseline = scoped_test_baseline(&"a".repeat(64));
+        assert!(matches!(
+            ensure_established_v2_checkout_opened(&scoped, Some(&scoped_baseline), false),
+            Err(LinkError::ScopedProjectionModified)
+        ));
+
+        let mut full = scoped.clone();
+        full.view_kind = "full".to_string();
+        let mut full_baseline = scoped_baseline.clone();
+        full_baseline.view_kind = Some("full".to_string());
+        full_baseline.projection_sha256 = None;
+        assert!(matches!(
+            ensure_established_v2_checkout_opened(&full, Some(&full_baseline), false),
+            Err(LinkError::InvalidPack { .. })
+        ));
+
+        assert!(ensure_established_v2_checkout_opened(&scoped, None, false).is_ok());
+        assert!(
+            ensure_established_v2_checkout_opened(&scoped, Some(&scoped_baseline), true).is_ok()
+        );
     }
 
     #[test]
