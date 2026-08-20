@@ -480,6 +480,8 @@ impl Store {
             }
             directory.sync_all()?;
         }
+        #[cfg(not(unix))]
+        drop(directory);
         Ok(())
     }
 
