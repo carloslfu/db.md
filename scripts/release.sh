@@ -117,6 +117,9 @@ test -d "$release_git_dir" ||
 # the exact-source scratch tree private and invisible inside .git instead.
 release_tmp="$(mktemp -d "$release_git_dir/dbmd-release.XXXXXXXX")"
 chmod 700 "$release_tmp"
+xwin_dir="$release_tmp/cargo-xwin"
+llvm_dir="$release_tmp/llvm-mingw"
+xwin_cache_dir="$release_tmp/xwin-cache"
 cleanup() {
     cleanup_status=$?
     trap - EXIT
@@ -148,7 +151,8 @@ preflight_release_builder() {
     )
     rustup target add \
         --toolchain "$RUST_TOOLCHAIN" \
-        x86_64-apple-darwin aarch64-apple-darwin >/dev/null
+        x86_64-apple-darwin aarch64-apple-darwin \
+        x86_64-pc-windows-msvc >/dev/null
     rustup toolchain install "$LINUX_RUST_TOOLCHAIN" \
         --profile minimal --force-non-host >/dev/null
 
@@ -165,6 +169,20 @@ preflight_release_builder() {
                 --format '{{.Architecture}}' "$builder_image"
         )" = amd64 || die "Linux builder image is not linux/amd64: $builder_image"
     done
+
+    xwin_archive="$release_tmp/cargo-xwin.tar.gz"
+    curl -fsSL \
+        https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.0/cargo-xwin-v0.23.0.universal2-apple-darwin.tar.gz \
+        -o "$xwin_archive"
+    printf '%s  %s\n' \
+        d78a88f43247a6298d8888dc4c44a8af92801fdf4e5374cc5a359a1e53770993 \
+        "$xwin_archive" |
+        shasum -a 256 -c - >/dev/null
+    mkdir -m 0700 "$xwin_dir"
+    tar -xzf "$xwin_archive" -C "$xwin_dir"
+    test "$("$xwin_dir/cargo-xwin" --version)" = "cargo-xwin 0.23.0" ||
+        die "digest-verified cargo-xwin reported an unexpected version"
+    "$release_source/scripts/install-pinned-llvm.sh" "$llvm_dir" >/dev/null
 }
 
 preflight_release_builder
@@ -346,11 +364,12 @@ rebuild_and_compare() {
         darwin-x86_64 \
         darwin-aarch64 \
         linux-x86_64-musl \
-        linux-aarch64-musl; do
+        linux-aarch64-musl \
+        windows-x86_64; do
         mkdir -p "$ci_dir/$target_name"
         gh run download "$run_id" \
             --repo "$SOURCE_REPO" \
-            --name "tarball-${target_name}" \
+            --name "release-asset-${target_name}" \
             --dir "$ci_dir/$target_name"
     done
 
@@ -388,6 +407,25 @@ rebuild_and_compare() {
             target_dir="$rebuilt_dir/$rust_target"
             build_linux_release_target "$rust_target" "$target_dir"
         done
+
+        windows_target_dir="$rebuilt_dir/x86_64-pc-windows-msvc"
+        windows_rustflags="--remap-path-prefix=${release_source}=/dbmd-source --remap-path-prefix=${cargo_home}=/dbmd-cargo -C link-arg=/Brepro -C link-arg=/debug:none"
+        PATH="$llvm_dir/bin:$PATH" \
+        RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" \
+        RUSTFLAGS="$windows_rustflags" \
+        SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$source_sha")" \
+        XWIN_CACHE_DIR="$xwin_cache_dir" \
+            "$xwin_dir/cargo-xwin" xwin build \
+                --release --locked --target x86_64-pc-windows-msvc \
+                --target-dir "$windows_target_dir" -p dbmd-cli \
+                --xwin-version 17 \
+                --xwin-sdk-version 10.0.26100 \
+                --xwin-crt-version 14.44.17.14
+        windows_binary="$windows_target_dir/x86_64-pc-windows-msvc/release/dbmd.exe"
+        if LC_ALL=C grep -aFq "$release_source" "$windows_binary" ||
+            LC_ALL=C grep -aFq "$cargo_home" "$windows_binary"; then
+            die "Windows rebuild retained a builder-specific source path"
+        fi
     )
 
     compare_target() {
@@ -409,7 +447,11 @@ rebuild_and_compare() {
     compare_target darwin-aarch64 aarch64-apple-darwin
     compare_target linux-x86_64-musl x86_64-unknown-linux-musl
     compare_target linux-aarch64-musl aarch64-unknown-linux-musl
-    printf 'Independent rebuild matched all four CI binaries byte-for-byte.\n'
+    cmp \
+        "$rebuilt_dir/x86_64-pc-windows-msvc/x86_64-pc-windows-msvc/release/dbmd.exe" \
+        "$ci_dir/windows-x86_64/dbmd-${version}-windows-x86_64.exe" >/dev/null ||
+        die "independent rebuild differs for windows-x86_64"
+    printf 'Independent rebuild matched all five CI binaries byte-for-byte.\n'
 }
 
 pending_record="$(wait_for_pending_approval || true)"
@@ -430,7 +472,7 @@ case "$artifact_state" in
 esac
 # This comparison is unconditional. A fresh pending approval, a manually
 # approved run, a completed/resumed run, and a rerun all pass through the same
-# independent four-target rebuild before any permanent-channel convergence.
+# independent five-target rebuild before any permanent-channel convergence.
 can_approve=""
 if [ -n "$pending_record" ]; then
     IFS="$(printf '\t')" read -r environment_id can_approve <<EOF
@@ -459,7 +501,7 @@ if [ -n "$pending_record" ]; then
         '{
           environment_ids: [$environment_id],
           state: "approved",
-          comment: "Independent four-target byte-for-byte rebuild verified"
+          comment: "Independent five-target byte-for-byte rebuild verified"
         }' |
         gh api --method POST \
             "repos/${SOURCE_REPO}/actions/runs/${run_id}/pending_deployments" \
@@ -507,11 +549,12 @@ expected_assets="$(
         "dbmd-${version}-darwin-aarch64.tar.gz" \
         "dbmd-${version}-darwin-x86_64.tar.gz" \
         "dbmd-${version}-linux-aarch64-musl.tar.gz" \
-        "dbmd-${version}-linux-x86_64-musl.tar.gz" |
+        "dbmd-${version}-linux-x86_64-musl.tar.gz" \
+        "dbmd-${version}-windows-x86_64.exe" |
         LC_ALL=C sort
 )"
 test "$actual_assets" = "$expected_assets" ||
-    die "immutable release asset set does not match the four reviewed targets"
+    die "immutable release asset set does not match the five reviewed targets"
 
 verify_dir="$release_tmp/verify"
 mkdir -p "$verify_dir"
@@ -519,8 +562,8 @@ gh release download "$tag" --repo "$SOURCE_REPO" --dir "$verify_dir"
 (
     cd "$verify_dir"
     shasum -a 256 -c SHA256SUMS
-    for tarball in dbmd-*.tar.gz; do
-        gh attestation verify "$tarball" \
+    for asset in dbmd-*.tar.gz dbmd-*.exe; do
+        gh attestation verify "$asset" \
             --repo "$SOURCE_REPO" \
             --signer-workflow "${SOURCE_REPO}/.github/workflows/${RELEASE_WORKFLOW}" \
             --source-digest "$source_sha" \
@@ -552,7 +595,11 @@ compare_final_target darwin-x86_64 x86_64-apple-darwin
 compare_final_target darwin-aarch64 aarch64-apple-darwin
 compare_final_target linux-x86_64-musl x86_64-unknown-linux-musl
 compare_final_target linux-aarch64-musl aarch64-unknown-linux-musl
-printf 'Independent rebuild matched all four immutable release binaries byte-for-byte.\n'
+cmp \
+    "$rebuilt_dir/x86_64-pc-windows-msvc/x86_64-pc-windows-msvc/release/dbmd.exe" \
+    "$verify_dir/dbmd-${version}-windows-x86_64.exe" >/dev/null ||
+    die "immutable release contents differ from the independent rebuild for windows-x86_64"
+printf 'Independent rebuild matched all five immutable release binaries byte-for-byte.\n'
 
 # Verify crates.io converged to the exact local package bytes, not merely the
 # requested version label. Cargo includes `.cargo_vcs_info.json` only when the
@@ -723,7 +770,8 @@ repair_latest_forward() {
                 "dbmd-${raced_tap_version}-darwin-aarch64.tar.gz" \
                 "dbmd-${raced_tap_version}-darwin-x86_64.tar.gz" \
                 "dbmd-${raced_tap_version}-linux-aarch64-musl.tar.gz" \
-                "dbmd-${raced_tap_version}-linux-x86_64-musl.tar.gz" |
+                "dbmd-${raced_tap_version}-linux-x86_64-musl.tar.gz" \
+                "dbmd-${raced_tap_version}-windows-x86_64.exe" |
                 LC_ALL=C sort
         )"
         test "$repair_actual_assets" = "$repair_expected_assets" ||
@@ -736,8 +784,8 @@ repair_latest_forward() {
         (
             cd "$repair_dir"
             shasum -a 256 -c SHA256SUMS
-            for repair_tarball in dbmd-*.tar.gz; do
-                gh attestation verify "$repair_tarball" \
+            for repair_asset in dbmd-*.tar.gz dbmd-*.exe; do
+                gh attestation verify "$repair_asset" \
                     --repo "$SOURCE_REPO" \
                     --signer-workflow "${SOURCE_REPO}/.github/workflows/${RELEASE_WORKFLOW}" \
                     --source-digest "$repair_source_sha" \

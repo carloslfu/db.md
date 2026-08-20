@@ -209,6 +209,14 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
                     Some("authorization_refused") => {
                         CliError::new(ExitCode::Policy, "AUTHORIZATION_REFUSED", message)
                     }
+                    Some("v1_migration_required") => {
+                        CliError::new(ExitCode::Policy, "V1_MIGRATION_REQUIRED", message)
+                            .with_hint("an owner or brain administrator must complete the explicit v2 migration")
+                    }
+                    Some("v2_sync_required") => {
+                        CliError::new(ExitCode::Policy, "V2_SYNC_REQUIRED", message)
+                            .with_hint("retry through dbmd sync, which negotiates link.md v2")
+                    }
                     _ => CliError::new(ExitCode::Runtime, "HUB_ERROR", message),
                 };
                 if let Some(details) = details {
@@ -325,6 +333,25 @@ mod tests {
         });
         assert_eq!(error.exit, ExitCode::Policy);
         assert_eq!(error.code, "AUTHORIZATION_REFUSED");
+    }
+
+    #[test]
+    fn profile_cutover_refusals_have_stable_agent_codes() {
+        for (hub_code, cli_code) in [
+            ("v1_migration_required", "V1_MIGRATION_REQUIRED"),
+            ("v2_sync_required", "V2_SYNC_REQUIRED"),
+        ] {
+            let error = CliError::from(dbmd_core::linkmd::LinkError::Http {
+                what: "sync push",
+                status: 426,
+                message: "profile upgrade required".to_string(),
+                code: Some(hub_code.to_string()),
+                details: None,
+            });
+            assert_eq!(error.exit, ExitCode::Policy);
+            assert_eq!(error.code, cli_code);
+            assert!(error.hint.is_some());
+        }
     }
 
     #[test]

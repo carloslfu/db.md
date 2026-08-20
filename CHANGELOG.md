@@ -8,9 +8,39 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.13**.
+  `Cargo.toml`, currently **v0.8.14**.
 
 ## Unreleased
+
+## [0.8.14] — 2026-08-19
+
+### Added
+
+- The permissioned v2 sync client now runs natively on Windows. Durable pull
+  journals recover interrupted preparing, ready, and committed transactions;
+  reparse-point removal never follows junctions; and the legacy v1 client
+  fails with a typed unsupported-platform error instead of reporting a false
+  successful sync.
+- Official releases now include a directly runnable Windows x64 executable.
+  The protected workflow and trusted local controller use one digest-pinned
+  cargo-xwin, Windows SDK, CRT, and LLVM toolchain and independently reproduce
+  all five platform binaries byte-for-byte before publication. A native
+  PowerShell installer requires Sevra's independently deployed SHA-256,
+  rejects reparse-point install paths, and atomically replaces `dbmd.exe`.
+
+### Fixed
+
+- Incremental pushes no longer rescan and reread an entire large brain solely
+  to print a post-sync file count. V2 output uses the signed applied-change
+  receipt; the legacy full snapshot scan remains isolated to v1.
+- Conflict bundles keep only bounded coordinates for large files. Explicit
+  take-remote resolution stages exact content through the resumable
+  content-addressed cache instead of loading a first-conflict blob into
+  memory. Default pruning removes only expired or incomplete bundles, while
+  corrupt completed evidence requires an explicit all-bundles cleanup.
+- Windows recovery prunes inert orphan pull backups only while holding the
+  per-brain sync lock, preserving the accepted installed state and baseline
+  across crash boundaries.
 
 ## [0.8.13] — 2026-08-19
 

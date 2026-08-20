@@ -128,13 +128,21 @@ jobs:
             exit 1
           }
           gh release download "$tag" --dir "mirror/v${ver}" \
-            --pattern 'dbmd-*.tar.gz' --pattern 'SHA256SUMS'
+            --pattern 'dbmd-*.tar.gz' \
+            --pattern 'dbmd-*-windows-x86_64.exe' \
+            --pattern 'SHA256SUMS'
           (
             cd "mirror/v${ver}"
             test "$(find . -maxdepth 1 -name 'dbmd-*.tar.gz' -type f | wc -l | tr -d ' ')" = 4
+            test "$(find . -maxdepth 1 -name 'dbmd-*-windows-x86_64.exe' -type f | wc -l | tr -d ' ')" = 1
             sha256sum -c SHA256SUMS
           )
           cp scripts/install.sh "mirror/v${ver}/install.sh"
+          windows_asset="dbmd-${ver}-windows-x86_64.exe"
+          mkdir -p "mirror/trusted/${ver}"
+          awk -v asset="$windows_asset" '$2 == asset { print $1 }' \
+            "mirror/v${ver}/SHA256SUMS" > "mirror/trusted/${ver}/${windows_asset}"
+          grep -Eq '^[0-9a-f]{64}$' "mirror/trusted/${ver}/${windows_asset}"
           printf '%s\n' "$ver" > mirror/latest.txt
 
       - name: Resolve version
@@ -323,3 +331,65 @@ jobs:
             echo "::error::binary is not aarch64" >&2; exit 1; }
           echo "::endgroup::"
           echo "Integrity OK for ${{ matrix.target_name }} (not executed: cross-arch)"
+
+  # Windows uses its native installer and the direct .exe asset. The local
+  # mirror has a separate /trusted tree so the smoke exercises the same
+  # independent-checksum contract as production.
+  install-smoke-windows:
+    needs: fetch-artifacts
+    name: install-smoke (windows-x86_64)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ needs.fetch-artifacts.outputs.source_sha }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: smoke-mirror
+          path: smoke-payload
+
+      - name: Install and execute the released Windows binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne '${{ needs.fetch-artifacts.outputs.source_sha }}') {
+            throw 'checkout is not the release source'
+          }
+          if ((Get-Content smoke-payload/mirror-source-sha.txt -Raw).Trim() -ne '${{ needs.fetch-artifacts.outputs.source_sha }}') {
+            throw 'mirror is not bound to the release source'
+          }
+          [void][scriptblock]::Create((Get-Content -Raw scripts/install.ps1))
+          $mirror = (Resolve-Path 'smoke-payload/mirror').Path
+          $python = (Get-Command python).Source
+          $server = Start-Process -FilePath $python -ArgumentList @(
+            '-m', 'http.server', '8099', '--bind', '127.0.0.1', '--directory', "`"$mirror`""
+          ) -WindowStyle Hidden -PassThru
+          try {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri 'http://127.0.0.1:8099/latest.txt' -UseBasicParsing | Out-Null
+                break
+              } catch {
+                if ($attempt -eq 29) { throw }
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+            $env:DBMD_VERSION = '${{ needs.fetch-artifacts.outputs.version }}'
+            $env:DBMD_BASE_URL = 'http://127.0.0.1:8099'
+            $env:DBMD_TRUSTED_MANIFEST_BASE = 'http://127.0.0.1:8099/trusted'
+            $env:DBMD_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'dbmd-bin'
+            ./scripts/install.ps1
+            $bin = Join-Path $env:DBMD_INSTALL_DIR 'dbmd.exe'
+            $reported = (& $bin --version | Out-String)
+            if ($reported -notmatch [regex]::Escape($env:DBMD_VERSION)) { throw 'wrong installed version' }
+            if (-not (& $bin spec | Select-Object -First 1)) { throw 'dbmd spec was empty' }
+            $store = Join-Path $env:RUNNER_TEMP 'dbmd-smoke-store'
+            & $bin init $store
+            & $bin validate $store
+            if ($LASTEXITCODE -ne 0) { throw 'dbmd validate failed' }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }

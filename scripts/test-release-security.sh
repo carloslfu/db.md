@@ -21,6 +21,9 @@ cross_config="$repo_root/Cross.toml"
 linkmd_source="$repo_root/crates/dbmd-core/src/linkmd.rs"
 darwin_verifier="$repo_root/scripts/verify-darwin-toolchain.sh"
 darwin_diagnostics="$repo_root/scripts/diagnose-darwin-toolchain.sh"
+windows_installer="$repo_root/scripts/install.ps1"
+windows_installer_tests="$repo_root/tests/installers.ps1"
+pinned_llvm_installer="$repo_root/scripts/install-pinned-llvm.sh"
 
 fail() {
     printf 'release security test: %s\n' "$*" >&2
@@ -92,8 +95,8 @@ reject_fixed 'libc::renameat2(' "$linkmd_source"
 # toolchain. Normalizing LC_BUILD_VERSION alone cannot erase SDK stub and
 # linker differences from the executable.
 require_fixed 'os: macos-26' "$workflow"
-[ "$(grep -Fc 'os: macos-26' "$workflow")" -eq 2 ] ||
-    fail "both Darwin release targets must use macos-26"
+[ "$(grep -Fc 'os: macos-26' "$workflow")" -eq 3 ] ||
+    fail "both Darwin targets and the cargo-xwin target must use macos-26"
 require_fixed 'release-darwin-targets:' "$test_workflow"
 require_fixed 'x86_64-apple-darwin' "$test_workflow"
 require_fixed 'aarch64-apple-darwin' "$test_workflow"
@@ -183,7 +186,38 @@ require_fixed '--volume "$target_dir:/target"' "$controller"
 require_fixed '--workdir /project' "$controller"
 require_fixed 'export PATH=/rust/bin:\$PATH; cargo build --release --locked --target $rust_target -p dbmd-cli' "$controller"
 require_fixed 'build_linux_release_target "$rust_target" "$target_dir"' "$controller"
-reject_fixed 'RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN"' "$controller"
+# Windows is a first-class native client and release target. CI, the protected
+# workflow, and the trusted controller must all use one pinned cargo-xwin/SDK/
+# CRT/LLVM stack and independently compare the direct executable.
+require_fixed 'native Windows sync and release target' "$test_workflow"
+require_fixed 'cargo test --locked -p dbmd-core linkmd::tests::windows_' "$test_workflow"
+require_fixed './tests/installers.ps1' "$test_workflow"
+require_fixed 'windows-x86_64' "$workflow"
+require_fixed 'x86_64-pc-windows-msvc' "$workflow"
+require_fixed 'cargo-xwin-v0.23.0.universal2-apple-darwin.tar.gz' "$workflow"
+require_fixed 'd78a88f43247a6298d8888dc4c44a8af92801fdf4e5374cc5a359a1e53770993' "$workflow"
+require_fixed '--xwin-sdk-version 10.0.26100' "$workflow"
+require_fixed '--xwin-crt-version 14.44.17.14' "$workflow"
+require_fixed '-C link-arg=/Brepro -C link-arg=/debug:none' "$workflow"
+require_fixed 'scripts/install-pinned-llvm.sh "$RUNNER_TEMP/llvm-mingw"' "$workflow"
+require_fixed 'cargo-xwin-v0.23.0.universal2-apple-darwin.tar.gz' "$controller"
+require_fixed 'd78a88f43247a6298d8888dc4c44a8af92801fdf4e5374cc5a359a1e53770993' "$controller"
+require_fixed 'RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN"' "$controller"
+require_fixed '--xwin-sdk-version 10.0.26100' "$controller"
+require_fixed '--xwin-crt-version 14.44.17.14' "$controller"
+require_fixed 'cmp \' "$controller"
+require_fixed 'dbmd-${version}-windows-x86_64.exe' "$controller"
+require_fixed 'llvm-mingw-20260616-ucrt-macos-universal.tar.xz' "$pinned_llvm_installer"
+require_fixed '2cab02a2e964bd4aae981150a45985d07c657cfa8d244959eb9e2dcc5eedd7b1' "$pinned_llvm_installer"
+require_fixed 'LLVM version 22.1.8' "$pinned_llvm_installer"
+require_fixed 'Invoke-Main' "$windows_installer"
+[ "$(tail -n 1 "$windows_installer")" = 'Invoke-Main' ] ||
+    fail "Windows installer must invoke only from its final line"
+require_fixed 'DBMD_TRUSTED_MANIFEST_BASE' "$windows_installer"
+require_fixed 'FILE_FLAG_OPEN_REPARSE_POINT' "$windows_installer"
+require_fixed 'MOVEFILE_WRITE_THROUGH' "$windows_installer"
+require_fixed 'installer accepted a bad independent digest' "$windows_installer_tests"
+require_fixed 'installer accepted a destination reparse point' "$windows_installer_tests"
 preflight_call_line="$(grep -n '^preflight_release_builder$' "$controller" | cut -d: -f1)"
 first_remote_mutation_line="$({
     grep -n '^# Immutable release enforcement' "$controller" || true
@@ -561,12 +595,13 @@ cli_publish_line="$(
     fail "core/CLI exact publish state machine is out of order"
 
 # The approving controller must consume CI artifacts, independently rebuild all
-# four targets, byte-compare them, and approve only after those comparisons.
+# five targets, byte-compare them, and approve only after those comparisons.
 require_fixed 'gh run download "$run_id"' "$controller"
 require_fixed 'compare_target darwin-x86_64 x86_64-apple-darwin' "$controller"
 require_fixed 'compare_target darwin-aarch64 aarch64-apple-darwin' "$controller"
 require_fixed 'compare_target linux-x86_64-musl x86_64-unknown-linux-musl' "$controller"
 require_fixed 'compare_target linux-aarch64-musl aarch64-unknown-linux-musl' "$controller"
+require_fixed 'independent rebuild differs for windows-x86_64' "$controller"
 require_fixed 'target_dir="$rebuilt_dir/$rust_target"' "$controller"
 require_fixed 'CARGO_TARGET_DIR="$target_dir"' "$controller"
 require_fixed '"$rebuilt_dir/$rust_target/$rust_target/release/dbmd"' "$controller"
@@ -617,10 +652,11 @@ require_fixed 'compare_final_target darwin-x86_64 x86_64-apple-darwin' "$control
 require_fixed 'compare_final_target darwin-aarch64 aarch64-apple-darwin' "$controller"
 require_fixed 'compare_final_target linux-x86_64-musl x86_64-unknown-linux-musl' "$controller"
 require_fixed 'compare_final_target linux-aarch64-musl aarch64-unknown-linux-musl' "$controller"
+require_fixed 'immutable release contents differ from the independent rebuild for windows-x86_64' "$controller"
 require_fixed 'actual_entries="$(tar -tzf "$tarball" | LC_ALL=C sort)"' "$controller_lib"
 require_fixed 'tar -xOzf "$tarball" "${stage}/dbmd"' "$controller_lib"
 reject_fixed 'tar -xzf "$tarball"' "$controller"
-final_compare_line="$(grep -n 'compare_final_target linux-aarch64-musl' "$controller" | tail -n 1 | cut -d: -f1)"
+final_compare_line="$(grep -n 'immutable release contents differ from the independent rebuild for windows-x86_64' "$controller" | tail -n 1 | cut -d: -f1)"
 homebrew_line="$(grep -n 'HomebrewFormula/render.sh' "$controller" | head -n 1 | cut -d: -f1)"
 [ -n "$final_compare_line" ] && [ -n "$homebrew_line" ] &&
     [ "$final_compare_line" -lt "$homebrew_line" ] ||
@@ -687,7 +723,7 @@ tap_fence_after_line="$(grep -n 'tap_head_after_latest=' "$controller" | tail -n
 require_fixed 'contents/Formula/dbmd.rb?ref=${verified_tap_head}' "$controller"
 require_fixed 'release_latest_preflight_action' "$controller"
 require_fixed 'contents/Formula/dbmd.rb?ref=${repair_head}' "$controller"
-require_fixed 'gh attestation verify "$repair_tarball"' "$controller"
+require_fixed 'gh attestation verify "$repair_asset"' "$controller"
 require_fixed 'cmp "$repair_expected_formula" "$repair_formula"' "$controller"
 require_fixed 'gh release edit "$repair_tag" --repo "$SOURCE_REPO" --latest' "$controller"
 require_fixed 'die "tap advanced concurrently; latest was repaired to $repair_tag"' "$controller"

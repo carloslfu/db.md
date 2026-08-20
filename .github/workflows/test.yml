@@ -169,6 +169,11 @@ jobs:
           key: native-windows-x86_64
       - name: Build native Windows CLI
         run: cargo build --release --locked --target x86_64-pc-windows-msvc -p dbmd-cli
+      - name: Parse and exercise Windows installer trust boundary
+        shell: pwsh
+        run: |
+          [void][scriptblock]::Create((Get-Content -Raw scripts/install.ps1))
+          ./tests/installers.ps1
       - name: Exercise Windows capability and crash-recovery primitives
         run: |
           cargo test --locked -p dbmd-core fsx::tests::windows_

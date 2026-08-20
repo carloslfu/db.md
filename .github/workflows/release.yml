@@ -3,22 +3,23 @@
 # Cross-compile + release pipeline for the single `dbmd` binary
 # (plan: db-md-rust-toolkit.md, Block 8).
 #
-# Four targets, built on native Darwin runners or in digest-pinned `cross`
-# containers for Linux:
+# Five targets, built on native Darwin runners, digest-pinned `cross`
+# containers for Linux, or the pinned cargo-xwin/SDK/LLVM toolchain for Windows:
 #
-#   darwin-x86_64        x86_64-apple-darwin          macos-13   (Intel runner, native)
-#   darwin-aarch64       aarch64-apple-darwin         macos-14   (Apple Silicon, native)
+#   darwin-x86_64        x86_64-apple-darwin          macos-26   (Intel runner, native)
+#   darwin-aarch64       aarch64-apple-darwin         macos-26   (Apple Silicon, native)
 #   linux-x86_64-musl    x86_64-unknown-linux-musl    ubuntu     (cross / Docker)
 #   linux-aarch64-musl   aarch64-unknown-linux-musl   ubuntu     (cross / Docker)
+#   windows-x86_64       x86_64-pc-windows-msvc       macOS      (cargo-xwin)
 #
 # Per-target output is a tarball `dbmd-<version>-<target>.tar.gz` containing
 # the `dbmd` binary + NOTICE + THIRD_PARTY_NOTICES + LICENSE. A single
 # `SHA256SUMS` manifest covers every tarball (standard `sha256sum -c` format).
 #
-# CI first builds four retained workflow artifacts. The job that creates the
+# CI first builds five retained workflow artifacts. The job that creates the
 # draft release is held behind the protected `release-publishing` environment
 # until the local release controller independently rebuilds and byte-compares
-# all four targets. After approval CI stages and attests the draft, publishes
+# all five targets. After approval CI stages and attests the draft, publishes
 # crates.io, then publishes the immutable, non-latest GitHub release. The
 # controller verifies both channels, updates Homebrew through the optimistic
 # GitHub Contents API, and sets `latest` only after full convergence.
@@ -160,18 +161,32 @@ jobs:
             rust_target: x86_64-apple-darwin
             os: macos-26
             use_cross: false
+            use_xwin: false
+            is_darwin: true
           - target_name: darwin-aarch64
             rust_target: aarch64-apple-darwin
             os: macos-26
             use_cross: false
+            use_xwin: false
+            is_darwin: true
           - target_name: linux-x86_64-musl
             rust_target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
             use_cross: true
+            use_xwin: false
+            is_darwin: false
           - target_name: linux-aarch64-musl
             rust_target: aarch64-unknown-linux-musl
             os: ubuntu-24.04
             use_cross: true
+            use_xwin: false
+            is_darwin: false
+          - target_name: windows-x86_64
+            rust_target: x86_64-pc-windows-msvc
+            os: macos-26
+            use_cross: false
+            use_xwin: true
+            is_darwin: false
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
@@ -181,14 +196,14 @@ jobs:
           targets: ${{ matrix.rust_target }}
 
       - name: Verify pinned Darwin toolchain
-        if: ${{ !matrix.use_cross }}
+        if: matrix.is_darwin
         shell: bash
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
         run: sh scripts/verify-darwin-toolchain.sh "$DEVELOPER_DIR"
 
       - name: Diagnose rejected Darwin toolchain
-        if: ${{ failure() && !matrix.use_cross }}
+        if: ${{ failure() && matrix.is_darwin }}
         shell: bash
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
@@ -222,8 +237,32 @@ jobs:
             exit 1
           }
 
+      - name: Install digest-verified cargo-xwin (Windows)
+        if: matrix.use_xwin
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-xwin.tar.gz"
+          tool_dir="$RUNNER_TEMP/cargo-xwin"
+          curl -fsSL \
+            https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.0/cargo-xwin-v0.23.0.universal2-apple-darwin.tar.gz \
+            -o "$archive"
+          echo "d78a88f43247a6298d8888dc4c44a8af92801fdf4e5374cc5a359a1e53770993  $archive" |
+            shasum -a 256 -c -
+          mkdir -p "$tool_dir"
+          tar -xzf "$archive" -C "$tool_dir"
+          test "$("$tool_dir/cargo-xwin" --version)" = "cargo-xwin 0.23.0"
+
+      - name: Install digest-verified LLVM archiver (Windows)
+        if: matrix.use_xwin
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/install-pinned-llvm.sh "$RUNNER_TEMP/llvm-mingw"
+          printf '%s\n' "$RUNNER_TEMP/llvm-mingw/bin" >> "$GITHUB_PATH"
+
       - name: Build (cargo)
-        if: ${{ !matrix.use_cross }}
+        if: matrix.is_darwin
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
           MACOSX_DEPLOYMENT_TARGET: '11.0'
@@ -236,6 +275,22 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli
+
+      - name: Build (cargo-xwin)
+        if: matrix.use_xwin
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/dbmd-source --remap-path-prefix=${cargo_home}=/dbmd-cargo -C link-arg=/Brepro -C link-arg=/debug:none"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export RUSTFLAGS SOURCE_DATE_EPOCH
+          XWIN_CACHE_DIR="$RUNNER_TEMP/xwin-cache" \
+            "$RUNNER_TEMP/cargo-xwin/cargo-xwin" xwin build \
+            --release --locked --target ${{ matrix.rust_target }} -p dbmd-cli \
+            --xwin-version 17 \
+            --xwin-sdk-version 10.0.26100 \
+            --xwin-crt-version 14.44.17.14
 
       - name: Normalize Darwin build metadata for reproducibility
         if: startsWith(matrix.target_name, 'darwin-')
@@ -255,14 +310,25 @@ jobs:
             exit 1
           fi
 
-      # Assemble the per-target tarball: binary + the three legal files.
-      # Tarball name: dbmd-<version>-<target>.tar.gz
-      - name: Assemble tarball
+      # Unix ships the historical legal-notice tarball. Windows ships one
+      # directly runnable .exe; the repository/release carries the notices.
+      - name: Assemble release asset
         shell: bash
         run: |
           set -euo pipefail
           version="${{ needs.version.outputs.version }}"
           target="${{ matrix.target_name }}"
+          if [ "${{ matrix.use_xwin }}" = true ]; then
+            bin_path="target/${{ matrix.rust_target }}/release/${BINARY}.exe"
+            asset="dbmd-${version}-${target}.exe"
+            test -f "$bin_path" || { echo "::error::binary not found at $bin_path" >&2; exit 1; }
+            mkdir -p dist
+            cp "$bin_path" "dist/$asset"
+            ( cd dist && shasum -a 256 "$asset" > "$asset.sha256" )
+            echo "Built dist/$asset"
+            cat "dist/$asset.sha256"
+            exit 0
+          fi
           stage="dbmd-${version}-${target}"
           bin_path="target/${{ matrix.rust_target }}/release/${BINARY}"
 
@@ -306,7 +372,7 @@ jobs:
       # the version we think we built (only for host-runnable targets — the
       # cross aarch64-musl binary can't execute on the x86_64 runner).
       - name: Verify --version (host-runnable targets)
-        if: ${{ !matrix.use_cross }}
+        if: matrix.is_darwin
         shell: bash
         run: |
           set -euo pipefail
@@ -322,10 +388,12 @@ jobs:
       - name: Upload target artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: tarball-${{ matrix.target_name }}
+          name: release-asset-${{ matrix.target_name }}
           path: |
             dist/dbmd-*-${{ matrix.target_name }}.tar.gz
             dist/dbmd-*-${{ matrix.target_name }}.tar.gz.sha256
+            dist/dbmd-*-${{ matrix.target_name }}.exe
+            dist/dbmd-*-${{ matrix.target_name }}.exe.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -347,7 +415,7 @@ jobs:
       - name: Download all target artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
-          pattern: tarball-*
+          pattern: release-asset-*
           path: incoming
           merge-multiple: true
 
@@ -360,21 +428,19 @@ jobs:
           rel="release/${version}"
           mkdir -p "$rel"
 
-          # Gather every tarball (one per target). Expect exactly 4.
+          # Gather four Unix tarballs and one Windows executable.
           shopt -s nullglob
           tarballs=(incoming/dbmd-*.tar.gz)
-          count="${#tarballs[@]}"
-          echo "Found $count tarball(s)."
-          if [ "$count" -ne 4 ]; then
-            echo "::error::expected 4 tarballs, found $count" >&2
-            printf '  %s\n' "${tarballs[@]}" >&2
+          executables=(incoming/dbmd-*.exe)
+          if [ "${#tarballs[@]}" -ne 4 ] || [ "${#executables[@]}" -ne 1 ]; then
+            echo "::error::expected four tarballs and one Windows executable" >&2
             exit 1
           fi
-          cp "${tarballs[@]}" "$rel/"
+          cp "${tarballs[@]}" "${executables[@]}" "$rel/"
 
           # One manifest covering all tarballs, standard `sha256sum -c` format
           # (relative names, so it verifies from inside the release dir).
-          ( cd "$rel" && shasum -a 256 dbmd-*.tar.gz > SHA256SUMS )
+          ( cd "$rel" && shasum -a 256 dbmd-*.tar.gz dbmd-*.exe > SHA256SUMS )
           echo "----- SHA256SUMS -----"
           cat "$rel/SHA256SUMS"
 
@@ -438,9 +504,9 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(release/"$VERSION"/dbmd-*.tar.gz release/"$VERSION"/SHA256SUMS)
-          if [ "${#assets[@]}" -ne 5 ]; then
-            echo "::error::expected four tarballs and SHA256SUMS, found ${#assets[@]} assets" >&2
+          assets=(release/"$VERSION"/dbmd-*.tar.gz release/"$VERSION"/dbmd-*.exe release/"$VERSION"/SHA256SUMS)
+          if [ "${#assets[@]}" -ne 6 ]; then
+            echo "::error::expected five platform assets and SHA256SUMS, found ${#assets[@]} assets" >&2
             exit 1
           fi
           gh release upload "v${VERSION}" "${assets[@]}" \
@@ -459,19 +525,19 @@ jobs:
         continue-on-error: true
         uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
         with:
-          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
+          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*'
       - name: Attest build provenance (attempt 2)
         id: attest2
         if: steps.attest1.outcome == 'failure'
         continue-on-error: true
         uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
         with:
-          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
+          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*'
       - name: Attest build provenance (attempt 3, final)
         if: steps.attest1.outcome == 'failure' && steps.attest2.outcome == 'failure'
         uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e
         with:
-          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*.tar.gz'
+          subject-path: 'release/${{ needs.version.outputs.version }}/dbmd-*'
 
       - name: Verify staged draft assets and attestations
         env:
@@ -506,7 +572,8 @@ jobs:
               "dbmd-${VERSION}-darwin-aarch64.tar.gz" \
               "dbmd-${VERSION}-darwin-x86_64.tar.gz" \
               "dbmd-${VERSION}-linux-aarch64-musl.tar.gz" \
-              "dbmd-${VERSION}-linux-x86_64-musl.tar.gz" |
+              "dbmd-${VERSION}-linux-x86_64-musl.tar.gz" \
+              "dbmd-${VERSION}-windows-x86_64.exe" |
               LC_ALL=C sort
           )"
           test "$actual" = "$expected" || {
@@ -517,8 +584,8 @@ jobs:
           (
             cd "release/${VERSION}"
             shasum -a 256 -c SHA256SUMS
-            for tarball in dbmd-*.tar.gz; do
-              gh attestation verify "$tarball" \
+            for asset in dbmd-*.tar.gz dbmd-*.exe; do
+              gh attestation verify "$asset" \
                 --repo "$GITHUB_REPOSITORY" >/dev/null
             done
           )
@@ -554,7 +621,7 @@ jobs:
 
   # Publish only after both permanent crates have converged. This release is
   # intentionally not promoted to `latest`; the local controller does that only
-  # after it independently verifies the four binaries and updates Homebrew.
+  # after it independently verifies all five binaries and updates Homebrew.
   publish-release:
     name: Publish immutable GitHub release
     needs: [version, publish, publish-crates]
