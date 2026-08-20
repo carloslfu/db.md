@@ -3402,6 +3402,19 @@ fn v2_asset_record(asset: &V2BaselineAsset, path: &str) -> crate::AssetRecord {
     }
 }
 
+fn v2_asset_resumes_hosting(
+    remote: Option<&V2BaselineAsset>,
+    path: &str,
+    record: &crate::AssetRecord,
+    disposition: &str,
+) -> bool {
+    remote.is_some_and(|asset| {
+        asset.disposition == "withheld"
+            && disposition == "hosted"
+            && v2_asset_record(asset, path) == *record
+    })
+}
+
 fn v2_asset_record_manifest_bytes(
     assets: &std::collections::BTreeMap<String, crate::AssetRecord>,
 ) -> LinkResult<Vec<u8>> {
@@ -6099,6 +6112,7 @@ fn v2_sync_push(
         .chain(local_assets.keys())
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
+    let mut asset_policy_transitions = Vec::new();
     for path in asset_paths {
         let base_record = base_assets
             .get(&path)
@@ -6142,12 +6156,9 @@ fn v2_sync_push(
                 message: format!("required asset {path} is missing"),
             });
         }
-        let op = if remote.is_some_and(|asset| {
-            asset.disposition == "withheld"
-                && disposition == "hosted"
-                && v2_asset_record(asset, &path) == *record
-        }) {
+        let op = if v2_asset_resumes_hosting(remote, &path, record, disposition) {
             if !resume_local_policy {
+                asset_policy_transitions.push(path);
                 continue;
             }
             "asset_resume"
@@ -6173,6 +6184,12 @@ fn v2_sync_push(
     if !conflicts.is_empty() {
         conflicts.truncate(100);
         return Err(LinkError::Conflict { paths: conflicts });
+    }
+    if !asset_policy_transitions.is_empty() {
+        asset_policy_transitions.truncate(100);
+        return Err(LinkError::LocalPolicyTransition {
+            paths: asset_policy_transitions,
+        });
     }
     if operations.is_empty() {
         let final_head = v2_verified_head(cfg, requested_brain)?
@@ -12451,6 +12468,59 @@ mod tests {
         );
         assert!(kept_home.accept_remote.is_empty());
         assert!(kept_home.conflicts.is_empty());
+    }
+
+    #[test]
+    fn v2_asset_hosting_resume_is_an_explicit_local_policy_transition() {
+        let path = "sources/report.pdf";
+        let record = crate::AssetRecord {
+            path: path.to_string(),
+            sha256: "a".repeat(64),
+            bytes: 42,
+            media_type: "application/pdf".to_string(),
+            wrappers: vec!["gzip".to_string()],
+            required: true,
+        };
+        let mut remote = V2BaselineAsset {
+            blob_sha256: record.sha256.clone(),
+            bytes: record.bytes,
+            media_type: record.media_type.clone(),
+            wrappers: record.wrappers.clone(),
+            required: record.required,
+            disposition: "withheld".to_string(),
+            leaf_hash: "b".repeat(64),
+        };
+
+        assert!(v2_asset_resumes_hosting(
+            Some(&remote),
+            path,
+            &record,
+            "hosted"
+        ));
+        assert!(!v2_asset_resumes_hosting(
+            Some(&remote),
+            path,
+            &record,
+            "withheld"
+        ));
+
+        remote.disposition = "hosted".to_string();
+        assert!(!v2_asset_resumes_hosting(
+            Some(&remote),
+            path,
+            &record,
+            "hosted"
+        ));
+
+        remote.disposition = "withheld".to_string();
+        remote.blob_sha256 = "c".repeat(64);
+        assert!(!v2_asset_resumes_hosting(
+            Some(&remote),
+            path,
+            &record,
+            "hosted"
+        ));
+        assert!(!v2_asset_resumes_hosting(None, path, &record, "hosted"));
     }
 
     #[cfg(target_os = "linux")]

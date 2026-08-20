@@ -25,6 +25,10 @@ Two things version independently:
   catalog or overwrite/delete its raw asset bytes. Post-install and
   post-commit barriers now include asset records when deciding whether a
   checkout is clean enough to advance its verified baseline.
+- Making a previously withheld asset eligible for hosting now refuses with
+  `LOCAL_POLICY_TRANSITION` until the agent retries with the explicit
+  `--resume-local-policy` intent. The safe default no longer reports a silent
+  no-op while bytes remain quarantined.
 - Windows now treats native closed-pipe error 109 as the same clean consumer
   exit as Unix `EPIPE`. The Windows release smoke builds a minimal valid store
   through the supported file contract instead of invoking a nonexistent
