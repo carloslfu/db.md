@@ -85,16 +85,16 @@ fn install_broken_pipe_clean_exit() {
 }
 
 /// Whether a panic payload is the stdlib's broken-pipe print failure. Matches on
-/// the I/O error text the panic carries — the locale-independent `os error 32`
-/// and the `Broken pipe` kind string — not the surrounding wording, which can
-/// shift between toolchains.
+/// the I/O error text the panic carries — Unix `os error 32`, Windows
+/// `os error 109`, and the `Broken pipe` kind string — not the surrounding
+/// wording, which can shift between toolchains.
 fn payload_is_broken_pipe(payload: &dyn std::any::Any) -> bool {
     let msg = payload
         .downcast_ref::<String>()
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .unwrap_or("");
-    msg.contains("Broken pipe") || msg.contains("os error 32")
+    msg.contains("Broken pipe") || msg.contains("os error 32") || msg.contains("os error 109")
 }
 
 /// Exhaustive dispatch over the locked [`Command`] tree. Each arm calls exactly
@@ -150,5 +150,22 @@ fn emit_error(ctx: &Context, err: &CliError) {
         if let Some(hint) = &err.hint {
             eprintln!("  hint: {}", sanitize::sanitize_single_line(hint));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::payload_is_broken_pipe;
+
+    #[test]
+    fn broken_pipe_panic_detection_covers_unix_and_windows() {
+        let unix = String::from("failed printing to stdout: Broken pipe (os error 32)");
+        let windows =
+            String::from("failed printing to stdout: The pipe has been ended. (os error 109)");
+        let unrelated = String::from("failed printing to stdout: permission denied (os error 13)");
+
+        assert!(payload_is_broken_pipe(&unix));
+        assert!(payload_is_broken_pipe(&windows));
+        assert!(!payload_is_broken_pipe(&unrelated));
     }
 }

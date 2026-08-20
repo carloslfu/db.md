@@ -25,6 +25,11 @@ Two things version independently:
   catalog or overwrite/delete its raw asset bytes. Post-install and
   post-commit barriers now include asset records when deciding whether a
   checkout is clean enough to advance its verified baseline.
+- Windows now treats native closed-pipe error 109 as the same clean consumer
+  exit as Unix `EPIPE`. The Windows release smoke builds a minimal valid store
+  through the supported file contract instead of invoking a nonexistent
+  initialization command, and asserts both the closed-pipe and validation exit
+  codes.
 
 ## [0.8.14] — 2026-08-19
 

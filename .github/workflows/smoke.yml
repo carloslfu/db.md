@@ -385,10 +385,21 @@ jobs:
             $bin = Join-Path $env:DBMD_INSTALL_DIR 'dbmd.exe'
             $reported = (& $bin --version | Out-String)
             if ($reported -notmatch [regex]::Escape($env:DBMD_VERSION)) { throw 'wrong installed version' }
-            if (-not (& $bin spec | Select-Object -First 1)) { throw 'dbmd spec was empty' }
+            $specLine = & $bin spec | Select-Object -First 1
+            if ($LASTEXITCODE -ne 0) { throw 'dbmd spec did not exit cleanly after its reader closed' }
+            if (-not $specLine) { throw 'dbmd spec was empty' }
             $store = Join-Path $env:RUNNER_TEMP 'dbmd-smoke-store'
-            & $bin init $store
-            & $bin validate $store
+            New-Item -ItemType Directory -Path $store | Out-Null
+            $marker = @(
+              '---',
+              'type: db-md',
+              'scope: personal',
+              'owner: release-smoke',
+              '---',
+              '# Release smoke'
+            ) -join "`n"
+            Set-Content -Path (Join-Path $store 'DB.md') -Value ($marker + "`n") -NoNewline -Encoding utf8
+            & $bin validate $store --all
             if ($LASTEXITCODE -ne 0) { throw 'dbmd validate failed' }
           } finally {
             Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
