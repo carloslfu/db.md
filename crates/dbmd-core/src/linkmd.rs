@@ -171,6 +171,10 @@ const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 /// capabilities must not create an unbounded connection storm. Keep the
 /// verified downloads inside this fixed worker count.
 const V2_BLOB_DOWNLOAD_WORKERS: usize = 16;
+/// File durability barriers are independent inside the private pull stage.
+/// Keep enough in flight to hide storage flush latency without approaching
+/// ordinary process descriptor limits.
+const V2_PULL_INSTALL_WORKERS: usize = 16;
 /// One authenticated link.md v2 bulk frame remains small enough for bounded
 /// retries and serverless streaming while amortizing tens of thousands of
 /// immutable blobs over a few hundred requests instead of one request each.
@@ -7769,112 +7773,232 @@ fn write_pull_entries_beneath_dir(
 }
 
 #[cfg(unix)]
+fn write_pull_source_beneath_dir(root: &std::fs::File, entry: &V2StagedFile) -> LinkResult<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let path = &entry.path;
+    let components: Vec<&str> = path.split('/').collect();
+    let (leaf, parents) = components
+        .split_last()
+        .ok_or_else(|| LinkError::UnsafePath { path: path.clone() })?;
+    let mut directory = root.try_clone()?;
+    for component in parents {
+        let name = c_name(component.as_bytes(), path)?;
+        let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+        if made != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error.into());
+            }
+        }
+        directory = open_dir_at(directory.as_raw_fd(), &name, path)?;
+    }
+    let leaf_name = c_name(leaf.as_bytes(), path)?;
+    let mut existing: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            leaf_name.as_ptr(),
+            &mut existing,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+        && (existing.st_mode & libc::S_IFMT) == libc::S_IFLNK
+    {
+        return Err(LinkError::UnsafePath { path: path.clone() });
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_name = format!(
+        ".dbmd-pull-{}-{nonce}-{}",
+        std::process::id(),
+        content_sha256(path.as_bytes())
+    );
+    let temp = c_name(temp_name.as_bytes(), path)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut input = crate::fsx::open_regular_nofollow(&entry.source)?;
+    let mut output = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    let copied = (|| -> std::io::Result<()> {
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > entry.bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "staged sync source grew beyond its verified length",
+                ));
+            }
+            digest.update(&buffer[..read]);
+            output.write_all(&buffer[..read])?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = copied {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    drop(output);
+    if total != entry.bytes || format!("{:x}", digest.finalize()) != entry.sha256 {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(invalid_feed(
+            "private staged sync source failed final integrity verification",
+        ));
+    }
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            directory.as_raw_fd(),
+            leaf_name.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_pull_source_beneath_dir(root: &std::fs::File, entry: &V2StagedFile) -> LinkResult<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let path = &entry.path;
+    let components: Vec<&str> = path.split('/').collect();
+    let (leaf, parents) = components
+        .split_last()
+        .ok_or_else(|| LinkError::UnsafePath { path: path.clone() })?;
+    let mut directory = root.try_clone()?;
+    for component in parents {
+        directory = open_dir_at(
+            directory.as_raw_fd(),
+            &c_name(component.as_bytes(), path)?,
+            path,
+        )?;
+    }
+    let leaf = c_name(leaf.as_bytes(), path)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if file.metadata()?.len() != entry.bytes || content_sha256_reader(&mut file)? != entry.sha256 {
+        return Err(invalid_feed(
+            "private pull stage changed before its durability barrier",
+        ));
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_pull_source_workers(
+    root: &std::fs::File,
+    entries: &[V2StagedFile],
+    operation: fn(&std::fs::File, &V2StagedFile) -> LinkResult<()>,
+) -> LinkResult<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let worker_count = entries.len().min(V2_PULL_INSTALL_WORKERS);
+    let mut first_error = None;
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next = &next;
+            let failed = &failed;
+            scope.spawn(move || {
+                while !failed.load(Ordering::Acquire) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(entry) = entries.get(index) else {
+                        break;
+                    };
+                    let result = operation(root, entry);
+                    if result.is_err() {
+                        failed.store(true, Ordering::Release);
+                    }
+                    if sender.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for result in receiver {
+            if let Err(error) = result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    });
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if next.load(Ordering::Relaxed) < entries.len() {
+        return Err(invalid_feed(
+            "a bounded pull worker stopped before reporting every file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_pull_directory_tree(root: &std::fs::File, display: &str) -> LinkResult<()> {
+    use std::os::fd::AsRawFd as _;
+
+    for name in directory_entry_names(root)? {
+        if entry_is_dir_at(root.as_raw_fd(), &name)? == Some(true) {
+            let child_display = format!("{display}/{}", String::from_utf8_lossy(name.to_bytes()));
+            let child = open_dir_at(root.as_raw_fd(), &name, &child_display)?;
+            sync_pull_directory_tree(&child, &child_display)?;
+        }
+    }
+    root.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn write_pull_sources_beneath_dir(
     root: &std::fs::File,
     entries: &[V2StagedFile],
 ) -> LinkResult<()> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
-    for entry in entries {
-        let path = &entry.path;
-        let components: Vec<&str> = path.split('/').collect();
-        let (leaf, parents) = components
-            .split_last()
-            .ok_or_else(|| LinkError::UnsafePath { path: path.clone() })?;
-        let mut directory = root.try_clone()?;
-        for component in parents {
-            let name = c_name(component.as_bytes(), path)?;
-            let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
-            if made != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EEXIST) {
-                    return Err(error.into());
-                }
-            }
-            directory = open_dir_at(directory.as_raw_fd(), &name, path)?;
-        }
-        let leaf_name = c_name(leaf.as_bytes(), path)?;
-        let mut existing: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                leaf_name.as_ptr(),
-                &mut existing,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-            && (existing.st_mode & libc::S_IFMT) == libc::S_IFLNK
-        {
-            return Err(LinkError::UnsafePath { path: path.clone() });
-        }
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temp_name = format!(".dbmd-pull-{}-{nonce}", std::process::id());
-        let temp = c_name(temp_name.as_bytes(), path)?;
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                temp.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let mut input = crate::fsx::open_regular_nofollow(&entry.source)?;
-        let mut output = unsafe { std::fs::File::from_raw_fd(fd) };
-        let mut digest = Sha256::new();
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        let copied = (|| -> std::io::Result<()> {
-            loop {
-                let read = input.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                total = total.saturating_add(read as u64);
-                if total > entry.bytes {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "staged sync source grew beyond its verified length",
-                    ));
-                }
-                digest.update(&buffer[..read]);
-                output.write_all(&buffer[..read])?;
-            }
-            output.sync_all()
-        })();
-        if let Err(error) = copied {
-            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
-            return Err(error.into());
-        }
-        drop(output);
-        if total != entry.bytes || format!("{:x}", digest.finalize()) != entry.sha256 {
-            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
-            return Err(invalid_feed(
-                "private staged sync source failed final integrity verification",
-            ));
-        }
-        if unsafe {
-            libc::renameat(
-                directory.as_raw_fd(),
-                temp.as_ptr(),
-                directory.as_raw_fd(),
-                leaf_name.as_ptr(),
-            )
-        } != 0
-        {
-            let error = std::io::Error::last_os_error();
-            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
-            return Err(error.into());
-        }
-        directory.sync_all()?;
-    }
-    root.sync_all()?;
-    Ok(())
+    // The stage is still private and unreachable as the checkout here. Write
+    // and verify every leaf first so the filesystem can coalesce dirty data,
+    // then re-open/re-hash/fsync leaves through the held root capability. Only
+    // after every file barrier succeeds do we flush each directory once. This
+    // preserves the same crash durability as file-fsync + directory-fsync per
+    // path without serializing 50,000 redundant directory barriers.
+    run_pull_source_workers(root, entries, write_pull_source_beneath_dir)?;
+    run_pull_source_workers(root, entries, sync_pull_source_beneath_dir)?;
+    sync_pull_directory_tree(root, "v2 pull stage")
 }
 
 #[cfg(unix)]
@@ -15151,6 +15275,61 @@ mod tests {
         assert!(destination.join("records/index.md").is_file());
         assert!(destination.join("records/contacts/index.md").is_file());
         assert!(destination.join("records/contacts/index.jsonl").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_bounded_parallel_source_install_is_exact_and_atomic() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let destination = sandbox.path().join("brain");
+        let cache = sandbox.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let db = scoped_projection_bytes(TEST_BRAIN_ID);
+        let shared = b"---\ntype: note\ncreated: 2026-08-19T00:00:00Z\nupdated: 2026-08-19T00:00:00Z\nsummary: Shared\n---\n\n# Shared\n";
+        let db_source = cache.join("db");
+        let shared_source = cache.join("shared");
+        crate::fsx::write_atomic(&db_source, &db).unwrap();
+        crate::fsx::write_atomic(&shared_source, shared).unwrap();
+        let mut entries = vec![V2StagedFile {
+            path: "DB.md".to_string(),
+            source: db_source,
+            sha256: content_sha256(&db),
+            bytes: db.len() as u64,
+        }];
+        for index in 0..512 {
+            entries.push(V2StagedFile {
+                path: format!("records/items/{index:05}.md"),
+                source: shared_source.clone(),
+                sha256: content_sha256(shared),
+                bytes: shared.len() as u64,
+            });
+        }
+        install_pulled_delta_sources(
+            &destination,
+            &entries,
+            &[],
+            false,
+            None,
+            &scoped_test_head(&"c".repeat(64)),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(destination.join("DB.md")).unwrap(), db);
+        for index in 0..512 {
+            assert_eq!(
+                std::fs::read(destination.join(format!("records/items/{index:05}.md"))).unwrap(),
+                shared
+            );
+        }
+        assert!(
+            std::fs::read_dir(sandbox.path())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("pull-stage")),
+            "the private stage must be atomically installed or removed"
+        );
     }
 
     #[test]
