@@ -8,9 +8,19 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.16**.
+  `Cargo.toml`, currently **v0.8.17**.
 
 ## Unreleased
+
+## [0.8.17] — 2026-08-20
+
+### Fixed
+
+- Scoped bidirectional sync now carries the pull-verified local view into the
+  push half without trying to remove its generated, non-authoritative `DB.md`
+  projection a second time. Scoped editors can commit inside their granted
+  prefix while an independently scanned or modified projection still fails
+  closed.
 
 ## [0.8.16] — 2026-08-20
 

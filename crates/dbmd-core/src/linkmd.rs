@@ -4232,6 +4232,26 @@ fn remove_scoped_projection(
     Ok(())
 }
 
+fn local_view_for_v2_push(
+    store: &Store,
+    head: &V2VerifiedHead,
+    baseline: Option<&V2SyncBaseline>,
+    carried: Option<V2LocalView>,
+) -> LinkResult<V2LocalView> {
+    match carried {
+        // The pull half already verified and removed the generated scoped
+        // projection before constructing its in-memory handoff. Requiring it
+        // a second time would turn every scoped bidirectional write into a
+        // false tamper refusal.
+        Some(view) => Ok(view),
+        None => {
+            let mut view = v2_local_files(store)?;
+            remove_scoped_projection(head, baseline, &mut view)?;
+            Ok(view)
+        }
+    }
+}
+
 fn files_for_v2_view(
     head: &V2VerifiedHead,
     mut files: std::collections::BTreeMap<String, V2BaselineFile>,
@@ -6377,11 +6397,7 @@ fn v2_sync_push(
     if head.view_kind == "scoped" && baseline.is_none() {
         return Err(LinkError::ScopedViewChanged);
     }
-    let mut local_view = match carried_local {
-        Some(view) => view,
-        None => v2_local_files(store)?,
-    };
-    remove_scoped_projection(&head, baseline.as_ref(), &mut local_view)?;
+    let local_view = local_view_for_v2_push(store, &head, baseline.as_ref(), carried_local)?;
     let local = &local_view.riding;
     let local_assets = match carried_local_assets {
         Some(assets) => assets,
@@ -15672,6 +15688,39 @@ mod tests {
         remove_scoped_projection(&head, Some(&baseline), &mut view).unwrap();
         assert!(!view.riding.contains_key("DB.md"));
         assert!(!view.eligibility.contains_key("DB.md"));
+    }
+
+    #[test]
+    fn scoped_push_accepts_a_pull_verified_handoff_without_double_checking_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            scoped_projection_bytes(TEST_BRAIN_ID),
+        )
+        .unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        let head = scoped_test_head(&"a".repeat(64));
+        let baseline = scoped_test_baseline(&"a".repeat(64));
+
+        let mut carried = v2_local_files(&store).unwrap();
+        remove_scoped_projection(&head, Some(&baseline), &mut carried).unwrap();
+        let handed_off =
+            local_view_for_v2_push(&store, &head, Some(&baseline), Some(carried)).unwrap();
+        assert!(!handed_off.riding.contains_key("DB.md"));
+
+        let freshly_scanned = local_view_for_v2_push(&store, &head, Some(&baseline), None).unwrap();
+        assert!(!freshly_scanned.riding.contains_key("DB.md"));
+
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\ntype: db-md\nscope: company\nowner: altered\n---\n",
+        )
+        .unwrap();
+        let tampered = Store::open_strict(directory.path()).unwrap();
+        assert!(matches!(
+            local_view_for_v2_push(&tampered, &head, Some(&baseline), None),
+            Err(LinkError::ScopedProjectionModified)
+        ));
     }
 
     #[test]
