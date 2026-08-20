@@ -897,10 +897,9 @@ mod tests {
 
     #[test]
     fn changed_sibling_rotates_the_nonce_hidden_from_retained_readers() {
-        let vector: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tests/vectors/linkmd-v2-content-tree.json"
-        ))
-        .unwrap();
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/linkmd-v2-content-tree.json"))
+                .unwrap();
         let privacy = &vector["changed_sibling"];
         let mut before_nonces = nonce_sequence();
         let before = build_content_tree(
@@ -984,7 +983,7 @@ mod tests {
     #[test]
     fn shared_portable_path_corpus_matches_rust() {
         let corpus: PathCorpus = serde_json::from_str(include_str!(
-            "../../../tests/vectors/linkmd-v2-portable-paths.json"
+            "../tests/vectors/linkmd-v2-portable-paths.json"
         ))
         .unwrap();
         assert_eq!(corpus.v, 1);

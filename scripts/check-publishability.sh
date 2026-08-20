@@ -25,6 +25,20 @@ grep -Fqx \
     exit 1
 }
 
+# Unit tests in the published dbmd-core crate consume package-local copies of
+# the public cross-implementation vectors. Refuse a source release if those
+# copies drift from the repository-level conformance fixtures.
+for vector in \
+    linkmd-v2-commit-bridge.json \
+    linkmd-v2-content-tree.json \
+    linkmd-v2-portable-paths.json
+do
+    cmp "tests/vectors/$vector" "crates/dbmd-core/tests/vectors/$vector" || {
+        printf 'packaged conformance vector drifted: %s\n' "$vector" >&2
+        exit 1
+    }
+done
+
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/dbmd-publish-check.XXXXXXXX")"
 cleanup() {
     rm -rf "$scratch"

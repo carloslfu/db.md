@@ -1,0 +1,77 @@
+{
+  "v": 1,
+  "profile": "link.md-v2-commit",
+  "identity": {
+    "fingerprint": "ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM",
+    "public_key_spki": "MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4",
+    "private_key_pkcs8": "MC4CAQAwBQYDK2VwBCIEIJBQq6vP7vVw-kOTGh6Mp-ceQaerQhikAHwbqrEivd4P",
+    "note": "TEST KEY ONLY. Never reuse."
+  },
+  "body": {
+    "actor_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "asset_root": null,
+    "brain": "ed25519:ytUalMZXa86de4qRDBYzlj1TrNnGHPSztfYhVoFfoMM",
+    "changes_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "control_revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "materializer": "dbmd-projection-v1",
+    "op": "changeset",
+    "parent_asset_root": null,
+    "parent_commit": null,
+    "parent_root": null,
+    "prev_entry_hash": null,
+    "public_key": "MCowBQYDK2VwAyEAOCFVH30p3nNC7Xd1PMHEsyYJv2TXFFDun0rsBYHRah4",
+    "seq": 1,
+    "signer_epoch": 1,
+    "state_root": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "ts": "2026-08-19T12:00:00.000Z",
+    "v": 2,
+    "v1_bridge": {
+      "feed_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "head_seq": 7,
+      "pack_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  },
+  "valid": [
+    {
+      "name": "verified_nonempty_v1_genesis",
+      "v1_bridge": {
+        "feed_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "head_seq": 7,
+        "pack_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "signature_base64url": "bHd349tGLEBuXttyKT6m3wpcrJerU5eKOFceYw8eSfJQkFz3ibKQtCBKMpJ_GTcJUdrDWY8U1fvebuJyhcpaCQ",
+      "commit_hash": "36115ce33c782aec9c2e69b9473750f614d2d9ecb7ccb495287024c41813f122",
+      "feed_hash": "6345eb00edb80e554420cfbb59651502f5d4f29573a8aec345f72807f0ca0226"
+    },
+    {
+      "name": "empty_profile_genesis",
+      "v1_bridge": null,
+      "signature_base64url": "aBvwwg5DkcHdl1-wniZU0Im3YVMLe-IdFMf0wBnBVXjum892grsYB6AT4XU3OHeGGmFtyGnmE0NrE9QQ_HDnCQ",
+      "commit_hash": "f3eaf3e9567ea6104b32f7ee0d11fa90e3aa90a694e44091adbbb3e6f262d8fa",
+      "feed_hash": "7032af0a67fb98d473f7602833c15c225ce1089ede306d81e9c1981389e58431"
+    }
+  ],
+  "invalid": [
+    { "reason": "missing_v1_bridge", "remove": ["v1_bridge"] },
+    { "reason": "extra_unsigned_field", "set": { "future": true } },
+    {
+      "reason": "invalid_bridge_hash",
+      "set": {
+        "v1_bridge": {
+          "feed_hash": "bad",
+          "head_seq": 7,
+          "pack_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      }
+    },
+    {
+      "reason": "bridge_on_non_genesis",
+      "set": {
+        "seq": 2,
+        "parent_commit": "1111111111111111111111111111111111111111111111111111111111111111",
+        "parent_root": "2222222222222222222222222222222222222222222222222222222222222222",
+        "prev_entry_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    }
+  ]
+}

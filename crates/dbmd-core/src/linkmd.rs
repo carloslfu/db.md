@@ -13395,7 +13395,7 @@ mod tests {
     #[test]
     fn shared_v2_commit_bridge_vector_matches_the_typescript_signer() {
         let vector: Value = serde_json::from_str(include_str!(
-            "../../../tests/vectors/linkmd-v2-commit-bridge.json"
+            "../tests/vectors/linkmd-v2-commit-bridge.json"
         ))
         .unwrap();
         let identity_value = vector.get("identity").unwrap();
