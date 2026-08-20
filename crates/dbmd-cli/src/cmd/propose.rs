@@ -119,7 +119,7 @@ fn set_after_body_file_open(hook: impl FnOnce() + 'static) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
