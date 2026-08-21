@@ -1746,7 +1746,10 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
         }
     };
     match result {
-        Ok(resp) if (200..300).contains(&resp.status()) => Ok(()),
+        Ok(resp) if (200..300).contains(&resp.status()) => {
+            drain_presigned_response(resp);
+            Ok(())
+        }
         Ok(resp) => Err(presigned_upload_refusal(resp)),
         Err(error) => match error {
             // Immutable uploads use If-None-Match. A concurrent writer may
@@ -1761,6 +1764,15 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
             }),
         },
     }
+}
+
+/// Draining a response is what returns its connection to the pool: the client
+/// cannot recycle a socket whose body may still have bytes pending, so a body
+/// that is dropped instead of read costs the next object a fresh handshake.
+/// An object-store PUT answers with almost nothing, so this is nearly free.
+fn drain_presigned_response(response: ureq::Response) {
+    let mut reader = response.into_reader().take(64 * 1024);
+    let _ = std::io::copy(&mut reader, &mut std::io::sink());
 }
 
 /// Carry the object store's own reason for a refusal. An unexplained status is
@@ -7048,7 +7060,10 @@ fn put_presigned_source(
         }
     };
     match result {
-        Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+        Ok(response) if (200..300).contains(&response.status()) => {
+            drain_presigned_response(response);
+            Ok(())
+        }
         Ok(response) => {
             // The object store states its own reason (checksum mismatch,
             // precondition, expiry). Carrying a bounded excerpt turns an
