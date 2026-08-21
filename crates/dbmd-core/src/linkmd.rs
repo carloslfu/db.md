@@ -226,6 +226,21 @@ fn upload_retry_backoff_ms(attempt: usize) -> u64 {
     UPLOAD_RETRY_BACKOFF_MS[attempt.min(UPLOAD_RETRY_BACKOFF_MS.len() - 1)]
 }
 
+/// A migration opens dozens of staging windows back to back, so it is ordinary
+/// for a shared limiter or a briefly busy hub to answer one of them with 429 or
+/// 5xx. Failing the push there throws away every byte already staged, and the
+/// waits have to reach past a whole limiter window to be worth anything.
+const RESERVATION_ATTEMPTS: usize = 7;
+const RESERVATION_BACKOFF_MS: [u64; RESERVATION_ATTEMPTS - 1] =
+    [500, 2_000, 5_000, 15_000, 30_000, 60_000];
+
+/// Answers a busy or briefly unhealthy hub gives, as opposed to a refusal that
+/// would repeat identically. A 4xx other than these states something about the
+/// request itself and is never retried.
+fn is_retryable_hub_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
 /// Statuses worth replaying an immutable, content-addressed upload for: edge
 /// and object-store refusals that are load-shaped rather than a statement about
 /// these bytes. A checksum or precondition failure is never retried.
@@ -7211,6 +7226,29 @@ fn v2_signed_request_view(body: &Value, operations: &[Value]) -> Value {
     value
 }
 
+/// Open one staging window, waiting out a busy hub rather than abandoning the
+/// push. The call reserves capacity and mints URLs; it commits nothing, so
+/// asking again after a refusal costs only the wait.
+fn reserve_upload_window(
+    cfg: &HubConfig,
+    path: &str,
+    body: &Value,
+    what: &'static str,
+) -> LinkResult<Value> {
+    let mut attempt = 0;
+    loop {
+        let response = request(cfg, "POST", path, Some(body), Auth::Required)?;
+        if is_retryable_hub_status(response.status) && attempt + 1 < RESERVATION_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(
+                RESERVATION_BACKOFF_MS[attempt.min(RESERVATION_BACKOFF_MS.len() - 1)],
+            ));
+            attempt += 1;
+            continue;
+        }
+        return ensure_ok(response, what);
+    }
+}
+
 /// The exact bytes of a staged change. The hub refuses a manifest carrying any
 /// other key, so this is the whole contract: operations, and the blob
 /// references they need, and nothing else.
@@ -7242,20 +7280,16 @@ fn stage_v2_change(
 ) -> LinkResult<Value> {
     let bytes = v2_change_manifest(operations, blobs)?;
     let sha256 = content_sha256(&bytes);
-    let reserved = ensure_ok(
-        request(
-            cfg,
-            "POST",
-            &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
-            Some(&json!({
-                "blobs": [{
-                    "sha256": sha256,
-                    "bytes": bytes.len(),
-                    "kind": "staged_change",
-                }],
-            })),
-            Auth::Required,
-        )?,
+    let reserved = reserve_upload_window(
+        cfg,
+        &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
+        &json!({
+            "blobs": [{
+                "sha256": sha256,
+                "bytes": bytes.len(),
+                "kind": "staged_change",
+            }],
+        }),
         "stage the v2 change",
     )?;
     let items = reserved
@@ -7884,14 +7918,10 @@ fn v2_sync_push(
         // and uploading afterwards expires the earliest URLs on a real store.
         for batch in batch_upload_declarations(declarations) {
             let batch_len = batch.len();
-            let reserved = ensure_ok(
-                request(
-                    cfg,
-                    "POST",
-                    &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
-                    Some(&json!({ "blobs": batch })),
-                    Auth::Required,
-                )?,
+            let reserved = reserve_upload_window(
+                cfg,
+                &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
+                &json!({ "blobs": batch }),
                 "prepare v2 changed-byte uploads",
             )?;
             let items = reserved
@@ -11759,14 +11789,10 @@ pub fn proposal_accept_exact(
             .collect::<Vec<_>>();
         let mut items: Vec<Value> = Vec::with_capacity(downloaded.len());
         for batch in batch_upload_declarations(declarations) {
-            let reserved = ensure_ok(
-                request(
-                    cfg,
-                    "POST",
-                    &format!("/api/hub/brains/{}/v2/uploads", head.brain_id),
-                    Some(&json!({ "blobs": batch })),
-                    Auth::Required,
-                )?,
+            let reserved = reserve_upload_window(
+                cfg,
+                &format!("/api/hub/brains/{}/v2/uploads", head.brain_id),
+                &json!({ "blobs": batch }),
                 "prepare proposal blob transport",
             )?;
             let reserved_items = reserved
@@ -14396,6 +14422,26 @@ mod tests {
             flattened, declarations,
             "batching must preserve the set and order"
         );
+    }
+
+    #[test]
+    fn only_load_shaped_hub_answers_are_worth_asking_again() {
+        // A migration opens dozens of staging windows, so a busy hub's 429 or
+        // 5xx must not end the push — while a refusal that states something
+        // about the request itself has to surface immediately rather than
+        // being repeated six times behind a minute of waiting.
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_hub_status(status), "{status} is load-shaped");
+        }
+        for status in [400, 401, 403, 404, 409, 413, 422] {
+            assert!(
+                !is_retryable_hub_status(status),
+                "{status} states something about the request"
+            );
+        }
+        // The waits must reach past a whole limiter window to be worth taking.
+        let total: u64 = RESERVATION_BACKOFF_MS.iter().sum();
+        assert!(total >= 60_000, "backoff totals only {total}ms");
     }
 
     #[test]
