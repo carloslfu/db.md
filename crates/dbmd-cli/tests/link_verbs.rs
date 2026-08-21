@@ -394,7 +394,7 @@ impl MockHub {
     }
 }
 
-fn serve_exact_snapshot_hub() -> MockHub {
+fn serve_exact_snapshot_hub(v2_probe_miss: bool) -> MockHub {
     serve_snapshot_hub(vec![
         (
             "DB.md".to_string(),
@@ -404,10 +404,10 @@ fn serve_exact_snapshot_hub() -> MockHub {
             "records/note.md".to_string(),
             "---\ntype: note\nid: 01j5qc3v9k4ym8rwbn2tqe6f7e\nsummary: Signed note\n---\n\n# Note\n".to_string(),
         ),
-    ])
+    ], v2_probe_miss)
 }
 
-fn serve_snapshot_hub(files: Vec<(String, String)>) -> MockHub {
+fn serve_snapshot_hub(files: Vec<(String, String)>, v2_probe_miss: bool) -> MockHub {
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
@@ -496,12 +496,17 @@ fn serve_snapshot_hub(files: Vec<(String, String)>) -> MockHub {
             "url": format!("{url}/snapshot.pack"),
         })
         .to_string();
-        vec![
+        let mut responses = Vec::new();
+        if v2_probe_miss {
+            responses.push((404, "application/json", b"{}".to_vec()));
+        }
+        responses.extend([
             (200, "application/json", card.into_bytes()),
             (200, "application/json", feed.into_bytes()),
             (200, "application/json", export.into_bytes()),
             (200, "application/zip", pack),
-        ]
+        ]);
+        responses
     })
 }
 
@@ -791,7 +796,7 @@ fn resolve_bare_brain_gets_card_with_bearer() {
 fn resolve_ulid_target_queries_by_id_and_path_target_by_path() {
     let dir = tempfile::tempdir().unwrap();
 
-    let hub = serve_exact_snapshot_hub();
+    let hub = serve_exact_snapshot_hub(true);
     let by_id = run_dbmd(
         dir.path(),
         &["resolve", &format!("@{BRAIN_ID}/{RECORD_ID}")],
@@ -801,14 +806,15 @@ fn resolve_ulid_target_queries_by_id_and_path_target_by_path() {
     assert_eq!(by_id.code, Some(0), "stderr: {}", by_id.stderr);
     assert!(by_id.stdout.contains("# Note"), "stdout: {}", by_id.stdout);
     let reqs = hub.finish();
-    assert_eq!(reqs[0].path, format!("/api/hub/brains/{BRAIN_ID}"));
+    assert_eq!(reqs[0].path, format!("/api/hub/brains/{BRAIN_ID}/v2/head"));
+    assert_eq!(reqs[1].path, format!("/api/hub/brains/{BRAIN_ID}"));
     assert!(
         reqs.iter()
             .all(|request| !request.path.contains("/resolve?")),
         "record resolution must not trust the unsigned query endpoint"
     );
 
-    let hub = serve_exact_snapshot_hub();
+    let hub = serve_exact_snapshot_hub(true);
     let by_path = run_dbmd(
         dir.path(),
         &["resolve", "@acme/records/note.md", "--json"],
@@ -818,7 +824,8 @@ fn resolve_ulid_target_queries_by_id_and_path_target_by_path() {
     assert_eq!(by_path.code, Some(0), "stderr: {}", by_path.stderr);
 
     let reqs = hub.finish();
-    assert_eq!(reqs[0].path, "/api/hub/brains/acme");
+    assert_eq!(reqs[0].path, "/api/hub/brains/acme/v2/head");
+    assert_eq!(reqs[1].path, "/api/hub/brains/acme");
     assert!(
         reqs.iter()
             .all(|request| !request.path.contains("/resolve?")),
@@ -1572,13 +1579,16 @@ fn hub_strings_render_terminal_sanitized_in_text_mode_and_verbatim_in_json() {
     let dir = tempfile::tempdir().unwrap();
     let addr = format!("@{BRAIN_ID}/{RECORD_ID}");
 
-    let hub = serve_snapshot_hub(vec![
-        (
-            "DB.md".to_string(),
-            "---\ntype: db-md\nscope: company\nname: Control test\n---\n".to_string(),
-        ),
-        ("records/clients/lumio.md".to_string(), record.clone()),
-    ]);
+    let hub = serve_snapshot_hub(
+        vec![
+            (
+                "DB.md".to_string(),
+                "---\ntype: db-md\nscope: company\nname: Control test\n---\n".to_string(),
+            ),
+            ("records/clients/lumio.md".to_string(), record.clone()),
+        ],
+        true,
+    );
     let text = run_dbmd(dir.path(), &["resolve", &addr], Some(&hub.url), Some("k"));
     assert_eq!(text.code, Some(0), "stderr: {}", text.stderr);
     assert!(
@@ -1601,13 +1611,16 @@ fn hub_strings_render_terminal_sanitized_in_text_mode_and_verbatim_in_json() {
     );
     hub.finish();
 
-    let hub = serve_snapshot_hub(vec![
-        (
-            "DB.md".to_string(),
-            "---\ntype: db-md\nscope: company\nname: Control test\n---\n".to_string(),
-        ),
-        ("records/clients/lumio.md".to_string(), record),
-    ]);
+    let hub = serve_snapshot_hub(
+        vec![
+            (
+                "DB.md".to_string(),
+                "---\ntype: db-md\nscope: company\nname: Control test\n---\n".to_string(),
+            ),
+            ("records/clients/lumio.md".to_string(), record),
+        ],
+        true,
+    );
     let json = run_dbmd(
         dir.path(),
         &["resolve", &addr, "--json"],
@@ -1950,7 +1963,7 @@ const VEC_HASH_3: &str = "50215474e01bb4698729fb1bab1befad430b95011a4d3fba358775
 
 #[test]
 fn mirror_verifies_the_whole_chain_stores_exact_bytes_and_pins() {
-    let hub = serve_exact_snapshot_hub();
+    let hub = serve_exact_snapshot_hub(false);
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("mirror");
     let out = run_dbmd(
@@ -2015,7 +2028,7 @@ fn mirror_refuses_a_planted_legacy_backup_without_touching_it_or_dialing() {
 #[test]
 fn serve_reserves_a_mirror_and_a_second_dbmd_reverifies_hub_independently() {
     // Mirror from the mock hub first.
-    let hub = serve_exact_snapshot_hub();
+    let hub = serve_exact_snapshot_hub(false);
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("mirror");
     let mirrored = run_dbmd(

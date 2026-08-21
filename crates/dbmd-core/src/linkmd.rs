@@ -2152,12 +2152,45 @@ pub fn resolve(cfg: &HubConfig, addr: &Address) -> LinkResult<Value> {
         }
     }
 
-    // A record is never accepted from the hub's mutable query/index response:
-    // that response was not covered by the brain's feed signature and could
-    // return arbitrary frontmatter/body while an unrelated signed head still
-    // verified. Materialize the record from the exact content-addressed pack
-    // named by the verified signed head instead.
+    // A record is never accepted from the hub's mutable query/index response.
+    // Under v2, an id lookup may suggest a path, but the client accepts only
+    // bytes whose exact path proof reaches the verified content root and whose
+    // parsed id still matches. Under v1, the signed snapshot pack remains the
+    // binding. Both profiles therefore reject a forged query response.
     if let Some(target) = &addr.target {
+        if let Some(head) = v2_verified_head(cfg, &addr.brain)? {
+            let pointer = head.pointer.as_ref().ok_or_else(|| LinkError::Http {
+                what: "resolve",
+                status: 404,
+                message: "record not found".to_string(),
+                code: Some("NOT_FOUND".to_string()),
+                details: None,
+            })?;
+            let (path, file) = match target {
+                AddressTarget::Path(path) => {
+                    let file =
+                        v2_manifest_file(cfg, &head.brain_id, pointer, path)?.ok_or_else(|| {
+                            LinkError::Http {
+                                what: "resolve",
+                                status: 404,
+                                message: "record not found".to_string(),
+                                code: Some("NOT_FOUND".to_string()),
+                                details: None,
+                            }
+                        })?;
+                    (path.clone(), file)
+                }
+                AddressTarget::Id(id) => v2_manifest_file_by_id(cfg, &head.brain_id, pointer, id)?,
+            };
+            let mut downloaded =
+                download_v2_blobs(cfg, &head.brain_id, pointer, vec![(&path, &file)])?;
+            let (_, bytes) = downloaded
+                .pop()
+                .ok_or_else(|| invalid_feed("v2 record download returned no bytes"))?;
+            let resolved = resolve_from_verified_record_bytes(&head.brain_id, target, path, bytes)?;
+            accept_v2_head(cfg, &head)?;
+            return Ok(resolved);
+        }
         let remote = verified_remote_head(cfg, &addr.brain, false)?;
         if !remote.head.verified {
             return Err(invalid_feed(
@@ -2315,6 +2348,28 @@ fn resolve_from_verified_pack(
         code: Some("NOT_FOUND".to_string()),
         details: None,
     })?;
+    resolve_from_verified_record_bytes(brain, target, path, bytes)
+}
+
+fn resolve_from_verified_record_bytes(
+    brain: &str,
+    target: &AddressTarget,
+    path: String,
+    bytes: Vec<u8>,
+) -> LinkResult<Value> {
+    match target {
+        AddressTarget::Path(expected) if expected != &path => {
+            return Err(invalid_feed(
+                "verified record path differs from the requested path",
+            ));
+        }
+        AddressTarget::Id(_) if !(path.starts_with("records/") || path.starts_with("sources/")) => {
+            return Err(invalid_feed(
+                "verified id resolved outside records or sources",
+            ));
+        }
+        _ => {}
+    }
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| invalid_feed(format!("signed snapshot record `{path}` is not UTF-8")))?;
     let parsed = crate::parser::split_frontmatter(text, Path::new(&path))
@@ -2326,6 +2381,13 @@ fn resolve_from_verified_pack(
             "signed snapshot record `{path}` frontmatter is not a mapping"
         )));
     };
+    if let AddressTarget::Id(expected) = target {
+        if fields.get("id").and_then(Value::as_str) != Some(expected.as_str()) {
+            return Err(invalid_feed(
+                "verified record id differs from the requested id",
+            ));
+        }
+    }
     let mut document = serde_json::Map::new();
     document.insert("path".to_string(), Value::String(path));
     for (key, value) in fields {
@@ -3472,6 +3534,130 @@ fn v2_manifest(
         }
     }
     Ok(files)
+}
+
+/// Fetch one exact path proof instead of enumerating the whole permission
+/// view. This keeps `resolve @brain/path` proportional to path depth even for
+/// a very large brain. The returned leaf is accepted only after its complete
+/// proof chain reaches the content root signed by `pointer`.
+fn v2_manifest_file(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    path: &str,
+) -> LinkResult<Option<V2BaselineFile>> {
+    let Some(root) = pointer.content_root.as_deref() else {
+        return Ok(None);
+    };
+    crate::linkmd_v2::normalize_path(path).map_err(|error| LinkError::UnsafePath {
+        path: error.to_string(),
+    })?;
+    let encoded: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+    let value = ensure_ok(
+        request_capped(
+            cfg,
+            "GET",
+            &format!(
+                "/api/hub/brains/{brain}/v2/files?commit={}&path={encoded}",
+                pointer.commit_hash
+            ),
+            None,
+            Auth::Required,
+            MAX_FEED_RESPONSE_BYTES,
+        )?,
+        "v2 exact file proof",
+    )?;
+    let mut page: V2ManifestPage = serde_json::from_value(value)
+        .map_err(|_| invalid_feed("v2 exact file proof has an invalid shape"))?;
+    if page.v != 2
+        || page.commit != pointer.commit_hash
+        || page.content_root.as_deref() != Some(root)
+        || page.next_cursor.is_some()
+        || page.files.len() != 1
+        || page.files[0].path != path
+    {
+        return Err(invalid_feed(
+            "v2 exact file proof is not bound to the requested signed path",
+        ));
+    }
+    let file = page.files.pop().expect("exactly one file was checked");
+    verify_v2_file_proof(root, &file)?;
+    Ok(Some(V2BaselineFile {
+        sha256: file.sha256,
+        bytes: file.bytes,
+        proof: Some(file.proof),
+    }))
+}
+
+/// Resolve an id through the hub's synchronously maintained, content-light
+/// validation certificate, then require the same exact signed path proof as a
+/// path lookup. The certificate is only an efficient locator: the downloaded
+/// bytes are parsed again and their id is checked by the caller.
+fn v2_manifest_file_by_id(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    id: &str,
+) -> LinkResult<(String, V2BaselineFile)> {
+    let root = pointer
+        .content_root
+        .as_deref()
+        .ok_or_else(|| LinkError::Http {
+            what: "resolve",
+            status: 404,
+            message: "record not found".to_string(),
+            code: Some("NOT_FOUND".to_string()),
+            details: None,
+        })?;
+    if !crate::ulid::is_ulid(id) {
+        return Err(LinkError::BadAddress {
+            given: id.to_string(),
+            reason: BAD_TARGET_REASON.to_string(),
+        });
+    }
+    let encoded: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+    let value = ensure_ok(
+        request_capped(
+            cfg,
+            "GET",
+            &format!(
+                "/api/hub/brains/{brain}/v2/files?commit={}&id={encoded}",
+                pointer.commit_hash
+            ),
+            None,
+            Auth::Required,
+            MAX_FEED_RESPONSE_BYTES,
+        )?,
+        "v2 exact id proof",
+    )?;
+    let mut page: V2ManifestPage = serde_json::from_value(value)
+        .map_err(|_| invalid_feed("v2 exact id proof has an invalid shape"))?;
+    if page.v != 2
+        || page.commit != pointer.commit_hash
+        || page.content_root.as_deref() != Some(root)
+        || page.next_cursor.is_some()
+        || page.files.len() != 1
+    {
+        return Err(invalid_feed(
+            "v2 exact id proof is not bound to one signed path",
+        ));
+    }
+    let file = page.files.pop().expect("exactly one file was checked");
+    if !safe_store_rel_path(&file.path)
+        || !file.path.ends_with(".md")
+        || !(file.path.starts_with("records/") || file.path.starts_with("sources/"))
+    {
+        return Err(invalid_feed("v2 exact id proof has an invalid record path"));
+    }
+    verify_v2_file_proof(root, &file)?;
+    Ok((
+        file.path,
+        V2BaselineFile {
+            sha256: file.sha256,
+            bytes: file.bytes,
+            proof: Some(file.proof),
+        },
+    ))
 }
 
 fn verify_v2_asset_proof(root: &str, item: &V2AssetManifestItem) -> LinkResult<()> {
@@ -14920,6 +15106,137 @@ mod tests {
         .unwrap();
         assert_eq!(by_path["document"]["id"], record_id);
         assert_eq!(by_path["document"]["path"], "records/clients/truth.md");
+
+        let wrong_id = resolve_from_verified_record_bytes(
+            TEST_BRAIN_ID,
+            &AddressTarget::Id("01j5qc3v9k4ym8rwbn2tqe6f7f".to_string()),
+            "records/clients/truth.md".to_string(),
+            raw.as_bytes().to_vec(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_id.contains("id differs"), "{wrong_id}");
+
+        let wrong_path = resolve_from_verified_record_bytes(
+            TEST_BRAIN_ID,
+            &AddressTarget::Path("records/clients/other.md".to_string()),
+            "records/clients/truth.md".to_string(),
+            raw.into_bytes(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_path.contains("path differs"), "{wrong_path}");
+    }
+
+    #[test]
+    fn v2_record_locators_return_one_proof_bound_to_the_signed_content_root() {
+        let path = "records/clients/truth.md";
+        let record_id = "01j5qc3v9k4ym8rwbn2tqe6f7e";
+        let raw = format!(
+            "---\ntype: client\nid: {record_id}\nsummary: Signed truth\n---\n# Signed truth\n"
+        );
+        let sha256 = content_sha256(raw.as_bytes());
+        let mut nonce = 0_u128;
+        let tree = crate::linkmd_v2::build_content_tree(
+            &[crate::linkmd_v2::ContentFile {
+                path: path.to_string(),
+                blob_hash: sha256.clone(),
+                bytes: raw.len() as u64,
+            }],
+            None,
+            &mut || {
+                nonce += 1;
+                format!("{nonce:032x}")
+            },
+        )
+        .unwrap();
+        let root = tree.root.clone().unwrap();
+        let mut directory_root = root.clone();
+        let mut proof = Vec::new();
+        for component in path.split('/') {
+            let inclusion =
+                crate::linkmd_v2::create_proof(&directory_root, component, &tree.nodes).unwrap();
+            let child = match &inclusion {
+                crate::linkmd_v2::HamtProof::Inclusion { entry, .. } => entry.child_hash.clone(),
+                crate::linkmd_v2::HamtProof::NonInclusion { .. } => {
+                    panic!("fixture path must have an inclusion proof")
+                }
+            };
+            proof.push(json!({
+                "directory_root": directory_root,
+                "component": component,
+                "proof": inclusion,
+            }));
+            directory_root = child;
+        }
+        let commit_hash = "c".repeat(64);
+        let pointer = V2PointerBody {
+            v: 2,
+            brain: TEST_BRAIN_ID.to_string(),
+            seq: 1,
+            commit_hash: commit_hash.clone(),
+            feed_hash: "f".repeat(64),
+            content_root: Some(root.clone()),
+            asset_root: None,
+            materializer: "dbmd-projection-v1".to_string(),
+            signer_epoch: 1,
+            control_revision: "d".repeat(64),
+            backup_preparation: "e".repeat(64),
+            prior_pointer_hash: None,
+            signed_at: "2026-08-21T12:00:00.000Z".to_string(),
+        };
+        let manifest = json!({
+            "v": 2,
+            "commit": commit_hash,
+            "content_root": root,
+            "files": [{
+                "path": path,
+                "sha256": sha256,
+                "bytes": raw.len(),
+                "proof": proof,
+            }],
+            "next_cursor": Value::Null,
+        })
+        .to_string();
+
+        let path_manifest = manifest.clone();
+        let (hub, server) = routed_json_hub(1, move |request| {
+            assert_eq!(
+                request,
+                format!(
+                    "/api/hub/brains/{TEST_BRAIN_ID}/v2/files?commit={}&path=records%2Fclients%2Ftruth.md",
+                    "c".repeat(64)
+                )
+            );
+            (200, path_manifest.clone())
+        });
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(hub, state.path().to_path_buf());
+        let by_path = v2_manifest_file(&cfg, TEST_BRAIN_ID, &pointer, path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_path.sha256, content_sha256(raw.as_bytes()));
+        assert!(by_path.proof.is_some());
+        server.join().unwrap();
+
+        let id_manifest = manifest;
+        let (hub, server) = routed_json_hub(1, move |request| {
+            assert_eq!(
+                request,
+                format!(
+                    "/api/hub/brains/{TEST_BRAIN_ID}/v2/files?commit={}&id={record_id}",
+                    "c".repeat(64)
+                )
+            );
+            (200, id_manifest.clone())
+        });
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(hub, state.path().to_path_buf());
+        let (located_path, by_id) =
+            v2_manifest_file_by_id(&cfg, TEST_BRAIN_ID, &pointer, record_id).unwrap();
+        assert_eq!(located_path, path);
+        assert_eq!(by_id.sha256, content_sha256(raw.as_bytes()));
+        server.join().unwrap();
     }
 
     #[test]

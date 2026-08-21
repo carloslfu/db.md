@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.20**.
+  `Cargo.toml`, currently **v0.8.21**.
 
 ## Unreleased
+
+## [0.8.21] — 2026-08-21
+
+### Fixed
+
+- `dbmd resolve @brain/<id-or-path>` now resolves records from a v2 brain
+  without consulting a mutable document projection or enumerating the whole
+  permission view. The client verifies one exact path proof against the signed
+  content root, rehashes the downloaded blob, and checks the parsed path or
+  record id before advancing its trust checkpoint. An id index is accepted
+  only as an exact-head locator and cannot supply trusted record content.
 
 ## [0.8.20] — 2026-08-21
 
