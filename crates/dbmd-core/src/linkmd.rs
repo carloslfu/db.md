@@ -1643,7 +1643,10 @@ fn hub_is_loopback(hub: &str) -> bool {
     })
 }
 
-fn presigned_agent(cfg: &HubConfig, raw: &str) -> LinkResult<ureq::Agent> {
+/// Every safety property a presigned object-store URL must carry, checked
+/// before anything is sent to it. Split out from agent construction so a batch
+/// can share one connection pool without ever skipping a per-URL check.
+fn checked_presigned_url(cfg: &HubConfig, raw: &str) -> LinkResult<(url::Url, bool)> {
     let parsed = url::Url::parse(raw).map_err(|_| LinkError::InvalidPack {
         message: "the hub returned an invalid object-store URL".to_string(),
     })?;
@@ -1658,12 +1661,48 @@ fn presigned_agent(cfg: &HubConfig, raw: &str) -> LinkResult<ureq::Agent> {
             message: "the hub returned an unsafe object-store URL".to_string(),
         });
     }
+    Ok((parsed, allow_private))
+}
+
+fn presigned_agent(cfg: &HubConfig, raw: &str) -> LinkResult<ureq::Agent> {
+    let (parsed, allow_private) = checked_presigned_url(cfg, raw)?;
     pinned_public_agent(&parsed, allow_private, "object-store URL").map_err(|_| {
         LinkError::InvalidPack {
             message: "the hub returned an object-store URL with an unsafe network target"
                 .to_string(),
         }
     })
+}
+
+/// One pinned agent for a whole staging batch.
+///
+/// Every object in a batch is presigned against the same object-store
+/// authority, so one agent can serve them all — and must: building one per
+/// object costs a DNS resolution and a fresh TLS handshake per object, which is
+/// the difference between a real store staging in minutes and in an hour. The
+/// shared authority is verified rather than assumed, and a batch that ever
+/// spans two of them falls back to a per-object agent.
+fn shared_staging_agent(cfg: &HubConfig, urls: &[&str]) -> Option<ureq::Agent> {
+    let (first, allow_private) = checked_presigned_url(cfg, urls.first()?).ok()?;
+    let authority = (
+        first.host_str()?.to_string(),
+        first.port_or_known_default()?,
+    );
+    for raw in &urls[1..] {
+        let (parsed, _) = checked_presigned_url(cfg, raw).ok()?;
+        if (parsed.host_str()?, parsed.port_or_known_default()?)
+            != (authority.0.as_str(), authority.1)
+        {
+            return None;
+        }
+    }
+    pinned_public_agent_pooled(
+        &first,
+        allow_private,
+        "object-store URL",
+        V2_UPLOAD_CONCURRENCY,
+    )
+    .ok()
 }
 
 fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> LinkResult<()> {
@@ -1899,6 +1938,18 @@ fn pinned_public_agent(
     allow_private: bool,
     label: &str,
 ) -> LinkResult<ureq::Agent> {
+    pinned_public_agent_pooled(url, allow_private, label, 1)
+}
+
+/// `idle_per_host` sizes the connection pool. The default of one is right for a
+/// lone request but throttles a concurrent batch back to one warm connection,
+/// so every extra worker would pay a fresh handshake.
+fn pinned_public_agent_pooled(
+    url: &url::Url,
+    allow_private: bool,
+    label: &str,
+    idle_per_host: usize,
+) -> LinkResult<ureq::Agent> {
     let host = url
         .host_str()
         .ok_or_else(|| invalid_feed(format!("{label} has no host")))?;
@@ -1929,6 +1980,7 @@ fn pinned_public_agent(
         format!("{host}:{port}")
     };
     Ok(agent_builder()
+        .max_idle_connections_per_host(idle_per_host.max(1))
         .resolver(PinnedRegistryResolver { netloc, addresses })
         .build())
 }
@@ -6844,7 +6896,10 @@ struct V2PendingUpload<'a> {
 /// How many objects a migration stages at once. Bounded so a first push does
 /// not behave like a burst against the object store, while still being far
 /// faster than one-at-a-time.
-const V2_UPLOAD_CONCURRENCY: usize = 8;
+/// Workers staging one batch. With a shared pooled connection the cost of an
+/// object is the PUT itself rather than a handshake, so a wider pool converts
+/// directly into throughput on a migration.
+const V2_UPLOAD_CONCURRENCY: usize = 16;
 
 /// Stage a reserved batch, uploading up to `V2_UPLOAD_CONCURRENCY` objects at a
 /// time and verifying each against the store after it lands. The first failure
@@ -6857,9 +6912,21 @@ fn upload_v2_batch_concurrently(
     if pending.is_empty() {
         return Ok(());
     }
+    let urls = pending
+        .iter()
+        .map(|task| task.url.as_str())
+        .collect::<Vec<_>>();
+    let shared = shared_staging_agent(cfg, &urls);
     if pending.len() == 1 {
         let task = &pending[0];
-        put_presigned_source(cfg, &task.url, &task.headers, store, task.source)?;
+        put_presigned_source(
+            cfg,
+            &task.url,
+            &task.headers,
+            store,
+            task.source,
+            shared.as_ref(),
+        )?;
         return verify_v2_upload_source(store, &task.source.path, &task.sha256, task.source.bytes);
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -6875,16 +6942,22 @@ fn upload_v2_batch_concurrently(
                 let Some(task) = pending.get(index) else {
                     return;
                 };
-                let outcome =
-                    put_presigned_source(cfg, &task.url, &task.headers, store, task.source)
-                        .and_then(|()| {
-                            verify_v2_upload_source(
-                                store,
-                                &task.source.path,
-                                &task.sha256,
-                                task.source.bytes,
-                            )
-                        });
+                let outcome = put_presigned_source(
+                    cfg,
+                    &task.url,
+                    &task.headers,
+                    store,
+                    task.source,
+                    shared.as_ref(),
+                )
+                .and_then(|()| {
+                    verify_v2_upload_source(
+                        store,
+                        &task.source.path,
+                        &task.sha256,
+                        task.source.bytes,
+                    )
+                });
                 if let Err(error) = outcome {
                     if let Ok(mut guard) = failure.lock() {
                         guard.get_or_insert(error);
@@ -6907,8 +6980,18 @@ fn put_presigned_source(
     headers: &Value,
     store: &Store,
     source: &V2UploadSource,
+    shared: Option<&ureq::Agent>,
 ) -> LinkResult<()> {
-    let http = presigned_agent(cfg, raw)?;
+    // The URL's own safety checks run either way; only the connection pool is
+    // shared, so a batch never trades a check for a warm socket.
+    let owned = match shared {
+        Some(_) => {
+            checked_presigned_url(cfg, raw)?;
+            None
+        }
+        None => Some(presigned_agent(cfg, raw)?),
+    };
+    let http = shared.unwrap_or_else(|| owned.as_ref().expect("an agent for this upload"));
     let mut attempt = 0;
     let result = loop {
         let file = store.open_regular(Path::new(&source.path))?;
@@ -14225,6 +14308,42 @@ mod tests {
         assert_eq!(
             flattened, declarations,
             "batching must preserve the set and order"
+        );
+    }
+
+    #[test]
+    fn a_batch_shares_a_connection_only_within_one_authority() {
+        // Sharing a pooled agent is what makes a migration stage in minutes,
+        // but it must never widen where bytes can go: a batch that spans two
+        // authorities, or names an unsafe URL, falls back to per-object agents
+        // rather than reusing a connection pinned to somewhere else.
+        let cfg = HubConfig {
+            hub: "https://www.sevrahq.com".to_string(),
+            key: Some("k".to_string()),
+            agent_key: None,
+            brain_key: None,
+            state_dir: PathBuf::from("."),
+            store_selected: false,
+        };
+        assert!(shared_staging_agent(&cfg, &[]).is_none());
+        assert!(
+            shared_staging_agent(
+                &cfg,
+                &[
+                    "https://one.example.com/a?sig=1",
+                    "https://two.example.com/b?sig=2",
+                ]
+            )
+            .is_none(),
+            "two authorities must not share a pinned pool"
+        );
+        assert!(
+            shared_staging_agent(&cfg, &["http://one.example.com/a"]).is_none(),
+            "an unsafe object-store URL must not produce an agent"
+        );
+        assert!(
+            shared_staging_agent(&cfg, &["https://user:pw@one.example.com/a"]).is_none(),
+            "credentials in the URL must not produce an agent"
         );
     }
 
