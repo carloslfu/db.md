@@ -132,6 +132,9 @@ const MAX_REGISTRY_CARD_BYTES: u64 = 1024 * 1024;
 /// Direct JSON pushes stay below the serverless request-body cap. Larger
 /// snapshots switch to the bounded object-store pack lane.
 const MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
+/// Ceiling for a staged change manifest. Mirrors the hub's bound so an
+/// oversized push is refused before it stages anything.
+const MAX_STAGED_CHANGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Canonical raw ZIP32 uses a u16 entry count and stores each UTF-8 name twice.
 const MAX_PUSH_FILES: usize = u16::MAX as usize;
@@ -1665,7 +1668,11 @@ fn presigned_agent(cfg: &HubConfig, raw: &str) -> LinkResult<ureq::Agent> {
 
 fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> LinkResult<()> {
     let http = presigned_agent(cfg, raw)?;
-    let result = with_connect_retries(|| {
+    let mut attempt = 0;
+    let result = loop {
+        // The reservation states content-length itself. This client sends the
+        // body from memory, so it never needs to add one, and adding one under
+        // a different capitalization would leave both on the wire.
         let mut req = http.put(raw);
         if let Some(map) = headers.as_object() {
             for (name, value) in map {
@@ -1674,35 +1681,70 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
                 }
             }
         }
-        req.send_bytes(bytes).map_err(Box::new)
-    });
+        match req.send_bytes(bytes) {
+            // An upload is idempotent here: fixed content address, exact
+            // length and checksum, write-once precondition. A dropped
+            // connection or a single overloaded refusal is worth replaying
+            // rather than failing a whole migration on. 412 already means
+            // "someone else stored these exact bytes".
+            Err(ureq::Error::Transport(_)) if attempt + 1 < UPLOAD_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
+                    attempt,
+                )));
+                attempt += 1;
+            }
+            Err(ureq::Error::Status(status, _))
+                if status != 412
+                    && is_retryable_upload_status(status)
+                    && attempt + 1 < UPLOAD_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
+                    attempt,
+                )));
+                attempt += 1;
+            }
+            result => break result,
+        }
+    };
     match result {
         Ok(resp) if (200..300).contains(&resp.status()) => Ok(()),
-        Ok(resp) => Err(LinkError::Http {
-            what: "pack upload",
-            status: resp.status(),
-            message: "object store rejected the upload".to_string(),
-            code: None,
-            details: None,
-        }),
-        Err(error) => match *error {
+        Ok(resp) => Err(presigned_upload_refusal(resp)),
+        Err(error) => match error {
             // Immutable uploads use If-None-Match. A concurrent writer may
             // win the same content address; the commit/confirm endpoint reads
             // and hashes that object before accepting it, so 412 safely means
             // "continue to verification", never "trust the upload".
             ureq::Error::Status(412, _) => Ok(()),
-            ureq::Error::Status(_, resp) => Err(LinkError::Http {
-                what: "pack upload",
-                status: resp.status(),
-                message: "object store rejected the upload".to_string(),
-                code: None,
-                details: None,
-            }),
+            ureq::Error::Status(_, resp) => Err(presigned_upload_refusal(resp)),
             ureq::Error::Transport(err) => Err(LinkError::Transport {
                 hub: "the object store".to_string(),
                 message: err.to_string(),
             }),
         },
+    }
+}
+
+/// Carry the object store's own reason for a refusal. An unexplained status is
+/// unactionable; the body states checksum mismatch, precondition, or expiry.
+fn presigned_upload_refusal(response: ureq::Response) -> LinkError {
+    let status = response.status();
+    let detail = response
+        .into_string()
+        .ok()
+        .map(|body| body.chars().take(400).collect::<String>())
+        .filter(|body| !body.trim().is_empty());
+    LinkError::Http {
+        what: "pack upload",
+        status,
+        message: match detail {
+            Some(body) => format!(
+                "object store rejected the upload: {}",
+                body.replace('\n', " ")
+            ),
+            None => "object store rejected the upload".to_string(),
+        },
+        code: None,
+        details: None,
     }
 }
 
@@ -6790,6 +6832,75 @@ fn verify_v2_upload_source(
     Ok(())
 }
 
+/// One reserved object waiting to be staged, held until its whole batch can be
+/// uploaded together.
+struct V2PendingUpload<'a> {
+    url: String,
+    headers: Value,
+    sha256: String,
+    source: &'a V2UploadSource,
+}
+
+/// How many objects a migration stages at once. Bounded so a first push does
+/// not behave like a burst against the object store, while still being far
+/// faster than one-at-a-time.
+const V2_UPLOAD_CONCURRENCY: usize = 8;
+
+/// Stage a reserved batch, uploading up to `V2_UPLOAD_CONCURRENCY` objects at a
+/// time and verifying each against the store after it lands. The first failure
+/// is returned and the remaining work is abandoned.
+fn upload_v2_batch_concurrently(
+    cfg: &HubConfig,
+    store: &Store,
+    pending: &[V2PendingUpload<'_>],
+) -> LinkResult<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if pending.len() == 1 {
+        let task = &pending[0];
+        put_presigned_source(cfg, &task.url, &task.headers, store, task.source)?;
+        return verify_v2_upload_source(store, &task.source.path, &task.sha256, task.source.bytes);
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failure: std::sync::Mutex<Option<LinkError>> = std::sync::Mutex::new(None);
+    let workers = V2_UPLOAD_CONCURRENCY.min(pending.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failure.lock().map(|guard| guard.is_some()).unwrap_or(true) {
+                    return;
+                }
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(task) = pending.get(index) else {
+                    return;
+                };
+                let outcome =
+                    put_presigned_source(cfg, &task.url, &task.headers, store, task.source)
+                        .and_then(|()| {
+                            verify_v2_upload_source(
+                                store,
+                                &task.source.path,
+                                &task.sha256,
+                                task.source.bytes,
+                            )
+                        });
+                if let Err(error) = outcome {
+                    if let Ok(mut guard) = failure.lock() {
+                        guard.get_or_insert(error);
+                    }
+                    return;
+                }
+            });
+        }
+    });
+    match failure.into_inner() {
+        Ok(Some(error)) => Err(error),
+        Ok(None) => Ok(()),
+        Err(_) => Err(invalid_feed("v2 upload worker state was poisoned")),
+    }
+}
+
 fn put_presigned_source(
     cfg: &HubConfig,
     raw: &str,
@@ -6806,9 +6917,10 @@ fn put_presigned_source(
                 message: format!("local path `{}` changed before upload", source.path),
             });
         }
-        // The reservation already states content-length. Setting it here as
-        // well emits the header twice, which an edge rejects as a malformed
-        // request, so it is only supplied when the reservation omits it.
+        // The reservation already states content-length, lowercased. The HTTP
+        // client de-duplicates headers by exact name, not case, so setting
+        // `Content-Length` here as well leaves both on the wire and an edge
+        // rejects the request as malformed. Supply it only when absent.
         let mut req = http.put(raw);
         let mut has_content_length = false;
         if let Some(map) = headers.as_object() {
@@ -6823,9 +6935,12 @@ fn put_presigned_source(
             req = req.set("Content-Length", &source.bytes.to_string());
         }
         match req.send(file) {
-            Err(ureq::Error::Transport(error))
-                if is_pre_request_transport(error.kind()) && attempt + 1 < UPLOAD_ATTEMPTS =>
-            {
+            // Every transport failure is retryable here, not only the
+            // pre-request kinds: staging an object is idempotent (fixed content
+            // address, exact length and checksum, write-once precondition), the
+            // file is reopened on each attempt, and a migration holds
+            // connections long enough that a mid-request drop is ordinary.
+            Err(ureq::Error::Transport(_)) if attempt + 1 < UPLOAD_ATTEMPTS => {
                 std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
                     attempt,
                 )));
@@ -6909,6 +7024,135 @@ fn put_presigned_source(
             }),
         },
     }
+}
+
+/// The request as it is hashed and signed. A staged push carries its operations
+/// by address rather than inline, so the signed view restores them: the request
+/// hash covers the change itself, never the transport that carried it.
+fn v2_signed_request_view(body: &Value, operations: &[Value]) -> Value {
+    if body.get("operations").is_some() {
+        return body.clone();
+    }
+    let mut value = body.clone();
+    if let Some(map) = value.as_object_mut() {
+        map.remove("staged_change");
+        map.insert("operations".to_string(), Value::Array(operations.to_vec()));
+    }
+    value
+}
+
+/// The exact bytes of a staged change. The hub refuses a manifest carrying any
+/// other key, so this is the whole contract: operations, and the blob
+/// references they need, and nothing else.
+fn v2_change_manifest(operations: &[Value], blobs: Value) -> LinkResult<Vec<u8>> {
+    let bytes = serde_json::to_vec(&json!({ "operations": operations, "blobs": blobs }))
+        .map_err(|_| invalid_feed("could not serialize the v2 change manifest"))?;
+    if bytes.len() > MAX_STAGED_CHANGE_BYTES {
+        return Err(LinkError::PushTooLarge {
+            detail: "v2 change metadata exceeds the staged-change ceiling".to_string(),
+        });
+    }
+    Ok(bytes)
+}
+
+/// State one change's operations and blob references through the same
+/// content-addressed lane its bytes already ride.
+///
+/// A first push of a real store names one operation and one blob reference per
+/// file, which alone outgrows the bounded commit request. Staging that metadata
+/// and addressing it by hash keeps the push a single atomic commit: the hub
+/// verifies the address, splices the manifest in, and validates exactly what it
+/// would have validated inline. The alternative — many partial commits — would
+/// make a failed migration leave a half-populated brain readable.
+fn stage_v2_change(
+    cfg: &HubConfig,
+    requested_brain: &str,
+    operations: &[Value],
+    blobs: Value,
+) -> LinkResult<Value> {
+    let bytes = v2_change_manifest(operations, blobs)?;
+    let sha256 = content_sha256(&bytes);
+    let reserved = ensure_ok(
+        request(
+            cfg,
+            "POST",
+            &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
+            Some(&json!({
+                "blobs": [{
+                    "sha256": sha256,
+                    "bytes": bytes.len(),
+                    "kind": "staged_change",
+                }],
+            })),
+            Auth::Required,
+        )?,
+        "stage the v2 change",
+    )?;
+    let items = reserved
+        .get("uploads")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_feed("v2 change staging response has no items"))?;
+    let [item] = items.as_slice() else {
+        return Err(invalid_feed(
+            "v2 change staging response changed the requested set",
+        ));
+    };
+    let reservation_id = item
+        .get("reservation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_feed("v2 change staging has no opaque id"))?;
+    if item.get("sha256").and_then(Value::as_str) != Some(sha256.as_str())
+        || item.get("bytes").and_then(Value::as_u64) != Some(bytes.len() as u64)
+        || !crate::ulid::is_ulid(reservation_id)
+    {
+        return Err(invalid_feed("v2 change staging item is inconsistent"));
+    }
+    match item.get("status").and_then(Value::as_str) {
+        Some("upload") => put_presigned(
+            cfg,
+            item.get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_feed("v2 change staging has no URL"))?,
+            item.get("headers").unwrap_or(&Value::Null),
+            &bytes,
+        )?,
+        Some("already_present") => {}
+        _ => return Err(invalid_feed("v2 change staging has an unknown status")),
+    }
+    Ok(json!({
+        "sha256": sha256,
+        "bytes": bytes.len(),
+        "reservation_id": reservation_id,
+    }))
+}
+
+/// Move a commit request's operations and blob references off the wire body
+/// when they no longer fit in it. Idempotent by construction: the mutation ID
+/// is derived from the change, never from how the change was transported.
+fn stage_oversized_v2_change(
+    cfg: &HubConfig,
+    requested_brain: &str,
+    operations: &[Value],
+    body: &mut Value,
+) -> LinkResult<()> {
+    if body.to_string().len() <= MAX_PUSH_BYTES {
+        return Ok(());
+    }
+    let staged = stage_v2_change(
+        cfg,
+        requested_brain,
+        operations,
+        body.get("blobs")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new())),
+    )?;
+    let map = body
+        .as_object_mut()
+        .ok_or_else(|| invalid_feed("v2 commit request is not an object"))?;
+    map.remove("operations");
+    map.remove("blobs");
+    map.insert("staged_change".to_string(), staged);
+    Ok(())
 }
 
 fn v2_sync_push(
@@ -7464,6 +7708,7 @@ fn v2_sync_push(
         let mut references = Vec::with_capacity(upload_sources.len());
         let mut seen = std::collections::BTreeSet::new();
         let mut reserved_count = 0usize;
+        let mut pending_uploads: Vec<V2PendingUpload<'_>> = Vec::new();
         // A reservation's presigned URL is short-lived, so each batch's bytes
         // ride before the next batch is reserved. Reserving every blob first
         // and uploading afterwards expires the earliest URLs on a real store.
@@ -7529,14 +7774,12 @@ fn v2_sync_push(
                             .get("url")
                             .and_then(Value::as_str)
                             .ok_or_else(|| invalid_feed("v2 upload reservation has no URL"))?;
-                        put_presigned_source(
-                            cfg,
-                            url,
-                            item.get("headers").unwrap_or(&Value::Null),
-                            store,
+                        pending_uploads.push(V2PendingUpload {
+                            url: url.to_string(),
+                            headers: item.get("headers").cloned().unwrap_or(Value::Null),
+                            sha256: sha256.to_string(),
                             source,
-                        )?;
-                        verify_v2_upload_source(store, &source.path, sha256, source.bytes)?;
+                        });
                     }
                     Some("already_present") => {}
                     _ => return Err(invalid_feed("v2 upload reservation has an unknown status")),
@@ -7547,6 +7790,13 @@ fn v2_sync_push(
                     "reservation_id": reservation_id,
                 }));
             }
+            // Stage this batch's bytes concurrently. Sequential PUTs move a real
+            // store at a few objects a second, which both takes hours and pushes
+            // the batch past its reservation's upload window; the object store
+            // is content-addressed and precondition-guarded, so parallel writes
+            // stay safe.
+            upload_v2_batch_concurrently(cfg, store, &pending_uploads)?;
+            pending_uploads.clear();
         }
         if reserved_count != upload_sources.len() {
             return Err(invalid_feed(
@@ -7555,11 +7805,7 @@ fn v2_sync_push(
         }
         body["blobs"] = Value::Array(references);
     }
-    if body.to_string().len() > MAX_PUSH_BYTES {
-        return Err(LinkError::PushTooLarge {
-            detail: "v2 operation metadata exceeds the bounded commit request".to_string(),
-        });
-    }
+    stage_oversized_v2_change(cfg, requested_brain, &operations, &mut body)?;
     let path = format!("/api/hub/brains/{requested_brain}/v2/commits");
     let mut candidate_hub_signer: Option<String> = None;
     let mut response = request(cfg, "POST", &path, Some(&body), Auth::Required)?;
@@ -7649,7 +7895,7 @@ fn v2_sync_push(
             &expected_candidate,
             &expected_candidate_assets,
             &mutation_id,
-            &body,
+            &v2_signed_request_view(&body, &operations),
             challenge,
         )?;
         body["signing_challenge_id"] = Value::String(challenge_id);
@@ -11413,11 +11659,10 @@ pub fn proposal_accept_exact(
         }
         body["blobs"] = Value::Array(references);
     }
-    if body.to_string().len() > MAX_PUSH_BYTES {
-        return Err(LinkError::PushTooLarge {
-            detail: "proposal operation metadata exceeds the commit request cap".to_string(),
-        });
-    }
+    // A proposal can be queued through the staged lane, so acceptance has to be
+    // able to restate it. Capping only this side would make a large proposal
+    // permanently unacceptable.
+    stage_oversized_v2_change(cfg, &head.brain_id, &operations, &mut body)?;
     let path = format!("/api/hub/brains/{}/v2/commits", head.brain_id);
     let mut result = ensure_ok(
         request(cfg, "POST", &path, Some(&body), Auth::Required)?,
@@ -11439,7 +11684,7 @@ pub fn proposal_accept_exact(
             &expected_candidate,
             &expected_candidate_assets,
             mutation_id,
-            &body,
+            &v2_signed_request_view(&body, &operations),
             challenge,
         )?;
         body["signing_challenge_id"] = Value::String(challenge_id);
@@ -13981,6 +14226,87 @@ mod tests {
             flattened, declarations,
             "batching must preserve the set and order"
         );
+    }
+
+    #[test]
+    fn a_staged_change_states_only_operations_and_blobs() {
+        // The hub refuses a manifest with any other key, so the two sides have
+        // to agree exactly. A drifting extra field would fail a whole migration
+        // at the commit, after every byte had already been staged.
+        let operations = vec![json!({
+            "op": "put",
+            "path": "records/a.md",
+            "blob": "a".repeat(64),
+            "bytes": 3,
+        })];
+        let blobs = json!([{ "sha256": "a".repeat(64), "bytes": 3, "reservation_id": "01" }]);
+        let bytes = v2_change_manifest(&operations, blobs.clone()).expect("manifest");
+        let parsed: Value = serde_json::from_slice(&bytes).expect("manifest is JSON");
+        let keys: Vec<&str> = parsed
+            .as_object()
+            .expect("manifest is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["blobs", "operations"]);
+        assert_eq!(parsed["operations"], Value::Array(operations));
+        assert_eq!(parsed["blobs"], blobs);
+    }
+
+    #[test]
+    fn a_staged_push_signs_the_change_not_the_transport() {
+        // Self-custody signs a request hash the hub recomputes from the parsed
+        // change. A staged body no longer states its operations, so the signed
+        // view has to restore them or every large self-custodied push would
+        // sign a different request than the one the hub validated.
+        let operations = vec![json!({ "op": "delete", "path": "records/a.md" })];
+        let staged = json!({
+            "mutation_id": "dbmd-1",
+            "rebase": "strict",
+            "staged_change": { "sha256": "a".repeat(64), "bytes": 9, "reservation_id": "01" },
+        });
+        let view = v2_signed_request_view(&staged, &operations);
+        assert_eq!(view["operations"], Value::Array(operations.clone()));
+        assert!(view.get("staged_change").is_none());
+        assert_eq!(view["mutation_id"], staged["mutation_id"]);
+
+        let inline = json!({ "mutation_id": "dbmd-1", "operations": operations });
+        assert_eq!(v2_signed_request_view(&inline, &[]), inline);
+    }
+
+    #[test]
+    fn a_change_past_the_staging_ceiling_is_refused_before_transport() {
+        let huge = vec![Value::String("a".repeat(MAX_STAGED_CHANGE_BYTES + 1))];
+        let error = v2_change_manifest(&huge, Value::Array(Vec::new()))
+            .expect_err("an oversized change must not be staged");
+        assert!(
+            matches!(error, LinkError::PushTooLarge { .. }),
+            "expected a size refusal, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_push_that_fits_the_request_is_left_inline() {
+        // The staged lane costs a reservation and a round trip, so it must
+        // engage only when the body genuinely does not fit. The hub here is a
+        // closed port: reaching for it at all would fail this test.
+        let cfg = HubConfig {
+            hub: "http://127.0.0.1:9".to_string(),
+            key: Some("k".to_string()),
+            agent_key: None,
+            brain_key: None,
+            state_dir: PathBuf::from("."),
+            store_selected: false,
+        };
+        let operations = vec![json!({ "op": "delete", "path": "records/a.md" })];
+        let mut body = json!({
+            "mutation_id": "dbmd-1",
+            "operations": operations,
+            "blobs": [],
+        });
+        stage_oversized_v2_change(&cfg, "brain", &operations, &mut body).expect("no staging");
+        assert!(body.get("staged_change").is_none());
+        assert_eq!(body["operations"], Value::Array(operations));
     }
 
     #[test]
