@@ -6143,6 +6143,104 @@ fn v2_asset_withdrawal_operation(
     }))
 }
 
+// A source is immutable, but its exact bytes may move from an intake namespace
+// to an archive namespace under the distinct `promote_source` capability. A
+// plain filesystem move appears to sync as one absent old path plus one new
+// path. Preserve that intent as a protocol rename only when the hash has one
+// unambiguous source delete and one unambiguous absent-destination source put.
+// Ambiguous duplicate bytes stay as put/delete and fail closed at the hub.
+fn infer_exact_source_promotions(operations: Vec<Value>) -> Vec<Value> {
+    let mut deletes = std::collections::BTreeMap::<String, Vec<(usize, String)>>::new();
+    let mut puts = std::collections::BTreeMap::<String, Vec<(usize, String, u64)>>::new();
+    for (index, operation) in operations.iter().enumerate() {
+        match operation.get("op").and_then(Value::as_str) {
+            Some("delete") => {
+                let Some(path) = operation.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(hash) = operation
+                    .get("expected")
+                    .and_then(|value| value.get("hash"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if path.starts_with("sources/") {
+                    deletes
+                        .entry(hash.to_string())
+                        .or_default()
+                        .push((index, path.to_string()));
+                }
+            }
+            Some("put") => {
+                let Some(path) = operation.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(hash) = operation.get("blob").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(bytes) = operation.get("bytes").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let destination_absent = operation
+                    .get("expected")
+                    .and_then(|value| value.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("absent");
+                if path.starts_with("sources/") && destination_absent {
+                    puts.entry(hash.to_string()).or_default().push((
+                        index,
+                        path.to_string(),
+                        bytes,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rename_at = std::collections::BTreeMap::<usize, Value>::new();
+    let mut consumed_puts = std::collections::BTreeSet::<usize>::new();
+    for (hash, source) in deletes {
+        let Some(destination) = puts.get(&hash) else {
+            continue;
+        };
+        if source.len() != 1 || destination.len() != 1 {
+            continue;
+        }
+        let (delete_index, from) = &source[0];
+        let (put_index, to, bytes) = &destination[0];
+        if from == to {
+            continue;
+        }
+        rename_at.insert(
+            *delete_index,
+            json!({
+                "op": "rename",
+                "from": from,
+                "to": to,
+                "expected_from": { "kind": "blob", "hash": hash },
+                "expected_to": { "kind": "absent" },
+                "blob": hash,
+                "bytes": bytes,
+            }),
+        );
+        consumed_puts.insert(*put_index);
+    }
+    operations
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            if let Some(rename) = rename_at.remove(&index) {
+                Some(rename)
+            } else if consumed_puts.contains(&index) {
+                None
+            } else {
+                Some(operation)
+            }
+        })
+        .collect()
+}
+
 fn v2_asset_value(record: &crate::AssetRecord, disposition: &str) -> Value {
     json!({
         "blob_sha256": record.sha256,
@@ -6541,6 +6639,7 @@ fn v2_sync_push(
             }
         }
     }
+    operations = infer_exact_source_promotions(operations);
     for path in &withdrawals {
         if local_assets.contains_key(path) {
             continue;
@@ -13176,6 +13275,68 @@ mod tests {
     use super::*;
 
     const TEST_BRAIN_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";
+
+    #[test]
+    fn exact_source_move_becomes_one_provenance_preserving_rename() {
+        let hash = "a".repeat(64);
+        let operations = vec![
+            json!({
+                "op": "put",
+                "path": "sources/curated/item.md",
+                "expected": { "kind": "absent" },
+                "blob": hash,
+                "bytes": 19,
+            }),
+            json!({
+                "op": "delete",
+                "path": "sources/inbox/item.md",
+                "expected": { "kind": "blob", "hash": hash },
+            }),
+        ];
+
+        assert_eq!(
+            infer_exact_source_promotions(operations),
+            vec![json!({
+                "op": "rename",
+                "from": "sources/inbox/item.md",
+                "to": "sources/curated/item.md",
+                "expected_from": { "kind": "blob", "hash": hash },
+                "expected_to": { "kind": "absent" },
+                "blob": hash,
+                "bytes": 19,
+            })]
+        );
+    }
+
+    #[test]
+    fn duplicate_source_bytes_never_guess_which_evidence_was_promoted() {
+        let hash = "b".repeat(64);
+        let operations = vec![
+            json!({
+                "op": "delete",
+                "path": "sources/inbox/a.md",
+                "expected": { "kind": "blob", "hash": hash },
+            }),
+            json!({
+                "op": "delete",
+                "path": "sources/inbox/b.md",
+                "expected": { "kind": "blob", "hash": hash },
+            }),
+            json!({
+                "op": "put",
+                "path": "sources/curated/item.md",
+                "expected": { "kind": "absent" },
+                "blob": hash,
+                "bytes": 19,
+            }),
+        ];
+
+        assert_eq!(
+            infer_exact_source_promotions(operations.clone()),
+            operations,
+            "an ambiguous filesystem diff must reach the hub unchanged and fail closed"
+        );
+    }
 
     fn merge_fixture(
         base: Option<&str>,

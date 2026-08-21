@@ -8,9 +8,19 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.17**.
+  `Cargo.toml`, currently **v0.8.18**.
 
 ## Unreleased
+
+## [0.8.18] — 2026-08-20
+
+### Fixed
+
+- Permissioned sync recognizes one unambiguous, byte-identical filesystem move
+  between `sources/` coordinates as a provenance-preserving `rename`. This lets
+  an authorized curator archive immutable inbox evidence without expressing an
+  ordinary source delete. Duplicate-byte ambiguity stays as separate put/delete
+  operations so the hub can fail closed instead of guessing identity.
 
 ## [0.8.17] — 2026-08-20
 
