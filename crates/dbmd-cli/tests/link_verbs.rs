@@ -47,6 +47,7 @@ const SIGNED_HEAD_FEED: &str = r#"{"headSeq":41,"feedHash":"d93db0de1f5f9b7b98da
 
 fn signed_head_responses() -> Vec<(u16, String)> {
     vec![
+        (404, "{}".to_string()),
         (200, SIGNED_HEAD_CARD.to_string()),
         (200, SIGNED_HEAD_FEED.to_string()),
     ]
@@ -1120,6 +1121,7 @@ fn sync_push_outside_a_store_is_the_standard_not_a_store_exit() {
 fn grant_issue_list_revoke_speak_the_grants_binding() {
     let grant_id = "01j5qc3v9k4ym8rwbn2tqe6f7f";
     let hub = MockHub::serve(vec![
+        (404, "{}".to_string()),
         (200, SIGNED_HEAD_CARD.to_string()),
         (200, SIGNED_HEAD_FEED.to_string()),
         (
@@ -1128,6 +1130,7 @@ fn grant_issue_list_revoke_speak_the_grants_binding() {
                 "{{\"id\":\"{grant_id}\",\"brain\":\"{BRAIN_ID}\",\"grantee\":{{\"email\":\"maya@example.com\"}},\"capability\":\"read\",\"scopePrefix\":\"records/clients/\",\"expiresAt\":\"2026-09-01T00:00:00.000Z\"}}"
             ),
         ),
+        (404, "{}".to_string()),
         (200, SIGNED_HEAD_CARD.to_string()),
         (200, SIGNED_HEAD_FEED.to_string()),
         (
@@ -1136,6 +1139,7 @@ fn grant_issue_list_revoke_speak_the_grants_binding() {
                 "{{\"brain\":\"{BRAIN_ID}\",\"grants\":[{{\"id\":\"{grant_id}\",\"email\":\"maya@example.com\",\"capability\":\"read\",\"scopePrefix\":\"records/clients/\"}}],\"invites\":[]}}"
             ),
         ),
+        (404, "{}".to_string()),
         (200, SIGNED_HEAD_CARD.to_string()),
         (200, SIGNED_HEAD_FEED.to_string()),
         (200, format!("{{\"revoked\":true,\"id\":\"{grant_id}\"}}")),
@@ -1186,17 +1190,17 @@ fn grant_issue_list_revoke_speak_the_grants_binding() {
     assert_eq!(revoke.code, Some(0));
 
     let reqs = hub.finish();
-    assert_eq!(reqs[2].method, "POST");
-    assert_eq!(reqs[2].path, format!("/api/hub/brains/{BRAIN_ID}/grants"));
-    let body: serde_json::Value = serde_json::from_str(&reqs[2].body).unwrap();
+    assert_eq!(reqs[3].method, "POST");
+    assert_eq!(reqs[3].path, format!("/api/hub/brains/{BRAIN_ID}/grants"));
+    let body: serde_json::Value = serde_json::from_str(&reqs[3].body).unwrap();
     assert_eq!(body["email"], "maya@example.com");
     assert_eq!(body["capability"], "read");
     assert_eq!(body["scopePrefix"], "records/clients/");
     assert_eq!(body["expiresAt"], "2026-09-01");
-    assert_eq!(reqs[5].method, "GET");
-    assert_eq!(reqs[8].method, "DELETE");
+    assert_eq!(reqs[7].method, "GET");
+    assert_eq!(reqs[11].method, "DELETE");
     assert_eq!(
-        reqs[8].path,
+        reqs[11].path,
         format!("/api/hub/brains/{BRAIN_ID}/grants/{grant_id}")
     );
 }
@@ -1332,7 +1336,7 @@ fn subscribe_once_reports_the_current_head_as_one_json_line() {
     assert_eq!(v["verified"], true);
     let requests = hub.finish();
     assert_eq!(
-        requests[1].path,
+        requests[2].path,
         format!("/api/hub/brains/{BRAIN_ID}/feed?after=40&limit=100")
     );
 }
@@ -1340,6 +1344,7 @@ fn subscribe_once_reports_the_current_head_as_one_json_line() {
 #[test]
 fn subscribe_json_redirect_is_an_error_not_a_panic() {
     let hub = MockHub::serve(vec![
+        (404, "{}".to_string()),
         (200, SIGNED_HEAD_CARD.to_string()),
         (
             302,
@@ -1427,8 +1432,10 @@ fn persisted_checkpoint_rejects_feed_rollback_and_equivocation() {
         ),
     ] {
         let hub = MockHub::serve(vec![
+            (404, "{}".to_string()),
             (200, SIGNED_HEAD_CARD.to_string()),
             (200, SIGNED_HEAD_FEED.to_string()),
+            (404, "{}".to_string()),
             (200, hostile_card),
         ]);
         let dir = tempfile::tempdir().unwrap();
@@ -1696,6 +1703,7 @@ const TS_VECTOR_FEED_TAMPERED: &str = r#"{"brain":"01k0abcdefghjkmnpqrstvwxyz","
 #[test]
 fn subscribe_accepts_the_ts_minted_conformance_vector() {
     let hub = MockHub::serve(vec![
+        (404, "{}".to_string()),
         (200, TS_VECTOR_CARD.to_string()),
         (200, TS_VECTOR_FEED.to_string()),
     ]);
@@ -1726,6 +1734,7 @@ fn subscribe_refuses_the_tampered_ts_minted_vector() {
     // Same head, one defect: `pack_sha256` altered after signing, so the
     // entry's bytes no longer match its advertised hash or its signature.
     let hub = MockHub::serve(vec![
+        (404, "{}".to_string()),
         (200, TS_VECTOR_CARD.to_string()),
         (200, TS_VECTOR_FEED_TAMPERED.to_string()),
     ]);
@@ -2098,6 +2107,7 @@ fn grant_issue_detects_a_key_grantee_and_sends_key_spki() {
         .to_string();
 
     let hub = MockHub::serve(vec![
+        (404, "{}".to_string()),
         (200, SIGNED_HEAD_CARD.to_string()),
         (200, SIGNED_HEAD_FEED.to_string()),
         (201, r#"{"id":"g1"}"#.to_string()),
@@ -2118,7 +2128,7 @@ fn grant_issue_detects_a_key_grantee_and_sends_key_spki() {
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     let requests = hub.finish();
-    let body: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
     assert_eq!(body["keySpki"], spki);
     assert!(
         body.get("email").is_none(),
@@ -2221,6 +2231,7 @@ fn key_rotate_signs_with_the_old_key_and_writes_the_new_one() {
     // A 2xx is followed by a fresh card/feed verification; only the verified
     // new public key is authoritative.
     let hub = MockHub::serve(vec![
+        (404, r#"{"error":"not v2"}"#.to_string()),
         (200, old_card.clone()),
         (200, old_feed),
         (200, r#"{"ok":true}"#.to_string()),
@@ -2245,11 +2256,11 @@ fn key_rotate_signs_with_the_old_key_and_writes_the_new_one() {
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     let requests = hub.finish();
     assert_eq!(
-        requests[2].path,
+        requests[3].path,
         format!("/api/hub/brains/{BRAIN_ID}/rotate")
     );
     // The statement's old side is the current key; it carries op=rotate + sig.
-    let body: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
     let statement_raw = body["statement"].as_str().unwrap().to_string();
     let stmt: serde_json::Value = serde_json::from_str(&statement_raw).unwrap();
     assert_eq!(stmt["op"], "rotate");
@@ -2297,7 +2308,11 @@ fn key_rotate_signs_with_the_old_key_and_writes_the_new_one() {
         }],
         "rotations": [statement_raw],
     });
-    let retry_hub = MockHub::serve(vec![(200, retry_card), (200, retry_feed.to_string())]);
+    let retry_hub = MockHub::serve(vec![
+        (404, r#"{"error":"not v2"}"#.to_string()),
+        (200, retry_card),
+        (200, retry_feed.to_string()),
+    ]);
     let retry = run_dbmd(
         dir.path(),
         &[
@@ -2361,11 +2376,13 @@ fn key_rotate_ambiguous_retry_reuses_the_byte_identical_statement() {
     let old_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&old_pkcs8).unwrap();
     let (old_card, old_feed, _) = signed_head_for_key(&old_pair);
     let hub = MockHub::serve(vec![
+        (404, r#"{"error":"not v2"}"#.to_string()),
         (200, old_card.clone()),
         (200, old_feed.clone()),
         (500, r#"{"error":"ambiguous"}"#.to_string()),
         (200, old_card.clone()),
         (200, old_feed.clone()),
+        (404, r#"{"error":"not v2"}"#.to_string()),
         (200, old_card.clone()),
         (200, old_feed.clone()),
         (500, r#"{"error":"ambiguous"}"#.to_string()),
@@ -2389,10 +2406,10 @@ fn key_rotate_ambiguous_retry_reuses_the_byte_identical_statement() {
     assert_eq!(second.code, Some(1), "stdout: {}", second.stdout);
 
     let requests = hub.finish();
-    assert_eq!(requests[2].method, "POST");
-    assert_eq!(requests[7].method, "POST");
+    assert_eq!(requests[3].method, "POST");
+    assert_eq!(requests[9].method, "POST");
     assert_eq!(
-        requests[2].body, requests[7].body,
+        requests[3].body, requests[9].body,
         "the recovery key is insufficient: the exact timestamped, signed statement must be journaled"
     );
     let journal = format!("{}.rotation.json", new_file.display());

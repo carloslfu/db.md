@@ -43,6 +43,7 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
             let cap = sanitize_single_line(
                 body.get("capability")
                     .and_then(Value::as_str)
+                    .or_else(|| body.get("preset").and_then(Value::as_str))
                     .unwrap_or(capability(a.can).as_str()),
             );
             if pending {
@@ -58,10 +59,19 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                     sanitize_single_line(&a.grantee)
                 );
             }
-            if let Some(scope) = body.get("scopePrefix").and_then(Value::as_str) {
+            if let Some(scope) = body
+                .get("scopePrefix")
+                .or_else(|| body.get("scope"))
+                .and_then(Value::as_str)
+                .filter(|scope| !scope.is_empty())
+            {
                 println!("scope: {}", sanitize_single_line(scope));
             }
-            if let Some(until) = body.get("expiresAt").and_then(Value::as_str) {
+            if let Some(until) = body
+                .get("expiresAt")
+                .or_else(|| body.get("expires_at"))
+                .and_then(Value::as_str)
+            {
                 println!("expires: {}", sanitize_single_line(until));
             }
             Ok(())
@@ -93,6 +103,37 @@ pub fn run(ctx: &Context, args: &GrantArgs) -> CliResult {
                 sanitize_single_line(v.get(key).and_then(Value::as_str).unwrap_or("?"))
             };
             for g in &grants {
+                if body.get("v").and_then(Value::as_u64) == Some(2) {
+                    let actions = g
+                        .get("actions")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(sanitize_single_line)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    println!(
+                        "{}  {}  {}  actions={}{}{}",
+                        field(g, "id"),
+                        field(g, "principal_kind"),
+                        field(g, "principal_label"),
+                        actions,
+                        g.get("scope")
+                            .and_then(Value::as_str)
+                            .filter(|scope| !scope.is_empty())
+                            .map(|scope| format!("  scope={}", sanitize_single_line(scope)))
+                            .unwrap_or_default(),
+                        g.get("expires_at")
+                            .and_then(Value::as_str)
+                            .map(|until| format!("  until={}", sanitize_single_line(until)))
+                            .unwrap_or_default(),
+                    );
+                    continue;
+                }
                 println!(
                     "{}  {}  {}{}{}",
                     field(g, "id"),

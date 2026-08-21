@@ -8,9 +8,32 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.19**.
+  `Cargo.toml`, currently **v0.8.20**.
 
 ## Unreleased
+
+## [0.8.20] — 2026-08-21
+
+### Added
+
+- Native link.md v2 support for key grants, grant listing and revocation,
+  verified head subscription, direct private-brain resolution, and
+  self-custody key rotation. Every verb verifies and advances the same pinned
+  v2 trust state instead of consulting the retired v1 feed.
+
+### Fixed
+
+- Large first syncs reserve changed blobs in bounded batches and upload each
+  batch before its presigned URLs age. Content-addressed uploads retry
+  transient edge refusals, never duplicate `Content-Length`, and surface a
+  bounded object-store reason with the affected coordinate.
+- Self-custody sync and proposal acceptance reuse the challenge's exact request
+  identity when submitting the signature, so the signed canonical candidate
+  cannot change between challenge and commit.
+- Ambiguous v2 rotation responses retain the private local rotation journal
+  and replay its byte-identical statement until the hub acknowledges the
+  recovery checkpoint. Seeing only the new public identity is no longer
+  treated as sufficient durability.
 
 ## [0.8.19] — 2026-08-20
 

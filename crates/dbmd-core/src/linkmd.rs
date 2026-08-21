@@ -141,9 +141,47 @@ const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
 /// payload + (local 30 + central 46 + name twice) per entry + EOCD 22.
 const MAX_PACK_BYTES: u64 =
     MAX_STORE_BYTES + MAX_PUSH_FILES as u64 * (76 + 2 * MAX_STORE_PATH_BYTES) as u64 + 22;
+/// An upload reservation body carries one entry per changed blob, so a real
+/// store's first push does not fit in a single request: the hub bounds the body
+/// and the hosting platform rejects an oversized payload before the route sees
+/// it. Reservations are therefore batched. The budget is deliberately well
+/// under the hub's own ceiling, and both bounds are enforced because a single
+/// hash can carry many coordinates and a path may be long.
+/// The count matches the reservation window a hub grants per request; batching
+/// above it only fails deeper in, after the body has already been accepted.
+const MAX_UPLOAD_RESERVATION_BYTES: usize = 1024 * 1024;
+const MAX_UPLOAD_RESERVATION_BLOBS: usize = 1_000;
+
 /// A legitimate brain should rotate rarely. Bound adversarial identity
 /// histories before allocating and repeatedly verifying an unbounded chain.
 const MAX_IDENTITY_ROTATIONS: usize = 1_024;
+
+/// Split blob declarations into request-sized batches, by serialized size and
+/// by count. Order is preserved so a caller can concatenate the responses.
+fn batch_upload_declarations(declarations: Vec<Value>) -> Vec<Vec<Value>> {
+    let mut batches: Vec<Vec<Value>> = Vec::new();
+    let mut current: Vec<Value> = Vec::new();
+    let mut current_bytes = 0usize;
+    for declaration in declarations {
+        let declared_bytes = serde_json::to_string(&declaration)
+            .map(|text| text.len())
+            .unwrap_or(MAX_UPLOAD_RESERVATION_BYTES)
+            + 1;
+        if !current.is_empty()
+            && (current.len() >= MAX_UPLOAD_RESERVATION_BLOBS
+                || current_bytes + declared_bytes > MAX_UPLOAD_RESERVATION_BYTES)
+        {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += declared_bytes;
+        current.push(declaration);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
 /// A client never needs to replay an unbounded feed in one invocation. Large
 /// histories are mirrored incrementally; a first mirror beyond this cap needs a
 /// checkpoint/export rather than allocating attacker-controlled metadata.
@@ -167,6 +205,23 @@ const READ_TIMEOUT_SECS: u64 = 120;
 const OVERALL_REQUEST_TIMEOUT_SECS: u64 = 120;
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
+
+/// Staging a real store means tens of thousands of immutable object PUTs in a
+/// row. A single refusal under sustained load must not fail the migration, so
+/// the upload lane retries further and waits longer than a connect blip does.
+const UPLOAD_ATTEMPTS: usize = 6;
+const UPLOAD_RETRY_BACKOFF_MS: [u64; UPLOAD_ATTEMPTS - 1] = [200, 600, 1_500, 3_000, 6_000];
+
+fn upload_retry_backoff_ms(attempt: usize) -> u64 {
+    UPLOAD_RETRY_BACKOFF_MS[attempt.min(UPLOAD_RETRY_BACKOFF_MS.len() - 1)]
+}
+
+/// Statuses worth replaying an immutable, content-addressed upload for: edge
+/// and object-store refusals that are load-shaped rather than a statement about
+/// these bytes. A checksum or precondition failure is never retried.
+fn is_retryable_upload_status(status: u16) -> bool {
+    matches!(status, 400 | 408 | 429 | 500 | 502 | 503 | 504)
+}
 /// Cold checkouts may need every visible blob, but short-lived direct object
 /// capabilities must not create an unbounded connection storm. Keep the
 /// verified downloads inside this fixed worker count.
@@ -1370,7 +1425,24 @@ fn request_raw(
     max_response_bytes: u64,
 ) -> LinkResult<RawHubResponse> {
     let http = hub_agent(cfg)?;
-    request_raw_with_agent(cfg, &http, method, path, body, auth, max_response_bytes)
+    request_raw_with_agent(
+        cfg,
+        &http,
+        method,
+        path,
+        body,
+        RawRequestOptions {
+            auth,
+            max_response_bytes,
+            request_id: None,
+        },
+    )
+}
+
+struct RawRequestOptions<'a> {
+    auth: Auth,
+    max_response_bytes: u64,
+    request_id: Option<&'a str>,
 }
 
 fn request_raw_with_agent(
@@ -1379,15 +1451,14 @@ fn request_raw_with_agent(
     method: &str,
     path: &str,
     body: Option<&Value>,
-    auth: Auth,
-    max_response_bytes: u64,
+    options: RawRequestOptions<'_>,
 ) -> LinkResult<RawHubResponse> {
     let url = format!("{}{}", cfg.hub, path);
     let encoded_body = body.map(Value::to_string);
     let origin = normalized_origin(&cfg.hub)?;
     // An agent signing key outranks the bearer: possession proofs put nothing
     // reusable on the wire, so when both are configured the stronger one wins.
-    let credential = match auth {
+    let credential = match options.auth {
         Auth::Required => Some(match &cfg.agent_key {
             Some(key) => linkmd_sig_header(key, &origin, method, path, encoded_body.as_deref())?,
             None => format!("Bearer {}", cfg.require_key()?),
@@ -1408,6 +1479,9 @@ fn request_raw_with_agent(
         let mut req = http.request(method, &url);
         if let Some(value) = &credential {
             req = req.set("authorization", value);
+        }
+        if let Some(value) = options.request_id {
+            req = req.set("x-request-id", value);
         }
         match &encoded_body {
             Some(value) => req
@@ -1433,11 +1507,11 @@ fn request_raw_with_agent(
     let status = resp.status();
     let mut buf = Vec::new();
     resp.into_reader()
-        .take(max_response_bytes + 1)
+        .take(options.max_response_bytes + 1)
         .read_to_end(&mut buf)?;
-    if buf.len() as u64 > max_response_bytes {
+    if buf.len() as u64 > options.max_response_bytes {
         return Err(LinkError::ResponseTooLarge {
-            limit_bytes: max_response_bytes,
+            limit_bytes: options.max_response_bytes,
         });
     }
     Ok(RawHubResponse { status, body: buf })
@@ -1467,6 +1541,45 @@ fn request(
     auth: Auth,
 ) -> LinkResult<HubResponse> {
     request_capped(cfg, method, path, body, auth, MAX_RESPONSE_BYTES)
+}
+
+/// Repeat one challenge-response mutation with the exact request identity the
+/// hub bound into its actor claim. A new request id would create a new actor
+/// hash and therefore a different canonical commit candidate, making the
+/// otherwise correct self-custody signature unusable.
+fn request_with_request_id(
+    cfg: &HubConfig,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: Auth,
+    request_id: &str,
+) -> LinkResult<HubResponse> {
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+    {
+        return Err(invalid_feed("hub returned an unsafe request id"));
+    }
+    let http = hub_agent(cfg)?;
+    let raw = request_raw_with_agent(
+        cfg,
+        &http,
+        method,
+        path,
+        body,
+        RawRequestOptions {
+            auth,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+            request_id: Some(request_id),
+        },
+    )?;
+    Ok(HubResponse {
+        status: raw.status,
+        body: serde_json::from_slice(&raw.body).ok(),
+    })
 }
 
 fn ensure_raw_ok(r: RawHubResponse, what: &'static str) -> LinkResult<Vec<u8>> {
@@ -2076,7 +2189,53 @@ pub fn resolve(cfg: &HubConfig, addr: &Address) -> LinkResult<Value> {
             return Ok(card);
         }
     }
-    let resolved = ensure_ok(direct, "resolve")?;
+    let mut resolved = ensure_ok(direct, "resolve")?;
+    if resolved.get("storageProfile").and_then(Value::as_str) == Some("v2") {
+        let v2 = v2_verified_head(cfg, &addr.brain)?
+            .ok_or_else(|| invalid_feed("v2 resolve card has no verified v2 head"))?;
+        if resolved.get("id").and_then(Value::as_str) != Some(v2.brain_id.as_str()) {
+            return Err(invalid_feed(
+                "resolve card is not bound to the verified v2 brain",
+            ));
+        }
+        let card_identity: FeedIdentity = serde_json::from_value(
+            resolved
+                .get("identity")
+                .cloned()
+                .ok_or_else(|| invalid_feed("resolve card has no signed identity"))?,
+        )
+        .map_err(|_| invalid_feed("resolve card has an invalid identity"))?;
+        if card_identity != v2_identity(&v2.identity) {
+            return Err(invalid_feed(
+                "resolve card identity differs from the verified v2 identity",
+            ));
+        }
+        accept_v2_head(cfg, &v2)?;
+        if let Value::Object(card) = &mut resolved {
+            card.insert(
+                "headSeq".to_string(),
+                json!(v2.pointer.as_ref().map_or(0, |pointer| pointer.seq)),
+            );
+            card.insert(
+                "feedHash".to_string(),
+                v2.pointer
+                    .as_ref()
+                    .map(|pointer| Value::String(pointer.feed_hash.clone()))
+                    .unwrap_or(Value::Null),
+            );
+            card.insert(
+                "storageProfile".to_string(),
+                Value::String("v2".to_string()),
+            );
+            if let Some(pointer) = &v2.pointer {
+                card.insert(
+                    "updatedAt".to_string(),
+                    Value::String(pointer.signed_at.clone()),
+                );
+            }
+        }
+        return Ok(resolved);
+    }
     // A successful direct response is accepted only after the same centralized
     // identity/rotation/feed checkpoint verification used by sync and
     // subscribe. No verb gets a weaker ad-hoc pinning path.
@@ -2903,6 +3062,10 @@ fn verify_v2_commit(
 fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2VerifiedHead>> {
     require_hardened_filesystem("verified link.md v2 state")?;
     require_safe_ref(brain)?;
+    // Open and pin the private trust directory before a credential can leave
+    // the process. A hostile checkout must not turn an unsafe state root into
+    // a network oracle or receive a bearer before checkpoint safety is known.
+    let trust_directory = open_trust_dir(cfg)?;
     let path = format!("/api/hub/brains/{brain}/v2/head");
     let response = request(cfg, "GET", &path, None, Auth::Required)?;
     if response.status == 404 {
@@ -2948,7 +3111,6 @@ fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2Verifie
         .identity
         .as_ref()
         .ok_or_else(|| invalid_feed("v2 head has no brain identity"))?;
-    let trust_directory = open_trust_dir(cfg)?;
     let _trust_locks = lock_trust_many(cfg, &trust_directory, &[brain, &head.brain_id])?;
     let (pinned, alias_binding) = load_canonical_pin(cfg, &trust_directory, brain, &head.brain_id)?;
     let feed_identity = v2_identity(identity);
@@ -6458,23 +6620,44 @@ fn put_presigned_source(
                 message: format!("local path `{}` changed before upload", source.path),
             });
         }
-        let mut req = http
-            .put(raw)
-            .set("Content-Length", &source.bytes.to_string());
+        // The reservation already states content-length. Setting it here as
+        // well emits the header twice, which an edge rejects as a malformed
+        // request, so it is only supplied when the reservation omits it.
+        let mut req = http.put(raw);
+        let mut has_content_length = false;
         if let Some(map) = headers.as_object() {
             for (name, value) in map {
                 if let Some(value) = value.as_str() {
+                    has_content_length |= name.eq_ignore_ascii_case("content-length");
                     req = req.set(name, value);
                 }
             }
         }
+        if !has_content_length {
+            req = req.set("Content-Length", &source.bytes.to_string());
+        }
         match req.send(file) {
             Err(ureq::Error::Transport(error))
-                if is_pre_request_transport(error.kind()) && attempt + 1 < CONNECT_ATTEMPTS =>
+                if is_pre_request_transport(error.kind()) && attempt + 1 < UPLOAD_ATTEMPTS =>
             {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    CONNECT_RETRY_BACKOFF_MS[attempt],
-                ));
+                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
+                    attempt,
+                )));
+                attempt += 1;
+            }
+            // A migration stages tens of thousands of immutable objects, and an
+            // edge or object store may refuse a single one under sustained
+            // load. The upload is content-addressed and precondition-guarded,
+            // so replaying it is safe; failing the whole push on one refusal is
+            // not. 412 already means "someone else stored these exact bytes".
+            Err(ureq::Error::Status(status, _))
+                if status != 412
+                    && is_retryable_upload_status(status)
+                    && attempt + 1 < UPLOAD_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
+                    attempt,
+                )));
                 attempt += 1;
             }
             result => break result,
@@ -6482,22 +6665,58 @@ fn put_presigned_source(
     };
     match result {
         Ok(response) if (200..300).contains(&response.status()) => Ok(()),
-        Ok(response) => Err(LinkError::Http {
-            what: "v2 changed-byte upload",
-            status: response.status(),
-            message: "object store rejected the upload".to_string(),
-            code: None,
-            details: None,
-        }),
-        Err(error) => match error {
-            ureq::Error::Status(412, _) => Ok(()),
-            ureq::Error::Status(_, response) => Err(LinkError::Http {
+        Ok(response) => {
+            // The object store states its own reason (checksum mismatch,
+            // precondition, expiry). Carrying a bounded excerpt turns an
+            // unactionable refusal into one an operator can diagnose; the
+            // coordinate is the store path, never file content.
+            let status = response.status();
+            let detail = response
+                .into_string()
+                .ok()
+                .map(|body| body.chars().take(400).collect::<String>())
+                .filter(|body| !body.trim().is_empty());
+            Err(LinkError::Http {
                 what: "v2 changed-byte upload",
-                status: response.status(),
-                message: "object store rejected the upload".to_string(),
+                status,
+                message: match detail {
+                    Some(body) => format!(
+                        "object store rejected the upload of `{}`: {}",
+                        source.path,
+                        body.replace('\n', " ")
+                    ),
+                    None => format!("object store rejected the upload of `{}`", source.path),
+                },
                 code: None,
                 details: None,
-            }),
+            })
+        }
+        Err(error) => match error {
+            ureq::Error::Status(412, _) => Ok(()),
+            ureq::Error::Status(_, response) => {
+                let status = response.status();
+                let detail = response
+                    .into_string()
+                    .ok()
+                    .map(|body| body.chars().take(400).collect::<String>())
+                    .filter(|body| !body.trim().is_empty());
+                Err(LinkError::Http {
+                    what: "v2 changed-byte upload",
+                    status,
+                    message: match detail {
+                        Some(body) => format!(
+                            "object store rejected the upload of `{}`: {}",
+                            source.path,
+                            body.replace('\n', " ")
+                        ),
+                        None => {
+                            format!("object store rejected the upload of `{}`", source.path)
+                        }
+                    },
+                    code: None,
+                    details: None,
+                })
+            }
             ureq::Error::Transport(error) => Err(LinkError::Transport {
                 hub: "the object store".to_string(),
                 message: error.to_string(),
@@ -7056,84 +7275,97 @@ fn v2_sync_push(
                 })
             })
             .collect::<Vec<_>>();
-        let reserved = ensure_ok(
-            request(
-                cfg,
-                "POST",
-                &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
-                Some(&json!({ "blobs": declarations })),
-                Auth::Required,
-            )?,
-            "prepare v2 changed-byte uploads",
-        )?;
-        let items = reserved
-            .get("uploads")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid_feed("v2 upload reservation response has no items"))?;
-        if items.len() != upload_sources.len() {
+        let mut references = Vec::with_capacity(upload_sources.len());
+        let mut seen = std::collections::BTreeSet::new();
+        let mut reserved_count = 0usize;
+        // A reservation's presigned URL is short-lived, so each batch's bytes
+        // ride before the next batch is reserved. Reserving every blob first
+        // and uploading afterwards expires the earliest URLs on a real store.
+        for batch in batch_upload_declarations(declarations) {
+            let batch_len = batch.len();
+            let reserved = ensure_ok(
+                request(
+                    cfg,
+                    "POST",
+                    &format!("/api/hub/brains/{requested_brain}/v2/uploads"),
+                    Some(&json!({ "blobs": batch })),
+                    Auth::Required,
+                )?,
+                "prepare v2 changed-byte uploads",
+            )?;
+            let items = reserved
+                .get("uploads")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_feed("v2 upload reservation response has no items"))?;
+            if items.len() != batch_len {
+                return Err(invalid_feed(
+                    "v2 upload reservation response changed the requested set",
+                ));
+            }
+            reserved_count += items.len();
+            for item in items {
+                let sha256 = item
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 upload reservation has no hash"))?;
+                let source = upload_sources
+                    .get(sha256)
+                    .ok_or_else(|| invalid_feed("v2 upload reservation introduced a blob"))?;
+                let declared_bytes = item
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_feed("v2 upload reservation has no byte length"))?;
+                let reservation_id = item
+                    .get("reservation_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 upload reservation has no opaque id"))?;
+                let expected_coordinates = coordinates_by_hash.get(sha256).ok_or_else(|| {
+                    invalid_feed("v2 upload reservation has no coordinate binding")
+                })?;
+                let returned_coordinates = item
+                    .get("coordinates")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| invalid_feed("v2 upload reservation has no coordinates"))?;
+                if declared_bytes != source.bytes
+                    || !crate::ulid::is_ulid(reservation_id)
+                    || !seen.insert(sha256.to_string())
+                    || returned_coordinates.len() != expected_coordinates.len()
+                    || returned_coordinates
+                        .iter()
+                        .zip(expected_coordinates)
+                        .any(|(actual, expected)| actual.as_str() != Some(expected.as_str()))
+                {
+                    return Err(invalid_feed("v2 upload reservation item is inconsistent"));
+                }
+                match item.get("status").and_then(Value::as_str) {
+                    Some("upload") => {
+                        let url = item
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| invalid_feed("v2 upload reservation has no URL"))?;
+                        put_presigned_source(
+                            cfg,
+                            url,
+                            item.get("headers").unwrap_or(&Value::Null),
+                            store,
+                            source,
+                        )?;
+                        verify_v2_upload_source(store, &source.path, sha256, source.bytes)?;
+                    }
+                    Some("already_present") => {}
+                    _ => return Err(invalid_feed("v2 upload reservation has an unknown status")),
+                }
+                references.push(json!({
+                    "sha256": sha256,
+                    "bytes": source.bytes,
+                    "reservation_id": reservation_id,
+                }));
+            }
+        }
+        if reserved_count != upload_sources.len() {
             return Err(invalid_feed(
                 "v2 upload reservation response changed the requested set",
             ));
-        }
-        let mut references = Vec::with_capacity(items.len());
-        let mut seen = std::collections::BTreeSet::new();
-        for item in items {
-            let sha256 = item
-                .get("sha256")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_feed("v2 upload reservation has no hash"))?;
-            let source = upload_sources
-                .get(sha256)
-                .ok_or_else(|| invalid_feed("v2 upload reservation introduced a blob"))?;
-            let declared_bytes = item
-                .get("bytes")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| invalid_feed("v2 upload reservation has no byte length"))?;
-            let reservation_id = item
-                .get("reservation_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_feed("v2 upload reservation has no opaque id"))?;
-            let expected_coordinates = coordinates_by_hash
-                .get(sha256)
-                .ok_or_else(|| invalid_feed("v2 upload reservation has no coordinate binding"))?;
-            let returned_coordinates = item
-                .get("coordinates")
-                .and_then(Value::as_array)
-                .ok_or_else(|| invalid_feed("v2 upload reservation has no coordinates"))?;
-            if declared_bytes != source.bytes
-                || !crate::ulid::is_ulid(reservation_id)
-                || !seen.insert(sha256.to_string())
-                || returned_coordinates.len() != expected_coordinates.len()
-                || returned_coordinates
-                    .iter()
-                    .zip(expected_coordinates)
-                    .any(|(actual, expected)| actual.as_str() != Some(expected.as_str()))
-            {
-                return Err(invalid_feed("v2 upload reservation item is inconsistent"));
-            }
-            match item.get("status").and_then(Value::as_str) {
-                Some("upload") => {
-                    let url = item
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| invalid_feed("v2 upload reservation has no URL"))?;
-                    put_presigned_source(
-                        cfg,
-                        url,
-                        item.get("headers").unwrap_or(&Value::Null),
-                        store,
-                        source,
-                    )?;
-                    verify_v2_upload_source(store, &source.path, sha256, source.bytes)?;
-                }
-                Some("already_present") => {}
-                _ => return Err(invalid_feed("v2 upload reservation has an unknown status")),
-            }
-            references.push(json!({
-                "sha256": sha256,
-                "bytes": source.bytes,
-                "reservation_id": reservation_id,
-            }));
         }
         body["blobs"] = Value::Array(references);
     }
@@ -7209,6 +7441,11 @@ fn v2_sync_push(
         return Ok(result);
     }
     if result.get("code").and_then(Value::as_str) == Some("brain_signature_required") {
+        let request_id = result
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_feed("self-custody response has no request id"))?
+            .to_string();
         let challenge = result
             .get("signing_challenge")
             .ok_or_else(|| invalid_feed("self-custody response has no signing challenge"))?;
@@ -7233,7 +7470,7 @@ fn v2_sync_push(
         body["signature_base64url"] = Value::String(signature);
         candidate_hub_signer = Some(actor_signer);
         result = ensure_ok(
-            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            request_with_request_id(cfg, "POST", &path, Some(&body), Auth::Required, &request_id)?,
             "v2 self-custody commit",
         )?;
     }
@@ -10108,7 +10345,6 @@ pub fn grant_issue(
     until: Option<&str>,
 ) -> LinkResult<Value> {
     require_safe_ref(brain)?;
-    let _ = verified_remote_head(cfg, brain, false)?;
     // Grantee shape decides the axis: a base64url Ed25519 SPKI is a bare
     // multikey holder (link.md §6 cross-party keys — no hub account; the
     // printed `publicKeySpki` from `dbmd key generate`); anything else is a
@@ -10117,6 +10353,80 @@ pub fn grant_issue(
         .decode(grantee)
         .map(|der| der.len() == 44 && der.starts_with(&ED25519_SPKI_PREFIX))
         .unwrap_or(false);
+    if let Some(head) = v2_verified_head(cfg, brain)? {
+        if is_key_grantee {
+            let scope = scope.unwrap_or("");
+            let preset = match can {
+                Capability::Read => "viewer",
+                Capability::Write => "editor",
+            };
+            let entropy = format!(
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                normalized_origin(&cfg.hub)?,
+                head.brain_id,
+                head.control_revision,
+                grantee,
+                preset,
+                scope,
+                until.unwrap_or("")
+            );
+            let mut body = json!({
+                "context": "external",
+                "expected_control_revision": head.control_revision,
+                "mutation_id": format!("dbmd-grant-{}", content_sha256(entropy.as_bytes())),
+                "preset": preset,
+                "principal_kind": "key",
+                "public_key": grantee,
+                "scope": scope,
+                "scope_kind": "prefix",
+            });
+            if let Some(value) = until {
+                body["expires_at"] = json!(value);
+            }
+            let path = format!("/api/hub/brains/{}/v2/grants", head.brain_id);
+            let response = ensure_ok(
+                request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+                "v2 grant issue",
+            )?;
+            let expected_fingerprint = identity_fingerprint(grantee)?;
+            if response.get("v").and_then(Value::as_u64) != Some(2)
+                || response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| !crate::ulid::is_ulid(id))
+                || response.get("principal_kind").and_then(Value::as_str) != Some("key")
+                || response.get("principal_id").and_then(Value::as_str)
+                    != Some(expected_fingerprint.as_str())
+                || response
+                    .get("control_revision")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| !is_sha256(value))
+            {
+                return Err(invalid_feed(
+                    "v2 grant issue response is not authority-bound",
+                ));
+            }
+            return Ok(response);
+        }
+        // Account invitations remain a product workflow. The compatibility
+        // endpoint resolves email/account identity, then commits a native v2
+        // grant with the same control-plane recovery boundary. The v2 head
+        // above is already the authenticated authority checkpoint; never
+        // fall through to the retired v1 feed verifier for this request.
+        let mut body = json!({ "email": grantee, "capability": can.as_str() });
+        if let Some(value) = scope {
+            body["scopePrefix"] = json!(value);
+        }
+        if let Some(value) = until {
+            body["expiresAt"] = json!(value);
+        }
+        let path = format!("/api/hub/brains/{}/grants", head.brain_id);
+        return ensure_ok(
+            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            "account grant issue",
+        );
+    }
+    let _ = verified_remote_head(cfg, brain, false)?;
     let mut body = if is_key_grantee {
         json!({ "keySpki": grantee, "capability": can.as_str() })
     } else {
@@ -10138,6 +10448,23 @@ pub fn grant_issue(
 /// List the active grants (and pending invites) on `brain`. Owner-side.
 pub fn grant_list(cfg: &HubConfig, brain: &str) -> LinkResult<Value> {
     require_safe_ref(brain)?;
+    if let Some(head) = v2_verified_head(cfg, brain)? {
+        let path = format!("/api/hub/brains/{}/v2/grants", head.brain_id);
+        let response = ensure_ok(
+            request(cfg, "GET", &path, None, Auth::Required)?,
+            "v2 grant list",
+        )?;
+        if response.get("v").and_then(Value::as_u64) != Some(2)
+            || response.get("control_revision").and_then(Value::as_str)
+                != Some(head.control_revision.as_str())
+            || !response.get("grants").is_some_and(Value::is_array)
+        {
+            return Err(invalid_feed(
+                "v2 grant list is not bound to the verified authority",
+            ));
+        }
+        return Ok(response);
+    }
     let _ = verified_remote_head(cfg, brain, false)?;
     let path = format!("/api/hub/brains/{brain}/grants");
     ensure_ok(
@@ -10151,6 +10478,37 @@ pub fn grant_list(cfg: &HubConfig, brain: &str) -> LinkResult<Value> {
 pub fn grant_revoke(cfg: &HubConfig, brain: &str, grant_id: &str) -> LinkResult<Value> {
     require_safe_ref(brain)?;
     require_safe_grant_id(grant_id)?;
+    if let Some(head) = v2_verified_head(cfg, brain)? {
+        let entropy = format!(
+            "{}\0{}\0{}\0{}",
+            normalized_origin(&cfg.hub)?,
+            head.brain_id,
+            head.control_revision,
+            grant_id
+        );
+        let body = json!({
+            "expected_control_revision": head.control_revision,
+            "mutation_id": format!("dbmd-revoke-{}", content_sha256(entropy.as_bytes())),
+        });
+        let path = format!("/api/hub/brains/{}/v2/grants/{grant_id}", head.brain_id);
+        let response = ensure_ok(
+            request(cfg, "DELETE", &path, Some(&body), Auth::Required)?,
+            "v2 grant revoke",
+        )?;
+        if response.get("v").and_then(Value::as_u64) != Some(2)
+            || response.get("id").and_then(Value::as_str) != Some(grant_id)
+            || response.get("revoked").and_then(Value::as_bool) != Some(true)
+            || response
+                .get("control_revision")
+                .and_then(Value::as_str)
+                .is_none_or(|value| !is_sha256(value))
+        {
+            return Err(invalid_feed(
+                "v2 grant revocation response is not authority-bound",
+            ));
+        }
+        return Ok(response);
+    }
     let _ = verified_remote_head(cfg, brain, false)?;
     let path = format!("/api/hub/brains/{brain}/grants/{grant_id}");
     ensure_ok(
@@ -10797,20 +11155,24 @@ pub fn proposal_accept_exact(
                 })
             })
             .collect::<Vec<_>>();
-        let reserved = ensure_ok(
-            request(
-                cfg,
-                "POST",
-                &format!("/api/hub/brains/{}/v2/uploads", head.brain_id),
-                Some(&json!({ "blobs": declarations })),
-                Auth::Required,
-            )?,
-            "prepare proposal blob transport",
-        )?;
-        let items = reserved
-            .get("uploads")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid_feed("proposal upload reservation has no items"))?;
+        let mut items: Vec<Value> = Vec::with_capacity(downloaded.len());
+        for batch in batch_upload_declarations(declarations) {
+            let reserved = ensure_ok(
+                request(
+                    cfg,
+                    "POST",
+                    &format!("/api/hub/brains/{}/v2/uploads", head.brain_id),
+                    Some(&json!({ "blobs": batch })),
+                    Auth::Required,
+                )?,
+                "prepare proposal blob transport",
+            )?;
+            let reserved_items = reserved
+                .get("uploads")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_feed("proposal upload reservation has no items"))?;
+            items.extend(reserved_items.iter().cloned());
+        }
         if items.len() != downloaded.len() {
             return Err(invalid_feed("proposal upload reservation changed the set"));
         }
@@ -10877,6 +11239,11 @@ pub fn proposal_accept_exact(
     )?;
     let mut candidate_hub_signer = None;
     if result.get("code").and_then(Value::as_str) == Some("brain_signature_required") {
+        let request_id = result
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_feed("proposal acceptance has no request id"))?
+            .to_string();
         let challenge = result
             .get("signing_challenge")
             .ok_or_else(|| invalid_feed("proposal acceptance has no signing challenge"))?;
@@ -10893,7 +11260,7 @@ pub fn proposal_accept_exact(
         body["signature_base64url"] = Value::String(signature);
         candidate_hub_signer = Some(actor_signer);
         result = ensure_ok(
-            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            request_with_request_id(cfg, "POST", &path, Some(&body), Auth::Required, &request_id)?,
             "signed exact proposal acceptance",
         )?;
     }
@@ -12513,13 +12880,41 @@ pub fn rotate_brain_key(
     let new_spki = new_key.public_key_spki.clone();
     let new_multikey = new_key.multikey.clone();
     let journal_path = rotation_journal_path(out);
-    let before = verified_remote_head(cfg, brain, false)?;
-    let served_identity = before
-        .identity
-        .as_ref()
-        .ok_or_else(|| invalid_feed("cannot rotate a brain with no signed identity"))?;
+    let before_v2 = v2_verified_head(cfg, brain)?;
+    let (canonical_brain, served_identity, observed_head, v2_profile) =
+        if let Some(head) = before_v2 {
+            let observed = Head {
+                brain: head.brain_id.clone(),
+                seq: head.pointer.as_ref().map_or(0, |pointer| pointer.seq),
+                updated_at: head
+                    .pointer
+                    .as_ref()
+                    .map(|pointer| pointer.signed_at.clone()),
+                feed_hash: head
+                    .pointer
+                    .as_ref()
+                    .map(|pointer| pointer.feed_hash.clone()),
+                verified: true,
+            };
+            let identity = v2_identity(&head.identity);
+            let canonical = head.brain_id.clone();
+            accept_v2_head(cfg, &head)?;
+            (canonical, identity, observed, true)
+        } else {
+            let remote = verified_remote_head(cfg, brain, false)?;
+            let identity = remote
+                .identity
+                .clone()
+                .ok_or_else(|| invalid_feed("cannot rotate a brain with no signed identity"))?;
+            (remote.head.brain.clone(), identity, remote.head, false)
+        };
     let served_multikey = format!("ed25519:{}", served_identity.fingerprint);
-    if served_multikey == new_multikey {
+    let already_rotated = served_multikey == new_multikey;
+    // A completed invocation removes the journal only after the server has
+    // acknowledged its recovery boundary. If the verified identity advanced
+    // but the journal remains, the prior response was ambiguous: replay the
+    // exact signed statement so a v2 hub can repair/confirm its checkpoint.
+    if already_rotated && !journal_path.exists() {
         remove_rotation_journal(&journal_path);
         return Ok(RotationReport {
             brain: brain.to_string(),
@@ -12532,7 +12927,7 @@ pub fn rotate_brain_key(
                 .collect(),
         });
     }
-    if served_multikey != old_key.multikey {
+    if !already_rotated && served_multikey != old_key.multikey {
         return Err(invalid_feed(
             "the supplied old key is not the brain's verified current identity",
         ));
@@ -12552,8 +12947,8 @@ pub fn rotate_brain_key(
             public_key: &old_key.public_key_spki,
             new_brain: &new_multikey,
             new_public_key: &new_spki,
-            prior_head_seq: before.head.seq,
-            prior_feed_hash: before.head.feed_hash.as_deref(),
+            prior_head_seq: observed_head.seq,
+            prior_feed_hash: observed_head.feed_hash.as_deref(),
             ts,
         })
         .expect("serialize rotation");
@@ -12563,11 +12958,11 @@ pub fn rotate_brain_key(
         let journal = RotationJournal {
             v: 1,
             origin: normalized_origin(&cfg.hub)?,
-            brain: before.head.brain.clone(),
+            brain: canonical_brain.clone(),
             old_brain: old_key.multikey.clone(),
             new_brain: new_multikey.clone(),
-            prior_head_seq: before.head.seq,
-            prior_feed_hash: before.head.feed_hash.clone(),
+            prior_head_seq: observed_head.seq,
+            prior_feed_hash: observed_head.feed_hash.clone(),
             statement,
         };
         let mut exact = serde_json::to_vec(&journal)
@@ -12584,10 +12979,10 @@ pub fn rotate_brain_key(
     validate_rotation_journal(
         &journal,
         cfg,
-        &before.head.brain,
+        &canonical_brain,
         old_key,
         &new_key,
-        &before.head,
+        &observed_head,
     )?;
 
     let body = json!({ "statement": journal.statement });
@@ -12602,20 +12997,43 @@ pub fn rotate_brain_key(
     // A 2xx body is not authority, and a failed response may have followed a
     // committed mutation. In both cases success means the normal verifier sees
     // an append-only rotation chain ending at the durable new key.
-    let after = match verified_remote_head(cfg, brain, false) {
-        Ok(after) => after,
-        Err(error) => return Err(attempted_failure.unwrap_or(error)),
+    let identity = if v2_profile {
+        match v2_verified_head(cfg, brain) {
+            Ok(Some(after)) => {
+                let identity = v2_identity(&after.identity);
+                accept_v2_head(cfg, &after)?;
+                identity
+            }
+            Ok(None) => {
+                return Err(attempted_failure.unwrap_or_else(|| {
+                    invalid_feed("rotated v2 brain no longer serves a v2 head")
+                }));
+            }
+            Err(error) => return Err(attempted_failure.unwrap_or(error)),
+        }
+    } else {
+        match verified_remote_head(cfg, brain, false) {
+            Ok(after) => after
+                .identity
+                .ok_or_else(|| invalid_feed("rotated brain has no verified identity"))?,
+            Err(error) => return Err(attempted_failure.unwrap_or(error)),
+        }
     };
-    let identity = after
-        .identity
-        .as_ref()
-        .ok_or_else(|| invalid_feed("rotated brain has no verified identity"))?;
     if format!("ed25519:{}", identity.fingerprint) != new_multikey
         || identity.public_key_spki != new_spki
     {
         return Err(attempted_failure.unwrap_or_else(|| {
             invalid_feed("hub acknowledged rotation without committing the verified new identity")
         }));
+    }
+    if v2_profile {
+        if let Some(error) = attempted_failure {
+            // Seeing the new public identity is insufficient: v2 rotation is
+            // successful only after the endpoint has forced and acknowledged
+            // the recovery checkpoint that contains it. Keep the journal for
+            // an exact retry after any non-2xx or transport ambiguity.
+            return Err(error);
+        }
     }
     let previous = identity
         .previous
@@ -13319,6 +13737,23 @@ fn verified_remote_head(
 /// local TOFU anchor; sequence and hash checkpoints reject rollback and
 /// equivocation across invocations.
 pub fn head(cfg: &HubConfig, brain: &str) -> LinkResult<Head> {
+    if let Some(verified) = v2_verified_head(cfg, brain)? {
+        let observation = Head {
+            brain: verified.brain_id.clone(),
+            seq: verified.pointer.as_ref().map_or(0, |pointer| pointer.seq),
+            updated_at: verified
+                .pointer
+                .as_ref()
+                .map(|pointer| pointer.signed_at.clone()),
+            feed_hash: verified
+                .pointer
+                .as_ref()
+                .map(|pointer| pointer.feed_hash.clone()),
+            verified: true,
+        };
+        accept_v2_head(cfg, &verified)?;
+        return Ok(observation);
+    }
     Ok(verified_remote_head(cfg, brain, false)?.head)
 }
 
@@ -13327,6 +13762,78 @@ mod tests {
     use super::*;
 
     const TEST_BRAIN_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";
+
+    fn upload_declaration(index: usize, coordinate_len: usize) -> Value {
+        json!({
+            "sha256": "a".repeat(64),
+            "bytes": 10,
+            "coordinates": [format!("records/notes/{}-{}.md", "n".repeat(coordinate_len), index)],
+        })
+    }
+
+    #[test]
+    fn upload_reservations_batch_by_count_and_by_size() {
+        // A real store's first push declares one blob per changed file, which
+        // does not fit in one request. Every batch has to stay inside both
+        // bounds, and concatenating them has to reproduce the original order.
+        let declarations: Vec<Value> = (0..5_000).map(|i| upload_declaration(i, 8)).collect();
+        let batches = batch_upload_declarations(declarations.clone());
+
+        assert!(batches.len() > 1, "5,000 blobs must not ride one request");
+        for batch in &batches {
+            assert!(batch.len() <= MAX_UPLOAD_RESERVATION_BLOBS);
+            let bytes = serde_json::to_string(&json!({ "blobs": batch }))
+                .expect("batch serializes")
+                .len();
+            assert!(
+                bytes <= MAX_UPLOAD_RESERVATION_BYTES + 1_024,
+                "batch body {bytes} exceeds the reservation budget"
+            );
+        }
+        let flattened: Vec<Value> = batches.into_iter().flatten().collect();
+        assert_eq!(
+            flattened, declarations,
+            "batching must preserve the set and order"
+        );
+    }
+
+    #[test]
+    fn wide_coordinate_sets_shrink_batches_below_the_count_bound() {
+        // Byte budget, not just count. One hash can carry many coordinates
+        // (the same bytes reachable at several paths), so a batch sized only by
+        // count would blow the body budget on a deduplicated store.
+        let declarations: Vec<Value> = (0..2_000)
+            .map(|index| {
+                json!({
+                    "sha256": "a".repeat(64),
+                    "bytes": 10,
+                    "coordinates": (0..24)
+                        .map(|slot| format!(
+                            "records/workflowy-nodes/2019/02/a-fairly-long-node-title-{index}-{slot}-abcd1234.md"
+                        ))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let batches = batch_upload_declarations(declarations);
+        assert!(
+            batches[0].len() < MAX_UPLOAD_RESERVATION_BLOBS,
+            "wide coordinate sets must bound the batch by size"
+        );
+        for batch in &batches {
+            let bytes = serde_json::to_string(&json!({ "blobs": batch }))
+                .expect("batch serializes")
+                .len();
+            assert!(bytes <= MAX_UPLOAD_RESERVATION_BYTES + 2_048);
+        }
+    }
+
+    #[test]
+    fn a_small_push_still_rides_exactly_one_request() {
+        let declarations: Vec<Value> = (0..3).map(|i| upload_declaration(i, 8)).collect();
+        assert_eq!(batch_upload_declarations(declarations).len(), 1);
+        assert!(batch_upload_declarations(Vec::new()).is_empty());
+    }
 
     #[test]
     fn exact_source_move_becomes_one_provenance_preserving_rename() {
@@ -14060,7 +14567,7 @@ mod tests {
             "identity": signed_remote_fixture().identity,
         })
         .to_string();
-        let (hub, server) = scripted_json_hub(vec![(200, card)]);
+        let (hub, server) = scripted_json_hub(vec![(404, "{}".to_string()), (200, card)]);
         let state = tempfile::tempdir().unwrap();
         let cfg = test_hub_config(hub, state.path().to_path_buf());
         let error = head(&cfg, TEST_BRAIN_ID).unwrap_err().to_string();
@@ -14083,7 +14590,12 @@ mod tests {
             })
             .to_string()
         };
-        let (hub, server) = scripted_json_hub(vec![(200, card(first)), (200, card(second))]);
+        let (hub, server) = scripted_json_hub(vec![
+            (404, "{}".to_string()),
+            (200, card(first)),
+            (404, "{}".to_string()),
+            (200, card(second)),
+        ]);
         let state = tempfile::tempdir().unwrap();
         let cfg = test_hub_config(hub, state.path().to_path_buf());
         assert!(head(&cfg, TEST_BRAIN_ID).unwrap().verified);
@@ -14134,7 +14646,7 @@ mod tests {
             "identity": identity,
         })
         .to_string();
-        let (hub, server) = scripted_json_hub(vec![(200, card)]);
+        let (hub, server) = scripted_json_hub(vec![(404, "{}".to_string()), (200, card)]);
         let state = tempfile::tempdir().unwrap();
         let cfg = test_hub_config(hub, state.path().to_path_buf());
         let error = head(&cfg, TEST_BRAIN_ID).unwrap_err().to_string();
@@ -14155,8 +14667,10 @@ mod tests {
         let mut fork: Value = serde_json::from_str(&fixture.card).unwrap();
         fork["feedHash"] = Value::String("b".repeat(64));
         let (hub, server) = scripted_json_hub(vec![
+            (404, "{}".to_string()),
             (200, fixture.card),
             (200, fixture.feed),
+            (404, "{}".to_string()),
             (200, fork.to_string()),
         ]);
         let state = tempfile::tempdir().unwrap();
@@ -14171,8 +14685,10 @@ mod tests {
         let trusted = signed_remote_fixture();
         let attacker = signed_remote_fixture();
         let (hub, server) = scripted_json_hub(vec![
+            (404, "{}".to_string()),
             (200, trusted.card),
             (200, trusted.feed),
+            (404, "{}".to_string()),
             (200, attacker.card),
         ]);
         let state = tempfile::tempdir().unwrap();
@@ -14235,8 +14751,10 @@ mod tests {
         let alpha_feed = alpha.feed.clone();
         let beta_card = beta.card.clone();
         let beta_feed = beta.feed.clone();
-        let (hub, server) = routed_json_hub(3, move |path| {
-            if path.contains("/alpha/feed?") {
+        let (hub, server) = routed_json_hub(5, move |path| {
+            if path.ends_with("/v2/head") {
+                (404, "{}".to_string())
+            } else if path.contains("/alpha/feed?") {
                 (200, alpha_feed.clone())
             } else if path.contains("/beta/feed?") {
                 (200, beta_feed.clone())
@@ -14349,6 +14867,7 @@ mod tests {
         })
         .to_string();
         let (hub, server) = scripted_json_hub(vec![
+            (404, "{}".to_string()),
             (200, remote.card.clone()),
             (200, remote.feed.clone()),
             (200, forged),
