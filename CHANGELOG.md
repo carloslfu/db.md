@@ -8,9 +8,18 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.18**.
+  `Cargo.toml`, currently **v0.8.19**.
 
 ## Unreleased
+
+## [0.8.19] — 2026-08-20
+
+### Fixed
+
+- Permissioned sync applies an accepted exact-byte source promotion to its
+  private local baseline. A successful promotion now converges cleanly instead
+  of reporting an unsupported generated operation after the hub has committed
+  the signed rename.
 
 ## [0.8.18] — 2026-08-20
 

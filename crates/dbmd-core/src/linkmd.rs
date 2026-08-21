@@ -6286,6 +6286,58 @@ fn apply_generated_v2_operations(
                     },
                 );
             }
+            Some("rename") => {
+                let from = operation
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 rename has no source path"))?;
+                let to = operation
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 rename has no destination path"))?;
+                let sha256 = operation
+                    .get("blob")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("v2 rename has no blob"))?;
+                let bytes = operation
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_feed("v2 rename has no byte count"))?;
+                let expected_from = operation
+                    .get("expected_from")
+                    .and_then(|expected| expected.get("hash"))
+                    .and_then(Value::as_str);
+                let expected_to_absent = operation
+                    .get("expected_to")
+                    .and_then(|expected| expected.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("absent");
+                if from == to
+                    || !from.starts_with("sources/")
+                    || !to.starts_with("sources/")
+                    || expected_from != Some(sha256)
+                    || !expected_to_absent
+                    || candidate.contains_key(to)
+                {
+                    return Err(invalid_feed("generated v2 source rename is malformed"));
+                }
+                let source = candidate
+                    .remove(from)
+                    .ok_or_else(|| invalid_feed("v2 rename source is absent"))?;
+                if source.sha256 != sha256 || source.bytes != bytes {
+                    return Err(invalid_feed(
+                        "v2 rename source differs from its exact-byte claim",
+                    ));
+                }
+                candidate.insert(
+                    to.to_string(),
+                    V2BaselineFile {
+                        sha256: sha256.to_string(),
+                        bytes,
+                        proof: None,
+                    },
+                );
+            }
             Some("delete" | "withdraw_from_hosting") => {
                 let path = operation
                     .get("path")
@@ -13335,6 +13387,62 @@ mod tests {
             infer_exact_source_promotions(operations.clone()),
             operations,
             "an ambiguous filesystem diff must reach the hub unchanged and fail closed"
+        );
+    }
+
+    #[test]
+    fn accepted_source_promotion_advances_the_local_baseline_exactly() {
+        let hash = "c".repeat(64);
+        let mut candidate = std::collections::BTreeMap::from([(
+            "sources/inbox/item.md".to_string(),
+            V2BaselineFile {
+                sha256: hash.clone(),
+                bytes: 19,
+                proof: None,
+            },
+        )]);
+        let mut candidate_assets = std::collections::BTreeMap::new();
+        let operations = vec![
+            json!({
+                "op": "rename",
+                "from": "sources/inbox/item.md",
+                "to": "sources/curated/item.md",
+                "expected_from": { "kind": "blob", "hash": hash },
+                "expected_to": { "kind": "absent" },
+                "blob": hash,
+                "bytes": 19,
+            }),
+            json!({
+                "op": "put",
+                "path": "records/rsvps/item.md",
+                "expected": { "kind": "absent" },
+                "blob": "d".repeat(64),
+                "bytes": 23,
+            }),
+        ];
+
+        assert!(!apply_generated_v2_operations(
+            &operations,
+            &std::collections::BTreeMap::new(),
+            &mut candidate,
+            &mut candidate_assets,
+        )
+        .unwrap());
+        assert!(!candidate.contains_key("sources/inbox/item.md"));
+        assert_eq!(
+            candidate
+                .get("sources/curated/item.md")
+                .map(|file| (&file.sha256, file.bytes)),
+            Some((&hash, 19))
+        );
+        assert_eq!(
+            candidate
+                .get("records/rsvps/item.md")
+                .map(|file| (file.sha256.as_str(), file.bytes)),
+            Some((
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                23
+            ))
         );
     }
 
