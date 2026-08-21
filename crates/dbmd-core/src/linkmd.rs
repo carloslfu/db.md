@@ -210,8 +210,9 @@ const OVERALL_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// its full route budget on, so the client has to outwait the server rather
 /// than the other way round. At the default 120 seconds a first push of a real
 /// store abandoned a commit the hub was still completing and reported a
-/// transport failure for work that had not failed.
-const COMMIT_REQUEST_TIMEOUT_SECS: u64 = 360;
+/// transport failure for work that had not failed. This sits above the hub's
+/// own genesis-commit ceiling so the client always learns the outcome.
+const COMMIT_REQUEST_TIMEOUT_SECS: u64 = 900;
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 
