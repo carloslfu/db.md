@@ -206,6 +206,12 @@ const READ_TIMEOUT_SECS: u64 = 120;
 /// response headers, and the complete response body. DNS performed for pinned
 /// agents has its own interruptible deadline below.
 const OVERALL_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// A commit of a whole store is brain-sized work the hub is allowed to spend
+/// its full route budget on, so the client has to outwait the server rather
+/// than the other way round. At the default 120 seconds a first push of a real
+/// store abandoned a commit the hub was still completing and reported a
+/// transport failure for work that had not failed.
+const COMMIT_REQUEST_TIMEOUT_SECS: u64 = 360;
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 
@@ -1397,22 +1403,32 @@ fn agent_builder_with_timeout(overall: std::time::Duration) -> ureq::AgentBuilde
         .timeout(overall)
 }
 
-fn agent_builder() -> ureq::AgentBuilder {
-    agent_builder_with_timeout(std::time::Duration::from_secs(OVERALL_REQUEST_TIMEOUT_SECS))
-}
-
-fn agent() -> ureq::Agent {
-    agent_builder().build()
-}
-
 fn hub_agent(cfg: &HubConfig) -> LinkResult<ureq::Agent> {
+    hub_agent_with_timeout(
+        cfg,
+        std::time::Duration::from_secs(OVERALL_REQUEST_TIMEOUT_SECS),
+    )
+}
+
+fn hub_agent_with_timeout(
+    cfg: &HubConfig,
+    overall: std::time::Duration,
+) -> LinkResult<ureq::Agent> {
     if !cfg.store_selected {
-        return Ok(agent());
+        return Ok(agent_builder_with_timeout(overall).build());
     }
     let parsed = url::Url::parse(&cfg.hub).map_err(|_| LinkError::UnsafeHub {
         hub: cfg.hub.clone(),
     })?;
-    pinned_public_agent(&parsed, false, "store-selected hub")
+    pinned_public_agent_pooled(
+        &parsed,
+        false,
+        "store-selected hub",
+        AgentShape {
+            overall,
+            ..AgentShape::default()
+        },
+    )
 }
 
 /// Perform one hub request. `path` is the binding path (starts with `/`);
@@ -1536,6 +1552,38 @@ fn request_capped(
     })
 }
 
+/// One request the hub is allowed to take brain-sized time over. Used for the
+/// commit lane, where abandoning the attempt early does not cancel the work —
+/// it only loses the receipt for it.
+fn request_patient(
+    cfg: &HubConfig,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: Auth,
+) -> LinkResult<HubResponse> {
+    let http = hub_agent_with_timeout(
+        cfg,
+        std::time::Duration::from_secs(COMMIT_REQUEST_TIMEOUT_SECS),
+    )?;
+    let raw = request_raw_with_agent(
+        cfg,
+        &http,
+        method,
+        path,
+        body,
+        RawRequestOptions {
+            auth,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+            request_id: None,
+        },
+    )?;
+    Ok(HubResponse {
+        status: raw.status,
+        body: serde_json::from_slice(&raw.body).ok(),
+    })
+}
+
 fn request(
     cfg: &HubConfig,
     method: &str,
@@ -1566,7 +1614,12 @@ fn request_with_request_id(
     {
         return Err(invalid_feed("hub returned an unsafe request id"));
     }
-    let http = hub_agent(cfg)?;
+    // Both callers are commit responses, so this shares the commit lane's
+    // patience: the hub is finishing the same brain-sized work either way.
+    let http = hub_agent_with_timeout(
+        cfg,
+        std::time::Duration::from_secs(COMMIT_REQUEST_TIMEOUT_SECS),
+    )?;
     let raw = request_raw_with_agent(
         cfg,
         &http,
@@ -1700,7 +1753,10 @@ fn shared_staging_agent(cfg: &HubConfig, urls: &[&str]) -> Option<ureq::Agent> {
         &first,
         allow_private,
         "object-store URL",
-        V2_UPLOAD_CONCURRENCY,
+        AgentShape {
+            idle_per_host: V2_UPLOAD_CONCURRENCY,
+            ..AgentShape::default()
+        },
     )
     .ok()
 }
@@ -1950,17 +2006,32 @@ fn pinned_public_agent(
     allow_private: bool,
     label: &str,
 ) -> LinkResult<ureq::Agent> {
-    pinned_public_agent_pooled(url, allow_private, label, 1)
+    pinned_public_agent_pooled(url, allow_private, label, AgentShape::default())
 }
 
-/// `idle_per_host` sizes the connection pool. The default of one is right for a
-/// lone request but throttles a concurrent batch back to one warm connection,
-/// so every extra worker would pay a fresh handshake.
+/// How one agent is built: `idle_per_host` sizes the connection pool (the
+/// default of one is right for a lone request but throttles a concurrent batch
+/// back to a single warm connection), and `overall` is the wall-clock budget
+/// for one attempt.
+struct AgentShape {
+    idle_per_host: usize,
+    overall: std::time::Duration,
+}
+
+impl Default for AgentShape {
+    fn default() -> Self {
+        Self {
+            idle_per_host: 1,
+            overall: std::time::Duration::from_secs(OVERALL_REQUEST_TIMEOUT_SECS),
+        }
+    }
+}
+
 fn pinned_public_agent_pooled(
     url: &url::Url,
     allow_private: bool,
     label: &str,
-    idle_per_host: usize,
+    shape: AgentShape,
 ) -> LinkResult<ureq::Agent> {
     let host = url
         .host_str()
@@ -1991,8 +2062,8 @@ fn pinned_public_agent_pooled(
     } else {
         format!("{host}:{port}")
     };
-    Ok(agent_builder()
-        .max_idle_connections_per_host(idle_per_host.max(1))
+    Ok(agent_builder_with_timeout(shape.overall)
+        .max_idle_connections_per_host(shape.idle_per_host.max(1))
         .resolver(PinnedRegistryResolver { netloc, addresses })
         .build())
 }
@@ -7906,7 +7977,7 @@ fn v2_sync_push(
     stage_oversized_v2_change(cfg, requested_brain, &operations, &mut body)?;
     let path = format!("/api/hub/brains/{requested_brain}/v2/commits");
     let mut candidate_hub_signer: Option<String> = None;
-    let mut response = request(cfg, "POST", &path, Some(&body), Auth::Required)?;
+    let mut response = request_patient(cfg, "POST", &path, Some(&body), Auth::Required)?;
     let bulk_preview_required = !(200..300).contains(&response.status)
         && response.body.as_ref().is_some_and(|value| {
             value.get("code").and_then(Value::as_str) == Some("bulk_preview_required")
@@ -7920,7 +7991,7 @@ fn v2_sync_push(
         body["rebase"] = Value::String("strict".to_string());
         body["preview_only"] = Value::Bool(true);
         let preview = ensure_ok(
-            request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+            request_patient(cfg, "POST", &path, Some(&body), Auth::Required)?,
             "v2 bulk preview",
         )?;
         let preview_code = preview.get("code").and_then(Value::as_str);
@@ -7958,7 +8029,7 @@ fn v2_sync_push(
         body.as_object_mut()
             .expect("v2 commit request is an object")
             .remove("preview_only");
-        response = request(cfg, "POST", &path, Some(&body), Auth::Required)?;
+        response = request_patient(cfg, "POST", &path, Some(&body), Auth::Required)?;
     }
     let mut result = ensure_ok(response, "v2 sync push")?;
     if result.get("code").and_then(Value::as_str) == Some("proposal_queued") {
@@ -11763,7 +11834,7 @@ pub fn proposal_accept_exact(
     stage_oversized_v2_change(cfg, &head.brain_id, &operations, &mut body)?;
     let path = format!("/api/hub/brains/{}/v2/commits", head.brain_id);
     let mut result = ensure_ok(
-        request(cfg, "POST", &path, Some(&body), Auth::Required)?,
+        request_patient(cfg, "POST", &path, Some(&body), Auth::Required)?,
         "exact proposal acceptance",
     )?;
     let mut candidate_hub_signer = None;
