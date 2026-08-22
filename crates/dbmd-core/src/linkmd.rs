@@ -7249,15 +7249,30 @@ fn reserve_upload_window(
 ) -> LinkResult<Value> {
     let mut attempt = 0;
     loop {
-        let response = request(cfg, "POST", path, Some(body), Auth::Required)?;
-        if is_retryable_hub_status(response.status) && attempt + 1 < RESERVATION_ATTEMPTS {
+        let pause = |attempt: usize| {
             std::thread::sleep(std::time::Duration::from_millis(
                 RESERVATION_BACKOFF_MS[attempt.min(RESERVATION_BACKOFF_MS.len() - 1)],
             ));
-            attempt += 1;
-            continue;
+        };
+        match request(cfg, "POST", path, Some(body), Auth::Required) {
+            // A migration opens dozens of windows over tens of minutes, so one
+            // response that never arrives is ordinary rather than final. The
+            // call reserves capacity and mints URLs; it commits nothing, so a
+            // dropped or timed-out attempt is worth asking again.
+            Err(LinkError::Transport { .. }) if attempt + 1 < RESERVATION_ATTEMPTS => {
+                pause(attempt);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+            Ok(response) => {
+                if is_retryable_hub_status(response.status) && attempt + 1 < RESERVATION_ATTEMPTS {
+                    pause(attempt);
+                    attempt += 1;
+                    continue;
+                }
+                return ensure_ok(response, what);
+            }
         }
-        return ensure_ok(response, what);
     }
 }
 
