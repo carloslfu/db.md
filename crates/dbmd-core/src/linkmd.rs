@@ -1540,10 +1540,7 @@ fn request_raw_with_agent(
     };
 
     let status = resp.status();
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(options.max_response_bytes + 1)
-        .read_to_end(&mut buf)?;
+    let buf = read_response_body(resp, options.max_response_bytes + 1, &cfg.hub)?;
     if buf.len() as u64 > options.max_response_bytes {
         return Err(LinkError::ResponseTooLarge {
             limit_bytes: options.max_response_bytes,
@@ -1838,6 +1835,27 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
     }
 }
 
+/// Read a response body, typed as the transport failure it is.
+///
+/// A connection that fails while the body is still arriving is the same class
+/// of problem as one that fails before it arrives at all — but a bare `?` on
+/// the read turned it into an anonymous io error that no retry path recognised
+/// and no message attributed to a peer. On a migration making tens of
+/// thousands of requests, one stalled body ended the whole push and reported
+/// only "timed out reading response".
+fn read_response_body(response: ureq::Response, limit: u64, peer: &str) -> LinkResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    response
+        .into_reader()
+        .take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|error| LinkError::Transport {
+            hub: peer.to_string(),
+            message: error.to_string(),
+        })?;
+    Ok(buf)
+}
+
 /// Draining a response is what returns its connection to the pool: the client
 /// cannot recycle a socket whose body may still have bytes pending, so a body
 /// that is dropped instead of read costs the next object a fresh handshake.
@@ -1911,10 +1929,7 @@ fn get_presigned(cfg: &HubConfig, raw: &str) -> LinkResult<Vec<u8>> {
             details: None,
         });
     }
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(presigned_download_read_limit())
-        .read_to_end(&mut bytes)?;
+    let bytes = read_response_body(resp, presigned_download_read_limit(), "the object store")?;
     if bytes.len() as u64 > MAX_PACK_BYTES {
         return Err(LinkError::InvalidPack {
             message: "download exceeds the compressed-size limit".to_string(),
@@ -2169,10 +2184,7 @@ fn get_json_absolute(url: &str) -> LinkResult<Value> {
             details: None,
         });
     }
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .take(MAX_REGISTRY_CARD_BYTES + 1)
-        .read_to_end(&mut buf)?;
+    let buf = read_response_body(resp, MAX_REGISTRY_CARD_BYTES + 1, url)?;
     if buf.len() as u64 > MAX_REGISTRY_CARD_BYTES {
         return Err(LinkError::ResponseTooLarge {
             limit_bytes: MAX_REGISTRY_CARD_BYTES,
@@ -5653,9 +5665,18 @@ fn download_presigned_to_cache(
     let mut digest = Sha256::new();
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
-    let write_result = (|| -> std::io::Result<()> {
+    // Reading the socket and writing the file are different failures wearing
+    // the same io::Error: a stalled download is the peer's problem and a full
+    // disk is this machine's, and an operator who is told only "timed out"
+    // cannot tell which one to act on.
+    let write_result = (|| -> LinkResult<()> {
         loop {
-            let read = reader.read(&mut buffer)?;
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| LinkError::Transport {
+                    hub: cfg.hub.clone(),
+                    message: error.to_string(),
+                })?;
             if read == 0 {
                 break;
             }
@@ -5663,11 +5684,11 @@ fn download_presigned_to_cache(
             digest.update(&buffer[..read]);
             output.write_all(&buffer[..read])?;
         }
-        output.sync_all()
+        output.sync_all().map_err(LinkError::from)
     })();
     if let Err(error) = write_result {
         let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) };
-        return Err(error.into());
+        return Err(error);
     }
     drop(output);
     if total != expected_bytes || format!("{:x}", digest.finalize()) != sha256 {
@@ -5745,9 +5766,15 @@ fn download_presigned_to_cache(
     let mut digest = Sha256::new();
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
-    let copied = (|| -> std::io::Result<()> {
+    // Same split as the cache-fill path: a stalled socket is not a disk error.
+    let copied = (|| -> LinkResult<()> {
         loop {
-            let read = reader.read(&mut buffer)?;
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| LinkError::Transport {
+                    hub: cfg.hub.clone(),
+                    message: error.to_string(),
+                })?;
             if read == 0 {
                 break;
             }
@@ -17071,6 +17098,50 @@ mod tests {
         let response = request(&cfg, "GET", "/retry", None, Auth::None).unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, Some(json!({ "ok": true })));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_body_that_dies_mid_stream_is_a_transport_failure() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+
+        // A connection that fails while the body is arriving is the same class
+        // of problem as one that fails before it arrives at all. Typed as a
+        // bare io error it matched no retry path and named no peer, and one
+        // stalled body ended a whole migration reporting only "timed out
+        // reading response".
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = [0_u8; 1024];
+            let _ = stream.read(&mut request_bytes).unwrap();
+            // Promise a hundred bytes, send ten, hang up.
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"ok\":true",
+                )
+                .unwrap();
+        });
+        let cfg = HubConfig {
+            hub: format!("http://{address}"),
+            key: None,
+            agent_key: None,
+            brain_key: None,
+            state_dir: tempfile::tempdir().unwrap().keep(),
+            store_selected: false,
+        };
+
+        let error = request(&cfg, "GET", "/truncated", None, Auth::None)
+            .expect_err("a truncated body must not read as success");
+        match error {
+            LinkError::Transport { hub, .. } => {
+                assert!(hub.contains(&address.to_string()), "names its peer: {hub}");
+            }
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
         server.join().unwrap();
     }
 
