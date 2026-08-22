@@ -213,6 +213,11 @@ const OVERALL_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// transport failure for work that had not failed. This sits above the hub's
 /// own genesis-commit ceiling so the client always learns the outcome.
 const COMMIT_REQUEST_TIMEOUT_SECS: u64 = 900;
+/// A commit is idempotent by mutation coordinate, so a lost response is worth
+/// asking after — and the work it lost the receipt for may still be finishing,
+/// which is why the waits are long enough to let a brain-sized commit land.
+const COMMIT_ATTEMPTS: usize = 4;
+const COMMIT_RETRY_BACKOFF_MS: [u64; COMMIT_ATTEMPTS - 1] = [5_000, 20_000, 45_000];
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 
@@ -1568,6 +1573,14 @@ fn request_capped(
 /// One request the hub is allowed to take brain-sized time over. Used for the
 /// commit lane, where abandoning the attempt early does not cancel the work —
 /// it only loses the receipt for it.
+///
+/// Which is why a lost connection is asked again rather than reported. The
+/// mutation coordinate is derived from the observed base and the exact
+/// operation set precisely so a repeat is the SAME effect: the hub answers a
+/// mutation it already applied with that commit's receipt instead of a second
+/// commit. Measured on a 32,338-file store: the commit landed durably and the
+/// push reported a transport failure, because nobody went back for the
+/// receipt.
 fn request_patient(
     cfg: &HubConfig,
     method: &str,
@@ -1579,22 +1592,36 @@ fn request_patient(
         cfg,
         std::time::Duration::from_secs(COMMIT_REQUEST_TIMEOUT_SECS),
     )?;
-    let raw = request_raw_with_agent(
-        cfg,
-        &http,
-        method,
-        path,
-        body,
-        RawRequestOptions {
-            auth,
-            max_response_bytes: MAX_RESPONSE_BYTES,
-            request_id: None,
-        },
-    )?;
-    Ok(HubResponse {
-        status: raw.status,
-        body: serde_json::from_slice(&raw.body).ok(),
-    })
+    let mut attempt = 0;
+    loop {
+        let sent = request_raw_with_agent(
+            cfg,
+            &http,
+            method,
+            path,
+            body,
+            RawRequestOptions {
+                auth,
+                max_response_bytes: MAX_RESPONSE_BYTES,
+                request_id: None,
+            },
+        );
+        match sent {
+            Err(LinkError::Transport { .. }) if attempt + 1 < COMMIT_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    COMMIT_RETRY_BACKOFF_MS[attempt.min(COMMIT_RETRY_BACKOFF_MS.len() - 1)],
+                ));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+            Ok(raw) => {
+                return Ok(HubResponse {
+                    status: raw.status,
+                    body: serde_json::from_slice(&raw.body).ok(),
+                })
+            }
+        }
+    }
 }
 
 fn request(
@@ -17098,6 +17125,69 @@ mod tests {
         let response = request(&cfg, "GET", "/retry", None, Auth::None).unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, Some(json!({ "ok": true })));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_commit_goes_back_for_a_receipt_it_lost() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+
+        // The mutation coordinate is derived from the observed base and the
+        // exact operation set so a repeat is the SAME effect. A commit that
+        // lands durably and then loses its connection must therefore be asked
+        // after, not reported as a failure — which is what happened to a
+        // 32,338-file store that had already committed.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            // First attempt: promise a body, hang up mid-way.
+            let (mut first, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 4096];
+            let _ = first.read(&mut bytes).unwrap();
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 90\r\nConnection: close\r\n\r\n{\"v\":2",
+                )
+                .unwrap();
+            drop(first);
+            // Second attempt: the receipt for the commit that already landed.
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = second.read(&mut bytes).unwrap();
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"v\":2,\"outcome\":\"converged\"}",
+                )
+                .unwrap();
+        });
+        let cfg = HubConfig {
+            hub: format!("http://{address}"),
+            key: Some("k".to_string()),
+            agent_key: None,
+            brain_key: None,
+            state_dir: tempfile::tempdir().unwrap().keep(),
+            store_selected: false,
+        };
+
+        let response = request_patient(
+            &cfg,
+            "POST",
+            "/api/hub/brains/b/v2/commits",
+            Some(&json!({ "mutation_id": "dbmd-1" })),
+            Auth::Required,
+        )
+        .expect("the receipt is collected on the second ask");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response
+                .body
+                .as_ref()
+                .and_then(|value| value.get("outcome"))
+                .and_then(Value::as_str),
+            Some("converged"),
+            "an already-applied mutation answers with its receipt"
+        );
         server.join().unwrap();
     }
 
