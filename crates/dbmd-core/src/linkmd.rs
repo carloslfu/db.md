@@ -5149,12 +5149,24 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
         .into_iter()
         .flat_map(|(source, targets)| {
             let kept_home = &kept_home;
+            let policy = &policy;
             targets.into_iter().filter_map(move |target| {
                 let target = format!("{target}.md");
-                kept_home.contains(&target).then_some(V2WithheldLink {
-                    source: source.clone(),
-                    target,
-                })
+                // A kept-home target need not be a file on THIS machine. An
+                // export omits kept-home content by construction, so a store
+                // restored from one links to names it does not carry — and
+                // without this the owner's own export could never be pushed
+                // back, which is the opposite of owning your data. The policy
+                // is the owner's statement about where a path lives, and it
+                // stands whether or not this checkout holds a copy. It
+                // discloses nothing either way: the name is already written in
+                // the content that links to it.
+                (kept_home.contains(&target) || policy.keeps_home(&target)).then_some(
+                    V2WithheldLink {
+                        source: source.clone(),
+                        target,
+                    },
+                )
             })
         })
         .collect::<Vec<_>>();
@@ -17446,6 +17458,56 @@ mod tests {
                 source: "records/notes/a.md".to_string(),
                 target: "sources/private/secret.md".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn a_kept_home_target_is_withheld_even_when_this_machine_lacks_it() {
+        // An export omits kept-home content by construction, so a store
+        // restored from one links to names it does not carry. Without this the
+        // owner's own export could never be pushed back — the links would read
+        // as broken and the commit would be refused.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("records/notes")).unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\nname: Restored export\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("records/notes/a.md"),
+            b"---\ntype: note\n---\nSee [[sources/private/absent]].\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(".sevralocal"),
+            b"sources/private/**\n",
+        )
+        .unwrap();
+
+        let store = Store::open_strict(directory.path()).unwrap();
+        let view = v2_local_files(&store).unwrap();
+        assert_eq!(
+            view.withheld_links,
+            vec![V2WithheldLink {
+                source: "records/notes/a.md".to_string(),
+                target: "sources/private/absent.md".to_string(),
+            }]
+        );
+        // A dangling link the owner never claimed is still dangling.
+        std::fs::write(
+            directory.path().join("records/notes/b.md"),
+            b"---\ntype: note\n---\nSee [[records/notes/nowhere]].\n",
+        )
+        .unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        let view = v2_local_files(&store).unwrap();
+        assert!(
+            !view
+                .withheld_links
+                .iter()
+                .any(|link| link.target == "records/notes/nowhere.md"),
+            "an unclaimed dangling target must not be declared withheld"
         );
     }
 
