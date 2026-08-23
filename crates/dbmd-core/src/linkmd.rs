@@ -5809,7 +5809,8 @@ fn download_presigned_to_cache(
             digest.update(&buffer[..read]);
             output.write_all(&buffer[..read])?;
         }
-        output.sync_all()
+        output.sync_all()?;
+        Ok(())
     })();
     if let Err(error) = copied {
         let _ = std::fs::remove_file(&temp);

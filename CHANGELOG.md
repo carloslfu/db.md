@@ -8,14 +8,30 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.21**.
+  `Cargo.toml`, currently **v0.8.22**.
 
 ## Unreleased
+
+## [0.8.22] — 2026-08-23
 
 ### Changed
 
 - README now documents the optional link.md v2 sync surface and native Windows
   installer, and no longer pins a toolkit version that drifts between releases.
+
+### Fixed
+
+- A first sync can stage a brain-sized change manifest, reuse bounded pooled
+  object-store connections, and wait through the hub's full genesis-commit
+  budget. Real-size migrations no longer fail at the request-body ceiling or
+  pay a fresh DNS and TLS setup for every changed blob.
+- Dropped reservation or commit responses are retried using their idempotent
+  identities, and mid-body read failures are classified as transport failures.
+  A commit that already landed is recovered by asking for its receipt again.
+- An exported brain can be pushed back even when its kept-home targets are not
+  present in that export; the owner's local-scope policy remains the authority.
+- The direct-download durability step now converts filesystem flush errors
+  consistently on Windows as well as Unix targets.
 
 ## [0.8.21] — 2026-08-21
 
