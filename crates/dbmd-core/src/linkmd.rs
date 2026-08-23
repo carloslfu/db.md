@@ -1801,6 +1801,18 @@ fn shared_staging_agent(cfg: &HubConfig, urls: &[&str]) -> Option<ureq::Agent> {
     .ok()
 }
 
+/// Turn an object-store transport failure into a useful but credential-safe
+/// diagnostic. `ureq::Transport`'s Display implementation includes the full
+/// request URL; for a presigned URL that means the short-lived signature and
+/// every signed query coordinate. The error kind is enough to distinguish a
+/// network failure without copying bearer material into terminals or logs.
+fn object_store_transport_error(error: ureq::Transport) -> LinkError {
+    LinkError::Transport {
+        hub: "the object store".to_string(),
+        message: format!("network error ({:?})", error.kind()),
+    }
+}
+
 fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> LinkResult<()> {
     let http = presigned_agent(cfg, raw)?;
     let mut attempt = 0;
@@ -1854,10 +1866,7 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
             // "continue to verification", never "trust the upload".
             ureq::Error::Status(412, _) => Ok(()),
             ureq::Error::Status(_, resp) => Err(presigned_upload_refusal(resp)),
-            ureq::Error::Transport(err) => Err(LinkError::Transport {
-                hub: "the object store".to_string(),
-                message: err.to_string(),
-            }),
+            ureq::Error::Transport(err) => Err(object_store_transport_error(err)),
         },
     }
 }
@@ -7270,10 +7279,7 @@ fn put_presigned_source(
                     details: None,
                 })
             }
-            ureq::Error::Transport(error) => Err(LinkError::Transport {
-                hub: "the object store".to_string(),
-                message: error.to_string(),
-            }),
+            ureq::Error::Transport(error) => Err(object_store_transport_error(error)),
         },
     }
 }
@@ -17234,6 +17240,32 @@ mod tests {
             other => panic!("expected a transport failure, got {other:?}"),
         }
         server.join().unwrap();
+    }
+
+    #[test]
+    fn object_store_transport_errors_never_render_presigned_urls() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let signature = "do-not-render-this-presigned-signature";
+        let raw =
+            format!("http://{address}/blob?X-Amz-Credential=temporary&X-Amz-Signature={signature}");
+        let error = ureq::get(&raw)
+            .timeout(std::time::Duration::from_millis(250))
+            .call()
+            .expect_err("the closed local port must fail");
+        let ureq::Error::Transport(transport) = error else {
+            panic!("expected a transport failure");
+        };
+
+        let rendered = object_store_transport_error(transport).to_string();
+        assert!(rendered.contains("the object store"));
+        assert!(rendered.contains("network error"));
+        assert!(!rendered.contains(&raw));
+        assert!(!rendered.contains(signature));
+        assert!(!rendered.contains("X-Amz-"));
     }
 
     #[test]

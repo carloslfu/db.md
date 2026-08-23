@@ -8,9 +8,17 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.22**.
+  `Cargo.toml`, currently **v0.8.23**.
 
 ## Unreleased
+
+## [0.8.23] — 2026-08-23
+
+### Fixed
+
+- Object-store transport failures now report only a stable network error kind.
+  Presigned URLs and their temporary signatures never appear in CLI errors or
+  logs when an immutable upload exhausts its safe retries.
 
 ## [0.8.22] — 2026-08-23
 
