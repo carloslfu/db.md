@@ -5814,7 +5814,7 @@ fn download_presigned_to_cache(
     })();
     if let Err(error) = copied {
         let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
+        return Err(error);
     }
     drop(output);
     if total != expected_bytes || format!("{:x}", digest.finalize()) != sha256 {
