@@ -203,6 +203,9 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::Transport { .. } => CliError::new(ExitCode::Runtime, "HUB_UNREACHABLE", message),
             L::Http { code, details, .. } => {
                 let mut e = match code.as_deref() {
+                    Some("NOT_FOUND") => {
+                        CliError::new(ExitCode::Runtime, "NOT_FOUND", message)
+                    }
                     Some("validation_refused") => {
                         CliError::new(ExitCode::ValidationFailed, "VALIDATION_REFUSED", message)
                     }
@@ -387,6 +390,20 @@ mod tests {
             assert_eq!(error.code, cli_code);
             assert!(error.hint.is_some());
         }
+    }
+
+    #[test]
+    fn link_not_found_has_a_stable_machine_code_without_scraping_prose() {
+        let error = CliError::from(dbmd_core::linkmd::LinkError::Http {
+            what: "resolve",
+            status: 404,
+            message: "record not found".to_string(),
+            code: Some("NOT_FOUND".to_string()),
+            details: None,
+        });
+        assert_eq!(error.exit, ExitCode::Runtime);
+        assert_eq!(error.code, "NOT_FOUND");
+        assert!(error.hint.is_none());
     }
 
     #[test]

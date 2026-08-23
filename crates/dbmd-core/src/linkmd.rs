@@ -3822,20 +3822,24 @@ fn v2_manifest_file(
         path: error.to_string(),
     })?;
     let encoded: String = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
-    let value = ensure_ok(
-        request_capped(
-            cfg,
-            "GET",
-            &format!(
-                "/api/hub/brains/{brain}/v2/files?commit={}&path={encoded}",
-                pointer.commit_hash
-            ),
-            None,
-            Auth::Required,
-            MAX_FEED_RESPONSE_BYTES,
-        )?,
-        "v2 exact file proof",
+    let response = request_capped(
+        cfg,
+        "GET",
+        &format!(
+            "/api/hub/brains/{brain}/v2/files?commit={}&path={encoded}",
+            pointer.commit_hash
+        ),
+        None,
+        Auth::Required,
+        MAX_FEED_RESPONSE_BYTES,
     )?;
+    // Exact v2 file reads deliberately collapse absent and unreadable paths
+    // into the same 404. Preserve that non-oracle as a normal `None`; callers
+    // such as `resolve` then produce the stable, local `NOT_FOUND` contract.
+    if response.status == 404 {
+        return Ok(None);
+    }
+    let value = ensure_ok(response, "v2 exact file proof")?;
     let mut page: V2ManifestPage = serde_json::from_value(value)
         .map_err(|_| invalid_feed("v2 exact file proof has an invalid shape"))?;
     if page.v != 2
@@ -15928,6 +15932,25 @@ mod tests {
             .unwrap();
         assert_eq!(by_path.sha256, content_sha256(raw.as_bytes()));
         assert!(by_path.proof.is_some());
+        server.join().unwrap();
+
+        let (hub, server) = routed_json_hub(1, move |request| {
+            assert_eq!(
+                request,
+                format!(
+                    "/api/hub/brains/{TEST_BRAIN_ID}/v2/files?commit={}&path=records%2Fclients%2Fmissing.md",
+                    "c".repeat(64)
+                )
+            );
+            (404, r#"{"error":"File not found"}"#.to_string())
+        });
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(hub, state.path().to_path_buf());
+        assert!(
+            v2_manifest_file(&cfg, TEST_BRAIN_ID, &pointer, "records/clients/missing.md")
+                .unwrap()
+                .is_none()
+        );
         server.join().unwrap();
 
         let id_manifest = manifest;

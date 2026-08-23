@@ -8,9 +8,18 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.24**.
+  `Cargo.toml`, currently **v0.8.25**.
 
 ## Unreleased
+
+## [0.8.25] — 2026-08-23
+
+### Fixed
+
+- Exact v2 path resolution now preserves the permission-safe 404 as the stable
+  `NOT_FOUND` client contract. Product wrappers can distinguish an absent path
+  without scraping error prose or bypassing dbmd's signed-head and HAMT-proof
+  verification.
 
 ## [0.8.24] — 2026-08-23
 
