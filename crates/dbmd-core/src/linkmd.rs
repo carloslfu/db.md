@@ -226,9 +226,40 @@ const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
 /// the upload lane retries further and waits longer than a connect blip does.
 const UPLOAD_ATTEMPTS: usize = 6;
 const UPLOAD_RETRY_BACKOFF_MS: [u64; UPLOAD_ATTEMPTS - 1] = [200, 600, 1_500, 3_000, 6_000];
+/// Retries share one wall-clock budget. Without this outer deadline, one
+/// black-holed object can consume the per-attempt timeout six times, outlive
+/// its presigned capability, and make a large migration appear hung.
+const UPLOAD_TOTAL_TIMEOUT_SECS: u64 = 300;
 
 fn upload_retry_backoff_ms(attempt: usize) -> u64 {
     UPLOAD_RETRY_BACKOFF_MS[attempt.min(UPLOAD_RETRY_BACKOFF_MS.len() - 1)]
+}
+
+fn upload_deadline_error() -> LinkError {
+    LinkError::Transport {
+        hub: "the object store".to_string(),
+        message: "network error (upload deadline exceeded)".to_string(),
+    }
+}
+
+fn upload_attempt_timeout(deadline: std::time::Instant) -> LinkResult<std::time::Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(upload_deadline_error());
+    }
+    Ok(remaining.min(std::time::Duration::from_secs(OVERALL_REQUEST_TIMEOUT_SECS)))
+}
+
+fn wait_for_upload_retry(deadline: std::time::Instant, attempt: usize) -> bool {
+    if attempt + 1 >= UPLOAD_ATTEMPTS {
+        return false;
+    }
+    let pause = std::time::Duration::from_millis(upload_retry_backoff_ms(attempt));
+    if deadline.saturating_duration_since(std::time::Instant::now()) <= pause {
+        return false;
+    }
+    std::thread::sleep(pause);
+    true
 }
 
 /// A migration opens dozens of staging windows back to back, so it is ordinary
@@ -1815,12 +1846,15 @@ fn object_store_transport_error(error: ureq::Transport) -> LinkError {
 
 fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> LinkResult<()> {
     let http = presigned_agent(cfg, raw)?;
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(UPLOAD_TOTAL_TIMEOUT_SECS))
+        .ok_or_else(upload_deadline_error)?;
     let mut attempt = 0;
     let result = loop {
         // The reservation states content-length itself. This client sends the
         // body from memory, so it never needs to add one, and adding one under
         // a different capitalization would leave both on the wire.
-        let mut req = http.put(raw);
+        let mut req = http.put(raw).timeout(upload_attempt_timeout(deadline)?);
         if let Some(map) = headers.as_object() {
             for (name, value) in map {
                 if let Some(value) = value.as_str() {
@@ -1834,20 +1868,14 @@ fn put_presigned(cfg: &HubConfig, raw: &str, headers: &Value, bytes: &[u8]) -> L
             // connection or a single overloaded refusal is worth replaying
             // rather than failing a whole migration on. 412 already means
             // "someone else stored these exact bytes".
-            Err(ureq::Error::Transport(_)) if attempt + 1 < UPLOAD_ATTEMPTS => {
-                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
-                    attempt,
-                )));
+            Err(ureq::Error::Transport(_)) if wait_for_upload_retry(deadline, attempt) => {
                 attempt += 1;
             }
             Err(ureq::Error::Status(status, _))
                 if status != 412
                     && is_retryable_upload_status(status)
-                    && attempt + 1 < UPLOAD_ATTEMPTS =>
+                    && wait_for_upload_retry(deadline, attempt) =>
             {
-                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
-                    attempt,
-                )));
                 attempt += 1;
             }
             result => break result,
@@ -7157,6 +7185,26 @@ fn put_presigned_source(
     source: &V2UploadSource,
     shared: Option<&ureq::Agent>,
 ) -> LinkResult<()> {
+    put_presigned_source_with_budget(
+        cfg,
+        raw,
+        headers,
+        store,
+        source,
+        shared,
+        std::time::Duration::from_secs(UPLOAD_TOTAL_TIMEOUT_SECS),
+    )
+}
+
+fn put_presigned_source_with_budget(
+    cfg: &HubConfig,
+    raw: &str,
+    headers: &Value,
+    store: &Store,
+    source: &V2UploadSource,
+    shared: Option<&ureq::Agent>,
+    total_budget: std::time::Duration,
+) -> LinkResult<()> {
     // The URL's own safety checks run either way; only the connection pool is
     // shared, so a batch never trades a check for a warm socket.
     let owned = match shared {
@@ -7167,6 +7215,9 @@ fn put_presigned_source(
         None => Some(presigned_agent(cfg, raw)?),
     };
     let http = shared.unwrap_or_else(|| owned.as_ref().expect("an agent for this upload"));
+    let deadline = std::time::Instant::now()
+        .checked_add(total_budget)
+        .ok_or_else(upload_deadline_error)?;
     let mut attempt = 0;
     let result = loop {
         let file = store.open_regular(Path::new(&source.path))?;
@@ -7179,7 +7230,7 @@ fn put_presigned_source(
         // client de-duplicates headers by exact name, not case, so setting
         // `Content-Length` here as well leaves both on the wire and an edge
         // rejects the request as malformed. Supply it only when absent.
-        let mut req = http.put(raw);
+        let mut req = http.put(raw).timeout(upload_attempt_timeout(deadline)?);
         let mut has_content_length = false;
         if let Some(map) = headers.as_object() {
             for (name, value) in map {
@@ -7198,10 +7249,7 @@ fn put_presigned_source(
             // address, exact length and checksum, write-once precondition), the
             // file is reopened on each attempt, and a migration holds
             // connections long enough that a mid-request drop is ordinary.
-            Err(ureq::Error::Transport(_)) if attempt + 1 < UPLOAD_ATTEMPTS => {
-                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
-                    attempt,
-                )));
+            Err(ureq::Error::Transport(_)) if wait_for_upload_retry(deadline, attempt) => {
                 attempt += 1;
             }
             // A migration stages tens of thousands of immutable objects, and an
@@ -7212,11 +7260,8 @@ fn put_presigned_source(
             Err(ureq::Error::Status(status, _))
                 if status != 412
                     && is_retryable_upload_status(status)
-                    && attempt + 1 < UPLOAD_ATTEMPTS =>
+                    && wait_for_upload_retry(deadline, attempt) =>
             {
-                std::thread::sleep(std::time::Duration::from_millis(upload_retry_backoff_ms(
-                    attempt,
-                )));
                 attempt += 1;
             }
             result => break result,
@@ -17348,6 +17393,67 @@ mod tests {
             started.elapsed() < Duration::from_millis(700),
             "stalled upload exceeded the wall-clock budget: {error}"
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn presigned_source_retries_share_one_upload_deadline() {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let signature = "do-not-render-this-stalled-upload-signature";
+        let url = format!(
+            "http://{address}/upload?X-Amz-Credential=temporary&X-Amz-Signature={signature}"
+        );
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            // Keep the socket open without consuming the request. The first
+            // attempt must spend the complete shared budget; retries may not
+            // each restart that budget.
+            std::thread::sleep(Duration::from_millis(600));
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        std::fs::create_dir(directory.path().join("records")).unwrap();
+        let relative = "records/stalled.bin";
+        let bytes = vec![0x5a; 32 * 1024 * 1024];
+        std::fs::write(directory.path().join(relative), &bytes).unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        let cfg = HubConfig {
+            hub: format!("http://{address}"),
+            key: None,
+            agent_key: None,
+            brain_key: None,
+            state_dir: tempfile::tempdir().unwrap().keep(),
+            store_selected: false,
+        };
+        let source = V2UploadSource {
+            path: relative.to_string(),
+            bytes: bytes.len() as u64,
+        };
+
+        let started = Instant::now();
+        let error = put_presigned_source_with_budget(
+            &cfg,
+            &url,
+            &json!({ "content-length": source.bytes.to_string() }),
+            &store,
+            &source,
+            None,
+            Duration::from_millis(150),
+        )
+        .expect_err("a black-holed upload must leave at its shared deadline");
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "presigned retries exceeded their shared budget: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("the object store"));
+        assert!(!rendered.contains(&url));
+        assert!(!rendered.contains(signature));
         server.join().unwrap();
     }
 
