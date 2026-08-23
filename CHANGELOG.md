@@ -12,6 +12,11 @@ Two things version independently:
 
 ## Unreleased
 
+### Changed
+
+- README now documents the optional link.md v2 sync surface and native Windows
+  installer, and no longer pins a toolkit version that drifts between releases.
+
 ## [0.8.21] — 2026-08-21
 
 ### Fixed
