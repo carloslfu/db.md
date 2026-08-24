@@ -20,6 +20,10 @@ Two things version independently:
   `NOT_FOUND` client contract. Product wrappers can distinguish an absent path
   without scraping error prose or bypassing dbmd's signed-head and HAMT-proof
   verification.
+- V2 sync baselines now apply the protocol's 2 GiB per-asset bound instead of
+  the 512 MiB Markdown-store bound. A brain with a large valid hosted asset can
+  continue syncing after its first commit, while oversized asset declarations
+  still fail before transport.
 
 ## [0.8.24] — 2026-08-23
 

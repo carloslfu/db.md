@@ -140,6 +140,11 @@ const MAX_STAGED_CHANGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PUSH_FILES: usize = u16::MAX as usize;
 const MAX_STORE_PATH_BYTES: usize = 1_024;
 const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
+/// Assets travel outside the Markdown store/pack lane and have their own
+/// protocol ceiling. Keep this distinct from `MAX_STORE_BYTES`: applying the
+/// pack bound to a signed asset leaf makes an otherwise valid checkout unable
+/// to load its own saved sync baseline after the first commit.
+const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Exact worst case for the canonical STORED profile:
 /// payload + (local 30 + central 46 + name twice) per entry + EOCD 22.
 const MAX_PACK_BYTES: u64 =
@@ -3938,6 +3943,7 @@ fn verify_v2_asset_proof(root: &str, item: &V2AssetManifestItem) -> LinkResult<(
         .map_err(|error| invalid_feed(error.to_string()))?;
     if !is_sha256(&item.blob_sha256)
         || !is_sha256(&item.leaf_hash)
+        || item.bytes > MAX_ASSET_BYTES
         || item.wrappers.is_empty()
         || !matches!(item.disposition.as_str(), "hosted" | "withheld")
         || item
@@ -4106,8 +4112,14 @@ fn v2_asset_record_manifest_bytes(
 fn v2_local_asset_records(
     store: &Store,
 ) -> LinkResult<std::collections::BTreeMap<String, crate::AssetRecord>> {
-    Ok(crate::assets::read_manifest(store)
-        .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?
+    let assets = crate::assets::read_manifest(store)
+        .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?;
+    if assets.iter().any(|asset| asset.bytes > MAX_ASSET_BYTES) {
+        return Err(LinkError::InvalidPack {
+            message: "local asset exceeds the link.md v2 per-blob limit".to_string(),
+        });
+    }
+    Ok(assets
         .into_iter()
         .map(|asset| (asset.path.clone(), asset))
         .collect())
@@ -4935,7 +4947,7 @@ fn parse_v2_baseline(cfg: &HubConfig, brain: &str, bytes: &[u8]) -> LinkResult<V
             crate::linkmd_v2::normalize_path(path).is_err()
                 || !is_sha256(&asset.blob_sha256)
                 || !is_sha256(&asset.leaf_hash)
-                || asset.bytes > MAX_STORE_BYTES
+                || asset.bytes > MAX_ASSET_BYTES
                 || !matches!(asset.disposition.as_str(), "hosted" | "withheld")
                 || asset.wrappers.is_empty()
                 || asset
@@ -17704,6 +17716,37 @@ mod tests {
             local_eligibility: std::collections::BTreeMap::new(),
             remote_copy_remains: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn v2_sync_baseline_keeps_asset_and_markdown_size_bounds_distinct() {
+        let cfg = test_hub_config(
+            "https://hub.example".to_string(),
+            tempfile::tempdir().unwrap().keep(),
+        );
+        let mut baseline = scoped_test_baseline(&"a".repeat(64));
+        baseline.assets.insert(
+            "assets/archive.bin".to_string(),
+            V2BaselineAsset {
+                blob_sha256: "b".repeat(64),
+                bytes: MAX_STORE_BYTES + 1,
+                media_type: "application/octet-stream".to_string(),
+                wrappers: vec!["records/archive.md".to_string()],
+                required: true,
+                disposition: "hosted".to_string(),
+                leaf_hash: "c".repeat(64),
+            },
+        );
+
+        let accepted = serde_json::to_vec(&baseline).unwrap();
+        assert!(parse_v2_baseline(&cfg, TEST_BRAIN_ID, &accepted).is_ok());
+
+        baseline.assets.get_mut("assets/archive.bin").unwrap().bytes = MAX_ASSET_BYTES + 1;
+        let refused = serde_json::to_vec(&baseline).unwrap();
+        assert!(matches!(
+            parse_v2_baseline(&cfg, TEST_BRAIN_ID, &refused),
+            Err(LinkError::InvalidFeed { .. })
+        ));
     }
 
     #[test]
