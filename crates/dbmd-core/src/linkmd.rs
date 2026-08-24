@@ -225,6 +225,11 @@ const COMMIT_ATTEMPTS: usize = 4;
 const COMMIT_RETRY_BACKOFF_MS: [u64; COMMIT_ATTEMPTS - 1] = [5_000, 20_000, 45_000];
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
+/// GET is idempotent, including authenticated link.md reads. Retry the whole
+/// read when a connection dies after headers or part-way through its body;
+/// connect-only retries cannot recover that common large-export failure.
+const SAFE_READ_ATTEMPTS: usize = 4;
+const SAFE_READ_RETRY_BACKOFF_MS: [u64; SAFE_READ_ATTEMPTS - 1] = [200, 1_000, 3_000];
 
 /// Staging a real store means tens of thousands of immutable object PUTs in a
 /// row. A single refusal under sustained load must not fail the migration, so
@@ -1532,62 +1537,90 @@ fn request_raw_with_agent(
     let url = format!("{}{}", cfg.hub, path);
     let encoded_body = body.map(Value::to_string);
     let origin = normalized_origin(&cfg.hub)?;
-    // An agent signing key outranks the bearer: possession proofs put nothing
-    // reusable on the wire, so when both are configured the stronger one wins.
-    let credential = match options.auth {
-        Auth::Required => Some(match &cfg.agent_key {
-            Some(key) => linkmd_sig_header(key, &origin, method, path, encoded_body.as_deref())?,
-            None => format!("Bearer {}", cfg.require_key()?),
-        }),
-        Auth::Optional => match &cfg.agent_key {
-            Some(key) => Some(linkmd_sig_header(
-                key,
-                &origin,
-                method,
-                path,
-                encoded_body.as_deref(),
-            )?),
-            None => cfg.key.as_deref().map(|k| format!("Bearer {k}")),
-        },
-        Auth::None => None,
-    };
-    let result = with_connect_retries(|| {
-        let mut req = http.request(method, &url);
-        if let Some(value) = &credential {
-            req = req.set("authorization", value);
-        }
-        if let Some(value) = options.request_id {
-            req = req.set("x-request-id", value);
-        }
-        match &encoded_body {
-            Some(value) => req
-                .set("content-type", "application/json")
-                .send_string(value)
-                .map_err(Box::new),
-            None => req.call().map_err(Box::new),
-        }
-    });
-    let resp = match result {
-        Ok(resp) => resp,
-        Err(error) => match *error {
-            ureq::Error::Status(_, resp) => resp,
-            ureq::Error::Transport(error) => {
-                return Err(LinkError::Transport {
-                    hub: cfg.hub.clone(),
-                    message: error.to_string(),
-                });
+    let safe_read = method == "GET" && encoded_body.is_none();
+    let mut read_attempt = 0;
+    loop {
+        // An agent signing key outranks the bearer: possession proofs put
+        // nothing reusable on the wire, so when both are configured the
+        // stronger one wins. Regenerate its timestamp for a whole-request GET
+        // retry; a long stalled read must not age the replacement signature
+        // outside the hub's acceptance window.
+        let credential = match options.auth {
+            Auth::Required => Some(match &cfg.agent_key {
+                Some(key) => {
+                    linkmd_sig_header(key, &origin, method, path, encoded_body.as_deref())?
+                }
+                None => format!("Bearer {}", cfg.require_key()?),
+            }),
+            Auth::Optional => match &cfg.agent_key {
+                Some(key) => Some(linkmd_sig_header(
+                    key,
+                    &origin,
+                    method,
+                    path,
+                    encoded_body.as_deref(),
+                )?),
+                None => cfg.key.as_deref().map(|k| format!("Bearer {k}")),
+            },
+            Auth::None => None,
+        };
+        let result = with_connect_retries(|| {
+            let mut req = http.request(method, &url);
+            if let Some(value) = &credential {
+                req = req.set("authorization", value);
             }
-        },
-    };
-
-    let status = resp.status();
-    let buf = read_response_body(resp, options.max_response_bytes + 1, &cfg.hub)?;
-    if buf.len() as u64 > options.max_response_bytes {
-        return Err(LinkError::ResponseTooLarge {
-            limit_bytes: options.max_response_bytes,
+            if let Some(value) = options.request_id {
+                req = req.set("x-request-id", value);
+            }
+            match &encoded_body {
+                Some(value) => req
+                    .set("content-type", "application/json")
+                    .send_string(value)
+                    .map_err(Box::new),
+                None => req.call().map_err(Box::new),
+            }
         });
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(error) => match *error {
+                ureq::Error::Status(_, resp) => resp,
+                ureq::Error::Transport(error) => {
+                    if safe_read && read_attempt + 1 < SAFE_READ_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            SAFE_READ_RETRY_BACKOFF_MS[read_attempt],
+                        ));
+                        read_attempt += 1;
+                        continue;
+                    }
+                    return Err(LinkError::Transport {
+                        hub: cfg.hub.clone(),
+                        message: error.to_string(),
+                    });
+                }
+            },
+        };
+
+        let status = resp.status();
+        let buf = match read_response_body(resp, options.max_response_bytes + 1, &cfg.hub) {
+            Ok(buf) => buf,
+            Err(LinkError::Transport { .. })
+                if safe_read && read_attempt + 1 < SAFE_READ_ATTEMPTS =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    SAFE_READ_RETRY_BACKOFF_MS[read_attempt],
+                ));
+                read_attempt += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if buf.len() as u64 > options.max_response_bytes {
+            return Err(LinkError::ResponseTooLarge {
+                limit_bytes: options.max_response_bytes,
+            });
+        }
+        return Ok(RawHubResponse { status, body: buf });
     }
-    Ok(RawHubResponse { status, body: buf })
 }
 
 fn request_capped(
@@ -17279,7 +17312,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_that_dies_mid_stream_is_a_transport_failure() {
+    fn a_mutation_body_that_dies_mid_stream_is_a_transport_failure() {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
         use std::thread;
@@ -17311,7 +17344,7 @@ mod tests {
             store_selected: false,
         };
 
-        let error = request(&cfg, "GET", "/truncated", None, Auth::None)
+        let error = request(&cfg, "POST", "/truncated", None, Auth::None)
             .expect_err("a truncated body must not read as success");
         match error {
             LinkError::Transport { hub, .. } => {
@@ -17319,6 +17352,49 @@ mod tests {
             }
             other => panic!("expected a transport failure, got {other:?}"),
         }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_safe_get_retries_when_its_body_dies_mid_stream() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut bytes = [0_u8; 1024];
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = first.read(&mut bytes).unwrap();
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"ok\":true",
+                )
+                .unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = second.read(&mut bytes).unwrap();
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+        let cfg = HubConfig {
+            hub: format!("http://{address}"),
+            key: None,
+            agent_key: None,
+            brain_key: None,
+            state_dir: tempfile::tempdir().unwrap().keep(),
+            store_selected: false,
+        };
+
+        let response = request(&cfg, "GET", "/retry-body", None, Auth::None)
+            .expect("a safe read retries the interrupted body");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, Some(json!({ "ok": true })));
         server.join().unwrap();
     }
 

@@ -8,9 +8,18 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.25**.
+  `Cargo.toml`, currently **v0.8.26**.
 
 ## Unreleased
+
+## [0.8.26] — 2026-08-23
+
+### Fixed
+
+- Safe hub GETs now retry a transport failure that arrives before or while the
+  response body is read. Large sync/export operations no longer lose tens of
+  thousands of verified downloads because one idempotent manifest or blob read
+  stalls; mutations retain their verb-specific retry rules.
 
 ## [0.8.25] — 2026-08-23
 
