@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.27**.
+  `Cargo.toml`, currently **v0.8.28**.
 
 ## Unreleased
+
+## [0.8.28] — 2026-08-24
+
+### Fixed
+
+- Incremental v2 sync now reuses its private, previously verified manifest
+  when a freshly verified signed head matches the exact content, asset,
+  permission-view, and authority revisions. A five-file update in a large
+  established checkout no longer downloads and re-verifies every unchanged
+  path; any remote or permission movement still falls back to proof-bearing
+  hub reads. Older baselines take one full refresh before reuse.
 
 ## [0.8.27] — 2026-08-23
 

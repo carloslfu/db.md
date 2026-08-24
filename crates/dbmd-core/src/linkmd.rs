@@ -3660,6 +3660,11 @@ struct V2SyncBaseline {
     view_kind: Option<String>,
     #[serde(default)]
     view_revision: Option<String>,
+    /// The authority revision observed with this materialized view. Older
+    /// baselines omit it and deliberately take one full verified refresh
+    /// before they become eligible for unchanged-head reuse.
+    #[serde(default)]
+    control_revision: Option<String>,
     #[serde(default)]
     projection_sha256: Option<String>,
     files: std::collections::BTreeMap<String, V2BaselineFile>,
@@ -4804,6 +4809,23 @@ fn same_v2_head(left: &V2VerifiedHead, right: &V2VerifiedHead) -> bool {
         }
 }
 
+/// A private sync baseline is an already verified materialization of the
+/// remote manifest. It may replace another paginated manifest download only
+/// when a freshly verified signed head names the exact same content, assets,
+/// view, and authority revision. Any remote or permission movement falls back
+/// to proof-bearing hub reads.
+fn v2_baseline_matches_head(head: &V2VerifiedHead, baseline: &V2SyncBaseline) -> bool {
+    let pointer = head.pointer.as_ref();
+    baseline.head_seq == Some(pointer.map_or(0, |value| value.seq))
+        && baseline.commit_hash.as_deref() == pointer.map(|value| value.commit_hash.as_str())
+        && baseline.content_root.as_deref()
+            == pointer.and_then(|value| value.content_root.as_deref())
+        && baseline.asset_root.as_deref() == pointer.and_then(|value| value.asset_root.as_deref())
+        && baseline.view_kind.as_deref() == Some(head.view_kind.as_str())
+        && baseline.view_revision.as_deref() == Some(head.view_revision.as_str())
+        && baseline.control_revision.as_deref() == Some(head.control_revision.as_str())
+}
+
 fn scoped_projection_bytes(brain: &str) -> Vec<u8> {
     format!(
         "---\ntype: db-md\nscope: company\nowner: link.md scoped view\n---\n\n# Scoped brain view\n\nThis DB.md is generated locally by dbmd. It is not the brain's canonical contract and is never uploaded.\n\nCanonical brain: @{brain}\n"
@@ -5001,6 +5023,10 @@ fn parse_v2_baseline(cfg: &HubConfig, brain: &str, bytes: &[u8]) -> LinkResult<V
             .is_some_and(|kind| !matches!(kind, "full" | "scoped"))
         || baseline
             .view_revision
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        || baseline
+            .control_revision
             .as_deref()
             .is_some_and(|hash| !is_sha256(hash))
         || baseline
@@ -5248,6 +5274,7 @@ fn v2_baseline_from_head(
         assets,
         view_kind: Some(head.view_kind.clone()),
         view_revision: Some(head.view_revision.clone()),
+        control_revision: Some(head.control_revision.clone()),
         projection_sha256: (head.view_kind == "scoped")
             .then(|| scoped_projection_sha256(&head.brain_id)),
         files,
@@ -6608,13 +6635,21 @@ fn v2_sync_pull_with_resolution(
     if take_remote.is_some() && !same_v2_head(&expected_head, &head) {
         return Err(LinkError::RemoteAdvancedDuringSync);
     }
-    let remote = files_for_v2_view(
-        &head,
-        v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
-    );
-    let remote_assets = v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?;
     let baseline = load_v2_baseline(cfg, &head.brain_id, &dest)?;
     ensure_v2_view_compatible(&head, baseline.as_ref())?;
+    let (remote, remote_assets) = match baseline
+        .as_ref()
+        .filter(|state| v2_baseline_matches_head(&head, state))
+    {
+        Some(state) => (state.files.clone(), state.assets.clone()),
+        None => (
+            files_for_v2_view(
+                &head,
+                v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+            ),
+            v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+        ),
+    };
     let local_store = Store::open_strict(&dest).ok();
     // A baseline proves this path is an established checkout. Never reinterpret
     // a damaged/edited store marker as an empty clone destination: doing so
@@ -7761,6 +7796,8 @@ fn v2_sync_push(
     let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
     let head = v2_verified_head(cfg, requested_brain)?
         .ok_or_else(|| invalid_feed("v2 head disappeared while waiting for the checkout lock"))?;
+    let baseline = load_v2_baseline(cfg, &head.brain_id, &store.root)?;
+    ensure_v2_view_compatible(&head, baseline.as_ref())?;
     let (mut remote, mut remote_assets, carried_local, carried_local_assets) =
         match pulled.filter(|snapshot| same_v2_head(&snapshot.head, &head)) {
             Some(snapshot) => (
@@ -7769,18 +7806,22 @@ fn v2_sync_push(
                 Some(snapshot.local),
                 Some(snapshot.local_assets),
             ),
-            None => (
-                files_for_v2_view(
-                    &head,
-                    v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+            None => match baseline
+                .as_ref()
+                .filter(|state| v2_baseline_matches_head(&head, state))
+            {
+                Some(state) => (state.files.clone(), state.assets.clone(), None, None),
+                None => (
+                    files_for_v2_view(
+                        &head,
+                        v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+                    ),
+                    v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
+                    None,
+                    None,
                 ),
-                v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
-                None,
-                None,
-            ),
+            },
         };
-    let baseline = load_v2_baseline(cfg, &head.brain_id, &store.root)?;
-    ensure_v2_view_compatible(&head, baseline.as_ref())?;
     if head.view_kind == "scoped" && baseline.is_none() {
         return Err(LinkError::ScopedViewChanged);
     }
@@ -18227,6 +18268,7 @@ mod tests {
             assets: std::collections::BTreeMap::new(),
             view_kind: Some("scoped".to_string()),
             view_revision: Some(revision.to_string()),
+            control_revision: Some(revision.to_string()),
             projection_sha256: Some(scoped_projection_sha256(TEST_BRAIN_ID)),
             files: std::collections::BTreeMap::new(),
             local_policy_digest: None,
@@ -18573,6 +18615,74 @@ mod tests {
         same_view_new_control.control_revision = "c".repeat(64);
         assert!(ensure_v2_view_compatible(&same_view_new_control, Some(&baseline)).is_ok());
         assert!(!same_v2_head(&head, &same_view_new_control));
+    }
+
+    #[test]
+    fn verified_baseline_reuse_requires_exact_content_assets_view_and_authority() {
+        let mut head = scoped_test_head(&"a".repeat(64));
+        head.control_revision = "b".repeat(64);
+        head.pointer = Some(V2PointerBody {
+            v: 2,
+            brain: TEST_BRAIN_ID.to_string(),
+            seq: 7,
+            commit_hash: "c".repeat(64),
+            feed_hash: "d".repeat(64),
+            content_root: Some("e".repeat(64)),
+            asset_root: Some("f".repeat(64)),
+            materializer: "dbmd-projection-v1".to_string(),
+            signer_epoch: 1,
+            control_revision: head.control_revision.clone(),
+            backup_preparation: "0".repeat(64),
+            prior_pointer_hash: Some("1".repeat(64)),
+            signed_at: "2026-08-24T00:00:00.000Z".to_string(),
+        });
+        let mut baseline = scoped_test_baseline(&head.view_revision);
+        baseline.head_seq = Some(7);
+        baseline.commit_hash = Some("c".repeat(64));
+        baseline.content_root = Some("e".repeat(64));
+        baseline.asset_root = Some("f".repeat(64));
+        baseline.control_revision = Some(head.control_revision.clone());
+        assert!(v2_baseline_matches_head(&head, &baseline));
+
+        let mut changed = baseline.clone();
+        changed.head_seq = Some(8);
+        assert!(!v2_baseline_matches_head(&head, &changed));
+        let mut changed = baseline.clone();
+        changed.commit_hash = Some("2".repeat(64));
+        assert!(!v2_baseline_matches_head(&head, &changed));
+        let mut changed = baseline.clone();
+        changed.content_root = Some("3".repeat(64));
+        assert!(!v2_baseline_matches_head(&head, &changed));
+        let mut changed = baseline.clone();
+        changed.asset_root = Some("4".repeat(64));
+        assert!(!v2_baseline_matches_head(&head, &changed));
+        let mut changed = baseline.clone();
+        changed.view_revision = Some("5".repeat(64));
+        assert!(!v2_baseline_matches_head(&head, &changed));
+        let mut changed = baseline.clone();
+        changed.control_revision = Some("6".repeat(64));
+        assert!(!v2_baseline_matches_head(&head, &changed));
+
+        let mut changed_head = head.clone();
+        changed_head.view_kind = "full".to_string();
+        assert!(!v2_baseline_matches_head(&changed_head, &baseline));
+    }
+
+    #[test]
+    fn legacy_baseline_without_authority_revision_refreshes_before_reuse() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(
+            "https://hub.example".to_string(),
+            sandbox.path().to_path_buf(),
+        );
+        let head = scoped_test_head(&"a".repeat(64));
+        let baseline = scoped_test_baseline(&head.view_revision);
+        let mut encoded = serde_json::to_value(&baseline).unwrap();
+        encoded.as_object_mut().unwrap().remove("control_revision");
+        let parsed =
+            parse_v2_baseline(&cfg, TEST_BRAIN_ID, &serde_json::to_vec(&encoded).unwrap()).unwrap();
+        assert!(parsed.control_revision.is_none());
+        assert!(!v2_baseline_matches_head(&head, &parsed));
     }
 
     #[test]
@@ -19316,6 +19426,7 @@ mod tests {
                 assets: Default::default(),
                 view_kind: next.view_kind.clone(),
                 view_revision: next.view_revision.clone(),
+                control_revision: Some("d".repeat(64)),
                 projection_sha256: None,
                 files: Default::default(),
                 local_policy_digest: None,
