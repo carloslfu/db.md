@@ -8,9 +8,22 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.26**.
+  `Cargo.toml`, currently **v0.8.27**.
 
 ## Unreleased
+
+## [0.8.27] — 2026-08-23
+
+### Fixed
+
+- Explicitly read-only POST endpoints now receive the same bounded
+  transport/body retry as GETs. V2 bulk streams and presigned-download plans
+  can recover a dropped response while ordinary POST mutations remain
+  single-attempt unless their own idempotency protocol says otherwise.
+- V2 asset restores now consume short-lived object capabilities in bounded,
+  immediately started windows. Successful files remain in the verified cache,
+  and a failed window refreshes authority before obtaining replacement URLs,
+  so large brains no longer expire early asset URLs before using them.
 
 ## [0.8.26] — 2026-08-23
 

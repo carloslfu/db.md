@@ -225,9 +225,10 @@ const COMMIT_ATTEMPTS: usize = 4;
 const COMMIT_RETRY_BACKOFF_MS: [u64; COMMIT_ATTEMPTS - 1] = [5_000, 20_000, 45_000];
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_RETRY_BACKOFF_MS: [u64; CONNECT_ATTEMPTS - 1] = [100, 300];
-/// GET is idempotent, including authenticated link.md reads. Retry the whole
-/// read when a connection dies after headers or part-way through its body;
-/// connect-only retries cannot recover that common large-export failure.
+/// Safe reads are idempotent, including authenticated GETs and the explicitly
+/// marked read-only POSTs whose proof lists do not fit in a URL. Retry the
+/// whole read when a connection dies after headers or part-way through its
+/// body; connect-only retries cannot recover that common large-export failure.
 const SAFE_READ_ATTEMPTS: usize = 4;
 const SAFE_READ_RETRY_BACKOFF_MS: [u64; SAFE_READ_ATTEMPTS - 1] = [200, 1_000, 3_000];
 
@@ -309,6 +310,15 @@ const V2_BULK_STREAM_FILES: usize = 256;
 const V2_BULK_STREAM_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
 const V2_BULK_STREAM_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 const V2_BULK_STREAM_MAGIC: &[u8; 8] = b"LMD2STRM";
+/// A read capability lives for five minutes. Ask only for the files the
+/// bounded worker pool can start immediately; collecting hundreds of signed
+/// asset URLs before consuming the first one deterministically expires the
+/// oldest capabilities on a company-sized brain.
+const V2_DOWNLOAD_CAPABILITY_FILES: usize = V2_BLOB_DOWNLOAD_WORKERS;
+const V2_DOWNLOAD_CAPABILITY_BYTES: u64 = 512 * 1024 * 1024;
+const V2_DOWNLOAD_CAPABILITY_ATTEMPTS: usize = 4;
+const V2_DOWNLOAD_CAPABILITY_BACKOFF_MS: [u64; V2_DOWNLOAD_CAPABILITY_ATTEMPTS - 1] =
+    [200, 1_000, 3_000];
 
 /// Everything that can go wrong on the wire or at its edges. Each variant maps
 /// onto one stable CLI error code; messages are single-line and never echo the
@@ -1516,6 +1526,34 @@ fn request_raw(
             auth,
             max_response_bytes,
             request_id: None,
+            retry_transport: false,
+        },
+    )
+}
+
+/// A body-bearing request that reads immutable state without changing hub
+/// authority. Some proof lists are too large for a URL, so link.md transports
+/// them with POST even though repeating the request is side-effect free.
+fn request_raw_retryable_read(
+    cfg: &HubConfig,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: Auth,
+    max_response_bytes: u64,
+) -> LinkResult<RawHubResponse> {
+    let http = hub_agent(cfg)?;
+    request_raw_with_agent(
+        cfg,
+        &http,
+        method,
+        path,
+        body,
+        RawRequestOptions {
+            auth,
+            max_response_bytes,
+            request_id: None,
+            retry_transport: true,
         },
     )
 }
@@ -1524,6 +1562,7 @@ struct RawRequestOptions<'a> {
     auth: Auth,
     max_response_bytes: u64,
     request_id: Option<&'a str>,
+    retry_transport: bool,
 }
 
 fn request_raw_with_agent(
@@ -1537,14 +1576,15 @@ fn request_raw_with_agent(
     let url = format!("{}{}", cfg.hub, path);
     let encoded_body = body.map(Value::to_string);
     let origin = normalized_origin(&cfg.hub)?;
-    let safe_read = method == "GET" && encoded_body.is_none();
+    let safe_read = (method == "GET" && encoded_body.is_none()) || options.retry_transport;
     let mut read_attempt = 0;
     loop {
         // An agent signing key outranks the bearer: possession proofs put
         // nothing reusable on the wire, so when both are configured the
         // stronger one wins. Regenerate its timestamp for a whole-request GET
         // retry; a long stalled read must not age the replacement signature
-        // outside the hub's acceptance window.
+        // outside the hub's acceptance window. This applies only to GETs and
+        // the explicitly marked read-only POST bindings above.
         let credential = match options.auth {
             Auth::Required => Some(match &cfg.agent_key {
                 Some(key) => {
@@ -1673,6 +1713,7 @@ fn request_patient(
                 auth,
                 max_response_bytes: MAX_RESPONSE_BYTES,
                 request_id: None,
+                retry_transport: false,
             },
         );
         match sent {
@@ -1739,6 +1780,7 @@ fn request_with_request_id(
             auth,
             max_response_bytes: MAX_RESPONSE_BYTES,
             request_id: Some(request_id),
+            retry_transport: false,
         },
     )?;
     Ok(HubResponse {
@@ -5305,7 +5347,7 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct V2DownloadItem {
     path: String,
     sha256: String,
@@ -5405,7 +5447,7 @@ fn download_v2_bulk_stream(
             }))
         })
         .collect::<LinkResult<Vec<_>>>()?;
-    let raw = request_raw(
+    let raw = request_raw_retryable_read(
         cfg,
         "POST",
         &format!("/api/hub/brains/{brain}/v2/stream"),
@@ -5418,6 +5460,22 @@ fn download_v2_bulk_stream(
     )?;
     let body = ensure_raw_ok(raw, "download v2 bulk stream")?;
     parse_v2_bulk_stream(&body, pending)
+}
+
+fn request_capped_retryable_read(
+    cfg: &HubConfig,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    auth: Auth,
+    max_response_bytes: u64,
+) -> LinkResult<HubResponse> {
+    let raw = request_raw_retryable_read(cfg, method, path, body, auth, max_response_bytes)?;
+    let parsed: Option<Value> = serde_json::from_slice(&raw.body).ok();
+    Ok(HubResponse {
+        status: raw.status,
+        body: parsed,
+    })
 }
 
 fn prepare_v2_downloads(
@@ -5442,7 +5500,7 @@ fn prepare_v2_downloads(
             })
             .collect::<LinkResult<Vec<_>>>()?;
         let value = ensure_ok(
-            request_capped(
+            request_capped_retryable_read(
                 cfg,
                 "POST",
                 &format!("/api/hub/brains/{brain}/v2/downloads"),
@@ -5512,7 +5570,7 @@ fn prepare_v2_asset_downloads(
             })
             .collect::<Vec<_>>();
         let value = ensure_ok(
-            request_capped(
+            request_capped_retryable_read(
                 cfg,
                 "POST",
                 &format!("/api/hub/brains/{brain}/v2/assets/downloads"),
@@ -5560,6 +5618,129 @@ fn prepare_v2_asset_downloads(
         }
     }
     Ok(result)
+}
+
+#[cfg(any(unix, windows))]
+fn stage_v2_asset_download_window(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    cache_dir: &Path,
+    pending: &[(&String, &V2BaselineAsset)],
+) -> LinkResult<Vec<V2StagedFile>> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    if pending.len() > V2_DOWNLOAD_CAPABILITY_FILES {
+        return Err(invalid_feed("v2 asset capability window is oversized"));
+    }
+
+    let mut last_error = None;
+    for retry_delay in V2_DOWNLOAD_CAPABILITY_BACKOFF_MS
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+    {
+        // This POST rechecks the exact head and current path authority before
+        // issuing fresh, immutable GET capabilities. Successful prior workers
+        // are already durable in the content-addressed cache, so retrying the
+        // complete small window neither redownloads them nor widens access.
+        let downloads = prepare_v2_asset_downloads(cfg, brain, pointer, pending)?;
+        let mut unique = std::collections::BTreeMap::<String, V2DownloadItem>::new();
+        for item in downloads {
+            match unique.get(&item.sha256) {
+                Some(prior) if prior.bytes != item.bytes => {
+                    return Err(invalid_feed(
+                        "one v2 asset hash has conflicting byte lengths",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    unique.insert(item.sha256.clone(), item);
+                }
+            }
+        }
+        let downloads = unique.into_values().collect::<Vec<_>>();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let worker_count = downloads.len().min(V2_BLOB_DOWNLOAD_WORKERS);
+        let mut results = std::iter::repeat_with(|| None)
+            .take(downloads.len())
+            .collect::<Vec<Option<LinkResult<PathBuf>>>>();
+        std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            for _ in 0..worker_count {
+                let sender = sender.clone();
+                let downloads = &downloads;
+                let next = &next;
+                scope.spawn(move || loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = downloads.get(index) else {
+                        break;
+                    };
+                    let result = download_presigned_to_cache(
+                        cfg,
+                        &item.url,
+                        cache_dir,
+                        &item.sha256,
+                        item.bytes,
+                    );
+                    if sender.send((index, result)).is_err() {
+                        break;
+                    }
+                });
+            }
+            drop(sender);
+            for (index, result) in receiver {
+                results[index] = Some(result);
+            }
+        });
+
+        let mut failed = None;
+        for result in results {
+            match result {
+                Some(Ok(_)) => {}
+                Some(Err(error)) if failed.is_none() => failed = Some(error),
+                Some(Err(_)) => {}
+                None if failed.is_none() => {
+                    failed = Some(LinkError::Transport {
+                        hub: cfg.hub.clone(),
+                        message: "a bounded v2 asset worker stopped before reporting its result"
+                            .to_string(),
+                    });
+                }
+                None => {}
+            }
+        }
+        if let Some(error) = failed {
+            last_error = Some(error);
+            if let Some(milliseconds) = retry_delay {
+                std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+                continue;
+            }
+            break;
+        }
+
+        return pending
+            .iter()
+            .map(|(path, asset)| {
+                let source = cache_dir.join(&asset.blob_sha256);
+                if !cached_blob_is_exact(&source, &asset.blob_sha256, asset.bytes)? {
+                    return Err(invalid_feed(
+                        "v2 asset download cache omitted a proven blob",
+                    ));
+                }
+                Ok(V2StagedFile {
+                    path: (*path).clone(),
+                    source,
+                    sha256: asset.blob_sha256.clone(),
+                    bytes: asset.bytes,
+                })
+            })
+            .collect();
+    }
+    Err(last_error
+        .unwrap_or_else(|| invalid_feed("v2 asset capability window made no download attempt")))
 }
 
 fn download_v2_blob(cfg: &HubConfig, item: &V2DownloadItem) -> LinkResult<Vec<u8>> {
@@ -6599,16 +6780,37 @@ fn v2_sync_pull_with_resolution(
                 pending_assets.push((path, asset));
             }
         }
-        for item in prepare_v2_asset_downloads(cfg, &head.brain_id, pointer, &pending_assets)? {
-            let source =
-                download_presigned_to_cache(cfg, &item.url, &cache_dir, &item.sha256, item.bytes)?;
-            changed.push(V2StagedFile {
-                path: item.path,
-                source,
-                sha256: item.sha256,
-                bytes: item.bytes,
-            });
+        let mut window = Vec::new();
+        let mut window_bytes = 0_u64;
+        let flush = |window: &mut Vec<(&String, &V2BaselineAsset)>,
+                     window_bytes: &mut u64,
+                     changed: &mut Vec<V2StagedFile>|
+         -> LinkResult<()> {
+            changed.extend(stage_v2_asset_download_window(
+                cfg,
+                &head.brain_id,
+                pointer,
+                &cache_dir,
+                window,
+            )?);
+            window.clear();
+            *window_bytes = 0;
+            Ok(())
+        };
+        for item @ (_, asset) in pending_assets {
+            if !window.is_empty()
+                && (window.len() == V2_DOWNLOAD_CAPABILITY_FILES
+                    || window_bytes.saturating_add(asset.bytes) > V2_DOWNLOAD_CAPABILITY_BYTES)
+            {
+                flush(&mut window, &mut window_bytes, &mut changed)?;
+            }
+            window.push(item);
+            window_bytes = window_bytes.saturating_add(asset.bytes);
+            if window_bytes >= V2_DOWNLOAD_CAPABILITY_BYTES {
+                flush(&mut window, &mut window_bytes, &mut changed)?;
+            }
         }
+        flush(&mut window, &mut window_bytes, &mut changed)?;
     }
     for (path, prior) in base_assets {
         if remote_assets.contains_key(path)
@@ -15453,6 +15655,138 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn an_expired_asset_capability_is_refreshed_without_losing_cached_progress() {
+        use std::sync::{Arc, Mutex};
+
+        let bytes = b"immutable asset bytes".to_vec();
+        let sha256 = content_sha256(&bytes);
+        let commit_hash = "c".repeat(64);
+        let base_url = Arc::new(Mutex::new(String::new()));
+        let server_base = Arc::clone(&base_url);
+        let object_attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_attempt = Arc::clone(&object_attempt);
+        let response_bytes = bytes.clone();
+        let response_sha = sha256.clone();
+        let response_commit = commit_hash.clone();
+        let (hub, server) = routed_json_hub(4, move |path| {
+            if path.contains("/v2/assets/downloads") {
+                let attempt = server_attempt.load(std::sync::atomic::Ordering::SeqCst) + 1;
+                let url = format!("{}/asset/{attempt}", server_base.lock().unwrap());
+                return (
+                    200,
+                    json!({
+                        "v": 2,
+                        "commit": response_commit,
+                        "downloads": [{
+                            "path": "assets/proof.bin",
+                            "sha256": response_sha,
+                            "bytes": response_bytes.len(),
+                            "url": url,
+                            "method": "GET"
+                        }]
+                    })
+                    .to_string(),
+                );
+            }
+            let attempt = server_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                (403, "{}".to_string())
+            } else {
+                (200, String::from_utf8(response_bytes.clone()).unwrap())
+            }
+        });
+        *base_url.lock().unwrap() = hub.clone();
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let cfg = test_hub_config(hub, temp.path().to_path_buf());
+        let pointer = V2PointerBody {
+            v: 2,
+            brain: TEST_BRAIN_ID.to_string(),
+            seq: 1,
+            commit_hash,
+            feed_hash: "f".repeat(64),
+            content_root: Some("a".repeat(64)),
+            asset_root: Some("b".repeat(64)),
+            materializer: "m".repeat(64),
+            signer_epoch: 1,
+            control_revision: "d".repeat(64),
+            backup_preparation: "ready".to_string(),
+            prior_pointer_hash: None,
+            signed_at: "2026-08-23T00:00:00Z".to_string(),
+        };
+        let path = "assets/proof.bin".to_string();
+        let asset = V2BaselineAsset {
+            blob_sha256: sha256.clone(),
+            bytes: bytes.len() as u64,
+            media_type: "application/octet-stream".to_string(),
+            wrappers: Vec::new(),
+            required: true,
+            disposition: "hosted".to_string(),
+            leaf_hash: "e".repeat(64),
+        };
+
+        let staged = stage_v2_asset_download_window(
+            &cfg,
+            TEST_BRAIN_ID,
+            &pointer,
+            &cache,
+            &[(&path, &asset)],
+        )
+        .expect("a fresh authority-checked capability recovers an expired one");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].path, path);
+        assert_eq!(std::fs::read(cache.join(sha256)).unwrap(), bytes);
+        assert_eq!(object_attempt.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.join().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn asset_capability_windows_cannot_exceed_the_worker_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config("http://127.0.0.1:1".to_string(), temp.path().to_path_buf());
+        let pointer = V2PointerBody {
+            v: 2,
+            brain: TEST_BRAIN_ID.to_string(),
+            seq: 1,
+            commit_hash: "c".repeat(64),
+            feed_hash: "f".repeat(64),
+            content_root: Some("a".repeat(64)),
+            asset_root: Some("b".repeat(64)),
+            materializer: "m".repeat(64),
+            signer_epoch: 1,
+            control_revision: "d".repeat(64),
+            backup_preparation: "ready".to_string(),
+            prior_pointer_hash: None,
+            signed_at: "2026-08-23T00:00:00Z".to_string(),
+        };
+        let paths = (0..=V2_DOWNLOAD_CAPABILITY_FILES)
+            .map(|index| format!("assets/{index}.bin"))
+            .collect::<Vec<_>>();
+        let assets = paths
+            .iter()
+            .map(|_| V2BaselineAsset {
+                blob_sha256: "a".repeat(64),
+                bytes: 1,
+                media_type: "application/octet-stream".to_string(),
+                wrappers: Vec::new(),
+                required: true,
+                disposition: "hosted".to_string(),
+                leaf_hash: "b".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        let pending = paths.iter().zip(&assets).collect::<Vec<_>>();
+
+        let error =
+            stage_v2_asset_download_window(&cfg, TEST_BRAIN_ID, &pointer, temp.path(), &pending)
+                .expect_err("an oversized window must fail before any network request");
+        assert!(matches!(error, LinkError::InvalidFeed { .. }));
+    }
+
     #[test]
     fn linkmd_sig_v2_is_bound_to_the_exact_hub_origin() {
         use ring::signature::KeyPair as _;
@@ -17358,15 +17692,42 @@ mod tests {
     #[test]
     fn a_safe_get_retries_when_its_body_dies_mid_stream() {
         use std::io::{Read as _, Write as _};
-        use std::net::TcpListener;
+        use std::net::{TcpListener, TcpStream};
         use std::thread;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let mut bytes = [0_u8; 1024];
+            let read_request = |stream: &mut TcpStream| {
+                let mut request = Vec::new();
+                let mut bytes = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut bytes).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..read]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            };
             let (mut first, _) = listener.accept().unwrap();
-            let _ = first.read(&mut bytes).unwrap();
+            read_request(&mut first);
             first
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"ok\":true",
@@ -17375,7 +17736,7 @@ mod tests {
             drop(first);
 
             let (mut second, _) = listener.accept().unwrap();
-            let _ = second.read(&mut bytes).unwrap();
+            read_request(&mut second);
             second
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -17395,6 +17756,86 @@ mod tests {
             .expect("a safe read retries the interrupted body");
         assert_eq!(response.status, 200);
         assert_eq!(response.body, Some(json!({ "ok": true })));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_explicit_read_only_post_retries_when_its_body_dies_mid_stream() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let read_request = |stream: &mut TcpStream| {
+                let mut request = Vec::new();
+                let mut bytes = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut bytes).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..read]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            };
+            let (mut first, _) = listener.accept().unwrap();
+            read_request(&mut first);
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"ok\":true",
+                )
+                .unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            read_request(&mut second);
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+        let cfg = HubConfig {
+            hub: format!("http://{address}"),
+            key: None,
+            agent_key: None,
+            brain_key: None,
+            state_dir: tempfile::tempdir().unwrap().keep(),
+            store_selected: false,
+        };
+
+        let response = request_raw_retryable_read(
+            &cfg,
+            "POST",
+            "/v2/stream",
+            Some(&json!({ "files": ["proof"] })),
+            Auth::None,
+            1_024,
+        )
+        .expect("an explicitly safe POST retries the interrupted body");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap(),
+            json!({ "ok": true })
+        );
         server.join().unwrap();
     }
 
