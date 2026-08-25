@@ -8,9 +8,19 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.29**.
+  `Cargo.toml`, currently **v0.8.30**.
 
 ## Unreleased
+
+## [0.8.30] — 2026-08-25
+
+### Fixed
+
+- A fresh v2 clone now preserves an unchanged required asset whose exact signed
+  baseline already marks its bytes as withheld. Its first push is a true no-op
+  instead of failing because the local-only bytes were correctly absent.
+  Hosted assets, new missing assets, and changed manifest records still fail
+  closed when required bytes are unavailable.
 
 ## [0.8.29] — 2026-08-25
 

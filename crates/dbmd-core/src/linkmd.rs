@@ -4172,6 +4172,17 @@ fn v2_asset_resumes_hosting(
     })
 }
 
+fn v2_asset_inherits_withheld_absence(
+    base: Option<&V2BaselineAsset>,
+    base_record: Option<&crate::AssetRecord>,
+    local_record: Option<&crate::AssetRecord>,
+    raw_present: bool,
+) -> bool {
+    !raw_present
+        && base.is_some_and(|asset| asset.disposition == "withheld")
+        && local_record == base_record
+}
+
 fn v2_asset_record_manifest_bytes(
     assets: &std::collections::BTreeMap<String, crate::AssetRecord>,
 ) -> LinkResult<Vec<u8>> {
@@ -8084,7 +8095,13 @@ fn v2_sync_push(
             } else {
                 "hosted"
             };
-            if !raw_present && record.required && !kept_home {
+            let inherits_withheld_absence = v2_asset_inherits_withheld_absence(
+                base_assets.get(&path),
+                base_record.as_ref(),
+                local_record,
+                raw_present,
+            );
+            if !raw_present && record.required && !kept_home && !inherits_withheld_absence {
                 return Err(LinkError::InvalidPack {
                     message: format!("required asset {path} is missing"),
                 });
@@ -15305,6 +15322,65 @@ mod tests {
             "hosted"
         ));
         assert!(!v2_asset_resumes_hosting(None, path, &record, "hosted"));
+    }
+
+    #[test]
+    fn v2_fresh_clone_preserves_only_exact_inherited_withheld_asset_absence() {
+        let path = "sources/report.pdf";
+        let record = crate::AssetRecord {
+            path: path.to_string(),
+            sha256: "a".repeat(64),
+            bytes: 42,
+            media_type: "application/pdf".to_string(),
+            wrappers: vec!["records/report.md".to_string()],
+            required: true,
+        };
+        let mut base = V2BaselineAsset {
+            blob_sha256: record.sha256.clone(),
+            bytes: record.bytes,
+            media_type: record.media_type.clone(),
+            wrappers: record.wrappers.clone(),
+            required: record.required,
+            disposition: "withheld".to_string(),
+            leaf_hash: "b".repeat(64),
+        };
+
+        assert!(v2_asset_inherits_withheld_absence(
+            Some(&base),
+            Some(&record),
+            Some(&record),
+            false,
+        ));
+        assert!(!v2_asset_inherits_withheld_absence(
+            Some(&base),
+            Some(&record),
+            Some(&record),
+            true,
+        ));
+
+        base.disposition = "hosted".to_string();
+        assert!(!v2_asset_inherits_withheld_absence(
+            Some(&base),
+            Some(&record),
+            Some(&record),
+            false,
+        ));
+
+        base.disposition = "withheld".to_string();
+        let mut changed = record.clone();
+        changed.bytes += 1;
+        assert!(!v2_asset_inherits_withheld_absence(
+            Some(&base),
+            Some(&record),
+            Some(&changed),
+            false,
+        ));
+        assert!(!v2_asset_inherits_withheld_absence(
+            None,
+            None,
+            Some(&record),
+            false,
+        ));
     }
 
     #[test]
