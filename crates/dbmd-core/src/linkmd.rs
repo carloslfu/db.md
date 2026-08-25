@@ -7337,6 +7337,38 @@ fn v2_riding_matches_remote(
     })
 }
 
+fn v2_initial_content_conflicts(
+    local: &std::collections::BTreeMap<String, (String, u64)>,
+    remote: &std::collections::BTreeMap<String, V2BaselineFile>,
+    resolving: bool,
+) -> Vec<String> {
+    if resolving {
+        // `sync resolve` already pins the exact remote head/view and rechecks
+        // every bundled local coordinate before it enters the push planner.
+        // Treating this as an ordinary baseline-less push would merely mint an
+        // identical conflict bundle forever. The operation loop below permits
+        // only those explicit remote replacements plus safe local-only
+        // additions, and verifies each selected local/remote pair again before
+        // authoring the commit.
+        return Vec::new();
+    }
+    remote
+        .iter()
+        .filter(|(path, file)| {
+            local.get(*path).map(|value| value.0.as_str()) != Some(file.sha256.as_str())
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+fn v2_resolution_allows_path(
+    resolution: Option<&std::collections::BTreeMap<String, V2ResolutionOverride>>,
+    path: &str,
+    remote_present: bool,
+) -> bool {
+    resolution.is_none_or(|allowed| allowed.contains_key(path) || !remote_present)
+}
+
 #[derive(Debug, Clone)]
 struct V2ResolutionOverride {
     expected_remote: Option<String>,
@@ -7886,13 +7918,7 @@ fn v2_sync_push(
         Some(state) => &state.files,
         None if remote.is_empty() => &remote,
         None => {
-            let mut conflicts = remote
-                .iter()
-                .filter(|(path, file)| {
-                    local.get(*path).map(|value| value.0.as_str()) != Some(file.sha256.as_str())
-                })
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>();
+            let mut conflicts = v2_initial_content_conflicts(local, &remote, resolution.is_some());
             if !conflicts.is_empty() {
                 conflicts.truncate(100);
                 let (bundle, paths) =
@@ -7920,7 +7946,7 @@ fn v2_sync_push(
         if local_hash == base_hash {
             continue;
         }
-        if resolution.is_some_and(|allowed| !allowed.contains_key(&path)) {
+        if !v2_resolution_allows_path(resolution, &path, remote_file.is_some()) {
             continue;
         }
         if local_view.policy.keeps_home(&path) {
@@ -19119,6 +19145,52 @@ mod tests {
         let mut trailing = stream;
         trailing.push(0);
         assert!(parse_v2_bulk_stream(&trailing, &[(&path, &file)]).is_err());
+    }
+
+    #[test]
+    fn first_checkout_resolution_does_not_recreate_the_same_conflict() {
+        let path = "records/value.md".to_string();
+        let mut local = std::collections::BTreeMap::new();
+        local.insert(path.clone(), (content_sha256(b"local"), 5));
+        let mut remote = std::collections::BTreeMap::new();
+        remote.insert(
+            path.clone(),
+            V2BaselineFile {
+                sha256: content_sha256(b"remote"),
+                bytes: 6,
+                proof: None,
+            },
+        );
+
+        assert_eq!(
+            v2_initial_content_conflicts(&local, &remote, false),
+            vec![path]
+        );
+        assert!(v2_initial_content_conflicts(&local, &remote, true).is_empty());
+
+        let mut resolution = std::collections::BTreeMap::new();
+        resolution.insert(
+            "records/value.md".to_string(),
+            V2ResolutionOverride {
+                expected_remote: Some(content_sha256(b"remote")),
+                selected_local: Some(content_sha256(b"local")),
+            },
+        );
+        assert!(v2_resolution_allows_path(
+            Some(&resolution),
+            "records/value.md",
+            true
+        ));
+        assert!(v2_resolution_allows_path(
+            Some(&resolution),
+            "records/new-target.md",
+            false
+        ));
+        assert!(!v2_resolution_allows_path(
+            Some(&resolution),
+            "records/unreviewed-remote.md",
+            true
+        ));
     }
 
     #[test]

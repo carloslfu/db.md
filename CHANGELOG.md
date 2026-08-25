@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.28**.
+  `Cargo.toml`, currently **v0.8.29**.
 
 ## Unreleased
+
+## [0.8.29] — 2026-08-25
+
+### Fixed
+
+- `dbmd sync resolve --keep-local` and `--from` now work for a first-time v2
+  checkout. The exact, reverified conflict bundle authors its bounded
+  resolution commit instead of recursively creating an identical bundle. Safe
+  local-only additions may accompany it so link-validating hubs cannot deadlock
+  a resolved record on its newly introduced target; unrelated remote
+  replacements and deletions remain excluded.
 
 ## [0.8.28] — 2026-08-24
 
