@@ -14,8 +14,9 @@
 //! hosting/transport layer's job, keyed off the SHA-256. This module never
 //! shells out to git and never touches the network.
 //!
-//! Four operations — one write, three reads:
+//! Five operations — two writes, three reads:
 //!   - [`scan`]   (write) discover declared assets, hash present files, rewrite the manifest
+//!   - [`refresh`] (write) re-hash one declared asset and update its manifest row
 //!   - [`verify`] (read)  prove the local store is byte-complete for required assets
 //!   - [`status`] (read)  report present / missing without failing
 //!   - [`paths`]  (read)  the store-relative path list (for an ignore mechanism)
@@ -92,6 +93,20 @@ pub struct ScanReport {
     pub dry_run: bool,
     pub warnings: Vec<String>,
     pub untracked: Vec<String>,
+}
+
+/// Result of [`refresh`]. A refresh is the bounded write-through counterpart
+/// to the full-store [`scan`]: it re-hashes one declared asset without touching
+/// unrelated bytes.
+#[derive(Debug, Serialize)]
+pub struct RefreshReport {
+    pub manifest: String,
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub wrappers: Vec<String>,
+    pub required: bool,
+    pub wrote: bool,
 }
 
 /// One asset's local state, used by [`status`] and [`verify`].
@@ -370,6 +385,127 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
         dry_run,
         warnings,
         untracked: untracked_list,
+    })
+}
+
+/// Re-hash one asset and write just its canonical manifest record.
+///
+/// `scan` remains the authoritative from-scratch projection. This bounded
+/// operation exists for write-through workflows that just created or changed
+/// one asset. The supplied wrapper must currently declare the exact path.
+/// Existing wrappers recorded for that path are re-read and stale declarations
+/// are dropped; unrelated manifest rows and asset bytes are never walked.
+pub fn refresh(store: &Store, raw_path: &str, raw_wrapper: &str) -> crate::Result<RefreshReport> {
+    let path = normalize_asset_path(raw_path)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    if is_markdown(&path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "asset path points at a markdown content file",
+        )
+        .into());
+    }
+
+    let wrapper_path = normalize_asset_path(raw_wrapper)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    if !is_markdown(&wrapper_path)
+        || !(wrapper_path.starts_with("sources/") || wrapper_path.starts_with("records/"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wrapper must be a sources/ or records/ markdown content path",
+        )
+        .into());
+    }
+
+    let declaration = |wrapper: &str| -> crate::Result<Option<bool>> {
+        let text =
+            store.read_text_bounded(Path::new(wrapper), crate::parser::MAX_DBMD_FILE_BYTES)?;
+        let parsed = parser::split_frontmatter(&text, Path::new(wrapper))?;
+        let fm = parser::Frontmatter::parse(&parsed.frontmatter_yaml, Path::new(wrapper))?;
+        let mut found = false;
+        let mut required = false;
+        for declaration in declared_assets(&fm) {
+            let declared = normalize_asset_path(&declaration.path).map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            if declared == path {
+                found = true;
+                required |= declaration.required;
+            }
+        }
+        Ok(found.then_some(required))
+    };
+
+    let Some(requested_required) = declaration(&wrapper_path)? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("wrapper `{wrapper_path}` does not declare asset `{path}`"),
+        )
+        .into());
+    };
+
+    let existing = read_manifest(store)?;
+    let mut wrappers = BTreeSet::from([wrapper_path.clone()]);
+    if let Some(record) = existing.iter().find(|record| record.path == path) {
+        wrappers.extend(record.wrappers.iter().cloned());
+    }
+    let mut live_wrappers = Vec::new();
+    let mut required = requested_required;
+    for wrapper in wrappers {
+        if wrapper != wrapper_path && !store.regular_file_exists(Path::new(&wrapper))? {
+            // Missing historical wrappers are stale declarations. A wrapper
+            // that still exists but cannot be parsed is not stale: refusing
+            // keeps a targeted refresh from silently hiding store corruption.
+            continue;
+        }
+        match declaration(&wrapper) {
+            Ok(Some(wrapper_required)) => {
+                required |= wrapper_required;
+                live_wrappers.push(wrapper);
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    live_wrappers.sort();
+
+    let asset_path = store.capability_relative(Path::new(&path))?;
+    let file = store.open_regular(asset_path)?;
+    let (sha256, bytes) = sha256_file(file)?;
+    let record = AssetRecord {
+        path: path.clone(),
+        sha256: sha256.clone(),
+        bytes,
+        media_type: media_type_for(&path),
+        wrappers: live_wrappers.clone(),
+        required,
+    };
+    let mut next = existing;
+    next.retain(|candidate| candidate.path != path);
+    next.push(record);
+    next.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let canonical = serialize_manifest(&next);
+    let on_disk =
+        match store.read_bounded(Path::new(MANIFEST_FILE), crate::parser::MAX_DBMD_FILE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+    let wrote = on_disk != canonical.as_bytes();
+    if wrote {
+        write_manifest(store, &next)?;
+    }
+
+    Ok(RefreshReport {
+        manifest: MANIFEST_FILE.to_string(),
+        path,
+        sha256,
+        bytes,
+        wrappers: live_wrappers,
+        required,
+        wrote,
     })
 }
 

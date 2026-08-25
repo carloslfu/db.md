@@ -1,8 +1,9 @@
 //! `dbmd assets <sub>` — the heavy-binary asset manifest.
 //!
 //! Arg-parse + format glue only; all logic lives in [`dbmd_core::assets`].
-//! Dispatches the four leaves:
+//! Dispatches the five leaves:
 //!   - `scan`   → discover declarations, hash present files, rewrite `assets.jsonl`
+//!   - `refresh` → re-hash one declared asset and update its manifest row
 //!   - `verify` → byte-completeness gate (exits non-zero when incomplete)
 //!   - `status` → present / missing report (never fails)
 //!   - `paths`  → the store-relative path list (for an ignore mechanism)
@@ -13,7 +14,8 @@
 use std::path::Path;
 
 use crate::cli::{
-    AssetsArgs, AssetsCommand, AssetsPathsArgs, AssetsScanArgs, AssetsStatusArgs, AssetsVerifyArgs,
+    AssetsArgs, AssetsCommand, AssetsPathsArgs, AssetsRefreshArgs, AssetsScanArgs,
+    AssetsStatusArgs, AssetsVerifyArgs,
 };
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
@@ -24,10 +26,41 @@ use dbmd_core::{assets, Store};
 pub fn run(ctx: &Context, args: &AssetsArgs) -> CliResult {
     match &args.command {
         AssetsCommand::Scan(a) => run_scan(ctx, a),
+        AssetsCommand::Refresh(a) => run_refresh(ctx, a),
         AssetsCommand::Verify(a) => run_verify(ctx, a),
         AssetsCommand::Status(a) => run_status(ctx, a),
         AssetsCommand::Paths(a) => run_paths(ctx, a),
     }
+}
+
+/// `dbmd assets refresh <path> --wrapper <wrapper>` — bounded write-through
+/// for one newly created or deliberately changed asset.
+fn run_refresh(ctx: &Context, args: &AssetsRefreshArgs) -> CliResult {
+    let store = Store::open_strict(Path::new(&args.dir))?;
+    let _transaction = store
+        .transaction()
+        .map_err(|error| CliError::runtime(format!("cannot lock store transaction: {error}")))?;
+    let report = assets::refresh(&store, &args.path, &args.wrapper)?;
+
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("refresh report serializes")
+        );
+    } else {
+        println!(
+            "{} · {} bytes · {} wrapper(s){}",
+            report.path,
+            report.bytes,
+            report.wrappers.len(),
+            if report.wrote {
+                " · manifest updated"
+            } else {
+                " · no change"
+            }
+        );
+    }
+    Ok(())
 }
 
 /// `dbmd assets scan` — rebuild the manifest from wrapper declarations.

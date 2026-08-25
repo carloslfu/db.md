@@ -1654,7 +1654,7 @@ outside the store.
 
 ### Operations
 
-`dbmd assets` has four leaves; none runs git or touches the network:
+`dbmd assets` has five leaves; none runs git or touches the network:
 
 - `dbmd assets scan` — read every content file's `asset`/`assets`, hash the
   present files, and rewrite `assets.jsonl`. The manifest is a projection of the
@@ -1663,6 +1663,11 @@ outside the store.
   cannot be re-hashed). Scan is the from-scratch and bulk-drop reconciliation,
   the asset analog of `index rebuild`. Scanning needs the bytes present (to
   hash); `status`/`verify` read the committed hashes and work without them.
+- `dbmd assets refresh <path> --wrapper <wrapper>` — the bounded write-through
+  path after one asset is created or deliberately changed. It verifies that the
+  supplied wrapper declares the exact path, re-hashes only those bytes, and
+  atomically updates that canonical manifest row. It does not discover
+  unrelated wrappers; `scan` remains the from-scratch reconciliation sweep.
 - `dbmd assets verify` — the byte-completeness gate: every required asset (plus
   optional under `--include-optional`) is present locally and matches the
   manifest. `--quick` checks presence and size; the default re-hashes. Exits

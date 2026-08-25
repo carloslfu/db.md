@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.30**.
+  `Cargo.toml`, currently **v0.8.31**.
 
 ## Unreleased
+
+## [0.8.31] — 2026-08-25
+
+### Added
+
+- `dbmd assets refresh <path> --wrapper <wrapper>` provides bounded
+  write-through after one asset is deliberately created or changed. It proves
+  the wrapper declares the exact asset, hashes only those bytes, preserves
+  unrelated manifest rows, drops only missing stale wrappers, and atomically
+  updates the canonical row. A full `assets scan` remains the authoritative
+  repair and bulk-reconciliation sweep.
 
 ## [0.8.30] — 2026-08-25
 

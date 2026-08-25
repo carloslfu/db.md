@@ -98,6 +98,191 @@ fn scan_is_idempotent_no_change_on_second_run() {
 }
 
 #[test]
+fn refresh_updates_one_declared_asset_without_walking_unrelated_bytes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    let manifest_path = tmp.path().join("assets.jsonl");
+    let first = std::fs::read_to_string(&manifest_path).unwrap();
+    let unrelated = serde_json::json!({
+        "path": "sources/docs/2026/06/missing.bin",
+        "sha256": "a".repeat(64),
+        "bytes": 99,
+        "media_type": "application/octet-stream",
+        "wrappers": ["sources/docs/2026/06/missing.md"],
+        "required": true,
+    });
+    std::fs::write(
+        &manifest_path,
+        format!("{first}{}\n", serde_json::to_string(&unrelated).unwrap()),
+    )
+    .unwrap();
+    write_file(
+        tmp.path(),
+        "sources/docs/2026/06/contract.pdf",
+        "SANITIZED DERIVATIVE BYTES",
+    );
+
+    let assert = dbmd()
+        .args([
+            "--json",
+            "assets",
+            "refresh",
+            "sources/docs/2026/06/contract.pdf",
+            "--wrapper",
+            "sources/docs/2026/06/contract.pdf.md",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let report = json_stdout(assert.get_output());
+    assert_eq!(report["path"], "sources/docs/2026/06/contract.pdf");
+    assert_eq!(report["bytes"], 26);
+    assert_eq!(report["wrote"], true);
+
+    let rows = std::fs::read_to_string(&manifest_path).unwrap();
+    let parsed: Vec<Value> = rows
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0]["path"], "sources/docs/2026/06/contract.pdf");
+    assert_eq!(parsed[0]["bytes"], 26);
+    assert_eq!(
+        parsed[1], unrelated,
+        "unrelated missing bytes stay untouched"
+    );
+
+    let second = dbmd()
+        .args([
+            "--json",
+            "assets",
+            "refresh",
+            "sources/docs/2026/06/contract.pdf",
+            "--wrapper",
+            "sources/docs/2026/06/contract.pdf.md",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    assert_eq!(json_stdout(second.get_output())["wrote"], false);
+}
+
+#[test]
+fn refresh_refuses_a_wrapper_that_does_not_declare_the_exact_asset() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    write_file(
+        tmp.path(),
+        "sources/docs/2026/06/other.md",
+        "---\ntype: note\ncreated: 2026-06-17T09:00:00-05:00\nupdated: 2026-06-17T09:00:00-05:00\nsummary: other\n---\nbody\n",
+    );
+    let refused = dbmd()
+        .args([
+            "assets",
+            "refresh",
+            "sources/docs/2026/06/contract.pdf",
+            "--wrapper",
+            "sources/docs/2026/06/other.md",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&refused.get_output().stderr).contains("does not declare asset")
+    );
+    assert!(!tmp.path().join("assets.jsonl").exists());
+}
+
+#[test]
+fn refresh_drops_a_missing_historical_wrapper_but_keeps_the_live_one() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    let manifest_path = tmp.path().join("assets.jsonl");
+    let mut row: Value =
+        serde_json::from_str(std::fs::read_to_string(&manifest_path).unwrap().trim()).unwrap();
+    row["wrappers"] = serde_json::json!([
+        "sources/docs/2026/06/contract.pdf.md",
+        "sources/docs/2026/06/missing-wrapper.md"
+    ]);
+    std::fs::write(
+        &manifest_path,
+        format!("{}\n", serde_json::to_string(&row).unwrap()),
+    )
+    .unwrap();
+
+    let refreshed = dbmd()
+        .args([
+            "--json",
+            "assets",
+            "refresh",
+            "sources/docs/2026/06/contract.pdf",
+            "--wrapper",
+            "sources/docs/2026/06/contract.pdf.md",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    assert_eq!(
+        json_stdout(refreshed.get_output())["wrappers"],
+        serde_json::json!(["sources/docs/2026/06/contract.pdf.md"])
+    );
+}
+
+#[test]
+fn refresh_refuses_an_existing_malformed_historical_wrapper() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    let malformed = "sources/docs/2026/06/malformed.md";
+    write_file(tmp.path(), malformed, "---\nassets: [unterminated\n---\n");
+    let manifest_path = tmp.path().join("assets.jsonl");
+    let mut row: Value =
+        serde_json::from_str(std::fs::read_to_string(&manifest_path).unwrap().trim()).unwrap();
+    row["wrappers"] = serde_json::json!(["sources/docs/2026/06/contract.pdf.md", malformed]);
+    let before = format!("{}\n", serde_json::to_string(&row).unwrap());
+    std::fs::write(&manifest_path, &before).unwrap();
+
+    dbmd()
+        .args([
+            "assets",
+            "refresh",
+            "sources/docs/2026/06/contract.pdf",
+            "--wrapper",
+            "sources/docs/2026/06/contract.pdf.md",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .failure();
+    assert_eq!(
+        std::fs::read_to_string(&manifest_path).unwrap(),
+        before,
+        "a refused targeted refresh must leave the manifest byte-identical"
+    );
+}
+
+#[test]
 fn scan_recompacts_duplicate_line_manifest() {
     // The documented git `merge=union` recovery (SPEC § Assets): a manifest with
     // duplicate identical lines must be recompacted to the single canonical line

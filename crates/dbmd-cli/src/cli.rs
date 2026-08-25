@@ -864,7 +864,7 @@ pub struct SpecArgs {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// assets (scan / verify / status / paths)
+// assets (scan / refresh / verify / status / paths)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `dbmd assets <sub>` — the heavy-binary asset manifest.
@@ -882,6 +882,11 @@ pub enum AssetsCommand {
     /// (re)write the canonical `assets.jsonl`. The manifest is a pure projection
     /// of the declarations; a path no longer declared drops out.
     Scan(AssetsScanArgs),
+
+    /// Re-hash one asset declared by one wrapper and update only that canonical
+    /// manifest row. This is the bounded write-through path; `scan` remains the
+    /// from-scratch sweep.
+    Refresh(AssetsRefreshArgs),
 
     /// Verify every required asset is present locally and matches the manifest.
     /// `--quick` checks presence+size only; the default deep mode re-hashes.
@@ -911,6 +916,22 @@ pub struct AssetsScanArgs {
     /// Also report non-markdown files under `sources/` that no wrapper declares.
     #[arg(long)]
     pub untracked: bool,
+}
+
+/// `dbmd assets refresh <path> --wrapper <wrapper>`.
+#[derive(Debug, Args)]
+pub struct AssetsRefreshArgs {
+    /// Store-relative asset path to re-hash.
+    #[arg(value_name = "PATH")]
+    pub path: String,
+
+    /// A markdown content file that currently declares this asset.
+    #[arg(long, value_name = "PATH")]
+    pub wrapper: String,
+
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
 }
 
 /// `dbmd assets verify`.
