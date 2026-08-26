@@ -202,6 +202,9 @@ pub mod codes {
     pub const ASSET_WRAPPER_BROKEN: &str = "ASSET_WRAPPER_BROKEN";
     /// an `assets.jsonl` record's path is referenced by no wrapper.
     pub const ASSET_MANIFEST_ORPHAN: &str = "ASSET_MANIFEST_ORPHAN";
+    /// an append-only asset supersession is malformed or its original manifest
+    /// row is absent/still required.
+    pub const ASSET_SUPERSESSION_INVALID: &str = "ASSET_SUPERSESSION_INVALID";
     /// an `asset`/`assets` path points at a tracked markdown content file.
     pub const ASSET_PATH_IS_CONTENT: &str = "ASSET_PATH_IS_CONTENT";
 }
@@ -3845,6 +3848,7 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
     // Per-wrapper declarations: every declared asset must be in the manifest and
     // must not point at a markdown content file.
     let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut supersessions: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
     for (rel, p) in parsed {
         let Some(map) = &p.fm else {
             continue;
@@ -3889,6 +3893,124 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
                     vec![PathBuf::from(&norm)],
                 );
             }
+        }
+        match assets::asset_supersession_from_yaml_map(map) {
+            Ok(Some(supersession)) => {
+                declared.insert(supersession.original.clone());
+                let wrapper = rel.to_string_lossy().replace('\\', "/");
+                if let Some((prior_replacement, prior_wrapper)) =
+                    supersessions.get(&supersession.original)
+                {
+                    if prior_replacement != &supersession.replacement {
+                        push(
+                            issues,
+                            Severity::Error,
+                            codes::ASSET_SUPERSESSION_INVALID,
+                            rel,
+                            None,
+                            Some(assets::SUPERSEDES_ASSET_KEY.to_string()),
+                            format!(
+                                "asset `{}` is superseded by both `{}` and `{}` ({})",
+                                supersession.original,
+                                prior_replacement,
+                                supersession.replacement,
+                                prior_wrapper.display()
+                            ),
+                            Some(
+                                "keep exactly one replacement for an asset coordinate".to_string(),
+                            ),
+                            vec![prior_wrapper.clone()],
+                        );
+                    }
+                } else {
+                    supersessions.insert(
+                        supersession.original.clone(),
+                        (supersession.replacement.clone(), rel.clone()),
+                    );
+                }
+                match manifest.get(&supersession.original) {
+                    Some(record)
+                        if !record.required && record.wrappers.contains(&wrapper) => {}
+                    Some(_) => push(
+                        issues,
+                        Severity::Error,
+                        codes::ASSET_SUPERSESSION_INVALID,
+                        rel,
+                        None,
+                        Some(assets::SUPERSEDES_ASSET_KEY.to_string()),
+                        format!(
+                            "superseded asset `{}` must remain cataloged as optional evidence under this wrapper",
+                            supersession.original
+                        ),
+                        Some(format!(
+                            "run `dbmd assets refresh {}` --wrapper {wrapper}",
+                            supersession.replacement
+                        )),
+                        vec![PathBuf::from(&supersession.original)],
+                    ),
+                    None => push(
+                        issues,
+                        Severity::Error,
+                        codes::ASSET_SUPERSESSION_INVALID,
+                        rel,
+                        None,
+                        Some(assets::SUPERSEDES_ASSET_KEY.to_string()),
+                        format!(
+                            "superseded asset `{}` has no record in {}",
+                            supersession.original,
+                            assets::MANIFEST_FILE
+                        ),
+                        Some("run `dbmd assets scan` to rebuild the manifest".to_string()),
+                        vec![PathBuf::from(&supersession.original)],
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => push(
+                issues,
+                Severity::Error,
+                codes::ASSET_SUPERSESSION_INVALID,
+                rel,
+                None,
+                Some(assets::SUPERSEDES_ASSET_KEY.to_string()),
+                error,
+                Some(format!(
+                    "remove `{}` or declare exactly one required replacement asset",
+                    assets::SUPERSEDES_ASSET_KEY
+                )),
+                vec![],
+            ),
+        }
+    }
+
+    let mut reported_cycle_members = BTreeSet::new();
+    for origin in supersessions.keys() {
+        let mut order: Vec<String> = Vec::new();
+        let mut positions = BTreeMap::new();
+        let mut current = origin.as_str();
+        while let Some((next, _)) = supersessions.get(current) {
+            if let Some(start) = positions.get(current).copied() {
+                for member in &order[start..] {
+                    if reported_cycle_members.insert(member.clone()) {
+                        let (_, wrapper) = &supersessions[member];
+                        push(
+                            issues,
+                            Severity::Error,
+                            codes::ASSET_SUPERSESSION_INVALID,
+                            wrapper,
+                            None,
+                            Some(assets::SUPERSEDES_ASSET_KEY.to_string()),
+                            format!("asset replacement cycle includes `{member}`"),
+                            Some("replace the cycle with a one-way provenance chain".to_string()),
+                            vec![],
+                        );
+                    }
+                }
+                break;
+            }
+            positions.insert(current.to_string(), order.len());
+            order.push(current.to_string());
+            current = next;
         }
     }
 

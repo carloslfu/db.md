@@ -8,9 +8,19 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.31**.
+  `Cargo.toml`, currently **v0.8.32**.
 
 ## Unreleased
+
+## [0.8.32] — 2026-08-25
+
+### Added
+
+- An append-only wrapper may declare one `supersedes-asset` alongside one
+  required replacement asset. `assets refresh` and the from-scratch scan retain
+  the original hash and provenance as optional evidence while making the
+  replacement the required portable copy. Validation rejects malformed,
+  conflicting, and cyclic supersessions.
 
 ## [0.8.31] — 2026-08-25
 

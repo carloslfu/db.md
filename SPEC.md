@@ -1281,6 +1281,7 @@ see; grouped by category):
 | `ASSET_UNDECLARED` | error | a content file's `asset`/`assets` path has no record in `assets.jsonl` — run `dbmd assets scan` |
 | `ASSET_WRAPPER_BROKEN` | error | an `assets.jsonl` record names a wrapper file that doesn't exist |
 | `ASSET_MANIFEST_ORPHAN` | warning | an `assets.jsonl` record's path is referenced by no wrapper |
+| `ASSET_SUPERSESSION_INVALID` | error | a `supersedes-asset` declaration is malformed, or its original is absent/still required in `assets.jsonl` |
 | `ASSET_PATH_IS_CONTENT` | warning | an `asset`/`assets` path points at a tracked markdown content file |
 
 The `ASSET_*` codes are checked by the full sweep (`dbmd validate --all`), not
@@ -1602,6 +1603,14 @@ an asset optional — a regenerable or nice-to-have artifact the store does not
 need to be byte-complete. The manager writes these keys on ingest; operators
 don't write frontmatter by hand.
 
+When an immutable wrapper already requires an asset but a later, portable asset
+must replace it without rewriting that earlier evidence, the new wrapper may
+carry one `supersedes-asset: <old-path>` line alongside exactly one required
+`asset:` declaration. The old coordinate remains cataloged with its exact hash,
+size, and provenance, but becomes optional; the new coordinate is the required
+working copy. The declaration is append-only and value-free. Conflicting,
+self-referential, multi-asset, or optional-replacement declarations are invalid.
+
 ### The `assets.jsonl` manifest
 
 A single root-level file, one JSON object per asset — the asset analog of the
@@ -1624,7 +1633,8 @@ where the bytes are present reproduces it byte-for-byte.
   not break rebuild equivalence).
 - `wrappers` — the content file(s) that declare the asset, sorted; usually one.
 - `required` — whether the asset is needed for byte-completeness (default
-  `true`; `false` only when every declaration marks it optional).
+  `true`; `false` when every declaration marks it optional or a valid
+  `supersedes-asset` wrapper retains it as replaced evidence).
 
 The manifest records **no** local-presence flag (that is machine state, computed
 on demand) and **no** storage location or provider URI (a storage layer derives
@@ -1666,8 +1676,11 @@ outside the store.
 - `dbmd assets refresh <path> --wrapper <wrapper>` — the bounded write-through
   path after one asset is created or deliberately changed. It verifies that the
   supplied wrapper declares the exact path, re-hashes only those bytes, and
-  atomically updates that canonical manifest row. It does not discover
-  unrelated wrappers; `scan` remains the from-scratch reconciliation sweep.
+  atomically updates that canonical manifest row. If the wrapper carries a
+  valid `supersedes-asset`, the same atomic write also marks that one existing
+  original row optional and attaches the new wrapper as provenance. It does not
+  discover unrelated wrappers; `scan` remains the from-scratch reconciliation
+  sweep.
 - `dbmd assets verify` — the byte-completeness gate: every required asset (plus
   optional under `--include-optional`) is present locally and matches the
   manifest. `--quick` checks presence and size; the default re-hashes. Exits

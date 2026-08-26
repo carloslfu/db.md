@@ -176,6 +176,150 @@ fn refresh_updates_one_declared_asset_without_walking_unrelated_bytes() {
 }
 
 #[test]
+fn append_only_supersession_keeps_original_optional_and_replacement_required() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    let replacement = "sources/redacted/contract.txt";
+    let replacement_wrapper = "sources/redacted/contract.md";
+    write_file(tmp.path(), replacement, "portable $API_TOKEN reference\n");
+    write_file(
+        tmp.path(),
+        replacement_wrapper,
+        &format!(
+            "---\ntype: note\ncreated: 2026-08-25T00:00:00Z\nupdated: 2026-08-25T00:00:00Z\nsummary: Portable sanitized derivative\nasset: {replacement}\nsupersedes-asset: sources/docs/2026/06/contract.pdf\n---\n\n# Replacement\n"
+        ),
+    );
+
+    let refreshed = dbmd()
+        .args([
+            "--json",
+            "assets",
+            "refresh",
+            replacement,
+            "--wrapper",
+            replacement_wrapper,
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    assert_eq!(
+        json_stdout(refreshed.get_output())["superseded_assets"],
+        serde_json::json!(["sources/docs/2026/06/contract.pdf"])
+    );
+
+    let manifest = tmp.path().join("assets.jsonl");
+    let rows: Vec<Value> = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["path"], "sources/docs/2026/06/contract.pdf");
+    assert_eq!(rows[0]["required"], false);
+    assert!(rows[0]["wrappers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|wrapper| wrapper == replacement_wrapper));
+    assert_eq!(rows[1]["path"], replacement);
+    assert_eq!(rows[1]["required"], true);
+
+    let before_scan = std::fs::read(&manifest).unwrap();
+    let rescanned = dbmd()
+        .args(["--json", "assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    assert_eq!(json_stdout(rescanned.get_output())["wrote"], false);
+    assert_eq!(std::fs::read(&manifest).unwrap(), before_scan);
+
+    std::fs::remove_file(tmp.path().join("sources/docs/2026/06/contract.pdf")).unwrap();
+    let absent_original_scan = dbmd()
+        .args(["--json", "assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    assert_eq!(
+        json_stdout(absent_original_scan.get_output())["wrote"],
+        false,
+        "a fresh clone preserves the exact optional original row without its local-only bytes"
+    );
+    dbmd()
+        .args(["index", "rebuild", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    dbmd()
+        .args(["validate", "--all"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    dbmd()
+        .args(["assets", "verify", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn conflicting_supersessions_fail_validation_and_keep_original_required() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    for (name, replacement) in [
+        ("one", "sources/redacted/one.txt"),
+        ("two", "sources/redacted/two.txt"),
+    ] {
+        write_file(tmp.path(), replacement, name);
+        write_file(
+            tmp.path(),
+            &format!("sources/redacted/{name}.md"),
+            &format!(
+                "---\ntype: note\ncreated: 2026-08-25T00:00:00Z\nupdated: 2026-08-25T00:00:00Z\nsummary: Conflicting replacement {name}\nasset: {replacement}\nsupersedes-asset: sources/docs/2026/06/contract.pdf\n---\n"
+            ),
+        );
+    }
+
+    let scan = dbmd()
+        .args(["--json", "assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let scan = json_stdout(scan.get_output());
+    assert!(scan["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("conflicts")));
+    let original: Value = std::fs::read_to_string(tmp.path().join("assets.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|row| row["path"] == "sources/docs/2026/06/contract.pdf")
+        .unwrap();
+    assert_eq!(original["required"], true);
+
+    dbmd()
+        .args(["index", "rebuild", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let validation = dbmd()
+        .args(["validate", "--all"])
+        .arg(tmp.path())
+        .assert()
+        .failure();
+    assert!(String::from_utf8_lossy(&validation.get_output().stdout)
+        .contains("ASSET_SUPERSESSION_INVALID"));
+}
+
+#[test]
 fn refresh_refuses_a_wrapper_that_does_not_declare_the_exact_asset() {
     let tmp = tempfile::TempDir::new().unwrap();
     setup(tmp.path());

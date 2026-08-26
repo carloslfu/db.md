@@ -41,6 +41,10 @@ use crate::store::Store;
 /// The manifest file name at the store root.
 pub const MANIFEST_FILE: &str = "assets.jsonl";
 
+/// Frontmatter key used by an append-only wrapper to state that its single
+/// declared asset is the portable replacement for an older asset coordinate.
+pub const SUPERSEDES_ASSET_KEY: &str = "supersedes-asset";
+
 /// One asset record — one line of `assets.jsonl`.
 ///
 /// Every field is derivable from the store (wrapper frontmatter + the file on
@@ -77,6 +81,15 @@ pub struct Declaration {
     pub required: bool,
 }
 
+/// A value-free, append-only asset replacement declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetSupersession {
+    /// The older asset coordinate retained as optional evidence.
+    pub original: String,
+    /// The wrapper's single required replacement coordinate.
+    pub replacement: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Reports (serialized directly in `--json`; the CLI renders the text form)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +119,8 @@ pub struct RefreshReport {
     pub bytes: u64,
     pub wrappers: Vec<String>,
     pub required: bool,
+    /// Older asset coordinates made optional by this wrapper.
+    pub superseded_assets: Vec<String>,
     pub wrote: bool,
 }
 
@@ -241,6 +256,8 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
     let mut wrappers_by_path: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut required_by_path: BTreeMap<String, bool> = BTreeMap::new();
     let mut declared_paths: BTreeSet<String> = BTreeSet::new();
+    let mut supersessions: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut ambiguous_supersessions: BTreeSet<String> = BTreeSet::new();
     let mut warnings: Vec<String> = Vec::new();
 
     for rel in store.walk()? {
@@ -279,6 +296,61 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
             *req = *req || decl.required;
             declared_paths.insert(norm);
         }
+        match asset_supersession(&fm) {
+            Ok(Some(supersession)) => {
+                if let Some((prior, prior_wrapper)) = supersessions.get(&supersession.original) {
+                    if prior != &supersession.replacement {
+                        ambiguous_supersessions.insert(supersession.original.clone());
+                        warnings.push(format!(
+                            "{wrapper}: `{SUPERSEDES_ASSET_KEY}` conflicts with {prior_wrapper} for {}",
+                            supersession.original
+                        ));
+                    }
+                } else {
+                    supersessions.insert(
+                        supersession.original,
+                        (supersession.replacement, wrapper.clone()),
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warnings.push(format!("{wrapper}: {error}")),
+        }
+    }
+
+    let cyclic_supersessions = supersession_cycle_members(&supersessions);
+    for original in &cyclic_supersessions {
+        if let Some((_, wrapper)) = supersessions.get(original) {
+            warnings.push(format!(
+                "{wrapper}: `{SUPERSEDES_ASSET_KEY}` participates in a replacement cycle at {original}"
+            ));
+        }
+    }
+    for (original, (replacement, wrapper)) in supersessions {
+        if ambiguous_supersessions.contains(&original) {
+            continue;
+        }
+        if cyclic_supersessions.contains(&original) {
+            continue;
+        }
+        if !wrappers_by_path.contains_key(&replacement) {
+            warnings.push(format!(
+                "{wrapper}: replacement asset `{replacement}` is not declared"
+            ));
+            continue;
+        }
+        if !wrappers_by_path.contains_key(&original) && !existing_by_path.contains_key(&original) {
+            warnings.push(format!(
+                "{wrapper}: superseded asset `{original}` is neither declared nor cataloged"
+            ));
+            continue;
+        }
+        wrappers_by_path
+            .entry(original.clone())
+            .or_default()
+            .insert(wrapper);
+        required_by_path.insert(original.clone(), false);
+        declared_paths.insert(original);
     }
 
     // Build records.
@@ -388,6 +460,27 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
     })
 }
 
+fn supersession_cycle_members(
+    supersessions: &BTreeMap<String, (String, String)>,
+) -> BTreeSet<String> {
+    let mut cyclic = BTreeSet::new();
+    for origin in supersessions.keys() {
+        let mut order = Vec::new();
+        let mut positions = BTreeMap::new();
+        let mut current = origin.as_str();
+        while let Some((next, _)) = supersessions.get(current) {
+            if let Some(start) = positions.get(current).copied() {
+                cyclic.extend(order[start..].iter().cloned());
+                break;
+            }
+            positions.insert(current.to_string(), order.len());
+            order.push(current.to_string());
+            current = next;
+        }
+    }
+    cyclic
+}
+
 /// Re-hash one asset and write just its canonical manifest record.
 ///
 /// `scan` remains the authoritative from-scratch projection. This bounded
@@ -444,6 +537,24 @@ pub fn refresh(store: &Store, raw_path: &str, raw_wrapper: &str) -> crate::Resul
         )
         .into());
     };
+    let requested_supersession = {
+        let text = store
+            .read_text_bounded(Path::new(&wrapper_path), crate::parser::MAX_DBMD_FILE_BYTES)?;
+        let parsed = parser::split_frontmatter(&text, Path::new(&wrapper_path))?;
+        let fm = parser::Frontmatter::parse(&parsed.frontmatter_yaml, Path::new(&wrapper_path))?;
+        asset_supersession(&fm)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?
+    };
+    if requested_supersession
+        .as_ref()
+        .is_some_and(|supersession| supersession.replacement != path)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("wrapper `{wrapper_path}` supersedes an asset with a different replacement"),
+        )
+        .into());
+    }
 
     let existing = read_manifest(store)?;
     let mut wrappers = BTreeSet::from([wrapper_path.clone()]);
@@ -484,6 +595,27 @@ pub fn refresh(store: &Store, raw_path: &str, raw_wrapper: &str) -> crate::Resul
     let mut next = existing;
     next.retain(|candidate| candidate.path != path);
     next.push(record);
+    let mut superseded_assets = Vec::new();
+    if let Some(supersession) = requested_supersession {
+        let original = next
+            .iter_mut()
+            .find(|candidate| candidate.path == supersession.original)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "superseded asset `{}` has no existing manifest row; run `dbmd assets scan` first",
+                        supersession.original
+                    ),
+                )
+            })?;
+        original.required = false;
+        if !original.wrappers.contains(&wrapper_path) {
+            original.wrappers.push(wrapper_path.clone());
+            original.wrappers.sort();
+        }
+        superseded_assets.push(supersession.original);
+    }
     next.sort_by(|left, right| left.path.cmp(&right.path));
 
     let canonical = serialize_manifest(&next);
@@ -505,6 +637,7 @@ pub fn refresh(store: &Store, raw_path: &str, raw_wrapper: &str) -> crate::Resul
         bytes,
         wrappers: live_wrappers,
         required,
+        superseded_assets,
         wrote,
     })
 }
@@ -695,6 +828,51 @@ pub fn declarations_from_yaml_map(map: &BTreeMap<String, Value>) -> Vec<Declarat
         collect_declarations(v, &mut out);
     }
     out
+}
+
+/// Parse the optional append-only asset supersession contract from typed
+/// frontmatter. The wrapper must declare exactly one required replacement
+/// asset; the older coordinate stays in the manifest as optional evidence.
+pub fn asset_supersession(fm: &parser::Frontmatter) -> Result<Option<AssetSupersession>, String> {
+    asset_supersession_from_parts(fm.get(SUPERSEDES_ASSET_KEY).as_ref(), declared_assets(fm))
+}
+
+/// Raw-map equivalent of [`asset_supersession`] for the validation sweep.
+pub fn asset_supersession_from_yaml_map(
+    map: &BTreeMap<String, Value>,
+) -> Result<Option<AssetSupersession>, String> {
+    asset_supersession_from_parts(
+        map.get(SUPERSEDES_ASSET_KEY),
+        declarations_from_yaml_map(map),
+    )
+}
+
+fn asset_supersession_from_parts(
+    value: Option<&Value>,
+    declarations: Vec<Declaration>,
+) -> Result<Option<AssetSupersession>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Value::String(original) = value else {
+        return Err(format!("`{SUPERSEDES_ASSET_KEY}` must be one asset path"));
+    };
+    if declarations.len() != 1 || !declarations[0].required {
+        return Err(format!(
+            "a `{SUPERSEDES_ASSET_KEY}` wrapper must declare exactly one required replacement asset"
+        ));
+    }
+    let original = normalize_asset_path(original)?;
+    let replacement = normalize_asset_path(&declarations[0].path)?;
+    if original == replacement {
+        return Err(format!(
+            "`{SUPERSEDES_ASSET_KEY}` cannot name the wrapper's replacement asset"
+        ));
+    }
+    Ok(Some(AssetSupersession {
+        original,
+        replacement,
+    }))
 }
 
 fn collect_declarations(v: &Value, out: &mut Vec<Declaration>) {
@@ -888,6 +1066,26 @@ fn find_untracked(store: &Store, declared: &BTreeSet<String>) -> crate::Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supersession_cycles_exclude_only_cycle_members() {
+        let supersessions = BTreeMap::from([
+            ("a".to_string(), ("b".to_string(), "a.md".to_string())),
+            ("b".to_string(), ("a".to_string(), "b.md".to_string())),
+            (
+                "before".to_string(),
+                ("a".to_string(), "before.md".to_string()),
+            ),
+            (
+                "clean".to_string(),
+                ("next".to_string(), "clean.md".to_string()),
+            ),
+        ]);
+        assert_eq!(
+            supersession_cycle_members(&supersessions),
+            BTreeSet::from(["a".to_string(), "b".to_string()])
+        );
+    }
 
     /// Regression (adversarial review): `normalize_asset_path` must fold a
     /// leading/interior `.` (CurDir) into the canonical key, so `./sources/x.pdf`
