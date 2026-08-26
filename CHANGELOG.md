@@ -12,6 +12,52 @@ Two things version independently:
 
 ## Unreleased
 
+### Added
+
+- `dbmd assets refresh-wrapper <wrapper>` reconciles one multi-asset wrapper
+  in a bounded batch, hashing its current declarations and writing
+  `assets.jsonl` once without walking unrelated store content or asset bytes;
+  an empty current set safely clears only that wrapper's stale associations.
+- `dbmd sync <canonical-brain-id> relocate --from <old-store> --to <new-store>`
+  atomically relocates private path-bound v2 baseline state after a higher-level
+  tool moves an unchanged checkout. The old path must be absent, the new store
+  must exactly match the verified content, asset, view, and local-policy
+  coordinates, and an existing destination baseline is never overwritten.
+
+### Fixed
+
+- Link.md sync now carries the canonical curator timeline (`log.md` and its
+  rotated `log/*.md` archives) alongside `DB.md`, records, sources, and the
+  asset manifest. Derived `index.*` catalogs remain local and rebuildable.
+- Link.md v2 now waits through the hub's typed post-commit validation/index lag
+  so an accepted commit and its local baseline finish in one operation. If a
+  response was already lost, an exact local/verified-head match can fast-forward
+  the private baseline without force or historical downloads; any differing
+  path still becomes a normal conflict. Patient mutation retries also recognize
+  that typed lag after an ambiguous accepted POST and keep asking for the same
+  content-derived idempotent receipt.
+- A local change that combines `DB.md` with content or assets is now phased
+  automatically into the hub-required sole strict-head contract commit and a
+  freshly planned remainder. The verified local scan is handed across only in
+  memory, upload bytes and the new head are rechecked, and a concurrent second
+  contract edit fails for a clean retry instead of chaining indefinitely.
+- Stable v2 checkouts now keep a private Git-style stat cache for content hashes
+  and policy-filtered withheld-link results. Reuse requires the exact Unix
+  device/inode/size/mtime/ctime tuple, the same `.sevralocal` policy digest, and
+  timestamps outside a racy-clean window; changed, recent, ambiguous, and
+  non-Unix files take the full hash path. The cache never enters the store or
+  wire protocol, and the private baseline has its own bounded 64 MiB envelope
+  so large brains do not inherit the smaller network-feed limit.
+- Cold v2 pulls stage each proven blob by content hash in a private resumable
+  cache and fetch independent bounded bulk windows with a four-worker ceiling.
+  Interruptions reuse only exact cached hashes; parallelism changes latency,
+  not manifests, proof verification, memory bounds, or atomic publication.
+- Conflict construction gives optional historical base bodies one bounded
+  15-second attempt per bundle. Exact base coordinates and current local/remote
+  bodies remain available when retained history is slow. Explicit keep-local
+  resolution can carry asset changes only when every affected asset is owned by
+  a wrapper already present in the reviewed content bundle.
+
 ## [0.8.33] — 2026-08-25
 
 ### Fixed

@@ -12,7 +12,7 @@ const MAX_BYTES: u64 = 1024 * 1024;
 const MAX_LINE_BYTES: usize = 4096;
 const MAX_ENTRIES: usize = 10_000;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SyncPolicy {
     set: GlobSet,
     pub(crate) digest: String,

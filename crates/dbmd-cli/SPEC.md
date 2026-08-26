@@ -1664,7 +1664,7 @@ outside the store.
 
 ### Operations
 
-`dbmd assets` has five leaves; none runs git or touches the network:
+`dbmd assets` has six leaves; none runs git or touches the network:
 
 - `dbmd assets scan` — read every content file's `asset`/`assets`, hash the
   present files, and rewrite `assets.jsonl`. The manifest is a projection of the
@@ -1681,6 +1681,13 @@ outside the store.
   original row optional and attaches the new wrapper as provenance. It does not
   discover unrelated wrappers; `scan` remains the from-scratch reconciliation
   sweep.
+- `dbmd assets refresh-wrapper <wrapper>` — the bounded batch write-through
+  path for one wrapper that declares multiple assets. It hashes that wrapper's
+  current asset set, removes only stale associations owned by that wrapper,
+  preserves unrelated wrappers and evicted-but-cataloged bytes, and writes the
+  manifest once. An empty current set clears that wrapper's stale associations,
+  so generators can remove their last object without a full scan. Asset
+  supersession remains a single-coordinate `refresh`.
 - `dbmd assets verify` — the byte-completeness gate: every required asset (plus
   optional under `--include-optional`) is present locally and matches the
   manifest. `--quick` checks presence and size; the default re-hashes. Exits

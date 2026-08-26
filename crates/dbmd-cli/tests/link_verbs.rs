@@ -591,7 +591,8 @@ fn seed_store(root: &Path) {
         "---\ntype: note\nsummary: Kickoff notes\n---\n\nNotes.\n",
     );
     w("assets.jsonl", "{\"path\":\"sources/brief.pdf\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"bytes\":1,\"media_type\":\"application/pdf\",\"required\":false}\n");
-    // Derived catalogs + history + toolkit state: all must stay OFF the wire.
+    // Derived catalogs + toolkit state stay off the wire. Curator history is
+    // canonical brain state and travels with the owned content.
     w("index.md", "# Index\n");
     w("records/clients/index.md", "# Clients\n");
     w("records/clients/index.jsonl", "{}\n");
@@ -1073,7 +1074,7 @@ fn sync_push_sends_owned_content_only_with_bearer() {
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     assert!(
-        out.stdout.contains("pushed 4 files") && out.stdout.contains("durable"),
+        out.stdout.contains("pushed 6 files") && out.stdout.contains("durable"),
         "stdout: {}",
         out.stdout
     );
@@ -1094,12 +1095,14 @@ fn sync_push_sends_owned_content_only_with_bearer() {
         .map(|f| f["path"].as_str().unwrap())
         .collect();
     paths.sort_unstable();
-    // The owned content travels; catalogs, history, and toolkit state do not.
+    // Owned content and curator history travel; catalogs and toolkit state do not.
     assert_eq!(
         paths,
         vec![
             "DB.md",
             "assets.jsonl",
+            "log.md",
+            "log/2026-06.md",
             "records/clients/lumio.md",
             "sources/notes/kickoff.md",
         ],

@@ -58,6 +58,36 @@ pub fn run(ctx: &Context, args: &SyncArgs) -> CliResult {
         }
         return Ok(());
     }
+    if let Some(SyncAction::Relocate(relocate)) = &args.action {
+        let brain = strip_sigil(args.brain.as_deref().ok_or_else(|| {
+            CliError::new(
+                ExitCode::Usage,
+                "MISSING_BRAIN",
+                "dbmd sync relocate requires the canonical brain id before the subcommand",
+            )
+        })?);
+        let cfg = linkmd::hub_config(args.hub.as_deref(), Path::new(&relocate.to))?;
+        let body = linkmd::relocate_v2_sync_baseline(
+            &cfg,
+            brain,
+            Path::new(&relocate.from),
+            Path::new(&relocate.to),
+        )?;
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "relocated the verified incremental baseline for {} from {} to {}",
+                sanitize_single_line(brain),
+                sanitize_single_line(&relocate.from),
+                sanitize_single_line(&relocate.to)
+            );
+        }
+        return Ok(());
+    }
     if let Some(SyncAction::Conflicts(conflicts)) = &args.action {
         let body =
             linkmd::sync_conflicts(Path::new(&conflicts.dir), conflicts.prune, conflicts.all)?;

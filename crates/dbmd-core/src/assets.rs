@@ -14,9 +14,11 @@
 //! hosting/transport layer's job, keyed off the SHA-256. This module never
 //! shells out to git and never touches the network.
 //!
-//! Five operations — two writes, three reads:
+//! Six operations — three writes, three reads:
 //!   - [`scan`]   (write) discover declared assets, hash present files, rewrite the manifest
 //!   - [`refresh`] (write) re-hash one declared asset and update its manifest row
+//!   - [`refresh_wrapper`] (write) reconcile every declaration in one wrapper
+//!     and update the manifest once
 //!   - [`verify`] (read)  prove the local store is byte-complete for required assets
 //!   - [`status`] (read)  report present / missing without failing
 //!   - [`paths`]  (read)  the store-relative path list (for an ignore mechanism)
@@ -121,6 +123,22 @@ pub struct RefreshReport {
     pub required: bool,
     /// Older asset coordinates made optional by this wrapper.
     pub superseded_assets: Vec<String>,
+    pub wrote: bool,
+}
+
+/// Result of [`refresh_wrapper`]. This is the bounded batch counterpart to
+/// [`refresh`]: every asset declared by one wrapper is reconciled, while
+/// unrelated wrappers and bytes are untouched.
+#[derive(Debug, Serialize)]
+pub struct RefreshWrapperReport {
+    pub manifest: String,
+    pub wrapper: String,
+    pub cataloged: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub hashed: usize,
+    pub preserved: usize,
+    pub bytes: u64,
     pub wrote: bool,
 }
 
@@ -638,6 +656,205 @@ pub fn refresh(store: &Store, raw_path: &str, raw_wrapper: &str) -> crate::Resul
         wrappers: live_wrappers,
         required,
         superseded_assets,
+        wrote,
+    })
+}
+
+/// Reconcile every asset declaration in one wrapper and write the canonical
+/// manifest once. This is for bounded generators that own one wrapper with a
+/// changing set of assets: it avoids a full-store [`scan`] and avoids N
+/// manifest rewrites through repeated [`refresh`] calls.
+///
+/// Existing rows declared by other wrappers are preserved. If the requested
+/// wrapper stops declaring a path, only its association is removed; the row
+/// survives when another live wrapper still declares it. Missing bytes may be
+/// preserved only when the exact path already has a manifest row. Asset
+/// supersession remains a one-coordinate [`refresh`] operation because its
+/// append-only provenance semantics are deliberately not batchable.
+pub fn refresh_wrapper(store: &Store, raw_wrapper: &str) -> crate::Result<RefreshWrapperReport> {
+    let wrapper_path = normalize_asset_path(raw_wrapper)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    if !is_markdown(&wrapper_path)
+        || !(wrapper_path.starts_with("sources/") || wrapper_path.starts_with("records/"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wrapper must be a sources/ or records/ markdown content path",
+        )
+        .into());
+    }
+
+    let wrapper_declarations = |wrapper: &str| -> crate::Result<BTreeMap<String, bool>> {
+        let text =
+            store.read_text_bounded(Path::new(wrapper), crate::parser::MAX_DBMD_FILE_BYTES)?;
+        let parsed = parser::split_frontmatter(&text, Path::new(wrapper))?;
+        let fm = parser::Frontmatter::parse(&parsed.frontmatter_yaml, Path::new(wrapper))?;
+        if asset_supersession(&fm)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?
+            .is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refresh-wrapper does not accept supersedes-asset; use assets refresh for that replacement",
+            )
+            .into());
+        }
+        let mut declarations = BTreeMap::new();
+        for declaration in declared_assets(&fm) {
+            let path = normalize_asset_path(&declaration.path).map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+            })?;
+            if is_markdown(&path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("asset path points at a markdown content file: {path}"),
+                )
+                .into());
+            }
+            let required = declarations.entry(path).or_insert(false);
+            *required |= declaration.required;
+        }
+        Ok(declarations)
+    };
+
+    // An empty declaration set is meaningful: a bounded generator may have
+    // removed its last object. Reconciliation must then remove only this
+    // wrapper's old associations instead of forcing a full-store scan.
+    let requested = wrapper_declarations(&wrapper_path)?;
+
+    let existing = read_manifest(store)?;
+    let existing_by_path: BTreeMap<String, AssetRecord> = existing
+        .iter()
+        .cloned()
+        .map(|record| (record.path.clone(), record))
+        .collect();
+    let old_paths: BTreeSet<String> = existing
+        .iter()
+        .filter(|record| record.wrappers.contains(&wrapper_path))
+        .map(|record| record.path.clone())
+        .collect();
+    let requested_paths: BTreeSet<String> = requested.keys().cloned().collect();
+
+    let mut wrapper_cache: BTreeMap<String, Option<BTreeMap<String, bool>>> = BTreeMap::new();
+    let mut live_other_declaration = |wrapper: &str, path: &str| -> crate::Result<Option<bool>> {
+        if !wrapper_cache.contains_key(wrapper) {
+            let declarations = if store.regular_file_exists(Path::new(wrapper))? {
+                Some(wrapper_declarations(wrapper)?)
+            } else {
+                None
+            };
+            wrapper_cache.insert(wrapper.to_string(), declarations);
+        }
+        Ok(wrapper_cache
+            .get(wrapper)
+            .and_then(Option::as_ref)
+            .and_then(|declarations| declarations.get(path).copied()))
+    };
+
+    let mut next = Vec::new();
+    for mut record in existing.iter().cloned() {
+        if requested.contains_key(&record.path) {
+            continue;
+        }
+        if record.wrappers.contains(&wrapper_path) {
+            let mut live_wrappers = Vec::new();
+            let mut required = false;
+            for wrapper in &record.wrappers {
+                if wrapper == &wrapper_path {
+                    continue;
+                }
+                if let Some(wrapper_required) = live_other_declaration(wrapper, &record.path)? {
+                    live_wrappers.push(wrapper.clone());
+                    required |= wrapper_required;
+                }
+            }
+            if live_wrappers.is_empty() {
+                continue;
+            }
+            live_wrappers.sort();
+            record.wrappers = live_wrappers;
+            record.required = required;
+        }
+        next.push(record);
+    }
+
+    let mut hashed = 0usize;
+    let mut preserved = 0usize;
+    let mut bytes_total = 0u64;
+    for (path, requested_required) in &requested {
+        let mut wrappers = vec![wrapper_path.clone()];
+        let mut required = *requested_required;
+        if let Some(existing_record) = existing_by_path.get(path) {
+            for wrapper in &existing_record.wrappers {
+                if wrapper == &wrapper_path {
+                    continue;
+                }
+                if let Some(wrapper_required) = live_other_declaration(wrapper, path)? {
+                    wrappers.push(wrapper.clone());
+                    required |= wrapper_required;
+                }
+            }
+        }
+        wrappers.sort();
+        wrappers.dedup();
+
+        let (sha256, bytes, media_type) = match store.open_regular(Path::new(path)) {
+            Ok(file) => {
+                let (sha256, bytes) = sha256_file(file)?;
+                hashed += 1;
+                (sha256, bytes, media_type_for(path))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let existing_record = existing_by_path.get(path).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "declared asset `{path}` is absent and has no manifest row to preserve"
+                        ),
+                    )
+                })?;
+                preserved += 1;
+                (
+                    existing_record.sha256.clone(),
+                    existing_record.bytes,
+                    existing_record.media_type.clone(),
+                )
+            }
+            Err(error) => return Err(error.into()),
+        };
+        bytes_total = bytes_total.saturating_add(bytes);
+        next.push(AssetRecord {
+            path: path.clone(),
+            sha256,
+            bytes,
+            media_type,
+            wrappers,
+            required,
+        });
+    }
+
+    next.sort_by(|left, right| left.path.cmp(&right.path));
+    let canonical = serialize_manifest(&next);
+    let on_disk =
+        match store.read_bounded(Path::new(MANIFEST_FILE), crate::parser::MAX_DBMD_FILE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+    let wrote = on_disk != canonical.as_bytes();
+    if wrote {
+        write_manifest(store, &next)?;
+    }
+
+    Ok(RefreshWrapperReport {
+        manifest: MANIFEST_FILE.to_string(),
+        wrapper: wrapper_path,
+        cataloged: requested.len(),
+        added: requested_paths.difference(&old_paths).count(),
+        removed: old_paths.difference(&requested_paths).count(),
+        hashed,
+        preserved,
+        bytes: bytes_total,
         wrote,
     })
 }
@@ -1305,6 +1522,72 @@ mod tests {
             canonical,
             "a no-op rescan must leave the manifest byte-identical"
         );
+    }
+
+    #[test]
+    fn refresh_wrapper_reconciles_one_generated_asset_set_in_one_manifest_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("records/package")).unwrap();
+        std::fs::create_dir_all(root.join("sources/package/objects")).unwrap();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        let wrapper = "records/package/current.md";
+        std::fs::write(
+            root.join(wrapper),
+            "---\ntype: package\nsummary: current\nassets:\n  - sources/package/objects/a.blob\n  - sources/package/objects/b.blob\n---\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("sources/package/objects/a.blob"), b"a").unwrap();
+        std::fs::write(root.join("sources/package/objects/b.blob"), b"bb").unwrap();
+        let store = Store::from_root_and_config(root, crate::parser::Config::default()).unwrap();
+
+        let first = refresh_wrapper(&store, wrapper).unwrap();
+        assert_eq!(first.cataloged, 2);
+        assert_eq!(first.added, 2);
+        assert_eq!(first.removed, 0);
+        assert_eq!(first.hashed, 2);
+        assert_eq!(first.bytes, 3);
+        assert!(first.wrote);
+
+        let no_change = refresh_wrapper(&store, wrapper).unwrap();
+        assert!(!no_change.wrote);
+        assert_eq!(no_change.added, 0);
+        assert_eq!(no_change.removed, 0);
+
+        std::fs::write(
+            root.join(wrapper),
+            "---\ntype: package\nsummary: current\nassets:\n  - sources/package/objects/b.blob\n  - sources/package/objects/c.blob\n---\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("sources/package/objects/c.blob"), b"ccc").unwrap();
+        let changed = refresh_wrapper(&store, wrapper).unwrap();
+        assert_eq!(changed.cataloged, 2);
+        assert_eq!(changed.added, 1);
+        assert_eq!(changed.removed, 1);
+        assert_eq!(changed.bytes, 5);
+        assert!(changed.wrote);
+
+        let records = read_manifest(&store).unwrap();
+        let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "sources/package/objects/b.blob",
+                "sources/package/objects/c.blob"
+            ]
+        );
+
+        std::fs::write(
+            root.join(wrapper),
+            "---\ntype: package\nsummary: current\n---\n",
+        )
+        .unwrap();
+        let cleared = refresh_wrapper(&store, wrapper).unwrap();
+        assert_eq!(cleared.cataloged, 0);
+        assert_eq!(cleared.added, 0);
+        assert_eq!(cleared.removed, 2);
+        assert!(cleared.wrote);
+        assert!(read_manifest(&store).unwrap().is_empty());
     }
 
     #[cfg(unix)]

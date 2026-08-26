@@ -864,7 +864,7 @@ pub struct SpecArgs {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// assets (scan / refresh / verify / status / paths)
+// assets (scan / refresh / refresh-wrapper / verify / status / paths)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `dbmd assets <sub>` — the heavy-binary asset manifest.
@@ -887,6 +887,11 @@ pub enum AssetsCommand {
     /// manifest row. This is the bounded write-through path; `scan` remains the
     /// from-scratch sweep.
     Refresh(AssetsRefreshArgs),
+
+    /// Reconcile one wrapper's complete current asset set and write the
+    /// manifest once, including clearing a now-empty generated set.
+    #[command(name = "refresh-wrapper")]
+    RefreshWrapper(AssetsRefreshWrapperArgs),
 
     /// Verify every required asset is present locally and matches the manifest.
     /// `--quick` checks presence+size only; the default deep mode re-hashes.
@@ -927,6 +932,18 @@ pub struct AssetsRefreshArgs {
 
     /// A markdown content file that currently declares this asset.
     #[arg(long, value_name = "PATH")]
+    pub wrapper: String,
+
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+/// `dbmd assets refresh-wrapper <wrapper>`.
+#[derive(Debug, Args)]
+pub struct AssetsRefreshWrapperArgs {
+    /// Markdown content file whose complete asset set should be reconciled.
+    #[arg(value_name = "WRAPPER")]
     pub wrapper: String,
 
     /// Store root. Defaults to the current directory.
@@ -1082,11 +1099,27 @@ pub enum SyncAction {
     /// canonical brain ids. Canonical trust history is preserved.
     Rebind(SyncRebindArgs),
 
+    /// Move the private incremental baseline after the checkout itself was
+    /// atomically moved. The old checkout path must no longer exist and the
+    /// new checkout must still match the verified baseline exactly.
+    Relocate(SyncRelocateArgs),
+
     /// Resolve one exact private conflict bundle. This never acts as force.
     Resolve(SyncResolveArgs),
 
     /// Inspect or prune private conflict bundles.
     Conflicts(SyncConflictsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SyncRelocateArgs {
+    /// Previous checkout root. It must no longer exist.
+    #[arg(long, value_name = "OLD_DIR")]
+    pub from: String,
+
+    /// New checkout root containing the unchanged verified store.
+    #[arg(long, value_name = "NEW_DIR")]
+    pub to: String,
 }
 
 #[derive(Debug, Args)]
@@ -1533,5 +1566,28 @@ mod tests {
         };
         assert_eq!(rebind.from, OLD);
         assert_eq!(rebind.to, NEW);
+    }
+
+    #[test]
+    fn sync_parses_the_checkout_relocation_shape() {
+        let cli = Cli::try_parse_from([
+            "dbmd",
+            "sync",
+            OLD,
+            "relocate",
+            "--from",
+            "/tmp/stage/db",
+            "--to",
+            "/tmp/live/db",
+        ])
+        .unwrap();
+        let Command::Sync(args) = cli.command else {
+            panic!("expected sync");
+        };
+        let Some(SyncAction::Relocate(relocate)) = args.action else {
+            panic!("expected relocate");
+        };
+        assert_eq!(relocate.from, "/tmp/stage/db");
+        assert_eq!(relocate.to, "/tmp/live/db");
     }
 }

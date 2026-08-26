@@ -122,7 +122,9 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
   damaged index)
 
 ### Assets
-- `dbmd assets scan|verify|status|paths` — catalog, verify, and report
+- `dbmd assets scan|refresh|refresh-wrapper|verify|status|paths` — catalog,
+  incrementally reconcile one asset or one wrapper's complete current set,
+  verify, and report
   raw binary assets a wrapper declares (`asset:`/`assets:` frontmatter)
   but Git should not carry; maintains the root `assets.jsonl` manifest,
   never transports bytes (SPEC § Assets)
@@ -155,7 +157,25 @@ zero telemetry: network I/O happens only when a verb is explicitly invoked.
   atomically; v2 pushes send only changed operations/blobs with exact
   preconditions and baseline-safe deletes. A scoped/self-custodied writer is
   queued as a proposal and reports `proposal_pending` without advancing the
-  local baseline. Legacy v1 hubs retain whole-snapshot push behavior.
+  local baseline. Canonical `log.md` history rides sync; derived `index.*`
+  catalogs rebuild locally. Typed post-commit projection lag waits in place;
+  an exact local/head match can recover a lost-response baseline without force.
+  Stable Unix checkouts reuse a private racy-clean-safe stat/hash/link cache;
+  policy changes or ambiguous metadata fall back to full reads.
+  Cold pulls stage proof-bound blobs in a private resumable content cache and
+  fetch independent ≤8 MiB windows with at most four workers; a retry reuses
+  exact hashes and still publishes only after complete verification.
+  `dbmd sync <canonical-brain-id> relocate --from <old-store> --to <new-store>`
+  is the explicit local-only handoff for an atomically moved checkout: it
+  verifies the new store against the old path-bound baseline and moves that
+  private baseline without overwriting another checkout's state.
+  A mixed local `DB.md` + content/asset delta is automatically committed in
+  two exact-head phases: the sole contract first, then a freshly planned
+  remainder. Lost-response retries also wait through typed validation recovery
+  until the same content-derived mutation receipt is available.
+  Conflict bundles bound optional historical-body retrieval and keep asset
+  resolution scoped to explicitly reviewed owning wrappers. Legacy v1 hubs
+  retain whole-snapshot push behavior.
 - `dbmd grant issue|list|revoke` — the capability model, owner-side:
   grant read or write to a principal (by email in v0), scoped to an
   optional store-path prefix, with an optional `--until` expiry

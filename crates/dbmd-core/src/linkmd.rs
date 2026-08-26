@@ -126,6 +126,10 @@ const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 /// A feed page can legitimately carry a large snapshot manifest, but remains
 /// far below a full pack and is parsed with count-bounded sequence visitors.
 const MAX_FEED_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Private v2 baselines also contain the local stat/hash cache for large
+/// checkouts. They never cross the wire, but remain bounded before parsing and
+/// writing so a corrupt cache cannot cause unbounded allocation.
+const MAX_V2_BASELINE_BYTES: u64 = 64 * 1024 * 1024;
 /// Foreign registry cards are identity metadata only.
 const MAX_REGISTRY_CARD_BYTES: u64 = 1024 * 1024;
 
@@ -1713,6 +1717,8 @@ fn request_patient(
         std::time::Duration::from_secs(COMMIT_REQUEST_TIMEOUT_SECS),
     )?;
     let mut attempt = 0;
+    let validation_started = std::time::Instant::now();
+    let mut validation_wait = std::time::Duration::from_millis(250);
     loop {
         let sent = request_raw_with_agent(
             cfg,
@@ -1736,10 +1742,33 @@ fn request_patient(
             }
             Err(error) => return Err(error),
             Ok(raw) => {
-                return Ok(HubResponse {
+                let response = HubResponse {
                     status: raw.status,
                     body: serde_json::from_slice(&raw.body).ok(),
-                })
+                };
+                // A patient mutation can land, lose its response, and then be
+                // retried while validation recovery is still behind the new
+                // source head. The hub returns the same typed lag signal as
+                // the head endpoint. Repeating the exact content-derived
+                // mutation id is idempotent and is the only way to recover its
+                // receipt without guessing whether the first attempt landed.
+                if v2_validation_catching_up(&response) {
+                    if validation_started.elapsed() >= std::time::Duration::from_secs(15 * 60) {
+                        return Err(LinkError::Http {
+                            what: "v2 commit receipt",
+                            status: response.status,
+                            message: "validation/index recovery did not make the exact mutation receipt available within 15 minutes".to_string(),
+                            code: Some("validation_index_catching_up".to_string()),
+                            details: response.body,
+                        });
+                    }
+                    std::thread::sleep(validation_wait);
+                    validation_wait = validation_wait
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(5));
+                    continue;
+                }
+                return Ok(response);
             }
         }
     }
@@ -3489,7 +3518,34 @@ fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2Verifie
     // a network oracle or receive a bearer before checkpoint safety is known.
     let trust_directory = open_trust_dir(cfg)?;
     let path = format!("/api/hub/brains/{brain}/v2/head");
-    let response = request(cfg, "GET", &path, None, Auth::Required)?;
+    // A commit is durable before the hub's validation/index recovery view is
+    // necessarily at that new source head. That is one typed transient state,
+    // not a rejected commit. Waiting here keeps the accepted commit and the
+    // local verification baseline in one operation; otherwise a large brain
+    // can be forced through an expensive historical reconciliation merely
+    // because its projection lagged for a few seconds.
+    let started = std::time::Instant::now();
+    let mut wait = std::time::Duration::from_millis(250);
+    let response = loop {
+        let response = request(cfg, "GET", &path, None, Auth::Required)?;
+        if !v2_validation_catching_up(&response) {
+            break response;
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(15 * 60) {
+            return Err(LinkError::Http {
+                what: "v2 head",
+                status: response.status,
+                message: "validation/index recovery did not reach the durable source head within 15 minutes"
+                    .to_string(),
+                code: Some("validation_index_catching_up".to_string()),
+                details: response.body,
+            });
+        }
+        std::thread::sleep(wait);
+        wait = wait
+            .saturating_mul(2)
+            .min(std::time::Duration::from_secs(5));
+    };
     if response.status == 404 {
         if has_accepted_v2_ref(cfg, brain)? {
             return Err(LinkError::BrainUnavailable);
@@ -3609,6 +3665,18 @@ fn v2_verified_head(cfg: &HubConfig, brain: &str) -> LinkResult<Option<V2Verifie
     }))
 }
 
+fn v2_validation_catching_up(response: &HubResponse) -> bool {
+    response.status == 422
+        && response.body.as_ref().is_some_and(|body| {
+            body.get("code").and_then(Value::as_str) == Some("validation_index_catching_up")
+                || body
+                    .get("details")
+                    .and_then(|details| details.get("code"))
+                    .and_then(Value::as_str)
+                    == Some("validation_index_catching_up")
+        })
+}
+
 fn accept_v2_head(cfg: &HubConfig, head: &V2VerifiedHead) -> LinkResult<()> {
     let directory = open_trust_dir(cfg)?;
     let _locks = lock_trust_many(cfg, &directory, &[&head.requested, &head.brain_id])?;
@@ -3652,6 +3720,20 @@ struct V2BaselineFile {
     proof: Option<Vec<V2ProofStep>>,
 }
 
+/// Private checkout acceleration, analogous to Git's stat cache. A cached
+/// hash is reusable only when the same held regular file still has the exact
+/// Unix identity/timestamps/length and those timestamps were already outside
+/// the racy-clean window when observed. `withheld_targets` is policy-specific;
+/// the complete cache is ignored when `.sevralocal`'s digest changes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct V2ScanCacheFile {
+    fingerprint: String,
+    sha256: String,
+    bytes: u64,
+    #[serde(default)]
+    withheld_targets: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct V2SyncBaseline {
     v: u8,
@@ -3680,6 +3762,8 @@ struct V2SyncBaseline {
     projection_sha256: Option<String>,
     files: std::collections::BTreeMap<String, V2BaselineFile>,
     #[serde(default)]
+    scan_cache: std::collections::BTreeMap<String, V2ScanCacheFile>,
+    #[serde(default)]
     local_policy_digest: Option<String>,
     #[serde(default)]
     local_eligibility: std::collections::BTreeMap<String, bool>,
@@ -3687,8 +3771,10 @@ struct V2SyncBaseline {
     remote_copy_remains: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Clone)]
 struct V2LocalView {
     riding: std::collections::BTreeMap<String, (String, u64)>,
+    scan_cache: std::collections::BTreeMap<String, V2ScanCacheFile>,
     eligibility: std::collections::BTreeMap<String, bool>,
     policy: crate::linkmd_sync_policy::SyncPolicy,
     withheld_links: Vec<V2WithheldLink>,
@@ -4980,6 +5066,7 @@ fn remove_scoped_projection(
         return Err(LinkError::ScopedProjectionModified);
     }
     view.riding.remove("DB.md");
+    view.scan_cache.remove("DB.md");
     view.eligibility.remove("DB.md");
     Ok(())
 }
@@ -4997,7 +5084,13 @@ fn local_view_for_v2_push(
         // false tamper refusal.
         Some(view) => Ok(view),
         None => {
-            let mut view = v2_local_files(store)?;
+            let hint = baseline.and_then(|state| {
+                state
+                    .local_policy_digest
+                    .as_deref()
+                    .map(|digest| (digest, &state.scan_cache))
+            });
+            let mut view = v2_local_files_cached(store, hint)?;
             remove_scoped_projection(head, baseline, &mut view)?;
             Ok(view)
         }
@@ -5058,6 +5151,7 @@ fn parse_v2_baseline(cfg: &HubConfig, brain: &str, bytes: &[u8]) -> LinkResult<V
         || (baseline.view_kind.as_deref() == Some("scoped")
             && (baseline.view_revision.is_none() || baseline.projection_sha256.is_none()))
         || baseline.files.len() > MAX_PUSH_FILES
+        || baseline.scan_cache.len() > MAX_PUSH_FILES
         || baseline.assets.len() > MAX_PUSH_FILES
         || baseline.local_eligibility.len() > MAX_PUSH_FILES
         || baseline.remote_copy_remains.len() > MAX_PUSH_FILES
@@ -5065,6 +5159,22 @@ fn parse_v2_baseline(cfg: &HubConfig, brain: &str, bytes: &[u8]) -> LinkResult<V
             crate::linkmd_v2::normalize_path(path).is_err()
                 || !is_sha256(&file.sha256)
                 || file.bytes > MAX_STORE_BYTES
+        })
+        || baseline.scan_cache.iter().any(|(path, file)| {
+            crate::linkmd_v2::normalize_path(path).is_err()
+                || !file.fingerprint.starts_with("unix-v1:")
+                || file.fingerprint.len() > 256
+                || !file.fingerprint.is_ascii()
+                || !is_sha256(&file.sha256)
+                || file.bytes > MAX_STORE_BYTES
+                || file.withheld_targets.len() > MAX_PUSH_FILES
+                || file.withheld_targets.iter().any(|target| {
+                    target.len() > MAX_STORE_PATH_BYTES
+                        || crate::linkmd_v2::normalize_path(target).is_err()
+                })
+                || baseline.files.get(path).is_none_or(|baseline_file| {
+                    baseline_file.sha256 != file.sha256 || baseline_file.bytes != file.bytes
+                })
         })
         || baseline.assets.iter().any(|(path, asset)| {
             crate::linkmd_v2::normalize_path(path).is_err()
@@ -5098,16 +5208,14 @@ fn parse_v2_baseline(cfg: &HubConfig, brain: &str, bytes: &[u8]) -> LinkResult<V
 }
 
 #[cfg(unix)]
-fn load_v2_baseline(
+fn load_v2_baseline_in(
     cfg: &HubConfig,
     brain: &str,
-    checkout: &Path,
+    directory: &TrustDirectory,
+    name_string: &str,
 ) -> LinkResult<Option<V2SyncBaseline>> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    let directory = open_trust_dir(cfg)?;
-    let name_string = v2_baseline_name(cfg, brain, checkout)?;
-    let _lock = lock_trust_name(&directory, &name_string)?;
-    let name = c_name(name_string.as_bytes(), &name_string)?;
+    let name = c_name(name_string.as_bytes(), name_string)?;
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -5120,17 +5228,48 @@ fn load_v2_baseline(
         return if error.kind() == std::io::ErrorKind::NotFound {
             Ok(None)
         } else {
-            Err(LinkError::UnsafePath { path: name_string })
+            Err(LinkError::UnsafePath {
+                path: name_string.to_string(),
+            })
         };
     }
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut bytes = Vec::new();
-    file.take(MAX_FEED_RESPONSE_BYTES + 1)
+    file.take(MAX_V2_BASELINE_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FEED_RESPONSE_BYTES {
+    if bytes.len() as u64 > MAX_V2_BASELINE_BYTES {
         return Err(invalid_feed("v2 sync baseline is oversized"));
     }
     Ok(Some(parse_v2_baseline(cfg, brain, &bytes)?))
+}
+
+#[cfg(unix)]
+fn load_v2_baseline(
+    cfg: &HubConfig,
+    brain: &str,
+    checkout: &Path,
+) -> LinkResult<Option<V2SyncBaseline>> {
+    let directory = open_trust_dir(cfg)?;
+    let name = v2_baseline_name(cfg, brain, checkout)?;
+    let _lock = lock_trust_name(&directory, &name)?;
+    load_v2_baseline_in(cfg, brain, &directory, &name)
+}
+
+#[cfg(windows)]
+fn load_v2_baseline_in(
+    cfg: &HubConfig,
+    brain: &str,
+    directory: &TrustDirectory,
+    name: &str,
+) -> LinkResult<Option<V2SyncBaseline>> {
+    let mut reader = crate::fsx::BoundedDirReader::from_root(&directory)?;
+    match reader.read(Path::new(&name), MAX_V2_BASELINE_BYTES) {
+        Ok(bytes) => Ok(Some(parse_v2_baseline(cfg, brain, &bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(LinkError::UnsafePath {
+            path: name.to_string(),
+        }),
+    }
 }
 
 #[cfg(windows)]
@@ -5142,12 +5281,7 @@ fn load_v2_baseline(
     let directory = open_trust_dir(cfg)?;
     let name = v2_baseline_name(cfg, brain, checkout)?;
     let _lock = lock_trust_name(&directory, &name)?;
-    let mut reader = crate::fsx::BoundedDirReader::from_root(&directory)?;
-    match reader.read(Path::new(&name), MAX_FEED_RESPONSE_BYTES) {
-        Ok(bytes) => Ok(Some(parse_v2_baseline(cfg, brain, &bytes)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(LinkError::UnsafePath { path: name }),
-    }
+    load_v2_baseline_in(cfg, brain, &directory, &name)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -5176,6 +5310,9 @@ fn save_v2_baseline(
     let mut bytes = serde_json::to_vec(baseline)
         .map_err(|_| invalid_feed("could not serialize v2 sync baseline"))?;
     bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_V2_BASELINE_BYTES {
+        return Err(invalid_feed("v2 sync baseline is oversized"));
+    }
     let temp_string = format!(
         ".{name_string}.tmp.{}-{}",
         std::process::id(),
@@ -5232,6 +5369,9 @@ fn save_v2_baseline(
     let mut bytes = serde_json::to_vec(baseline)
         .map_err(|_| invalid_feed("could not serialize v2 sync baseline"))?;
     bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_V2_BASELINE_BYTES {
+        return Err(invalid_feed("v2 sync baseline is oversized"));
+    }
     crate::fsx::write_atomic_beneath(&directory, Path::new(&name), &bytes, false, true)?;
     Ok(())
 }
@@ -5275,6 +5415,23 @@ fn v2_baseline_from_head(
                 .map(|file| (path.clone(), file.sha256.clone()))
         })
         .collect();
+    // The accepted remote tree is the new comparison base even if a local
+    // writer changed a few files while the commit was in flight. Preserve
+    // acceleration only for exact local/remote matches; divergent paths are
+    // intentionally absent and take the full hash path next run.
+    let scan_cache = local
+        .map(|view| {
+            view.scan_cache
+                .iter()
+                .filter(|(path, cached)| {
+                    files.get(*path).is_some_and(|remote| {
+                        remote.sha256 == cached.sha256 && remote.bytes == cached.bytes
+                    })
+                })
+                .map(|(path, cached)| (path.clone(), cached.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(V2SyncBaseline {
         v: 2,
         origin: normalized_origin(&cfg.hub)?,
@@ -5300,23 +5457,74 @@ fn v2_baseline_from_head(
         projection_sha256: (head.view_kind == "scoped")
             .then(|| scoped_projection_sha256(&head.brain_id)),
         files,
+        scan_cache,
         local_policy_digest: local.map(|view| view.policy.digest.clone()),
         local_eligibility,
         remote_copy_remains,
     })
 }
 
-fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
+#[cfg(unix)]
+fn v2_scan_fingerprint_at(metadata: &std::fs::Metadata, now_ns: i128) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // Git's "racy clean" lesson applies here: a same-size edit inside a
+    // filesystem timestamp tick can otherwise preserve the whole stat tuple.
+    // Do not cache a file until its mtime and ctime are at least two seconds
+    // behind the observer. Future/negative timestamps also stay on the full
+    // hash path. ctime cannot be restored by an unprivileged writer, so after
+    // that window an in-place edit, chmod, or atomic replacement invalidates
+    // the tuple even when a tool deliberately restores mtime.
+    let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+    let ctime_ns = i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
+    let newest = mtime_ns.max(ctime_ns);
+    if newest < 0 || now_ns.checked_sub(newest)? < 2_000_000_000 {
+        return None;
+    }
+    Some(format!(
+        "unix-v1:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
+}
+
+#[cfg(unix)]
+fn v2_scan_fingerprint(metadata: &std::fs::Metadata) -> Option<String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    let now_ns = i128::from(now.as_secs()) * 1_000_000_000 + i128::from(now.subsec_nanos());
+    v2_scan_fingerprint_at(metadata, now_ns)
+}
+
+#[cfg(not(unix))]
+fn v2_scan_fingerprint(_metadata: &std::fs::Metadata) -> Option<String> {
+    // Full hashing remains the honest portable fallback until another
+    // platform has an equally strong file-identity + change-time tuple.
+    None
+}
+
+fn v2_local_files_cached(
+    store: &Store,
+    prior_cache: Option<(&str, &std::collections::BTreeMap<String, V2ScanCacheFile>)>,
+) -> LinkResult<V2LocalView> {
     let policy = crate::linkmd_sync_policy::load(store)
         .map_err(|message| LinkError::InvalidPack { message })?;
+    let prior_cache = prior_cache
+        .filter(|(digest, _)| *digest == policy.digest.as_str())
+        .map(|(_, cache)| cache);
     let asset_paths = crate::assets::read_manifest(store)
         .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?
         .into_iter()
         .map(|asset| asset.path)
         .collect::<std::collections::BTreeSet<_>>();
     let mut result = std::collections::BTreeMap::new();
+    let mut scan_cache = std::collections::BTreeMap::new();
     let mut eligibility = std::collections::BTreeMap::new();
-    let mut riding_links = Vec::<(String, Vec<String>)>::new();
+    let mut withheld_links = Vec::<V2WithheldLink>::new();
     let mut total = 0_u64;
     let mut paths = vec![PathBuf::from("DB.md")];
     paths.extend(store.walk()?);
@@ -5338,7 +5546,44 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
             continue;
         }
         let remaining = MAX_STORE_BYTES.saturating_sub(total);
-        let bytes = store.read_bounded(&relative, remaining)?;
+        let mut file = store.open_regular(&relative)?;
+        let before = file.metadata()?;
+        if before.len() > remaining {
+            return Err(LinkError::PushTooLarge {
+                detail: format!("more than {MAX_STORE_BYTES} uncompressed bytes"),
+            });
+        }
+        let fingerprint = v2_scan_fingerprint(&before);
+        if let (Some(fingerprint), Some(cached)) = (
+            fingerprint.as_deref(),
+            prior_cache.and_then(|cache| cache.get(&path)),
+        ) {
+            if cached.fingerprint == fingerprint && cached.bytes == before.len() {
+                total = total
+                    .checked_add(cached.bytes)
+                    .ok_or_else(|| LinkError::PushTooLarge {
+                        detail: "v2 local byte count overflow".to_string(),
+                    })?;
+                result.insert(path.clone(), (cached.sha256.clone(), cached.bytes));
+                for target in &cached.withheld_targets {
+                    withheld_links.push(V2WithheldLink {
+                        source: path.clone(),
+                        target: target.clone(),
+                    });
+                }
+                scan_cache.insert(path, cached.clone());
+                continue;
+            }
+        }
+        let mut bytes = Vec::with_capacity(before.len().min(8 * 1024 * 1024) as usize);
+        Read::by_ref(&mut file)
+            .take(remaining.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > remaining {
+            return Err(LinkError::PushTooLarge {
+                detail: format!("more than {MAX_STORE_BYTES} uncompressed bytes"),
+            });
+        }
         total = total
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| LinkError::PushTooLarge {
@@ -5353,47 +5598,53 @@ fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
             return Err(LinkError::NotUtf8 { path });
         }
         let text = std::str::from_utf8(&bytes).expect("UTF-8 was checked");
-        riding_links.push((path.clone(), crate::store::extract_edge_targets(text)));
-        result.insert(path, (content_sha256(&bytes), bytes.len() as u64));
-    }
-    let kept_home = eligibility
-        .iter()
-        .filter(|(_, riding)| !**riding)
-        .map(|(path, _)| path.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut withheld_links = riding_links
-        .into_iter()
-        .flat_map(|(source, targets)| {
-            let kept_home = &kept_home;
-            let policy = &policy;
-            targets.into_iter().filter_map(move |target| {
-                let target = format!("{target}.md");
-                // A kept-home target need not be a file on THIS machine. An
-                // export omits kept-home content by construction, so a store
-                // restored from one links to names it does not carry — and
-                // without this the owner's own export could never be pushed
-                // back, which is the opposite of owning your data. The policy
-                // is the owner's statement about where a path lives, and it
-                // stands whether or not this checkout holds a copy. It
-                // discloses nothing either way: the name is already written in
-                // the content that links to it.
-                (kept_home.contains(&target) || policy.keeps_home(&target)).then_some(
-                    V2WithheldLink {
-                        source: source.clone(),
-                        target,
+        // A kept-home target need not be present on THIS machine. The policy
+        // is the owner's durable statement about where a path lives. Cache
+        // only the resulting withheld targets (rather than every wiki-link),
+        // and bind reuse to the exact policy digest above.
+        let targets = crate::store::extract_edge_targets(text)
+            .into_iter()
+            .map(|target| format!("{target}.md"))
+            .filter(|target| policy.keeps_home(target))
+            .collect::<Vec<_>>();
+        for target in &targets {
+            withheld_links.push(V2WithheldLink {
+                source: path.clone(),
+                target: target.clone(),
+            });
+        }
+        let sha256 = content_sha256(&bytes);
+        result.insert(path.clone(), (sha256.clone(), bytes.len() as u64));
+        let after = file.metadata()?;
+        if before.len() == bytes.len() as u64
+            && v2_scan_fingerprint(&before) == v2_scan_fingerprint(&after)
+        {
+            if let Some(fingerprint) = v2_scan_fingerprint(&after) {
+                scan_cache.insert(
+                    path,
+                    V2ScanCacheFile {
+                        fingerprint,
+                        sha256,
+                        bytes: bytes.len() as u64,
+                        withheld_targets: targets,
                     },
-                )
-            })
-        })
-        .collect::<Vec<_>>();
+                );
+            }
+        }
+    }
     withheld_links.sort();
     withheld_links.dedup();
     Ok(V2LocalView {
         riding: result,
+        scan_cache,
         eligibility,
         policy,
         withheld_links,
     })
+}
+
+fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
+    v2_local_files_cached(store, None)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6265,6 +6516,126 @@ fn download_v2_blobs(
 /// verified frame is durable before the next network window begins, so a
 /// retry skips it and memory never grows with total changed bytes.
 #[cfg(any(unix, windows))]
+fn queue_v2_bulk_window<'a>(
+    cache_dir: &Path,
+    window: &mut Vec<(&'a String, &'a V2BaselineFile)>,
+    window_bytes: &mut u64,
+    staged: &mut std::collections::BTreeMap<String, V2StagedFile>,
+    missing_windows: &mut Vec<Vec<(&'a String, &'a V2BaselineFile)>>,
+) -> LinkResult<()> {
+    if window.is_empty() {
+        return Ok(());
+    }
+    let missing = window
+        .iter()
+        .filter_map(|(path, file)| {
+            let target = cache_dir.join(&file.sha256);
+            match cached_blob_is_exact(&target, &file.sha256, file.bytes) {
+                Ok(true) => {
+                    staged.insert(
+                        (*path).clone(),
+                        V2StagedFile {
+                            path: (*path).clone(),
+                            source: target,
+                            sha256: file.sha256.clone(),
+                            bytes: file.bytes,
+                        },
+                    );
+                    None
+                }
+                Ok(false) => Some(Ok((*path, *file))),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<LinkResult<Vec<_>>>()?;
+    if !missing.is_empty() {
+        missing_windows.push(missing);
+    }
+    window.clear();
+    *window_bytes = 0;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn stage_v2_bulk_windows<'a>(
+    cfg: &HubConfig,
+    brain: &str,
+    pointer: &V2PointerBody,
+    cache_dir: &Path,
+    windows: Vec<Vec<(&'a String, &'a V2BaselineFile)>>,
+    staged: &mut std::collections::BTreeMap<String, V2StagedFile>,
+) -> LinkResult<()> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let worker_count = windows.len().min(V2_BLOB_DOWNLOAD_WORKERS);
+    let mut first_error = None;
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let windows = &windows;
+            let next = &next;
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(window) = windows.get(index) else {
+                    break;
+                };
+                let result = download_v2_bulk_stream(cfg, brain, pointer, window);
+                if sender.send((index, result)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+        for (index, result) in receiver {
+            match result {
+                Ok(files) => {
+                    for (path, bytes) in files {
+                        let Some(file) = windows[index].iter().find_map(|(expected_path, file)| {
+                            (*expected_path == &path).then_some(*file)
+                        }) else {
+                            first_error.get_or_insert_with(|| {
+                                invalid_feed("v2 stream returned an unrequested cache path")
+                            });
+                            continue;
+                        };
+                        match cache_v2_blob_bytes(cache_dir, &file.sha256, file.bytes, &bytes) {
+                            Ok(source) => {
+                                if staged
+                                    .insert(
+                                        path.clone(),
+                                        V2StagedFile {
+                                            path,
+                                            source,
+                                            sha256: file.sha256.clone(),
+                                            bytes: file.bytes,
+                                        },
+                                    )
+                                    .is_some()
+                                {
+                                    first_error.get_or_insert_with(|| {
+                                        invalid_feed("v2 bulk streams repeated a path")
+                                    });
+                                }
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+    });
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn stage_v2_blobs(
     cfg: &HubConfig,
     brain: &str,
@@ -6275,73 +6646,49 @@ fn stage_v2_blobs(
     let mut staged = std::collections::BTreeMap::<String, V2StagedFile>::new();
     let mut direct = Vec::new();
     let mut window = Vec::new();
+    let mut missing_windows = Vec::new();
     let mut window_bytes = 0_u64;
-    let flush = |window: &mut Vec<(&String, &V2BaselineFile)>,
-                 window_bytes: &mut u64,
-                 staged: &mut std::collections::BTreeMap<String, V2StagedFile>|
-     -> LinkResult<()> {
-        if window.is_empty() {
-            return Ok(());
-        }
-        let missing = window
-            .iter()
-            .filter_map(|(path, file)| {
-                let target = cache_dir.join(&file.sha256);
-                match cached_blob_is_exact(&target, &file.sha256, file.bytes) {
-                    Ok(true) => {
-                        staged.insert(
-                            (*path).clone(),
-                            V2StagedFile {
-                                path: (*path).clone(),
-                                source: target,
-                                sha256: file.sha256.clone(),
-                                bytes: file.bytes,
-                            },
-                        );
-                        None
-                    }
-                    Ok(false) => Some(Ok((*path, *file))),
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .collect::<LinkResult<Vec<_>>>()?;
-        if !missing.is_empty() {
-            for (path, bytes) in download_v2_bulk_stream(cfg, brain, pointer, &missing)? {
-                let file = missing
-                    .iter()
-                    .find_map(|(expected_path, file)| (*expected_path == &path).then_some(*file))
-                    .ok_or_else(|| invalid_feed("v2 stream returned an unrequested cache path"))?;
-                let source = cache_v2_blob_bytes(&cache_dir, &file.sha256, file.bytes, &bytes)?;
-                staged.insert(
-                    path.clone(),
-                    V2StagedFile {
-                        path,
-                        source,
-                        sha256: file.sha256.clone(),
-                        bytes: file.bytes,
-                    },
-                );
-            }
-        }
-        window.clear();
-        *window_bytes = 0;
-        Ok(())
-    };
     for &(path, file) in &pending {
         if file.bytes > V2_BULK_STREAM_CONTENT_BYTES {
-            flush(&mut window, &mut window_bytes, &mut staged)?;
+            queue_v2_bulk_window(
+                &cache_dir,
+                &mut window,
+                &mut window_bytes,
+                &mut staged,
+                &mut missing_windows,
+            )?;
             direct.push((path, file));
             continue;
         }
         if window.len() == V2_BULK_STREAM_FILES
             || window_bytes.saturating_add(file.bytes) > V2_BULK_STREAM_CONTENT_BYTES
         {
-            flush(&mut window, &mut window_bytes, &mut staged)?;
+            queue_v2_bulk_window(
+                &cache_dir,
+                &mut window,
+                &mut window_bytes,
+                &mut staged,
+                &mut missing_windows,
+            )?;
         }
         window.push((path, file));
         window_bytes += file.bytes;
     }
-    flush(&mut window, &mut window_bytes, &mut staged)?;
+    queue_v2_bulk_window(
+        &cache_dir,
+        &mut window,
+        &mut window_bytes,
+        &mut staged,
+        &mut missing_windows,
+    )?;
+    stage_v2_bulk_windows(
+        cfg,
+        brain,
+        pointer,
+        &cache_dir,
+        missing_windows,
+        &mut staged,
+    )?;
     for item in prepare_v2_downloads(cfg, brain, pointer, &direct)? {
         let source =
             download_presigned_to_cache(cfg, &item.url, &cache_dir, &item.sha256, item.bytes)?;
@@ -6478,7 +6825,28 @@ fn read_historical_conflict_blob(
         "/api/hub/brains/{brain}/v2/history/blob?seq={seq}&commit={commit}&path={encoded_path}&sha256={}",
         file.sha256
     );
-    let raw = request_raw(cfg, "GET", &endpoint, None, Auth::Required, file.bytes)?;
+    let history_http = hub_agent_with_timeout(cfg, std::time::Duration::from_secs(15))?;
+    let raw = match request_raw_with_agent(
+        cfg,
+        &history_http,
+        "GET",
+        &endpoint,
+        None,
+        RawRequestOptions {
+            auth: Auth::Required,
+            max_response_bytes: file.bytes,
+            request_id: None,
+            retry_transport: false,
+        },
+    ) {
+        Ok(raw) => raw,
+        // The base body is diagnostic convenience only. The conflict plan
+        // already carries its verified hash/length, plus exact local and
+        // current-remote bodies. A slow retained-object read must not prevent
+        // the operator from choosing keep-local or take-remote safely.
+        Err(LinkError::Transport { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if raw.status == 404 || raw.status == 403 {
         return Ok(None);
     }
@@ -6563,11 +6931,20 @@ fn create_v2_conflict_bundle(
     };
 
     let mut files = Vec::with_capacity(selected_paths.len());
+    let mut historical_body_available = true;
     for (index, path) in selected_paths.iter().enumerate() {
         let base_file = baseline.and_then(|state| state.files.get(path));
-        let base_bytes = match (baseline, base_file) {
-            (Some(state), Some(file)) => {
-                read_historical_conflict_blob(cfg, &head.brain_id, state, path, file)?
+        let base_bytes = match (historical_body_available, baseline, base_file) {
+            (true, Some(state), Some(file)) => {
+                let bytes = read_historical_conflict_blob(cfg, &head.brain_id, state, path, file)?;
+                if bytes.is_none() {
+                    // Historical content is optional diagnostic context. Once
+                    // the retained-object lane proves unavailable, preserve
+                    // the exact base coordinates but spend no more network
+                    // time on this bundle.
+                    historical_body_available = false;
+                }
+                bytes
             }
             _ => None,
         };
@@ -6919,7 +7296,13 @@ fn v2_sync_pull_with_resolution(
                 message: format!("installed v2 checkout is not a valid db.md store: {error}"),
             })?;
         let installed_local = if install_changed {
-            let mut scanned = v2_local_files(&installed_store)?;
+            let hint = baseline.as_ref().and_then(|state| {
+                state
+                    .local_policy_digest
+                    .as_deref()
+                    .map(|digest| (digest, &state.scan_cache))
+            });
+            let mut scanned = v2_local_files_cached(&installed_store, hint)?;
             remove_scoped_projection(&head, baseline.as_ref(), &mut scanned)?;
             scanned
         } else {
@@ -7396,6 +7779,27 @@ fn v2_resolution_allows_path(
     resolution.is_none_or(|allowed| allowed.contains_key(path) || !remote_present)
 }
 
+fn v2_resolution_allows_asset(
+    resolution: Option<&std::collections::BTreeMap<String, V2ResolutionOverride>>,
+    base: Option<&V2BaselineAsset>,
+    remote: Option<&V2BaselineAsset>,
+    local: Option<&crate::AssetRecord>,
+) -> bool {
+    let Some(allowed) = resolution else {
+        return false;
+    };
+    let wrappers = base
+        .into_iter()
+        .flat_map(|asset| asset.wrappers.iter())
+        .chain(remote.into_iter().flat_map(|asset| asset.wrappers.iter()))
+        .chain(local.into_iter().flat_map(|asset| asset.wrappers.iter()))
+        .collect::<BTreeSet<_>>();
+    !wrappers.is_empty()
+        && wrappers
+            .iter()
+            .all(|wrapper| allowed.contains_key(*wrapper))
+}
+
 #[derive(Debug, Clone)]
 struct V2ResolutionOverride {
     expected_remote: Option<String>,
@@ -7415,6 +7819,11 @@ struct V2SyncPushOptions<'a> {
     pulled: Option<V2PulledSnapshot>,
     withdrawal_paths: &'a [String],
     withdrawal_reason: Option<&'a str>,
+    /// Permit one automatic DB.md-only commit before the remaining exact
+    /// content/asset operations. The recursive second phase disables this so
+    /// a concurrently edited contract fails for a clean retry instead of
+    /// creating an unbounded commit chain.
+    allow_contract_phase: bool,
 }
 
 fn verify_v2_upload_source(
@@ -7851,6 +8260,7 @@ fn v2_sync_push(
         pulled,
         withdrawal_paths,
         withdrawal_reason,
+        allow_contract_phase,
     } = options;
     let _operation_lock = lock_v2_sync_operation(cfg, &head.brain_id)?;
     let head = v2_verified_head(cfg, requested_brain)?
@@ -7941,6 +8351,62 @@ fn v2_sync_push(
             }
         }
     }
+    // An accepted commit can outlive the response path that would have saved
+    // its local baseline. If the complete current riding tree and asset set
+    // already match the independently verified new head, fast-forward the
+    // private baseline by proof. This is not force and cannot hide a conflict:
+    // any differing path falls through to the ordinary three-way algorithm.
+    if baseline
+        .as_ref()
+        .is_some_and(|state| !v2_baseline_matches_head(&head, state))
+        && resolution.is_none()
+        && withdrawal_paths.is_empty()
+        && v2_riding_matches_remote(local, &remote, |path| local_view.policy.keeps_home(path))
+        && v2_asset_records_match_remote(&local_assets, &remote_assets)
+    {
+        let final_head = v2_verified_head(cfg, requested_brain)?
+            .ok_or_else(|| invalid_feed("v2 head disappeared during baseline recovery"))?;
+        if !same_v2_head(&head, &final_head) {
+            return Err(LinkError::RemoteAdvancedDuringSync);
+        }
+        let mut final_local = v2_local_files_cached(
+            store,
+            Some((&local_view.policy.digest, &local_view.scan_cache)),
+        )?;
+        remove_scoped_projection(&head, baseline.as_ref(), &mut final_local)?;
+        let final_assets = v2_local_asset_records(store)?;
+        if final_local.riding != local_view.riding || final_assets != local_assets {
+            return Err(LinkError::RemoteAdvancedDuringSync);
+        }
+        let checkout_pseudonym = v2_checkout_id(
+            baseline
+                .as_ref()
+                .and_then(|current| current.checkout_id.as_deref()),
+        )?;
+        let next = v2_baseline_from_head(
+            cfg,
+            &head,
+            remote,
+            remote_assets,
+            Some(&final_local),
+            Some(&checkout_pseudonym),
+        )?;
+        let split_count = next.remote_copy_remains.len();
+        accept_v2_head(cfg, &final_head)?;
+        refresh_scoped_view_marker(store, &head, next.files.len())?;
+        save_v2_baseline(cfg, &head.brain_id, &store.root, &next)?;
+        return Ok(json!({
+            "v": 2,
+            "outcome": "no_change",
+            "sync_status": "synced",
+            "baseline_recovered": true,
+            "seq": head.pointer.as_ref().map_or(0, |pointer| pointer.seq),
+            "commit_hash": head.pointer.as_ref().map(|pointer| &pointer.commit_hash),
+            "local_policy": {
+                "remote_copy_remains": split_count,
+            },
+        }));
+    }
     let base = match baseline.as_ref() {
         Some(state) => &state.files,
         None if remote.is_empty() => &remote,
@@ -7970,6 +8436,13 @@ fn v2_sync_push(
         let remote_hash = remote_file.map(|file| file.sha256.as_str());
         let local_file = local.get(&path);
         let local_hash = local_file.map(|file| file.0.as_str());
+        // A remote change that already equals the exact local intent is
+        // converged, even when the private baseline is older. Emitting a
+        // redundant put here can turn a completed DB.md contract phase back
+        // into another mixed contract/content mutation.
+        if local_hash == remote_hash {
+            continue;
+        }
         if local_hash == base_hash {
             continue;
         }
@@ -8053,10 +8526,29 @@ fn v2_sync_push(
         Some(state) => &state.assets,
         None if remote_assets.is_empty() => &remote_assets,
         None => {
-            let mismatched = remote_assets.iter().any(|(path, remote)| {
-                local_assets.get(path) != Some(&v2_asset_record(remote, path))
-            }) || local_assets.len() != remote_assets.len();
-            if mismatched {
+            let mismatched = remote_assets
+                .keys()
+                .chain(local_assets.keys())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|path| {
+                    remote_assets
+                        .get(*path)
+                        .map(|asset| v2_asset_record(asset, path))
+                        .as_ref()
+                        != local_assets.get(*path)
+                })
+                .collect::<Vec<_>>();
+            let resolution_covers_all = !mismatched.is_empty()
+                && mismatched.iter().all(|path| {
+                    v2_resolution_allows_asset(
+                        resolution,
+                        None,
+                        remote_assets.get(*path),
+                        local_assets.get(*path),
+                    )
+                });
+            if !mismatched.is_empty() && !resolution_covers_all {
                 return Err(LinkError::Conflict {
                     paths: vec!["assets.jsonl".to_string()],
                 });
@@ -8134,7 +8626,10 @@ fn v2_sync_push(
         if local_record == base_record.as_ref() && !resumes_hosting {
             continue;
         }
-        if remote_record != base_record && local_record != remote_record.as_ref() {
+        if remote_record != base_record
+            && local_record != remote_record.as_ref()
+            && !v2_resolution_allows_asset(resolution, base_assets.get(&path), remote, local_record)
+        {
             conflicts.push(path);
             continue;
         }
@@ -8206,6 +8701,31 @@ fn v2_sync_push(
             paths: asset_withdrawal_transitions,
         });
     }
+    let contract_phase = operations.len() > 1
+        && operations.iter().any(|operation| {
+            operation.get("path").and_then(Value::as_str) == Some("DB.md")
+                && !operation
+                    .get("op")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("asset_"))
+        });
+    if contract_phase {
+        if !allow_contract_phase {
+            return Err(LinkError::RemoteAdvancedDuringSync);
+        }
+        operations.retain(|operation| {
+            operation.get("path").and_then(Value::as_str) == Some("DB.md")
+                && !operation
+                    .get("op")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("asset_"))
+        });
+        let contract_blobs = operations
+            .iter()
+            .filter_map(|operation| operation.get("blob").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        upload_sources.retain(|sha256, _| contract_blobs.contains(sha256.as_str()));
+    }
     let touched_sources = operations
         .iter()
         .filter_map(
@@ -8237,7 +8757,10 @@ fn v2_sync_push(
         if !same_v2_head(&head, &final_head) {
             return Err(LinkError::RemoteAdvancedDuringSync);
         }
-        let mut final_local = v2_local_files(store)?;
+        let mut final_local = v2_local_files_cached(
+            store,
+            Some((&local_view.policy.digest, &local_view.scan_cache)),
+        )?;
         remove_scoped_projection(&head, baseline.as_ref(), &mut final_local)?;
         let final_assets = v2_local_asset_records(store)?;
         let local_changed = final_local.riding != local_view.riding || final_assets != local_assets;
@@ -8254,7 +8777,7 @@ fn v2_sync_push(
         )?;
         let split_count = next.remote_copy_remains.len();
         accept_v2_head(cfg, &final_head)?;
-        if !local_changed && !remote_ahead {
+        if !remote_ahead {
             refresh_scoped_view_marker(store, &head, next.files.len())?;
             save_v2_baseline(cfg, &head.brain_id, &store.root, &next)?;
         }
@@ -8651,7 +9174,10 @@ fn v2_sync_push(
         };
         (remote, assets)
     };
-    let mut final_local = v2_local_files(store)?;
+    let mut final_local = v2_local_files_cached(
+        store,
+        Some((&local_view.policy.digest, &local_view.scan_cache)),
+    )?;
     remove_scoped_projection(&refreshed, baseline.as_ref(), &mut final_local)?;
     let final_assets = v2_local_asset_records(store)?;
     let local_dirty = final_local.riding != local_view.riding
@@ -8660,6 +9186,27 @@ fn v2_sync_push(
         })
         || final_assets != local_assets
         || !v2_asset_records_match_remote(&final_assets, &refreshed_assets);
+    // A required DB.md-only first phase can hand its already verified remote
+    // manifests and local stat/hash view directly to the second phase. This is
+    // an in-memory optimization only; v2_sync_push re-verifies the hosted head
+    // under the operation lock, upload sources are re-opened before use, and
+    // the ordinary final scan still detects concurrent local edits.
+    let contract_handoff = contract_phase.then(|| V2PulledSnapshot {
+        report: PullReport {
+            brain: refreshed.brain_id.clone(),
+            slug: requested_brain.to_string(),
+            head_seq: refreshed.pointer.as_ref().map_or(0, |pointer| pointer.seq),
+            files: refreshed_files.len(),
+            dest: store.root.to_string_lossy().into_owned(),
+            extra_local: Vec::new(),
+            sync_status: "contract_phase".to_string(),
+        },
+        head: refreshed.clone(),
+        files: refreshed_files.clone(),
+        assets: refreshed_assets.clone(),
+        local: final_local.clone(),
+        local_assets: final_assets.clone(),
+    });
     let next = v2_baseline_from_head(
         cfg,
         &refreshed,
@@ -8672,8 +9219,12 @@ fn v2_sync_push(
     accept_v2_head(cfg, &refreshed)?;
     if !local_dirty {
         refresh_scoped_view_marker(store, &refreshed, next.files.len())?;
-        save_v2_baseline(cfg, &refreshed.brain_id, &store.root, &next)?;
     }
+    // The verified accepted head remains the correct three-way base when a
+    // local writer races the final scan. v2_baseline_from_head kept cache
+    // entries only for exact local/remote matches, so saving here neither
+    // hides those edits nor trusts their stale hashes.
+    save_v2_baseline(cfg, &refreshed.brain_id, &store.root, &next)?;
     if let Some(object) = result.as_object_mut() {
         object.insert(
             "local_policy".to_string(),
@@ -8687,6 +9238,38 @@ fn v2_sync_push(
                 "synced".to_string()
             }),
         );
+    }
+    if contract_phase && result.get("code").and_then(Value::as_str) != Some("proposal_queued") {
+        let contract_receipt = result;
+        // The hub deliberately requires DB.md authority changes to be a sole,
+        // strict-head mutation. Release the checkout-wide operation lock, then
+        // recompute the remaining delta from the independently verified new
+        // head. No local byte or permission conclusion is carried across.
+        drop(_operation_lock);
+        let mut remaining = v2_sync_push(
+            cfg,
+            requested_brain,
+            store,
+            refreshed,
+            V2SyncPushOptions {
+                resume_local_policy,
+                bulk_confirmation,
+                resolution,
+                pulled: contract_handoff,
+                withdrawal_paths,
+                withdrawal_reason,
+                allow_contract_phase: false,
+            },
+        )?;
+        if let Some(object) = remaining.as_object_mut() {
+            object.insert("contract_phase".to_string(), contract_receipt);
+        }
+        return Ok(remaining);
+    }
+    if contract_phase {
+        if let Some(object) = result.as_object_mut() {
+            object.insert("contract_phase_pending".to_string(), Value::Bool(true));
+        }
     }
     Ok(result)
 }
@@ -8752,6 +9335,7 @@ pub fn sync_push_incremental_with_controls(
                 pulled: None,
                 withdrawal_paths,
                 withdrawal_reason,
+                allow_contract_phase: true,
             },
         );
     }
@@ -8769,6 +9353,132 @@ pub fn sync_push_incremental_with_controls(
 pub fn has_v2_sync_baseline(cfg: &HubConfig, brain: &str, checkout: &Path) -> LinkResult<bool> {
     require_safe_ref(brain)?;
     Ok(load_v2_baseline(cfg, brain, checkout)?.is_some())
+}
+
+/// Rebind one verified incremental baseline after its checkout directory was
+/// moved without changing the checkout bytes. Baselines deliberately live in
+/// private trust state and are path-bound, so callers performing an atomic
+/// staged publish must cross this explicit boundary instead of silently
+/// turning the moved checkout into a baseline-less clone.
+pub fn relocate_v2_sync_baseline(
+    cfg: &HubConfig,
+    brain: &str,
+    from: &Path,
+    to: &Path,
+) -> LinkResult<Value> {
+    require_hardened_filesystem("verified link.md v2 baseline relocation")?;
+    require_safe_ref(brain)?;
+    if !crate::ulid::is_ulid(brain) {
+        return Err(invalid_feed(
+            "v2 baseline relocation requires the canonical brain id",
+        ));
+    }
+    let from_absolute = if from.is_absolute() {
+        from.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(from)
+    };
+    let to_absolute = if to.is_absolute() {
+        to.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(to)
+    };
+    let source_name = v2_baseline_name(cfg, brain, &from_absolute)?;
+    let target_name = v2_baseline_name(cfg, brain, &to_absolute)?;
+    if source_name == target_name {
+        return Err(invalid_feed(
+            "v2 baseline relocation source and destination are the same checkout",
+        ));
+    }
+    match std::fs::symlink_metadata(&from_absolute) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => {
+            return Err(LinkError::InvalidPack {
+                message: "the old checkout still exists; move it before relocating its baseline"
+                    .to_string(),
+            })
+        }
+    }
+    let store = Store::open_strict(&to_absolute).map_err(|error| LinkError::InvalidPack {
+        message: format!("relocated checkout is not a valid db.md store: {error}"),
+    })?;
+    let _operation_lock = lock_v2_sync_operation(cfg, brain)?;
+
+    #[cfg(any(unix, windows))]
+    {
+        let directory = open_trust_dir(cfg)?;
+        let mut lock_names = [source_name.as_str(), target_name.as_str()];
+        lock_names.sort();
+        let _locks = lock_names
+            .iter()
+            .map(|name| lock_trust_name(&directory, name))
+            .collect::<LinkResult<Vec<_>>>()?;
+        let source = load_v2_baseline_in(cfg, brain, &directory, &source_name)?;
+        let target = load_v2_baseline_in(cfg, brain, &directory, &target_name)?;
+        let (baseline, already_relocated) = match (source, target) {
+            (Some(source), None) => (source, false),
+            (None, Some(target)) => (target, true),
+            (Some(_), Some(_)) => {
+                return Err(LinkError::InvalidPack {
+                    message: "both old and new checkout paths already have private sync baselines"
+                        .to_string(),
+                })
+            }
+            (None, None) => {
+                return Err(LinkError::InvalidPack {
+                    message: "the old checkout has no verified incremental baseline to relocate"
+                        .to_string(),
+                })
+            }
+        };
+
+        let mut local = v2_local_files(&store)?;
+        if baseline.view_kind.as_deref() == Some("scoped") {
+            let expected = baseline
+                .projection_sha256
+                .as_deref()
+                .ok_or_else(|| invalid_feed("scoped baseline has no projection hash"))?;
+            if local.riding.get("DB.md").map(|value| value.0.as_str()) != Some(expected) {
+                return Err(LinkError::ScopedProjectionModified);
+            }
+            local.riding.remove("DB.md");
+        }
+        if baseline.local_policy_digest.as_deref() != Some(local.policy.digest.as_str())
+            || !v2_riding_matches_remote(&local.riding, &baseline.files, |path| {
+                local.policy.keeps_home(path)
+            })
+            || !v2_asset_records_match_remote(&v2_local_asset_records(&store)?, &baseline.assets)
+        {
+            return Err(LinkError::InvalidPack {
+                message: "the moved checkout no longer matches its verified incremental baseline"
+                    .to_string(),
+            });
+        }
+        if !already_relocated {
+            crate::fsx::rename_beneath(
+                &directory,
+                Path::new(&source_name),
+                Path::new(&target_name),
+            )?;
+            directory.sync_all()?;
+        }
+        Ok(json!({
+            "v": 2,
+            "class": "checkout_baseline_relocated",
+            "brain": baseline.brain,
+            "from": from_absolute,
+            "to": to_absolute,
+            "headSeq": baseline.head_seq.unwrap_or(0),
+            "commitHash": baseline.commit_hash,
+            "moved": !already_relocated,
+        }))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    Err(LinkError::UnsupportedPlatform {
+        operation: "verified link.md v2 baseline relocation",
+    })
 }
 
 #[cfg(windows)]
@@ -9057,6 +9767,7 @@ pub fn sync_resolve_conflict(
                     pulled: None,
                     withdrawal_paths: &[],
                     withdrawal_reason: None,
+                    allow_contract_phase: true,
                 },
             )?
         }
@@ -9150,6 +9861,7 @@ pub fn sync_converge_with_controls(
             pulled: Some(pulled),
             withdrawal_paths,
             withdrawal_reason,
+            allow_contract_phase: true,
         },
     )?;
     if let Some(object) = result.as_object_mut() {
@@ -11083,12 +11795,11 @@ fn verify_snapshot_manifest(entries: &[(String, Vec<u8>)], signed: &[FeedFile]) 
     Ok(())
 }
 
-/// Collect the files a push sends: the store's owned text — `DB.md`,
-/// `assets.jsonl` when present, and every content `.md` under `records/` and
-/// `sources/` (the store walk, which already excludes hidden dirs like
-/// `.dbmd/`, the `log/` archive, and derived `index.*` catalogs; the hub
-/// derives its own index, and local history stays local). Returns
-/// `(store-relative path, content)` pairs, path-sorted.
+/// Collect the files a push sends: the store's owned source text — `DB.md`,
+/// `assets.jsonl` when present, the canonical curator timeline (`log.md` plus
+/// rotated `log/*.md` archives), and every content `.md` under `records/` and
+/// `sources/`. Derived `index.*` catalogs remain local because the receiver
+/// rebuilds them. Returns `(store-relative path, content)` pairs, path-sorted.
 pub fn collect_push_files(store: &Store) -> LinkResult<Vec<(String, String)>> {
     require_hardened_filesystem("sync push")?;
     preflight_push_ownership(store)?;
@@ -11118,6 +11829,25 @@ pub fn collect_push_files(store: &Store) -> LinkResult<Vec<(String, String)>> {
         .unwrap_or(false)
     {
         out.push(("assets.jsonl".to_string(), read_text("assets.jsonl")?));
+    }
+    if store
+        .regular_file_exists(Path::new("log.md"))
+        .unwrap_or(false)
+    {
+        out.push(("log.md".to_string(), read_text("log.md")?));
+    }
+    if store.directory_exists(Path::new("log"))? {
+        for rel in store.walk_regular_files(Path::new("log"))? {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if rel.extension().and_then(std::ffi::OsStr::to_str) != Some("md") {
+                continue;
+            }
+            if !safe_store_rel_path(&rel_str) {
+                return Err(LinkError::UnsafePath { path: rel_str });
+            }
+            let content = read_text(&rel_str)?;
+            out.push((rel_str, content));
+        }
     }
 
     for rel in store.walk()? {
@@ -16765,6 +17495,55 @@ mod tests {
         assert!(err.contains("nested db.md store"), "{err}");
     }
 
+    #[test]
+    fn collect_push_files_carries_curator_history_but_not_derived_catalogs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("records/notes")).unwrap();
+        std::fs::create_dir_all(root.path().join("log")).unwrap();
+        std::fs::write(
+            root.path().join("DB.md"),
+            "---\ntype: db-md\nscope: company\nowner: Test\n---\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("index.md"), "derived root catalog\n").unwrap();
+        std::fs::write(
+            root.path().join("records/notes/index.md"),
+            "derived type catalog\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("records/notes/owned.md"),
+            "---\ntype: note\nsummary: owned\ncreated: 2026-08-26T00:00:00Z\nupdated: 2026-08-26T00:00:00Z\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("log.md"),
+            "---\ntype: log\n---\n\n# Curator log\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("log/2026-07.md"),
+            "---\ntype: log\n---\n\n# Curator log — 2026-07\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("log/README.txt"), "not a log archive\n").unwrap();
+
+        let store = Store::open_strict(root.path()).unwrap();
+        let paths: Vec<String> = collect_push_files(&store)
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+
+        assert!(paths.contains(&"DB.md".to_string()));
+        assert!(paths.contains(&"records/notes/owned.md".to_string()));
+        assert!(paths.contains(&"log.md".to_string()));
+        assert!(paths.contains(&"log/2026-07.md".to_string()));
+        assert!(!paths.contains(&"index.md".to_string()));
+        assert!(!paths.contains(&"records/notes/index.md".to_string()));
+        assert!(!paths.contains(&"log/README.txt".to_string()));
+    }
+
     #[cfg(unix)]
     #[test]
     fn remote_push_uses_opened_root_after_path_replacement() {
@@ -17871,6 +18650,62 @@ mod tests {
     }
 
     #[test]
+    fn a_patient_commit_waits_for_its_typed_post_acceptance_receipt_lag() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let lag = br#"{"error":"validation recovery state is not at the source head","details":{"code":"validation_index_catching_up"}}"#;
+            let receipt = br#"{"v":2,"outcome":"converged"}"#;
+            for (status, body) in [
+                ("422 Unprocessable Entity", lag.as_slice()),
+                ("200 OK", receipt.as_slice()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request_bytes = [0_u8; 4096];
+                let _ = stream.read(&mut request_bytes).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let cfg = HubConfig {
+            hub: format!("http://{address}"),
+            key: Some("k".to_string()),
+            agent_key: None,
+            brain_key: None,
+            state_dir: tempfile::tempdir().unwrap().keep(),
+            store_selected: false,
+        };
+
+        let response = request_patient(
+            &cfg,
+            "POST",
+            "/api/hub/brains/b/v2/commits",
+            Some(&json!({ "mutation_id": "dbmd-1" })),
+            Auth::Required,
+        )
+        .expect("typed projection lag is retried until the exact receipt is available");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response
+                .body
+                .as_ref()
+                .and_then(|value| value.get("outcome"))
+                .and_then(Value::as_str),
+            Some("converged")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn a_mutation_body_that_dies_mid_stream_is_a_transport_failure() {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
@@ -18455,6 +19290,7 @@ mod tests {
             control_revision: Some(revision.to_string()),
             projection_sha256: Some(scoped_projection_sha256(TEST_BRAIN_ID)),
             files: std::collections::BTreeMap::new(),
+            scan_cache: std::collections::BTreeMap::new(),
             local_policy_digest: None,
             local_eligibility: std::collections::BTreeMap::new(),
             remote_copy_remains: std::collections::BTreeMap::new(),
@@ -18490,6 +19326,34 @@ mod tests {
             parse_v2_baseline(&cfg, TEST_BRAIN_ID, &refused),
             Err(LinkError::InvalidFeed { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_stat_cache_waits_out_racy_files_and_binds_file_identity() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.md");
+        let second = directory.path().join("second.md");
+        std::fs::write(&first, b"same").unwrap();
+        std::fs::write(&second, b"same").unwrap();
+        let first = std::fs::metadata(first).unwrap();
+        let second = std::fs::metadata(second).unwrap();
+        let observed_ns = |metadata: &std::fs::Metadata| {
+            let mtime =
+                i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+            let ctime =
+                i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
+            mtime.max(ctime)
+        };
+
+        assert!(v2_scan_fingerprint_at(&first, observed_ns(&first) + 1_000_000_000).is_none());
+        let first_fingerprint =
+            v2_scan_fingerprint_at(&first, observed_ns(&first) + 3_000_000_000).unwrap();
+        let second_fingerprint =
+            v2_scan_fingerprint_at(&second, observed_ns(&second) + 3_000_000_000).unwrap();
+        assert_ne!(first_fingerprint, second_fingerprint);
     }
 
     #[test]
@@ -18781,6 +19645,76 @@ mod tests {
         assert_eq!(first, v2_checkout_id(Some(&first)).unwrap());
         assert_ne!(first, v2_checkout_id(None).unwrap());
         assert!(is_sha256(&first));
+    }
+
+    #[test]
+    fn moved_checkout_relocates_its_path_bound_baseline_without_rehash_ambiguity() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let stage_root = sandbox.path().join("stage");
+        let live_root = sandbox.path().join("live");
+        let from = stage_root.join("db");
+        let to = live_root.join("db");
+        std::fs::create_dir_all(from.join("records/items")).unwrap();
+        std::fs::write(
+            from.join("DB.md"),
+            b"---\ntype: db-md\nscope: company\nowner: test\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            from.join("records/items/example.md"),
+            b"---\ntype: item\n---\n\n# Example\n",
+        )
+        .unwrap();
+        let cfg = test_hub_config(
+            "https://hub.example".to_string(),
+            sandbox.path().join("state"),
+        );
+        let store = Store::open_strict(&from).unwrap();
+        let local = v2_local_files(&store).unwrap();
+        let files = local
+            .riding
+            .iter()
+            .map(|(path, (sha256, bytes))| {
+                (
+                    path.clone(),
+                    V2BaselineFile {
+                        sha256: sha256.clone(),
+                        bytes: *bytes,
+                        proof: None,
+                    },
+                )
+            })
+            .collect();
+        let baseline = V2SyncBaseline {
+            v: 2,
+            origin: "https://hub.example".to_string(),
+            brain: TEST_BRAIN_ID.to_string(),
+            checkout_id: Some("c".repeat(64)),
+            head_seq: Some(7),
+            commit_hash: Some("a".repeat(64)),
+            content_root: Some("b".repeat(64)),
+            asset_root: None,
+            assets: std::collections::BTreeMap::new(),
+            view_kind: Some("full".to_string()),
+            view_revision: Some("d".repeat(64)),
+            control_revision: Some("e".repeat(64)),
+            projection_sha256: None,
+            files,
+            scan_cache: local.scan_cache.clone(),
+            local_policy_digest: Some(local.policy.digest.clone()),
+            local_eligibility: local.eligibility.clone(),
+            remote_copy_remains: std::collections::BTreeMap::new(),
+        };
+        save_v2_baseline(&cfg, TEST_BRAIN_ID, &from, &baseline).unwrap();
+        std::fs::rename(&stage_root, &live_root).unwrap();
+
+        let first = relocate_v2_sync_baseline(&cfg, TEST_BRAIN_ID, &from, &to).unwrap();
+        assert_eq!(first.get("moved").and_then(Value::as_bool), Some(true));
+        assert!(!has_v2_sync_baseline(&cfg, TEST_BRAIN_ID, &from).unwrap());
+        assert!(has_v2_sync_baseline(&cfg, TEST_BRAIN_ID, &to).unwrap());
+
+        let retry = relocate_v2_sync_baseline(&cfg, TEST_BRAIN_ID, &from, &to).unwrap();
+        assert_eq!(retry.get("moved").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
@@ -19670,6 +20604,7 @@ mod tests {
                 control_revision: Some("d".repeat(64)),
                 projection_sha256: None,
                 files: Default::default(),
+                scan_cache: Default::default(),
                 local_policy_digest: None,
                 local_eligibility: Default::default(),
                 remote_copy_remains: Default::default(),
@@ -19683,5 +20618,74 @@ mod tests {
         assert!(!root.join(V2_PULL_JOURNAL).exists());
         assert!(!root.join(backup_dir).exists());
         assert!(!root.join(orphan).exists());
+    }
+
+    #[test]
+    fn only_typed_validation_projection_lag_retries_v2_head() {
+        let typed = HubResponse {
+            status: 422,
+            body: Some(json!({ "code": "validation_index_catching_up" })),
+        };
+        let nested = HubResponse {
+            status: 422,
+            body: Some(json!({
+                "details": { "code": "validation_index_catching_up" }
+            })),
+        };
+        let unrelated = HubResponse {
+            status: 422,
+            body: Some(json!({ "code": "source_immutable" })),
+        };
+        let wrong_status = HubResponse {
+            status: 403,
+            body: typed.body.clone(),
+        };
+        assert!(v2_validation_catching_up(&typed));
+        assert!(v2_validation_catching_up(&nested));
+        assert!(!v2_validation_catching_up(&unrelated));
+        assert!(!v2_validation_catching_up(&wrong_status));
+    }
+
+    #[test]
+    fn asset_resolution_is_limited_to_explicitly_resolved_wrappers() {
+        let wrapper = "records/operational/package.md".to_string();
+        let mut resolution = std::collections::BTreeMap::new();
+        resolution.insert(
+            wrapper.clone(),
+            V2ResolutionOverride {
+                expected_remote: Some("a".repeat(64)),
+                selected_local: Some("b".repeat(64)),
+            },
+        );
+        let local = crate::AssetRecord {
+            path: "sources/package/object.blob".to_string(),
+            sha256: "c".repeat(64),
+            bytes: 1,
+            media_type: "application/octet-stream".to_string(),
+            wrappers: vec![wrapper.clone()],
+            required: true,
+        };
+        assert!(v2_resolution_allows_asset(
+            Some(&resolution),
+            None,
+            None,
+            Some(&local),
+        ));
+        let unrelated = crate::AssetRecord {
+            wrappers: vec!["records/unrelated.md".to_string()],
+            ..local
+        };
+        assert!(!v2_resolution_allows_asset(
+            Some(&resolution),
+            None,
+            None,
+            Some(&unrelated),
+        ));
+        assert!(!v2_resolution_allows_asset(
+            None,
+            None,
+            None,
+            Some(&unrelated),
+        ));
     }
 }

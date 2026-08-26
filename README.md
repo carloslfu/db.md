@@ -282,7 +282,46 @@ Permissioned v2 sync transfers changed files rather than whole snapshots,
 verifies the signed remote state, and compares both sides with the last
 accepted baseline. A clean change or deletion can move in either direction.
 A divergent edit changes neither side and leaves a private conflict bundle
-for explicit resolution.
+for explicit resolution. The canonical curator timeline (`log.md` plus rotated
+`log/*.md` archives) rides sync; derived `index.*` catalogs rebuild locally.
+Typed post-commit projection lag is retried in place. If a receipt was lost but
+the complete local riding tree exactly matches the verified head, dbmd safely
+recovers the private baseline without downloading historical blobs; a single
+difference still follows the ordinary conflict path. Historical base bodies are
+optional context in a bundle, while current local/remote bodies and exact base
+coordinates remain binding.
+
+`DB.md` authority changes are automatically phased as one strict-head contract
+commit followed by the recomputed content/asset delta, because a contract must
+never silently authorize the other mutations travelling beside it. The second
+phase re-verifies the new head and reuses only the first phase's in-memory,
+racy-clean-safe local scan; concurrent contract edits stop for a fresh retry.
+An exact mutation whose response was lost also waits through the hub's typed
+validation-recovery lag and asks again for the same idempotent receipt.
+
+Repeated scans of a stable Unix checkout are locally incremental too. The
+private baseline caches a content hash and the `.sevralocal`-filtered link
+result behind the exact device/inode/length/mtime/ctime tuple. Files inside a
+racy timestamp window, files changed by bytes or metadata, policy changes, and
+platforms without an equivalent identity tuple are re-read and re-hashed. This
+is private disposable acceleration, never signed state and never a substitute
+for content-addressed verification at upload/commit boundaries.
+
+Cold pulls use the same principle in the other direction: verified blobs are
+staged by hash in a private resumable cache, and independent ≤8 MiB bulk
+windows run with a bounded four-worker ceiling. An interrupted clone therefore
+reuses only exact proof-bound bytes, while the destination remains unpublished
+until the complete store and declared asset set verify.
+
+The private incremental baseline is deliberately bound to the checkout's
+absolute path. A higher-level tool that publishes a verified checkout by
+atomically renaming a private stage must immediately run
+`dbmd sync <canonical-brain-id> relocate --from <old-store> --to <new-store>`.
+Relocation is local-only and atomic: the old path must be gone, the new store
+must still match every baseline content and asset coordinate, and an existing
+destination baseline is never overwritten. This preserves the next ordinary
+sync as an incremental operation instead of misclassifying a moved clone as a
+baseline-less concurrent edit.
 
 Grants can expose a whole brain or a path-scoped view. Writes that require
 review become proposals. `.sevralocal` keeps selected content and assets at

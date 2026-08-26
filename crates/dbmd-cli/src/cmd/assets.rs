@@ -1,9 +1,10 @@
 //! `dbmd assets <sub>` — the heavy-binary asset manifest.
 //!
 //! Arg-parse + format glue only; all logic lives in [`dbmd_core::assets`].
-//! Dispatches the five leaves:
+//! Dispatches the six leaves:
 //!   - `scan`   → discover declarations, hash present files, rewrite `assets.jsonl`
 //!   - `refresh` → re-hash one declared asset and update its manifest row
+//!   - `refresh-wrapper` → reconcile one wrapper's complete asset set in one write
 //!   - `verify` → byte-completeness gate (exits non-zero when incomplete)
 //!   - `status` → present / missing report (never fails)
 //!   - `paths`  → the store-relative path list (for an ignore mechanism)
@@ -14,8 +15,8 @@
 use std::path::Path;
 
 use crate::cli::{
-    AssetsArgs, AssetsCommand, AssetsPathsArgs, AssetsRefreshArgs, AssetsScanArgs,
-    AssetsStatusArgs, AssetsVerifyArgs,
+    AssetsArgs, AssetsCommand, AssetsPathsArgs, AssetsRefreshArgs, AssetsRefreshWrapperArgs,
+    AssetsScanArgs, AssetsStatusArgs, AssetsVerifyArgs,
 };
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
@@ -27,10 +28,44 @@ pub fn run(ctx: &Context, args: &AssetsArgs) -> CliResult {
     match &args.command {
         AssetsCommand::Scan(a) => run_scan(ctx, a),
         AssetsCommand::Refresh(a) => run_refresh(ctx, a),
+        AssetsCommand::RefreshWrapper(a) => run_refresh_wrapper(ctx, a),
         AssetsCommand::Verify(a) => run_verify(ctx, a),
         AssetsCommand::Status(a) => run_status(ctx, a),
         AssetsCommand::Paths(a) => run_paths(ctx, a),
     }
+}
+
+/// `dbmd assets refresh-wrapper <wrapper>` — bounded write-through for one
+/// wrapper's complete current set, including an empty generated set.
+fn run_refresh_wrapper(ctx: &Context, args: &AssetsRefreshWrapperArgs) -> CliResult {
+    let store = Store::open_strict(Path::new(&args.dir))?;
+    let _transaction = store
+        .transaction()
+        .map_err(|error| CliError::runtime(format!("cannot lock store transaction: {error}")))?;
+    let report = assets::refresh_wrapper(&store, &args.wrapper)?;
+
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("refresh-wrapper report serializes")
+        );
+    } else {
+        println!(
+            "{} · {} cataloged · {} added · {} removed · {} hashed · {} preserved{}",
+            report.wrapper,
+            report.cataloged,
+            report.added,
+            report.removed,
+            report.hashed,
+            report.preserved,
+            if report.wrote {
+                " · manifest updated"
+            } else {
+                " · no change"
+            }
+        );
+    }
+    Ok(())
 }
 
 /// `dbmd assets refresh <path> --wrapper <wrapper>` — bounded write-through
