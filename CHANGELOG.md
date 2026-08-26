@@ -8,9 +8,18 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.32**.
+  `Cargo.toml`, currently **v0.8.33**.
 
 ## Unreleased
+
+## [0.8.33] — 2026-08-25
+
+### Fixed
+
+- Withdrawing an already-hosted asset now atomically preserves its exact blob
+  identity while accepting reviewed wrapper and required-state changes. A local
+  policy edit cannot imply that custody transition: each asset needs an
+  explicit path and company audit reason.
 
 ## [0.8.32] — 2026-08-25
 

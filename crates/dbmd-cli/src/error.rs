@@ -289,6 +289,15 @@ impl From<dbmd_core::linkmd::LinkError> for CliError {
             L::LocalPolicyTransition { .. } => {
                 CliError::new(ExitCode::Policy, "LOCAL_POLICY_RELAXED", message)
             }
+            L::AssetWithdrawalRequired { paths } => CliError::new(
+                ExitCode::Policy,
+                "ASSET_WITHDRAWAL_REQUIRED",
+                message,
+            )
+            .with_hint(
+                "review custody for every listed path, then retry with --withdraw-from-hosting <path> and --withdraw-reason <company audit reason>",
+            )
+            .with_details(serde_json::json!({ "paths": paths })),
             L::BulkPreviewRequired { preview } => CliError::new(
                 ExitCode::Policy,
                 "BULK_PREVIEW_REQUIRED",
@@ -358,6 +367,21 @@ mod tests {
         assert_eq!(error.exit, ExitCode::Policy);
         assert_eq!(error.code, "SOURCE_COORDINATE_USED");
         assert!(error.hint.as_deref().unwrap().contains("exact historical"));
+    }
+
+    #[test]
+    fn hosted_asset_withdrawal_requires_explicit_audited_intent() {
+        let paths = vec!["sources/private/customer-export.csv".to_string()];
+        let error = CliError::from(dbmd_core::linkmd::LinkError::AssetWithdrawalRequired {
+            paths: paths.clone(),
+        });
+        assert_eq!(error.exit, ExitCode::Policy);
+        assert_eq!(error.code, "ASSET_WITHDRAWAL_REQUIRED");
+        assert_eq!(
+            error.to_json()["error"]["details"]["paths"],
+            serde_json::json!(paths)
+        );
+        assert!(error.hint.as_deref().unwrap().contains("--withdraw-reason"));
     }
 
     #[test]

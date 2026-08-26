@@ -522,6 +522,17 @@ pub enum LinkError {
         paths: Vec<String>,
     },
 
+    /// A currently hosted asset would become withheld. That custody change
+    /// requires an exact coordinate and a bounded company audit reason; a
+    /// manifest edit or `.sevralocal` rule cannot imply it.
+    #[error(
+        "hosted assets require explicit withdrawal {paths:?} — retry with one --withdraw-from-hosting <path> per asset and a non-empty --withdraw-reason"
+    )]
+    AssetWithdrawalRequired {
+        /// Bounded asset paths. They are never sent in telemetry.
+        paths: Vec<String>,
+    },
+
     /// The exact mutation crosses a permissioned bulk-impact boundary. The
     /// hub has not committed it; `preview` is the bounded, permission-filtered
     /// receipt an agent must inspect before explicitly confirming the same
@@ -7070,10 +7081,14 @@ fn v2_asset_withdrawal_operation(
         });
     }
     verify_v2_upload_source(store, path, &local.sha256, local.bytes)?;
-    if current.disposition != "hosted" || v2_asset_record(current, path) != *local {
+    if current.disposition != "hosted"
+        || current.blob_sha256 != local.sha256
+        || current.bytes != local.bytes
+        || current.media_type != local.media_type
+    {
         return Err(LinkError::InvalidPack {
             message: format!(
-                "asset withdrawal path `{path}` must exactly match its currently hosted signed leaf"
+                "asset withdrawal path `{path}` must preserve the currently hosted blob identity, byte count, and media type"
             ),
         });
     }
@@ -7081,6 +7096,7 @@ fn v2_asset_withdrawal_operation(
         "op": "asset_withdraw",
         "path": path,
         "expected": v2_asset_expected(Some(current)),
+        "asset": v2_asset_value(local, "withheld"),
         "reason": reason,
     }))
 }
@@ -8055,6 +8071,7 @@ fn v2_sync_push(
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     let mut asset_policy_transitions = Vec::new();
+    let mut asset_withdrawal_transitions = Vec::new();
     for path in asset_paths {
         let base_record = base_assets
             .get(&path)
@@ -8107,6 +8124,12 @@ fn v2_sync_push(
                 });
             }
             resumes_hosting = v2_asset_resumes_hosting(remote, &path, record, disposition);
+            if remote.is_some_and(|asset| asset.disposition == "hosted")
+                && disposition == "withheld"
+            {
+                asset_withdrawal_transitions.push(path.clone());
+                continue;
+            }
         }
         if local_record == base_record.as_ref() && !resumes_hosting {
             continue;
@@ -8175,6 +8198,12 @@ fn v2_sync_push(
         asset_policy_transitions.truncate(100);
         return Err(LinkError::LocalPolicyTransition {
             paths: asset_policy_transitions,
+        });
+    }
+    if !asset_withdrawal_transitions.is_empty() {
+        asset_withdrawal_transitions.truncate(100);
+        return Err(LinkError::AssetWithdrawalRequired {
+            paths: asset_withdrawal_transitions,
         });
     }
     let touched_sources = operations
@@ -12106,11 +12135,64 @@ pub fn proposal_accept_exact(
                     .get("path")
                     .and_then(Value::as_str)
                     .ok_or_else(|| invalid_feed("proposal asset withdrawal has no path"))?;
-                let asset = expected_candidate_assets
-                    .get_mut(path)
-                    .ok_or_else(|| invalid_feed("proposal withdraws an unknown asset"))?;
-                asset.disposition = "withheld".to_string();
-                asset.leaf_hash.clear();
+                if !expected_candidate_assets.contains_key(path) {
+                    return Err(invalid_feed("proposal withdraws an unknown asset"));
+                }
+                let Some(asset) = operation.get("asset").and_then(Value::as_object) else {
+                    // Pre-supersession proposals carried no replacement leaf.
+                    // Preserve their exact historical meaning while all new
+                    // pushes include the explicit withheld value.
+                    let prior = expected_candidate_assets
+                        .get_mut(path)
+                        .expect("presence checked above");
+                    prior.disposition = "withheld".to_string();
+                    prior.leaf_hash.clear();
+                    continue;
+                };
+                let blob_sha256 = asset
+                    .get("blob_sha256")
+                    .and_then(Value::as_str)
+                    .filter(|hash| is_sha256(hash))
+                    .ok_or_else(|| invalid_feed("proposal asset has no blob hash"))?;
+                let bytes = asset
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| invalid_feed("proposal asset has no byte count"))?;
+                let media_type = asset
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_feed("proposal asset has no media type"))?;
+                let wrappers = asset
+                    .get("wrappers")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| invalid_feed("proposal asset has no wrappers"))?
+                    .iter()
+                    .map(|wrapper| {
+                        wrapper
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| invalid_feed("proposal asset wrapper is invalid"))
+                    })
+                    .collect::<LinkResult<Vec<_>>>()?;
+                let required = asset
+                    .get("required")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| invalid_feed("proposal asset required flag is invalid"))?;
+                if asset.get("disposition").and_then(Value::as_str) != Some("withheld") {
+                    return Err(invalid_feed("proposal asset withdrawal is not withheld"));
+                }
+                expected_candidate_assets.insert(
+                    path.to_string(),
+                    V2BaselineAsset {
+                        blob_sha256: blob_sha256.to_string(),
+                        bytes,
+                        media_type: media_type.to_string(),
+                        wrappers,
+                        required,
+                        disposition: "withheld".to_string(),
+                        leaf_hash: String::new(),
+                    },
+                );
             }
             "asset_put" | "asset_resume" => {
                 let path = operation
@@ -18637,15 +18719,18 @@ mod tests {
             sha256: content_sha256(bytes),
             bytes: bytes.len() as u64,
             media_type: "application/pdf".to_string(),
-            wrappers: vec!["sources/files/private.md".to_string()],
-            required: true,
+            wrappers: vec![
+                "sources/files/private.md".to_string(),
+                "sources/redacted/private.md".to_string(),
+            ],
+            required: false,
         };
         let current = V2BaselineAsset {
             blob_sha256: local.sha256.clone(),
             bytes: local.bytes,
             media_type: local.media_type.clone(),
-            wrappers: local.wrappers.clone(),
-            required: local.required,
+            wrappers: vec!["sources/files/private.md".to_string()],
+            required: true,
             disposition: "hosted".to_string(),
             leaf_hash: "d".repeat(64),
         };
@@ -18663,12 +18748,20 @@ mod tests {
                 "op": "asset_withdraw",
                 "path": local.path,
                 "expected": { "kind": "asset", "hash": "d".repeat(64) },
+                "asset": {
+                    "blob_sha256": local.sha256.clone(),
+                    "bytes": local.bytes,
+                    "media_type": local.media_type.clone(),
+                    "wrappers": local.wrappers.clone(),
+                    "required": false,
+                    "disposition": "withheld",
+                },
                 "reason": "approved retention change",
             })
         );
 
         let mut mismatched = current.clone();
-        mismatched.required = false;
+        mismatched.blob_sha256 = "f".repeat(64);
         assert!(matches!(
             v2_asset_withdrawal_operation(
                 &store,
