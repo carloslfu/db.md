@@ -195,6 +195,26 @@ db.md turns the shape inside out:
   to carry millions of files with no vector database. Want SQLite or a
   search index on top? Build one. The files stay the source of truth.
 
+That last point deserves its own beat, because "files lack an index" is
+the first objection every engineer raises, and it is half right: a bare
+filesystem cannot group your documents by year, because mtimes lie and
+filenames carry no schema. db.md is not bare files. Records carry typed
+frontmatter, every type folder keeps a machine catalog (`index.jsonl`)
+maintained on write, and `dbmd query` reads the catalog rather than the
+tree. The design rule is that the index is never authoritative: delete
+every catalog and `dbmd index rebuild` regenerates them from the files,
+the way git regenerates pack indexes on clone, the way `locate` and
+Spotlight index a filesystem that never grew an index of its own, the
+way an LSM engine derives index blocks beside immutable data files.
+Baking the index into the interchange format is how open formats stop
+being open: the moment readers need the index, the index is the real
+format. And the objection misses where the work actually was. "Group my
+documents by year" never failed on files for lack of a B-tree; it
+failed because nothing extracted the year. Indexes presuppose
+extraction. Extraction is the agent's job at ingestion, and once the
+date sits in frontmatter, a derived catalog serves it at any personal
+scale.
+
 On portability: db.md is portable by default. It's just files. Git,
 tarballs, sync services move them. A capable model reads them directly
 without needing a format standard. That's the bet: as models improve, they

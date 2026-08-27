@@ -7,6 +7,11 @@ are written into the text itself.
 
 The folder is the database.
 
+The index still exists. It is derived: a plain catalog riding beside
+the files, read by queries, rebuilt from the files themselves. Sort
+everything, group by year, filter by any field: one command. The full
+answer is [Where is the index?](#where-is-the-index).
+
 Before agents, text was documentation. After agents, text is operational
 state. A capable agent reads the files, writes them, links them, repairs
 them, and finds the connections between them by meaning. The agent is the
@@ -196,7 +201,7 @@ records conform to. There is no config format to learn. The agent writes
 | Column | YAML frontmatter field |
 | Foreign key | Wiki-link |
 | Migration | Text edit to `DB.md` plus agent repair |
-| Index | `index.md` for browsing, `index.jsonl` for structured reads |
+| Index | [Derived sidecars](#where-is-the-index): `index.md` for browsing, `index.jsonl` for structured reads |
 | Backend logic | Agent harness plus deterministic `dbmd` operations |
 | UI | Chat, voice, forms, dashboards, or whatever the agent generates |
 
@@ -206,6 +211,53 @@ with an additive policy from v0.3 on: new fields and codes layer on, and
 existing stores keep validating. The contract is [SPEC.md](SPEC.md); the
 current toolkit release and the history of both axes are in the
 [CHANGELOG](CHANGELOG.md).
+
+## Where is the index?
+
+The first objection every engineer raises, and the right one: a folder
+famously lacks the thing that makes a database a database. A filesystem
+cannot sort your documents by year. Modification times lie, filenames
+carry no schema, and the date inside a PDF is invisible to `ls`.
+
+db.md answers with structure, then a catalog. Every record carries
+typed frontmatter (`created`, `updated`, `type`, `summary`, and
+whatever fields your schemas declare), and every type folder keeps
+`index.jsonl`: one JSON line per record, updated on every write.
+`dbmd query` reads that sidecar, never the whole tree. So the
+skeptic's example is one command:
+
+```bash
+dbmd query --in records --json |
+  jq 'group_by(.created[:4]) | map({year: .[0].created[:4], records: length})'
+```
+
+Millisecond-scale at the measured 10k-file tier
+([tests/PERF.md](tests/PERF.md)).
+
+The rule underneath: **the index is derived, never authoritative.**
+Delete every `index.md` and `index.jsonl` and nothing is lost; `dbmd
+index rebuild` regenerates them from the files, byte for byte. Every
+durable system makes this cut. Git regenerates its pack indexes on
+clone and never ships them as the format. LSM engines derive index
+blocks beside immutable data files. The filesystem itself never grew
+an index; `locate` and Spotlight grew next to it, disposable. Keeping
+the index out of the format is what keeps db.md implementable in an
+afternoon, and what makes the index something you can never lose.
+
+The objection also misses where the work was. "Group my documents by
+year" never failed on files for lack of a B-tree; it failed because
+nothing filled in the year. Postgres cannot sort documents by a date
+nobody extracted either. Extraction was always the hard part, and
+extraction is the agent's job at ingestion: the date comes out of the
+email or the PDF and into frontmatter, and from there any catalog can
+serve it. Indexes presuppose extraction. The missing piece was the
+agent, not the B-tree.
+
+And when a store outgrows a sequential catalog read, the rule holds:
+swap the cache, never the format. Build a local SQLite from the files,
+or let a host maintain a live index. The files stay the source of
+truth either way. [How far it scales](#how-far-it-scales) has the
+numbers.
 
 ## What it is for
 
