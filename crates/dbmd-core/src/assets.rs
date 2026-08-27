@@ -1,11 +1,16 @@
 //! `assets` — the db.md asset layer.
 //!
-//! Raw binary assets (PDFs, recordings, large exports) belong to a store but
-//! are too heavy for Git. A content file (the **wrapper**) declares one via an
-//! `asset:` / `assets:` frontmatter key; this module records each in the
-//! root-level `assets.jsonl` manifest: store-relative path, SHA-256, size,
-//! media type, the declaring wrapper(s), and whether it is required for
-//! byte-completeness.
+//! Raw assets (PDFs, recordings, large exports — typically binaries too heavy
+//! for Git) belong to a store but live outside the content plane. A content
+//! file (the **wrapper**) declares one via an `asset:` / `assets:` frontmatter
+//! key; this module records each in the root-level `assets.jsonl` manifest:
+//! store-relative path, SHA-256, size, media type, the declaring wrapper(s),
+//! and whether it is required for byte-completeness.
+//!
+//! Any in-store file may be declared — including a markdown content file, whose
+//! bytes are then integrity-tracked here while the content layer keeps parsing,
+//! indexing, and validating it as usual. [`paths`] still omits markdown, so an
+//! ignore mechanism fed from it can never hide a content file from the VCS.
 //!
 //! The manifest is a **pure projection** of (wrappers + asset files on disk):
 //! every field is derivable, so a [`scan`] where the bytes are present
@@ -300,12 +305,6 @@ pub fn scan(store: &Store, dry_run: bool, untracked: bool) -> crate::Result<Scan
                     continue;
                 }
             };
-            if is_markdown(&norm) {
-                warnings.push(format!(
-                    "{wrapper}: asset path points at a markdown content file ({norm}); skipped"
-                ));
-                continue;
-            }
             wrappers_by_path
                 .entry(norm.clone())
                 .or_default()
@@ -509,13 +508,6 @@ fn supersession_cycle_members(
 pub fn refresh(store: &Store, raw_path: &str, raw_wrapper: &str) -> crate::Result<RefreshReport> {
     let path = normalize_asset_path(raw_path)
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
-    if is_markdown(&path) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "asset path points at a markdown content file",
-        )
-        .into());
-    }
 
     let wrapper_path = normalize_asset_path(raw_wrapper)
         .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
@@ -704,13 +696,6 @@ pub fn refresh_wrapper(store: &Store, raw_wrapper: &str) -> crate::Result<Refres
             let path = normalize_asset_path(&declaration.path).map_err(|message| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
             })?;
-            if is_markdown(&path) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("asset path points at a markdown content file: {path}"),
-                )
-                .into());
-            }
             let required = declarations.entry(path).or_insert(false);
             *required |= declaration.required;
         }
@@ -1005,10 +990,16 @@ pub fn status(store: &Store) -> crate::Result<StatusReport> {
 /// managed block or a sync-exclude — can never carry an out-of-store path. The
 /// list analog of how `verify` counts an escaping record corrupt and `status`
 /// counts it missing: a path that can't be a real store member is left out.
+///
+/// Markdown paths are omitted too: a declared `.md` asset is simultaneously a
+/// content file, and an ignore feed carrying it could hide store content from
+/// the VCS. Its bytes stay tracked and verified through the manifest; only this
+/// ignore-oriented projection excludes it.
 pub fn paths(store: &Store) -> crate::Result<Vec<String>> {
     Ok(read_manifest(store)?
         .into_iter()
         .filter(|r| store.capability_relative(Path::new(&r.path)).is_ok())
+        .filter(|r| !is_markdown(&r.path))
         .map(|r| r.path)
         .collect())
 }
@@ -1235,6 +1226,7 @@ fn media_type_for(path: &str) -> String {
         "tar" => "application/x-tar",
         "csv" => "text/csv",
         "tsv" => "text/tab-separated-values",
+        "md" | "markdown" => "text/markdown",
         "json" => "application/json",
         "xml" => "application/xml",
         "txt" => "text/plain",
@@ -1502,6 +1494,63 @@ mod tests {
         let (_tmp, store, _canonical) = store_with_one_asset();
         let out = paths(&store).expect("paths over a clean manifest");
         assert_eq!(out, vec!["sources/a.pdf".to_string()]);
+    }
+
+    /// Assets accept ANY in-store file — a markdown content file included
+    /// (dual-plane: its bytes are tracked here while the content layer keeps
+    /// owning its meaning). `scan`, `refresh`, and `refresh-wrapper` must all
+    /// take the coordinate without a skip or an error, and `paths` must still
+    /// OMIT the markdown path so an ignore feed can never hide a content file.
+    #[test]
+    fn markdown_content_files_are_accepted_as_assets_and_omitted_from_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sources")).unwrap();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n# store\n").unwrap();
+        std::fs::write(
+            root.join("sources/bundle.md"),
+            "---\ntype: pdf-source\nsummary: bundle wrapper\nassets:\n  - sources/notes.md\n  - sources/a.pdf\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sources/notes.md"),
+            "---\ntype: pdf-source\nsummary: a content file doubling as an asset\n---\nnotes\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("sources/a.pdf"), b"PDFBYTES").unwrap();
+        let store = Store::from_root_and_config(root, crate::parser::Config::default()).unwrap();
+
+        let report = scan(&store, false, false).unwrap();
+        assert!(
+            report.warnings.is_empty(),
+            "a markdown asset must not be skipped or warned about: {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            report.cataloged, 2,
+            "both the pdf and the markdown asset are cataloged"
+        );
+
+        let refreshed = refresh(&store, "sources/notes.md", "sources/bundle.md")
+            .expect("refresh accepts a markdown asset coordinate");
+        assert_eq!(refreshed.path, "sources/notes.md");
+        let reconciled = refresh_wrapper(&store, "sources/bundle.md")
+            .expect("refresh-wrapper accepts a wrapper declaring a markdown asset");
+        assert_eq!(reconciled.cataloged, 2);
+
+        let manifest = read_manifest(&store).unwrap();
+        let md_row = manifest
+            .iter()
+            .find(|record| record.path == "sources/notes.md")
+            .expect("the markdown asset has a manifest row");
+        assert_eq!(md_row.media_type, "text/markdown");
+
+        let listed = paths(&store).expect("paths over the mixed manifest");
+        assert_eq!(
+            listed,
+            vec!["sources/a.pdf".to_string()],
+            "markdown assets are omitted from the ignore-feed list"
+        );
     }
 
     /// Idempotency must survive the fix: a genuinely-canonical manifest is left

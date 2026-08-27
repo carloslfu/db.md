@@ -205,8 +205,6 @@ pub mod codes {
     /// an append-only asset supersession is malformed or its original manifest
     /// row is absent/still required.
     pub const ASSET_SUPERSESSION_INVALID: &str = "ASSET_SUPERSESSION_INVALID";
-    /// an `asset`/`assets` path points at a tracked markdown content file.
-    pub const ASSET_PATH_IS_CONTENT: &str = "ASSET_PATH_IS_CONTENT";
 }
 
 /// The SPEC's `summary` length bound (chars). Over it → `SUMMARY_TOO_LONG`.
@@ -3845,8 +3843,9 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
         }
     }
 
-    // Per-wrapper declarations: every declared asset must be in the manifest and
-    // must not point at a markdown content file.
+    // Per-wrapper declarations: every declared asset must be in the manifest.
+    // (Any in-store file may be declared, markdown content files included —
+    // their bytes are tracked here while the content layer keeps owning them.)
     let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut supersessions: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
     for (rel, p) in parsed {
@@ -3859,24 +3858,6 @@ fn check_assets(store: &Store, parsed: &[(PathBuf, Parsed)], issues: &mut Vec<Is
                 Err(_) => continue, // a bad declared path is surfaced by `scan`, not here
             };
             declared.insert(norm.clone());
-            let is_md = Path::new(&norm)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("md"))
-                .unwrap_or(false);
-            if is_md {
-                push(
-                    issues,
-                    Severity::Warning,
-                    codes::ASSET_PATH_IS_CONTENT,
-                    rel,
-                    None,
-                    Some("asset".to_string()),
-                    format!("asset path `{norm}` points at a markdown content file"),
-                    Some("assets are raw binaries; reference a non-markdown path".to_string()),
-                    vec![PathBuf::from(&norm)],
-                );
-            }
             if !manifest.contains_key(&norm) {
                 push(
                     issues,

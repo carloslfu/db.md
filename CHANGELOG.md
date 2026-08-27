@@ -8,9 +8,24 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.34**.
+  `Cargo.toml`, currently **v0.8.35**.
 
 ## Unreleased
+
+## [0.8.35] — 2026-08-27
+
+### Changed
+
+- **Assets accept any in-store file, markdown content files included.**
+  `assets scan` no longer skips a declared `.md` path, and `assets refresh` /
+  `assets refresh-wrapper` no longer refuse one — a markdown asset is
+  dual-plane: `assets.jsonl` freezes its bytes (until refreshed) while the
+  content layer keeps parsing, indexing, and validating it as usual. The
+  `ASSET_PATH_IS_CONTENT` validation code is removed (SPEC § Validation now has
+  51 codes). To keep an ignore feed from ever hiding a content file from the
+  VCS, `assets paths` omits markdown paths — they stay tracked and verified,
+  just never emitted to the ignore-oriented list. Markdown assets are recorded
+  with `media_type: text/markdown`.
 
 ## [0.8.34] — 2026-08-26
 

@@ -1282,7 +1282,6 @@ see; grouped by category):
 | `ASSET_WRAPPER_BROKEN` | error | an `assets.jsonl` record names a wrapper file that doesn't exist |
 | `ASSET_MANIFEST_ORPHAN` | warning | an `assets.jsonl` record's path is referenced by no wrapper |
 | `ASSET_SUPERSESSION_INVALID` | error | a `supersedes-asset` declaration is malformed, or its original is absent/still required in `assets.jsonl` |
-| `ASSET_PATH_IS_CONTENT` | warning | an `asset`/`assets` path points at a tracked markdown content file |
 
 The `ASSET_*` codes are checked by the full sweep (`dbmd validate --all`), not
 the working set — like the `DUP_*` dedup codes — and are text-only: validation
@@ -1576,6 +1575,13 @@ recorded in the manifest and kept out of the VCS path. An asset is never a
 wiki-link target: wiki-links are edges between markdown nodes and a binary is
 not a node, so assets never appear in `graph` / `rename` / `backlinks`.
 
+Any in-store file may be declared as an asset — including a markdown content
+file, when a store wants byte-integrity tracking for one. A markdown asset is
+dual-plane: the manifest freezes its bytes (until a `refresh`) while the
+content layer keeps parsing, indexing, and validating it as usual, and
+`dbmd assets paths` omits it so an ignore mechanism can never hide a content
+file (see below).
+
 Declare assets with an `asset:` (single) or `assets:` (list) frontmatter
 key (the examples elide the universal `id` / `created` / `updated`
 fields for brevity):
@@ -1646,11 +1652,13 @@ merge=union` in `.gitattributes` (the same floor `log.md` uses) and let a later
 
 ### Keeping bytes out of the VCS
 
-Assets are recorded in the manifest and excluded from version control. **db.md
-does not write a `.gitignore` and never runs git** — a store may be carried by
-Git or by a sync service, so the toolkit stays VCS-neutral. `dbmd assets paths`
-prints the asset paths, one per line, for whatever ignore mechanism the store
-uses; maintaining the ignore list — and, for Git, ensuring no asset was
+Assets are recorded in the manifest and, markdown content files aside, excluded
+from version control. **db.md does not write a `.gitignore` and never runs
+git** — a store may be carried by Git or by a sync service, so the toolkit
+stays VCS-neutral. `dbmd assets paths` prints the non-markdown asset paths, one
+per line, for whatever ignore mechanism the store uses (markdown assets are
+omitted: they are content files and stay under the content plane's version
+control); maintaining the ignore list — and, for Git, ensuring no asset was
 committed before it was ignored (a tracked binary stays in history) — is the
 operator's or harness's job, not the format's.
 
@@ -1704,8 +1712,7 @@ check is text-only — it never hashes a byte or reads an asset's contents — s
 fresh clone whose bytes have not been restored still passes `validate`. Byte
 presence and hash correctness are `dbmd assets verify`, not `validate`. The
 codes are `ASSET_MANIFEST_MALFORMED`, `ASSET_UNDECLARED`, `ASSET_WRAPPER_BROKEN`,
-`ASSET_MANIFEST_ORPHAN`, and `ASSET_PATH_IS_CONTENT` (see
-[Validation](#validation)).
+and `ASSET_MANIFEST_ORPHAN` (see [Validation](#validation)).
 
 ## Roadmap
 

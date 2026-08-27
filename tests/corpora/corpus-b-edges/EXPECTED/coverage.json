@@ -1,11 +1,10 @@
 {
-  "_comment": "Coverage map. Maps each SEEDED SPEC.md § Validation code to the EXPECTED fixture(s) that fire it. The SPEC table has 52 codes; this corpus seeds 40, including NESTED_STORE from the deliberately embedded bad-db-md/ fixture, and explicitly leaves FM_MISSING_CREATED / FM_MISSING_UPDATED / FM_BAD_META_TYPE / FM_BAD_ID / FM_IN_BODY / FM_UNREADABLE plus the six ASSET_* codes uncovered. The e2e_corpus_b.rs test asserts (1) coverage keys are a subset of the SPEC table (no invented codes) and (2) `uncovered_spec_codes` exactly equals SPEC-codes minus seeded-codes (both directions), so this file cannot drift out of sync with the SPEC table. The four DB_MD_* codes are seeded by the bad-db-md/ sub-store in its separate EXPECTED/bad-db-md.json invocation; the parent-store sweep reports that same fixture as NESTED_STORE without reading through it. DUP_UNIQUE_KEY is seeded by the six dup-pair fixtures via this store's DB.md `unique:` directives. INDEX_JSONL_DESYNC is grouped under plan_extensions for provenance but counts as a seeded SPEC code in the coverage math.",
-  "spec_code_count": 52,
+  "_comment": "Coverage map. Maps each SEEDED SPEC.md \u00a7 Validation code to the EXPECTED fixture(s) that fire it. The SPEC table has 51 codes; this corpus seeds 40, including NESTED_STORE from the deliberately embedded bad-db-md/ fixture, and explicitly leaves FM_MISSING_CREATED / FM_MISSING_UPDATED / FM_BAD_META_TYPE / FM_BAD_ID / FM_IN_BODY / FM_UNREADABLE plus the five ASSET_* codes uncovered. The e2e_corpus_b.rs test asserts (1) coverage keys are a subset of the SPEC table (no invented codes) and (2) `uncovered_spec_codes` exactly equals SPEC-codes minus seeded-codes (both directions), so this file cannot drift out of sync with the SPEC table. The four DB_MD_* codes are seeded by the bad-db-md/ sub-store in its separate EXPECTED/bad-db-md.json invocation; the parent-store sweep reports that same fixture as NESTED_STORE without reading through it. DUP_UNIQUE_KEY is seeded by the six dup-pair fixtures via this store's DB.md `unique:` directives. INDEX_JSONL_DESYNC is grouped under plan_extensions for provenance but counts as a seeded SPEC code in the coverage math.",
+  "spec_code_count": 51,
   "all_spec_codes_covered": false,
   "uncovered_spec_codes": [
     "ASSET_MANIFEST_MALFORMED",
     "ASSET_MANIFEST_ORPHAN",
-    "ASSET_PATH_IS_CONTENT",
     "ASSET_SUPERSESSION_INVALID",
     "ASSET_UNDECLARED",
     "ASSET_WRAPPER_BROKEN",

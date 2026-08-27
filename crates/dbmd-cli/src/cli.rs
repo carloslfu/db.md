@@ -163,9 +163,10 @@ pub enum Command {
     Rename(RenameArgs),
 
     // ── Assets: the heavy-binary manifest ────────────────────────────────────
-    /// Catalog, verify, and report raw binary assets (PDFs, recordings, large
-    /// exports) a wrapper references but Git should not carry. Maintains the
-    /// root `assets.jsonl` manifest; never transports bytes, never runs git.
+    /// Catalog, verify, and report raw assets (PDFs, recordings, large exports
+    /// — any in-store file a wrapper declares, markdown content files
+    /// included). Maintains the root `assets.jsonl` manifest; never transports
+    /// bytes, never runs git.
     Assets(AssetsArgs),
 
     // ── Interconnect: the link.md client ─────────────────────────────────────
@@ -904,6 +905,8 @@ pub enum AssetsCommand {
 
     /// Print the cataloged asset paths, one per line — the VCS-neutral list a
     /// harness feeds into a `.gitignore` managed block or a sync exclude.
+    /// Markdown assets are omitted (they are content files and must never be
+    /// hidden from the VCS); their bytes stay tracked via the manifest.
     Paths(AssetsPathsArgs),
 }
 
