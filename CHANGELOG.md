@@ -25,6 +25,11 @@ Two things version independently:
   remain asset-only. This closes fresh-clone and incremental-sync loss for
   integrity-tracked source notes and other markdown artifacts without weakening
   ordinary source immutability.
+- Converges the release channels after 0.8.35's controller was correctly
+  staled: a docs commit landed on `main` between that tag's review and its
+  final steps, and the immutable GitHub release pins the tag where it is, so
+  Homebrew and `latest` advance from 0.8.34 directly to 0.8.36. 0.8.35 stays
+  published on crates.io and GitHub.
 
 ## [0.8.35] — 2026-08-27
 
