@@ -15670,6 +15670,36 @@ mod tests {
 
     const TEST_BRAIN_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";
 
+    fn drain_test_http_request(stream: &mut std::net::TcpStream) {
+        use std::io::Read as _;
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "test client closed before its request completed");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return;
+            }
+        }
+    }
+
     fn upload_declaration(index: usize, coordinate_len: usize) -> Value {
         json!({
             "sha256": "a".repeat(64),
@@ -18588,7 +18618,7 @@ mod tests {
 
     #[test]
     fn a_commit_goes_back_for_a_receipt_it_lost() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         use std::thread;
 
@@ -18602,8 +18632,7 @@ mod tests {
         let server = thread::spawn(move || {
             // First attempt: promise a body, hang up mid-way.
             let (mut first, _) = listener.accept().unwrap();
-            let mut bytes = [0_u8; 4096];
-            let _ = first.read(&mut bytes).unwrap();
+            drain_test_http_request(&mut first);
             first
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 90\r\nConnection: close\r\n\r\n{\"v\":2",
@@ -18612,7 +18641,7 @@ mod tests {
             drop(first);
             // Second attempt: the receipt for the commit that already landed.
             let (mut second, _) = listener.accept().unwrap();
-            let _ = second.read(&mut bytes).unwrap();
+            drain_test_http_request(&mut second);
             second
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"v\":2,\"outcome\":\"converged\"}",
@@ -18651,7 +18680,7 @@ mod tests {
 
     #[test]
     fn a_patient_commit_waits_for_its_typed_post_acceptance_receipt_lag() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         use std::thread;
 
@@ -18665,8 +18694,7 @@ mod tests {
                 ("200 OK", receipt.as_slice()),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request_bytes = [0_u8; 4096];
-                let _ = stream.read(&mut request_bytes).unwrap();
+                drain_test_http_request(&mut stream);
                 write!(
                     stream,
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
