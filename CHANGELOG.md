@@ -8,9 +8,23 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.35**.
+  `Cargo.toml`, currently **v0.8.36**.
 
 ## Unreleased
+
+## [0.8.36] — 2026-08-27
+
+### Fixed
+
+- Link.md v2 now preserves markdown assets on both of their signed planes.
+  Markdown declared in `assets.jsonl` continues through the indexed content
+  tree and is emitted as a typed `put_asset_content` operation bound to the
+  same exact hosted asset hash and byte count. Pull verifies that cross-root
+  binding, installs the bytes once through the content plane, and explicit
+  hosting withdrawal removes both coordinates atomically. Non-markdown assets
+  remain asset-only. This closes fresh-clone and incremental-sync loss for
+  integrity-tracked source notes and other markdown artifacts without weakening
+  ordinary source immutability.
 
 ## [0.8.35] — 2026-08-27
 

@@ -5516,9 +5516,10 @@ fn v2_local_files_cached(
     let prior_cache = prior_cache
         .filter(|(digest, _)| *digest == policy.digest.as_str())
         .map(|(_, cache)| cache);
-    let asset_paths = crate::assets::read_manifest(store)
+    let non_markdown_asset_paths = crate::assets::read_manifest(store)
         .map_err(|error| invalid_feed(format!("local asset manifest is invalid: {error}")))?
         .into_iter()
+        .filter(|asset| !is_markdown_asset_path(&asset.path))
         .map(|asset| asset.path)
         .collect::<std::collections::BTreeSet<_>>();
     let mut result = std::collections::BTreeMap::new();
@@ -5534,7 +5535,7 @@ fn v2_local_files_cached(
         if matches!(path.as_str(), "assets.jsonl" | "index.md" | "index.jsonl") {
             continue;
         }
-        if asset_paths.contains(&path) {
+        if non_markdown_asset_paths.contains(&path) {
             continue;
         }
         crate::linkmd_v2::normalize_path(&path).map_err(|error| LinkError::UnsafePath {
@@ -5641,6 +5642,52 @@ fn v2_local_files_cached(
         policy,
         withheld_links,
     })
+}
+
+fn is_markdown_asset_path(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".md")
+}
+
+fn v2_content_put_operation_kind(
+    path: &str,
+    local_assets: &std::collections::BTreeMap<String, crate::AssetRecord>,
+) -> &'static str {
+    if local_assets.contains_key(path) && is_markdown_asset_path(path) {
+        "put_asset_content"
+    } else {
+        "put"
+    }
+}
+
+fn v2_withdrawal_includes_content(
+    path: &str,
+    local_assets: &std::collections::BTreeMap<String, crate::AssetRecord>,
+) -> bool {
+    local_assets
+        .get(path)
+        .is_none_or(|asset| is_markdown_asset_path(&asset.path))
+}
+
+fn verify_v2_markdown_asset_content_bindings(
+    content: &std::collections::BTreeMap<String, V2BaselineFile>,
+    assets: &std::collections::BTreeMap<String, V2BaselineAsset>,
+) -> LinkResult<()> {
+    for (path, asset) in assets {
+        if !is_markdown_asset_path(path) {
+            continue;
+        }
+        let content_file = content.get(path);
+        let exact = content_file
+            .is_some_and(|file| file.sha256 == asset.blob_sha256 && file.bytes == asset.bytes);
+        if (asset.disposition == "hosted" && !exact)
+            || (asset.disposition == "withheld" && content_file.is_some())
+        {
+            return Err(invalid_feed(format!(
+                "markdown asset `{path}` is not exactly bound across the signed content and asset views"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn v2_local_files(store: &Store) -> LinkResult<V2LocalView> {
@@ -7049,6 +7096,7 @@ fn v2_sync_pull_with_resolution(
             v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
         ),
     };
+    verify_v2_markdown_asset_content_bindings(&remote, &remote_assets)?;
     let local_store = Store::open_strict(&dest).ok();
     // A baseline proves this path is an established checkout. Never reinterpret
     // a damaged/edited store marker as an empty clone destination: doing so
@@ -7198,6 +7246,11 @@ fn v2_sync_pull_with_resolution(
                 || kept_home(path)
                 || !asset_merge.accept_remote.contains(path)
             {
+                continue;
+            }
+            if is_markdown_asset_path(path) {
+                // The signed content plane carries the same bytes and is
+                // already part of this install transaction.
                 continue;
             }
             let already_current = local_store.as_ref().is_some_and(|store| {
@@ -7513,7 +7566,7 @@ fn infer_exact_source_promotions(operations: Vec<Value>) -> Vec<Value> {
                         .push((index, path.to_string()));
                 }
             }
-            Some("put") => {
+            Some("put" | "put_asset_content") => {
                 let Some(path) = operation.get("path").and_then(Value::as_str) else {
                     continue;
                 };
@@ -7605,7 +7658,7 @@ fn apply_generated_v2_operations(
     let mut asset_changed = false;
     for operation in operations {
         match operation.get("op").and_then(Value::as_str) {
-            Some("put") => {
+            Some("put" | "put_asset_content") => {
                 let path = operation
                     .get("path")
                     .and_then(Value::as_str)
@@ -8470,7 +8523,7 @@ fn v2_sync_push(
             Some((sha256, byte_count)) => {
                 verify_v2_upload_source(store, &path, sha256, *byte_count)?;
                 operations.push(json!({
-                    "op": "put",
+                    "op": v2_content_put_operation_kind(&path, &local_assets),
                     "path": path,
                     "expected": v2_expected(remote_file),
                     "blob": sha256,
@@ -8497,7 +8550,7 @@ fn v2_sync_push(
     }
     operations = infer_exact_source_promotions(operations);
     for path in &withdrawals {
-        if local_assets.contains_key(path) {
+        if !v2_withdrawal_includes_content(path, &local_assets) {
             continue;
         }
         operations.push(v2_content_withdrawal_operation(
@@ -8730,7 +8783,9 @@ fn v2_sync_push(
         .iter()
         .filter_map(
             |operation| match operation.get("op").and_then(Value::as_str) {
-                Some("put" | "restore") => operation.get("path").and_then(Value::as_str),
+                Some("put" | "put_asset_content" | "restore") => {
+                    operation.get("path").and_then(Value::as_str)
+                }
                 Some("rename") => operation.get("to").and_then(Value::as_str),
                 _ => None,
             },
@@ -8884,7 +8939,9 @@ fn v2_sync_push(
                 return Err(invalid_feed("v2 upload operation has no kind"));
             };
             let hash = match kind {
-                "put" | "restore" | "rename" => operation.get("blob").and_then(Value::as_str),
+                "put" | "put_asset_content" | "restore" | "rename" => {
+                    operation.get("blob").and_then(Value::as_str)
+                }
                 "asset_put" | "asset_resume" => operation
                     .get("asset")
                     .and_then(|asset| asset.get("blob_sha256"))
@@ -9109,6 +9166,7 @@ fn v2_sync_push(
             &mut expected_candidate,
             &mut expected_candidate_assets,
         )?;
+        verify_v2_markdown_asset_content_bindings(&expected_candidate, &expected_candidate_assets)?;
         let (challenge_id, signature, actor_signer) = sign_verified_v2_candidate(
             cfg,
             &head,
@@ -9174,6 +9232,7 @@ fn v2_sync_push(
         };
         (remote, assets)
     };
+    verify_v2_markdown_asset_content_bindings(&refreshed_files, &refreshed_assets)?;
     let mut final_local = v2_local_files_cached(
         store,
         Some((&local_view.policy.digest, &local_view.scan_cache)),
@@ -12788,7 +12847,7 @@ pub fn proposal_accept_exact(
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_feed("proposal operation has no kind"))?;
         match op {
-            "put" | "restore" => {
+            "put" | "put_asset_content" | "restore" => {
                 let path = operation
                     .get("path")
                     .and_then(Value::as_str)
@@ -13022,7 +13081,9 @@ pub fn proposal_accept_exact(
                 return Err(invalid_feed("proposal upload operation has no kind"));
             };
             let hash = match kind {
-                "put" | "restore" | "rename" => operation.get("blob").and_then(Value::as_str),
+                "put" | "put_asset_content" | "restore" | "rename" => {
+                    operation.get("blob").and_then(Value::as_str)
+                }
                 "asset_put" | "asset_resume" => operation
                     .get("asset")
                     .and_then(|asset| asset.get("blob_sha256"))
@@ -15968,6 +16029,37 @@ mod tests {
             infer_exact_source_promotions(operations.clone()),
             operations,
             "an ambiguous filesystem diff must reach the hub unchanged and fail closed"
+        );
+    }
+
+    #[test]
+    fn an_exact_dual_plane_source_move_remains_a_provenance_preserving_rename() {
+        let hash = "c".repeat(64);
+        let operations = vec![
+            json!({
+                "op": "delete",
+                "path": "sources/inbox/item.md",
+                "expected": { "kind": "blob", "hash": hash },
+            }),
+            json!({
+                "op": "put_asset_content",
+                "path": "sources/archive/item.md",
+                "expected": { "kind": "absent" },
+                "blob": hash,
+                "bytes": 19,
+            }),
+        ];
+        assert_eq!(
+            infer_exact_source_promotions(operations),
+            vec![json!({
+                "op": "rename",
+                "from": "sources/inbox/item.md",
+                "to": "sources/archive/item.md",
+                "expected_from": { "kind": "blob", "hash": hash },
+                "expected_to": { "kind": "absent" },
+                "blob": hash,
+                "bytes": 19,
+            })]
         );
     }
 
@@ -19354,6 +19446,149 @@ mod tests {
             parse_v2_baseline(&cfg, TEST_BRAIN_ID, &refused),
             Err(LinkError::InvalidFeed { .. })
         ));
+    }
+
+    #[test]
+    fn v2_local_view_keeps_markdown_assets_in_content_but_excludes_binary_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("records/notes")).unwrap();
+        std::fs::create_dir_all(directory.path().join("sources/files")).unwrap();
+        std::fs::write(
+            directory.path().join("DB.md"),
+            b"---\nname: Dual plane test\n---\n",
+        )
+        .unwrap();
+        let markdown = b"---\ntype: note\n---\nintegrity tracked\n";
+        let binary = b"pdf bytes";
+        std::fs::write(directory.path().join("records/notes/a.md"), markdown).unwrap();
+        std::fs::write(directory.path().join("sources/files/a.pdf"), binary).unwrap();
+        let store = Store::open_strict(directory.path()).unwrap();
+        crate::assets::write_manifest(
+            &store,
+            &[
+                crate::AssetRecord {
+                    path: "records/notes/a.md".to_string(),
+                    sha256: content_sha256(markdown),
+                    bytes: markdown.len() as u64,
+                    media_type: "text/markdown".to_string(),
+                    wrappers: vec!["records/notes/a.md".to_string()],
+                    required: true,
+                },
+                crate::AssetRecord {
+                    path: "sources/files/a.pdf".to_string(),
+                    sha256: content_sha256(binary),
+                    bytes: binary.len() as u64,
+                    media_type: "application/pdf".to_string(),
+                    wrappers: vec!["records/notes/a.md".to_string()],
+                    required: true,
+                },
+            ],
+        )
+        .unwrap();
+
+        let view = v2_local_files(&store).unwrap();
+        assert_eq!(
+            view.riding.get("records/notes/a.md"),
+            Some(&(content_sha256(markdown), markdown.len() as u64))
+        );
+        assert!(!view.riding.contains_key("sources/files/a.pdf"));
+    }
+
+    #[test]
+    fn v2_markdown_asset_binding_requires_identical_cross_root_state() {
+        let path = "sources/notes/a.md".to_string();
+        let hash = "a".repeat(64);
+        let mut content = std::collections::BTreeMap::from([(
+            path.clone(),
+            V2BaselineFile {
+                sha256: hash.clone(),
+                bytes: 7,
+                proof: None,
+            },
+        )]);
+        let mut assets = std::collections::BTreeMap::from([(
+            path.clone(),
+            V2BaselineAsset {
+                blob_sha256: hash,
+                bytes: 7,
+                media_type: "text/markdown".to_string(),
+                wrappers: vec![path.clone()],
+                required: true,
+                disposition: "hosted".to_string(),
+                leaf_hash: "b".repeat(64),
+            },
+        )]);
+        assert!(verify_v2_markdown_asset_content_bindings(&content, &assets).is_ok());
+
+        content.get_mut(&path).unwrap().bytes = 8;
+        assert!(verify_v2_markdown_asset_content_bindings(&content, &assets).is_err());
+        content.remove(&path);
+        assets.get_mut(&path).unwrap().disposition = "withheld".to_string();
+        assert!(verify_v2_markdown_asset_content_bindings(&content, &assets).is_ok());
+        content.insert(
+            path,
+            V2BaselineFile {
+                sha256: "a".repeat(64),
+                bytes: 7,
+                proof: None,
+            },
+        );
+        assert!(verify_v2_markdown_asset_content_bindings(&content, &assets).is_err());
+    }
+
+    #[test]
+    fn v2_markdown_asset_writes_use_the_typed_dual_plane_operation() {
+        let path = "sources/notes/a.md";
+        let assets = std::collections::BTreeMap::from([(
+            path.to_string(),
+            crate::AssetRecord {
+                path: path.to_string(),
+                sha256: "a".repeat(64),
+                bytes: 7,
+                media_type: "text/markdown".to_string(),
+                wrappers: vec![path.to_string()],
+                required: true,
+            },
+        )]);
+        assert_eq!(
+            v2_content_put_operation_kind(path, &assets),
+            "put_asset_content"
+        );
+        assert_eq!(
+            v2_content_put_operation_kind("records/ordinary.md", &assets),
+            "put"
+        );
+        assert!(v2_withdrawal_includes_content(path, &assets));
+        let mut binary_assets = assets.clone();
+        binary_assets.insert(
+            "sources/files/a.pdf".to_string(),
+            crate::AssetRecord {
+                path: "sources/files/a.pdf".to_string(),
+                sha256: "d".repeat(64),
+                bytes: 3,
+                media_type: "application/pdf".to_string(),
+                wrappers: vec![path.to_string()],
+                required: true,
+            },
+        );
+        assert!(!v2_withdrawal_includes_content(
+            "sources/files/a.pdf",
+            &binary_assets
+        ));
+
+        let hash = "b".repeat(64);
+        let operations = vec![json!({
+            "op": "put_asset_content",
+            "path": path,
+            "expected": { "kind": "absent" },
+            "blob": hash,
+            "bytes": 11,
+        })];
+        let mut content = std::collections::BTreeMap::new();
+        let mut remote_assets = std::collections::BTreeMap::new();
+        apply_generated_v2_operations(&operations, &assets, &mut content, &mut remote_assets)
+            .unwrap();
+        assert_eq!(content.get(path).unwrap().sha256, "b".repeat(64));
     }
 
     #[cfg(unix)]
