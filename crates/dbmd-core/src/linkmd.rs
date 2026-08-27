@@ -5262,7 +5262,7 @@ fn load_v2_baseline_in(
     directory: &TrustDirectory,
     name: &str,
 ) -> LinkResult<Option<V2SyncBaseline>> {
-    let mut reader = crate::fsx::BoundedDirReader::from_root(&directory)?;
+    let mut reader = crate::fsx::BoundedDirReader::from_root(directory)?;
     match reader.read(Path::new(&name), MAX_V2_BASELINE_BYTES) {
         Ok(bytes) => Ok(Some(parse_v2_baseline(cfg, brain, &bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
