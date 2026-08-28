@@ -18,9 +18,19 @@ workspace:
 
 ## Hard rules (do not violate)
 
-- **Zero AI/LLM dependencies.** No provider SDKs, API keys, model calls,
-  embeddings, vectors, or ANN — anywhere, ever. The agent driving `dbmd` is the
-  intelligence; `dbmd` is a deterministic tool.
+- **Zero AI/LLM dependencies; zero intelligence in the verbs.** No provider
+  SDK crates, no embeddings, no vectors, no ANN — anywhere, ever (`deny.toml`
+  enforces the crate bans). Every dbmd *verb* is deterministic plumbing; the
+  agent driving `dbmd` is the intelligence. The one deliberate exception is
+  the embedded micro-harness (`dbmd ask` / `do` / `build`, cargo feature
+  `harness`): an optional, stateless tool-calling loop that runs the **user's
+  own** model endpoint against the store's verb surface — two hand-rolled wire
+  protocols over the HTTP client already in the tree (never an SDK crate), no
+  default endpoint or vendor, the API key read from the environment only, and
+  its tools are dbmd verbs plus workspace-scoped file operations (never a
+  shell). It is a client for user-supplied intelligence, the way a database
+  ships a shell: the toolkit still contains no model, meters nothing, and
+  never phones home on its own.
 - **All logic in `dbmd-core`; `dbmd-cli` is thin wrappers.**
 - **Embedded ripgrep** via the `grep` + `ignore` crates — never bundle or shell
   out to `rg`.

@@ -3,7 +3,9 @@
 db.md is plain files. Any tool that reads files works. The reference
 toolkit is **one binary** — `dbmd` — that performs every
 db.md-specific file/data operation. **Zero LLM dependencies**; the
-agent runtime is BYO.
+agent runtime is BYO. The optional embedded harness (`dbmd ask` /
+`do` / `build`) is a client for **your own** model — point it at a key
+or a local server; the toolkit still ships no SDK and no vendor.
 
 ## One binary, many subcommands
 
@@ -13,12 +15,17 @@ fast search and builds its own document extraction (`dbmd extract`),
 so there are no external tools to install or license.
 
 - **All Rust.** Built for velocity the way ripgrep is.
-- **Zero AI dependencies.** No provider SDKs, no API keys, no model
-  calls. `dbmd` is deterministic file/data plumbing; the agent
-  reasons, `dbmd` executes. It never scaffolds, templates, or
-  generates what a capable agent authors itself — there is no `dbmd
-  init`, no wizards: you write `DB.md` and summaries; `dbmd` validates,
-  indexes, queries, and links.
+- **Zero AI dependencies.** No provider SDK crates, no bundled model,
+  no vendor default. Every `dbmd` verb is deterministic file/data
+  plumbing; the agent reasons, `dbmd` executes. It never scaffolds,
+  templates, or generates what a capable agent authors itself — there
+  is no `dbmd init`, no wizards: you write `DB.md` and summaries;
+  `dbmd` validates, indexes, queries, and links. The embedded harness
+  (`ask` / `do` / `build`) adds a *client* for user-supplied
+  intelligence — a stateless loop that drives the same verbs with a
+  model **you** configure (a key in your environment, or a local
+  server) over raw wire protocols; nothing in the binary calls a model
+  on its own.
 - **Permissive dependency policy.** No GPL, no AGPL, no AI SDKs, no
   vector database crates anywhere in the binary.
 - **One install.** One static binary, cross-platform (darwin / linux ×
@@ -39,7 +46,11 @@ fd, jq, git) behind a smart installer. We collapsed it to one binary:
    across six tools.
 3. **The model does the composition.** A capable agent composes
    `dbmd` subcommands through pipes far better than it juggles six
-   differently-flavored CLIs.
+   differently-flavored CLIs. The embedded harness does not change
+   this: `ask` / `do` / `build` exist for callers that cannot host a
+   harness — an app process calling `/v1/ask`, a machine with a model
+   but no agent installed — and their loop composes exactly the verbs
+   an external agent would, through the same binary.
 
 ## Subcommand surface
 
@@ -294,7 +305,11 @@ markdown and acting on it — a capable agent is the installer. There is no
 per-harness machinery to depend on: the mechanism is generic text + a smart
 model. The repo-root `llms.txt` is the agent-readable entry point (what db.md
 is, plus how to install, integrate, and operate); the canonical path is **read
-`dbmd spec` (or `llms.txt`) and act.**
+`dbmd spec` (or `llms.txt`) and act.** (For a machine with a model but no
+agent, the embedded harness is the fallback operator: `dbmd ask` / `do` run
+the same verb surface with a model you point them at — see "The embedded
+harness" below. External agents remain the primary residents; the harness is
+the doorbell, not the tenant.)
 
 ```bash
 # 1 — get the binary (prebuilt; brew / cargo are alternatives, same
