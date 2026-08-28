@@ -104,7 +104,12 @@ pub fn run(
         }
         Protocol::CodexCli => {
             let mut command = std::process::Command::new(binary(CODEX_BIN_ENV, "codex"));
-            command.arg("exec").arg("--json");
+            // A db.md store need not be a git repository; without this flag
+            // headless codex refuses any untrusted (non-repo) directory.
+            command
+                .arg("exec")
+                .arg("--json")
+                .arg("--skip-git-repo-check");
             match opts.mask {
                 Mask::Read => {
                     command.arg("--sandbox").arg("read-only");
