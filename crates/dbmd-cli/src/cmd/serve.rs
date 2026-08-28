@@ -11,7 +11,11 @@
 //! `authorization` header is ignored, which lets unmodified clients (whose
 //! authenticated verbs always send a credential) speak to it unchanged.
 
-use std::io::{Read, Write};
+// `Read` powers the unix-only mirror readers (`read_regular_beneath`); the
+// Windows build's I/O all flows through the shared `httpd` plumbing.
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
