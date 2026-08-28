@@ -36,7 +36,7 @@ workspace_version="$(
 [ "$workspace_version" = "$version" ] ||
     die "workspace version $workspace_version does not match $version"
 grep -Fqx \
-    "dbmd-core = { path = \"../dbmd-core\", version = \"=${version}\", features = [\"link\"] }" \
+    "dbmd-core = { path = \"../dbmd-core\", version = \"=${version}\", features = [\"link\", \"harness\"] }" \
     crates/dbmd-cli/Cargo.toml ||
     die "dbmd-cli must require exact same-release dbmd-core =$version"
 
