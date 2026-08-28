@@ -8,9 +8,21 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.37**.
+  `Cargo.toml`, currently **v0.8.38**.
 
 ## Unreleased
+
+## [0.8.38] — 2026-08-27
+
+### Fixed
+
+- Link.md v2 pull journals now preserve the protocol's separate 2 GiB asset
+  ceiling instead of applying the 512 MiB Markdown-pack ceiling to every
+  installed coordinate. A receipt-less but exact Git checkout can therefore
+  hydrate a large hosted asset through the ordinary verified incremental pull.
+  Transaction preimages remain independently bounded, journal validation now
+  reports the exact rejected coordinate, and recovery still verifies every
+  live and backup hash before changing a byte.
 
 ## [0.8.37] — 2026-08-27
 

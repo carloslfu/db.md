@@ -149,6 +149,10 @@ const MAX_STORE_BYTES: u64 = 512 * 1024 * 1024;
 /// pack bound to a signed asset leaf makes an otherwise valid checkout unable
 /// to load its own saved sync baseline after the first commit.
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// A durable pull journal covers both ordinary store files and out-of-band
+/// asset coordinates. Its per-file and total-preimage bounds therefore need
+/// to admit one maximum-size asset while remaining independently bounded.
+const MAX_PULL_TRANSACTION_BYTES: u64 = MAX_ASSET_BYTES;
 /// Exact worst case for the canonical STORED profile:
 /// payload + (local 30 + central 46 + name twice) per entry + EOCD 22.
 const MAX_PACK_BYTES: u64 =
@@ -11114,7 +11118,7 @@ fn v2_pull_file_coordinate(
         Err(error) => return Err(error.into()),
     };
     let bytes = file.metadata()?.len();
-    if bytes > limit || bytes > MAX_STORE_BYTES {
+    if bytes > limit || bytes > MAX_PULL_TRANSACTION_BYTES {
         return Err(invalid_feed(
             "pull transaction file exceeds its declared bound",
         ));
@@ -11152,21 +11156,46 @@ fn validate_v2_pull_journal(journal: &V2PullJournal) -> LinkResult<()> {
         if !safe_store_rel_path(&entry.path)
             || entry.path == V2_PULL_JOURNAL
             || entry.path.starts_with(backup_prefix)
-            || !paths.insert(entry.path.clone())
-            || (entry.old.is_none() && entry.new.is_none())
-            || entry
-                .old
-                .iter()
-                .chain(entry.new.iter())
-                .any(|value| !is_sha256(&value.sha256) || value.bytes > MAX_STORE_BYTES)
-            || entry.backup.as_deref()
-                != entry
-                    .old
-                    .as_ref()
-                    .map(|_| format!("{index:08x}"))
-                    .as_deref()
         {
-            return Err(invalid_feed("v2 pull journal entry failed validation"));
+            return Err(invalid_feed(format!(
+                "v2 pull journal has an unsafe entry path: {}",
+                entry.path
+            )));
+        }
+        if !paths.insert(entry.path.clone()) {
+            return Err(invalid_feed(format!(
+                "v2 pull journal repeats entry path: {}",
+                entry.path
+            )));
+        }
+        if entry.old.is_none() && entry.new.is_none() {
+            return Err(invalid_feed(format!(
+                "v2 pull journal entry has no coordinate: {}",
+                entry.path
+            )));
+        }
+        if entry
+            .old
+            .iter()
+            .chain(entry.new.iter())
+            .any(|value| !is_sha256(&value.sha256) || value.bytes > MAX_PULL_TRANSACTION_BYTES)
+        {
+            return Err(invalid_feed(format!(
+                "v2 pull journal entry has invalid content metadata: {}",
+                entry.path
+            )));
+        }
+        if entry.backup.as_deref()
+            != entry
+                .old
+                .as_ref()
+                .map(|_| format!("{index:08x}"))
+                .as_deref()
+        {
+            return Err(invalid_feed(format!(
+                "v2 pull journal entry has an invalid backup coordinate: {}",
+                entry.path
+            )));
         }
     }
     Ok(())
@@ -11419,7 +11448,7 @@ fn install_established_v2_delta(
         entries: Vec::with_capacity(paths.len()),
     };
     for path in &paths {
-        let old = v2_pull_file_coordinate(&store, path, MAX_STORE_BYTES)?;
+        let old = v2_pull_file_coordinate(&store, path, MAX_PULL_TRANSACTION_BYTES)?;
         let new = sources.get(path).map(|entry| V2PullFileCoordinate {
             sha256: entry.sha256.clone(),
             bytes: entry.bytes,
@@ -11444,9 +11473,9 @@ fn install_established_v2_delta(
             .as_ref()
             .map_or(Some(total), |old| total.checked_add(old.bytes))
     });
-    if backup_bytes.is_none_or(|bytes| bytes > MAX_STORE_BYTES) {
+    if backup_bytes.is_none_or(|bytes| bytes > MAX_PULL_TRANSACTION_BYTES) {
         return Err(LinkError::InvalidPack {
-            message: "pull recovery preimages exceed the 512 MB transaction limit".to_string(),
+            message: "pull recovery preimages exceed the bounded transaction limit".to_string(),
         });
     }
     validate_v2_pull_journal(&journal)?;
@@ -11483,7 +11512,9 @@ fn install_established_v2_delta(
     }
     let installed = (|| -> LinkResult<()> {
         for entry in &journal.entries {
-            if v2_pull_file_coordinate(&store, &entry.path, MAX_STORE_BYTES)? != entry.old {
+            if v2_pull_file_coordinate(&store, &entry.path, MAX_PULL_TRANSACTION_BYTES)?
+                != entry.old
+            {
                 return Err(LinkError::InvalidPack {
                     message: format!("local path `{}` changed during pull", entry.path),
                 });
@@ -20652,6 +20683,40 @@ mod tests {
         let pruned = sync_conflicts(&root, true, true).unwrap();
         assert_eq!(pruned["pruned"], 1);
         assert!(!root.join(".dbmd/conflicts").join(bundle).exists());
+    }
+
+    #[test]
+    fn pull_journal_admits_large_asset_coordinates_but_keeps_a_hard_bound() {
+        let coordinate = |bytes| V2PullJournal {
+            v: 1,
+            phase: V2PullPhase::Preparing,
+            brain: TEST_BRAIN_ID.to_string(),
+            previous: V2PullCoordinate {
+                head_seq: None,
+                commit_hash: None,
+                view_kind: None,
+                view_revision: None,
+            },
+            next: V2PullCoordinate {
+                head_seq: Some(1),
+                commit_hash: Some("a".repeat(64)),
+                view_kind: Some("full".to_string()),
+                view_revision: Some("b".repeat(64)),
+            },
+            backup_dir: format!(".dbmd/pull-backup-{}", crate::ulid::mint()),
+            entries: vec![V2PullJournalEntry {
+                path: "sources/media/large.mov".to_string(),
+                old: None,
+                new: Some(V2PullFileCoordinate {
+                    sha256: "c".repeat(64),
+                    bytes,
+                }),
+                backup: None,
+            }],
+        };
+
+        validate_v2_pull_journal(&coordinate(MAX_STORE_BYTES + 1)).unwrap();
+        assert!(validate_v2_pull_journal(&coordinate(MAX_PULL_TRANSACTION_BYTES + 1)).is_err());
     }
 
     #[test]
