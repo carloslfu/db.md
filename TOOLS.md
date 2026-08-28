@@ -176,6 +176,23 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 ### Close
 - `dbmd log <kind> <object> [-m <note>]` — append to the active `log.md`; auto-rotates older months into `log/<YYYY-MM>.md`
 
+### The local app API
+- `dbmd api [--addr 127.0.0.1:3263] [--dir]` — serve the store's full local
+  verb surface over loopback HTTP, so an application (a browser page
+  included — CORS is open) uses the store as its backend without shelling
+  out. ONE SEMANTICS by construction: every route executes the same-named
+  `dbmd` verb (same binary, `--json` output passed through verbatim, the
+  same frozen-page policy, index write-through, and store transaction lock
+  — concurrent HTTP writes serialize correctly), so the API can never
+  drift from the CLI. Exit codes map onto HTTP statuses (0→200, 1/2→400,
+  3→404, 4→403, 5→409, 6→422) with the structured `{"error":{…}}` line as
+  the error body. `GET /v1` lists every route; `GET /v1/events` streams
+  `dbmd watch` as Server-Sent Events; `GET /v1/emit?ndjson=1` line-streams
+  the whole-store dump. Loopback only, deliberately without a public-bind
+  escape hatch (an unauthenticated read-write surface for the machine's
+  own apps); cross-party verbs (sync, grants, proposals, keys, mirror) are
+  not exposed — link.md remains the cross-party surface.
+
 ### Interconnect (the link.md client)
 
 One binary, two specs: `dbmd` also speaks the link.md client verbs

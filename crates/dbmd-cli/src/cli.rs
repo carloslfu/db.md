@@ -186,6 +186,24 @@ pub enum Command {
     /// (no locks — a watcher never blocks a writer); runs until interrupted.
     Watch(WatchArgs),
 
+    // ── Serve: the local app API ─────────────────────────────────────────────
+    /// Serve the store's full local verb surface over loopback HTTP — the
+    /// app-server projection of the CLI. Every route executes the
+    /// corresponding `dbmd` verb (same binary, same store transaction locks,
+    /// `--json` output passed through verbatim), so the API can never drift
+    /// from the CLI: reads (`/v1/show`, `/v1/query`, `/v1/search`,
+    /// `/v1/schema`, graph/tree/stats/emit/validate/log/assets), writes
+    /// (`/v1/write`, `/v1/fm`, `/v1/body`, `/v1/section`, `/v1/link`,
+    /// `/v1/rename`, `/v1/rm`, …), and `/v1/events` — the `watch` feed as
+    /// Server-Sent Events. Exit codes map to HTTP statuses (0→200, 1/2→400,
+    /// 3→404, 4→403, 5→409, 6→422); CORS is open so a local browser app can
+    /// call it directly. Loopback ONLY — this is an unauthenticated
+    /// read-write surface for the machine's own apps; there is deliberately
+    /// no public-bind escape hatch. Cross-party operations (sync, grants,
+    /// keys) stay in the CLI and the hub — this serves the folder, not the
+    /// network. `GET /v1` lists the routes. Runs until interrupted.
+    Api(ApiArgs),
+
     // ── Read / Maintain: the index catalog ───────────────────────────────────
     /// Maintain or read the write-through index catalog (`index.md` +
     /// `index.jsonl`): rebuild or show. (For structured reads over the sidecar
@@ -955,6 +973,24 @@ pub struct RenameArgs {
     /// The new store-relative path.
     #[arg(value_name = "NEW")]
     pub new: String,
+
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// api
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd api` — the local app API over loopback HTTP.
+#[derive(Debug, Args)]
+pub struct ApiArgs {
+    /// Listen address. Must be loopback ("3263" is `dbmd` on a phone
+    /// keypad); port `0` binds an OS-assigned free port, printed on the
+    /// first output line.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3263")]
+    pub addr: String,
 
     /// Store root. Defaults to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]

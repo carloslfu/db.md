@@ -19,6 +19,7 @@
 //! retained in [`crate::error`] as a reserved contract code, but no body
 //! returns it.)
 
+pub mod api;
 pub mod assets;
 pub mod body;
 pub mod emit;
@@ -28,6 +29,7 @@ pub mod fm;
 pub mod format;
 pub mod grant;
 pub mod graph;
+mod httpd;
 pub mod index;
 pub mod install_verified;
 pub mod key;

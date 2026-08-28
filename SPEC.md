@@ -1877,6 +1877,7 @@ prompt interactively.
 | Validate  | `dbmd validate [--json]` (working set), `dbmd validate --all` (full sweep), `dbmd validate --all --projection-excludes <file>` (local declared projection), `dbmd validate --all --projection-manifest <file\|->` (path-commitment projection) |
 | Maintain  | indexes are write-through; `dbmd index rebuild [--layer --folder --dry-run]` repairs / folds in bulk drops |
 | Close     | `dbmd log <kind> <object> [-m <note>]` |
+| Serve     | `dbmd api [--addr]` — the local app API: the full local verb surface over loopback HTTP (every route executes the same-named verb; `GET /v1` lists routes; `GET /v1/events` streams `watch` as SSE), so an application uses the store as its backend without shelling out |
 
 ## Versioning
 

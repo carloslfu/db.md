@@ -8,9 +8,57 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.9.0**.
+  `Cargo.toml`, currently **v0.10.0**.
 
 ## Unreleased
+
+## [0.10.0] — 2026-08-28
+
+Implements format v0.4 (unchanged).
+
+### Added
+
+- **`dbmd api` — the local app API.** The store's full local verb surface
+  served over loopback HTTP, so an application (a browser page included —
+  CORS is open) can use a db.md store as its backend without shelling out.
+  The design rule is ONE SEMANTICS: every route executes the same-named
+  `dbmd` verb (the same binary, child CWD at the store root, `--json`
+  output passed through verbatim), so the API can never drift from the CLI
+  — flags, frozen-page policy, index write-through, and the store-wide
+  transaction lock all apply identically, and concurrent HTTP writes
+  serialize correctly by construction. Exit codes map onto HTTP statuses
+  (0→200, 1/2→400, 3→404, 4→403 policy refusal, 5→409 conflict, 6→422
+  validation failed) with the CLI's structured `{"error":{…}}` line as the
+  error body, so an HTTP client branches on `error.code` exactly like a CLI
+  consumer.
+  - Reads: `/v1/show`, `/v1/query`, `/v1/search`, `/v1/schema`,
+    `/v1/section`, `/v1/fm`, `/v1/sections`, `/v1/outline`,
+    `/v1/graph/*`, `/v1/tree`, `/v1/stats`, `/v1/validate`, `/v1/emit`
+    (single document, or line-streamed with `?ndjson=1`), `/v1/index`,
+    `/v1/log/tail`, `/v1/log/since`, `/v1/assets/*`, `/v1/extract`,
+    `/v1/spec`, `/v1/version`.
+  - Writes: `POST /v1/write`, `PUT /v1/fm`, `POST /v1/fm/init`,
+    `PUT /v1/body` + `POST /v1/body/append` (raw request body = the
+    content, byte-exact), `PUT /v1/section` + `POST /v1/section/append`
+    (`?create=1&level=`), `POST /v1/link`, `POST /v1/rename`,
+    `DELETE /v1/rm` (`?force=1`), `POST /v1/format`,
+    `POST /v1/index/rebuild`, `POST /v1/log`, `POST /v1/assets/*`.
+  - `GET /v1/events` re-frames `dbmd watch` as Server-Sent Events — the
+    live change feed an app subscribes to. `GET /v1` is the discovery
+    document.
+  - Loopback ONLY, deliberately without a public-bind escape hatch: this is
+    an unauthenticated read-write surface for the machine's own apps.
+    Cross-party operations (sync, grants, proposals, keys, mirror) are not
+    exposed — the API serves the folder, not the network; link.md remains
+    the cross-party surface.
+- The HTTP plumbing `dbmd serve` hand-rolled (bounded heads, idle timeouts
+  under absolute deadlines, the trickle-proof connection cap) is extracted
+  into a shared module both servers use, now grown a bounded request-body
+  reader; `serve`'s behavior is unchanged and its hardening tests exercise
+  the shared paths.
+
+The format is untouched — a toolkit transport surface, not a SPEC change;
+the format stays v0.4, and no existing verb changed shape.
 
 ## [0.9.0] — 2026-08-28
 

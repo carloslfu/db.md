@@ -12,13 +12,16 @@
 //! authenticated verbs always send a credential) speak to it unchanged.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::cli::ServeArgs;
+use crate::cmd::httpd::{
+    self, respond, DeadlineWriter, Timing as ServeTiming, MAX_CONCURRENT_CLIENTS,
+};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -46,32 +49,10 @@ struct SnapshotPack {
     len: u64,
 }
 
-const MAX_HTTP_HEAD_BYTES: usize = 16 * 1024;
-const MAX_CONCURRENT_CLIENTS: usize = 16;
 const MAX_SERVED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MIRROR_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_MIRROR_FEED_ENTRIES: u64 = 100_000;
 const MAX_MIRROR_FEED_BYTES: u64 = 64 * 1024 * 1024;
-const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const HEADER_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
-const RESPONSE_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
-
-#[derive(Clone, Copy)]
-struct ServeTiming {
-    idle: Duration,
-    header_total: Duration,
-    response_total: Duration,
-}
-
-impl Default for ServeTiming {
-    fn default() -> Self {
-        Self {
-            idle: IO_IDLE_TIMEOUT,
-            header_total: HEADER_TOTAL_TIMEOUT,
-            response_total: RESPONSE_TOTAL_TIMEOUT,
-        }
-    }
-}
 
 #[cfg(unix)]
 fn open_dir_path_nofollow(path: &Path) -> Result<std::fs::File, String> {
@@ -320,21 +301,6 @@ fn load_state(_dir: &Path, _expected_anchor: &str) -> Result<ServeState, String>
     Err("dbmd serve requires the official macOS/Linux build or WSL".to_string())
 }
 
-fn respond<W: Write>(stream: &mut W, status: u16, body: &str) {
-    let reason = match status {
-        200 => "OK",
-        404 => "Not Found",
-        _ => "Error",
-    };
-    let _ = stream.write_all(
-        format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len(),
-        )
-        .as_bytes(),
-    );
-}
-
 #[cfg(unix)]
 fn write_file_response<W: Write>(
     stream: &mut W,
@@ -522,118 +488,33 @@ fn handle<W: Write>(state: &ServeState, path_and_query: &str, stream: &mut W) {
     respond(stream, 404, "{\"error\":\"not found\"}");
 }
 
-struct DeadlineWriter<'a> {
-    stream: &'a mut TcpStream,
-    deadline: Instant,
-    idle: Duration,
-}
-
-impl DeadlineWriter<'_> {
-    fn arm(&self) -> std::io::Result<()> {
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "absolute response deadline elapsed",
-                )
-            })?;
-        self.stream
-            .set_write_timeout(Some(self.idle.min(remaining)))
-    }
-}
-
-impl Write for DeadlineWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.arm()?;
-        self.stream.write(bytes)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.arm()?;
-        self.stream.flush()
-    }
-}
-
 fn serve_connection(mut stream: TcpStream, state: &ServeState, timing: ServeTiming) {
-    let header_deadline = Instant::now() + timing.header_total;
-    let mut head = Vec::with_capacity(1024);
-    let mut byte = [0u8; 1];
-    while head.len() < MAX_HTTP_HEAD_BYTES {
-        let Some(remaining) = header_deadline.checked_duration_since(Instant::now()) else {
-            return;
-        };
-        if remaining.is_zero() {
-            return;
-        }
-        if stream
-            .set_read_timeout(Some(timing.idle.min(remaining)))
-            .is_err()
-        {
-            return;
-        }
-        match stream.read(&mut byte) {
-            Ok(1) => {
-                head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
-                    break;
-                }
-            }
-            _ => return,
-        }
-    }
+    // Read-only surface: max_body 0 skips the body phase entirely — the head
+    // is processed and any body a client sends is ignored, as before the
+    // shared-plumbing extraction.
+    let Some(request) = httpd::read_request(&mut stream, timing, 0) else {
+        return;
+    };
     let mut writer = DeadlineWriter {
         stream: &mut stream,
         deadline: Instant::now() + timing.response_total,
         idle: timing.idle,
     };
-    if head.len() == MAX_HTTP_HEAD_BYTES
-        || !(head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n"))
-    {
-        respond(
-            &mut writer,
-            400,
-            "{\"error\":\"request headers too large\"}",
-        );
-        return;
-    }
-    let request = match std::str::from_utf8(&head) {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let line = request.lines().next().unwrap_or("");
-    let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("").to_string();
-    if method != "GET" {
+    if request.method != "GET" {
         respond(&mut writer, 404, "{\"error\":\"not found\"}");
         return;
     }
-    handle(state, &target, &mut writer);
+    handle(state, &request.target, &mut writer);
 }
 
 fn dispatch_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     state: Arc<ServeState>,
     active: Arc<AtomicUsize>,
     timing: ServeTiming,
 ) {
-    if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_CLIENTS {
-        active.fetch_sub(1, Ordering::AcqRel);
-        respond(&mut stream, 503, "{\"error\":\"server busy\"}");
-        return;
-    }
-    std::thread::spawn(move || {
-        struct ActiveGuard(Arc<AtomicUsize>);
-        impl Drop for ActiveGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let _guard = ActiveGuard(active);
-        serve_connection(stream, &state, timing);
+    httpd::spawn_bounded(stream, active, MAX_CONCURRENT_CLIENTS, move |s| {
+        serve_connection(s, &state, timing)
     });
 }
 
@@ -643,31 +524,13 @@ pub fn run(ctx: &Context, args: &ServeArgs) -> CliResult {
         CliError::new(ExitCode::Runtime, "SERVE_STATE", message)
             .with_hint("run `dbmd mirror <brain> --dir <dir>` first")
     })?;
-    let requested: SocketAddr = args.addr.parse().map_err(|e| {
-        CliError::new(
-            ExitCode::Runtime,
-            "SERVE_BIND",
-            format!("address must be an IP socket address: {e}"),
-        )
-    })?;
-    if !requested.ip().is_loopback() && !args.unsafe_public {
-        return Err(CliError::new(
-            ExitCode::Runtime,
-            "SERVE_PUBLIC_REFUSED",
-            "refusing unauthenticated non-loopback bind",
-        )
-        .with_hint("bind loopback, or pass --unsafe-public only behind an authenticated proxy"));
-    }
-    let listener = TcpListener::bind(requested).map_err(|e| {
-        CliError::new(
-            ExitCode::Runtime,
-            "SERVE_BIND",
-            format!("cannot bind {}: {e}", args.addr),
-        )
-    })?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| CliError::new(ExitCode::Runtime, "SERVE_BIND", e.to_string()))?;
+    let (listener, addr) = httpd::bind_checked(
+        &args.addr,
+        "SERVE_BIND",
+        "SERVE_PUBLIC_REFUSED",
+        args.unsafe_public,
+        "bind loopback, or pass --unsafe-public only behind an authenticated proxy",
+    )?;
     let url = format!("http://{addr}");
     state.base_url = url.clone();
     let state = Arc::new(state);
@@ -706,7 +569,9 @@ type _MirrorDir = PathBuf;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[cfg(unix)]
     #[test]

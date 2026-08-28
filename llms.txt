@@ -87,7 +87,11 @@ Read with `dbmd search` / `dbmd query` / `dbmd show` / `dbmd graph` (and
 `dbmd link`; delete link-aware with `dbmd rm`; follow local changes with
 `dbmd watch`; validate with `dbmd validate`; record with
 `dbmd log` (store-wide actions like `validate` take a `-` object:
-`dbmd log validate - -m "..."`). Every command takes `--json`. Read the store's `DB.md` (identity,
+`dbmd log validate - -m "..."`). Every command takes `--json`. An
+application can consume the same surface over loopback HTTP: `dbmd api`
+serves every local verb as a route (`GET /v1` lists them; `/v1/events`
+streams changes as SSE) so a local app — a browser page included — uses
+the store as its backend without shelling out. Read the store's `DB.md` (identity,
 policies, schemas) before writing. `dbmd write` mints a stable lowercase-ULID
 `id` for each new record (recommended, not required — files without one stay
 fully valid); ids are minted by tooling — never compose a ULID by hand.

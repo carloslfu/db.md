@@ -120,6 +120,7 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Emit(args) => cmd::emit::run(ctx, args),
         Command::Outline(args) => cmd::outline::run(ctx, args),
         Command::Watch(args) => cmd::watch::run(ctx, args),
+        Command::Api(args) => cmd::api::run(ctx, args),
         Command::Index(args) => cmd::index::run(ctx, args),
         Command::Log(args) => cmd::log::run(ctx, args),
         Command::Write(args) => cmd::write::run(ctx, args),
