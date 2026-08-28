@@ -186,6 +186,37 @@ pub enum Command {
     /// (no locks — a watcher never blocks a writer); runs until interrupted.
     Watch(WatchArgs),
 
+    // ── Harness: the embedded operator ───────────────────────────────────────
+    /// Ask the store a question in natural language. Runs the embedded
+    /// micro-harness: a stateless tool-calling loop against YOUR model (a
+    /// preset + key, a local server — Ollama/LM Studio/llama.cpp are
+    /// autodetected — or a logged-in vendor CLI via `--provider claude-code`
+    /// / `codex`), whose tools are the store's READ verbs only (query,
+    /// search, show, schema, tree, log tail). Guaranteed no mutation: a
+    /// prompt injection can at worst produce a wrong answer. Configure with
+    /// `--provider/--model/--base-url/--protocol`, `DBMD_LLM_*` env vars, or
+    /// non-secret `llm_*` keys in `.dbmd/config`; the key is env-only
+    /// (`DBMD_LLM_KEY`, or the preset's conventional variable). No default
+    /// vendor. `--json` streams the event feed as NDJSON.
+    Ask(AskArgs),
+
+    /// Tell the store to do something in natural language. The same embedded
+    /// harness as `ask` with the WRITE verbs added (write, fm set, body set,
+    /// rm — link-aware, never forced — and log). Every mutation rides the
+    /// full store contract: schema enforcement, frozen pages, the
+    /// cross-process transaction lock (taken per tool call), write-through
+    /// indexes, and the store log — the audit trail of what the model did.
+    Do(AskArgs),
+
+    /// Operate the store AND the app workspace around it — the full-stack
+    /// tier. Adds file tools (list/read/write/edit) confined beneath the
+    /// DECLARED workspace root (`--workspace`, `DBMD_WORKSPACE`, or
+    /// `workspace = <path>` in `.dbmd/config`); the store subtree is refused
+    /// for file tools (store files go through store verbs), and there is no
+    /// shell — a running dev server (or your own agent) does any executing.
+    /// CLI-only by design: `build` is never exposed over `dbmd api`.
+    Build(AskArgs),
+
     // ── Serve: the local app API ─────────────────────────────────────────────
     /// Serve the store's full local verb surface over loopback HTTP — the
     /// app-server projection of the CLI. Every route executes the
@@ -991,6 +1022,68 @@ pub struct ApiArgs {
     /// first output line.
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3263")]
     pub addr: String,
+
+    /// Enable `POST /v1/ask` — the embedded harness's read-only registry,
+    /// streamed as SSE. Off by default: an ask route lets anything on
+    /// loopback spend the configured model's tokens.
+    #[arg(long = "ask")]
+    pub enable_ask: bool,
+
+    /// Enable `POST /v1/do` — the harness's write registry over SSE
+    /// (implies --ask). Off by default for the same reason, doubly so:
+    /// callers can mutate the store through the model.
+    #[arg(long = "do")]
+    pub enable_do: bool,
+
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ask / do / build (the embedded harness)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Shared arguments of `dbmd ask` / `do` / `build`.
+#[derive(Debug, Args)]
+pub struct AskArgs {
+    /// The natural-language request.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: String,
+
+    /// Provider preset (anthropic, openai, openrouter, groq, together,
+    /// deepseek, mistral, ollama, lmstudio, llamacpp) or a delegation
+    /// backend (claude-code, codex). No default: with nothing configured,
+    /// local servers are autodetected.
+    #[arg(long, value_name = "NAME")]
+    pub provider: Option<String>,
+
+    /// Model id sent on the wire (e.g. `claude-sonnet-5`, `qwen3:8b`).
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Endpoint base URL (overrides the preset). For `--protocol openai`
+    /// include the `/v1` prefix; for `--protocol anthropic` exclude it.
+    #[arg(long, value_name = "URL")]
+    pub base_url: Option<String>,
+
+    /// Wire protocol when `--base-url` is used without a preset:
+    /// `openai` or `anthropic`.
+    #[arg(long, value_name = "PROTO")]
+    pub protocol: Option<String>,
+
+    /// Maximum model round-trips before the final forced answer.
+    #[arg(long, value_name = "N", default_value_t = 15)]
+    pub max_turns: usize,
+
+    /// `max_tokens` per model call (default 4096).
+    #[arg(long, value_name = "N")]
+    pub max_tokens: Option<u32>,
+
+    /// The app workspace root for `dbmd build` (also `DBMD_WORKSPACE`, or
+    /// `workspace = <path>` in `.dbmd/config`, relative to the store root).
+    #[arg(long, value_name = "DIR")]
+    pub workspace: Option<String>,
 
     /// Store root. Defaults to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]

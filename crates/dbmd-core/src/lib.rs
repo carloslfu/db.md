@@ -49,6 +49,16 @@ pub mod index;
 // `default-features = false`. Deliberately NOT re-exported at the crate root:
 // the root re-exports are the format toolkit's locked interface, and the wire
 // client reads best module-qualified (`linkmd::HubConfig`).
+// The embedded micro-harness (feature `harness`, off core's defaults; the
+// `dbmd` binary requests it): `ask` / `do` / `build` — a stateless
+// tool-calling loop running the USER'S OWN model endpoint against the store's
+// verb surface. Client for user-supplied intelligence only: two hand-rolled
+// wire protocols over the same `ureq` the link client uses, no SDK crates, no
+// default vendor, key from the environment only. The db.md FORMAT is
+// untouched — a store never needs a model to be valid db.md, and the verbs
+// stay deterministic plumbing (AGENTS.md "Hard rules" carries the covenant).
+#[cfg(feature = "harness")]
+pub mod harness;
 #[cfg(feature = "link")]
 pub mod linkmd;
 #[cfg(feature = "link")]

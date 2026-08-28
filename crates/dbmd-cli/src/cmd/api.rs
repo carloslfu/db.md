@@ -88,12 +88,15 @@ pub fn run(ctx: &Context, args: &ApiArgs) -> CliResult {
     let exe = Arc::new(current_exe());
     let root = Arc::new(store_root);
     let active = Arc::new(AtomicUsize::new(0));
+    // --do implies --ask (the write registry contains the read one).
+    let ask_enabled = args.enable_ask || args.enable_do;
+    let do_enabled = args.enable_do;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let exe = Arc::clone(&exe);
         let root = Arc::clone(&root);
         httpd::spawn_bounded(stream, Arc::clone(&active), MAX_CONCURRENT_CLIENTS, {
-            move |s| handle_connection(s, &exe, &root)
+            move |s| handle_connection(s, &exe, &root, ask_enabled, do_enabled)
         });
     }
     Ok(())
@@ -104,7 +107,13 @@ fn current_exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dbmd"))
 }
 
-fn handle_connection(mut stream: TcpStream, exe: &PathBuf, store_root: &PathBuf) {
+fn handle_connection(
+    mut stream: TcpStream,
+    exe: &PathBuf,
+    store_root: &PathBuf,
+    ask_enabled: bool,
+    do_enabled: bool,
+) {
     let timing = Timing::default();
     let Some(request) = httpd::read_request(&mut stream, timing, MAX_DBMD_FILE_BYTES) else {
         return;
@@ -135,6 +144,15 @@ fn handle_connection(mut stream: TcpStream, exe: &PathBuf, store_root: &PathBuf)
     }
     if request.method == "GET" && path == "/v1/emit" && flag(&params, "ndjson") {
         stream_ndjson(stream, exe, store_root);
+        return;
+    }
+    // The embedded harness routes: long-lived SSE, explicitly opt-in
+    // (`dbmd api --ask` / `--do`) — an ask route lets anything on loopback
+    // spend the configured model's tokens, so neither exists by default.
+    if request.method == "POST" && (path == "/v1/ask" || path == "/v1/do") {
+        let wants_write = path == "/v1/do";
+        let enabled = if wants_write { do_enabled } else { ask_enabled };
+        stream_harness(stream, exe, store_root, wants_write, enabled, &request.body);
         return;
     }
 
@@ -610,6 +628,8 @@ fn known_path(seg: &[&str]) -> bool {
             | ["rm"]
             | ["format"]
             | ["events"]
+            | ["ask"]
+            | ["do"]
             | ["spec"]
             | ["version"]
     )
@@ -647,6 +667,10 @@ fn routes_index() -> Vec<u8> {
                 "POST /v1/index/rebuild?layer=&folder=",
                 "POST /v1/log?kind=&object=&m=",
                 "POST /v1/assets/{scan|refresh?path=}"
+            ],
+            "harness": [
+                "POST /v1/ask  {prompt, max_turns?}  (SSE; needs `dbmd api --ask`; read-only registry)",
+                "POST /v1/do   {prompt, max_turns?}  (SSE; needs `dbmd api --do`; adds store writes)"
             ]
         }
     })
@@ -868,6 +892,141 @@ fn stream_events(
             break; // client gone; the guard kills the watcher
         }
     }
+}
+
+/// `POST /v1/ask` / `POST /v1/do` — the embedded harness over SSE: the flat
+/// event stream (`text_delta`, `tool_call`, `tool_result`, `usage`,
+/// `turn_end`, `done` / `error`), one JSON object per `data:` frame. The
+/// request body is `{"prompt": "...", "max_turns"?: N}`; the provider comes
+/// from the server's environment / the store's `.dbmd/config` (non-secret
+/// knobs only — the key is env-only, per the harness covenant). Stateless:
+/// nothing is persisted; multi-turn state belongs to the calling app.
+fn stream_harness(
+    mut stream: TcpStream,
+    exe: &PathBuf,
+    store_root: &PathBuf,
+    wants_write: bool,
+    enabled: bool,
+    body: &[u8],
+) {
+    use dbmd_core::harness::{self, config, tools, Event, Mask, Msg, RunOptions};
+
+    let mut answer_early = |status: u16, code: &str, message: &str| {
+        let mut writer = DeadlineWriter {
+            stream: &mut stream,
+            deadline: Instant::now() + Timing::default().response_total,
+            idle: Timing::default().idle,
+        };
+        respond_bytes(
+            &mut writer,
+            status,
+            "application/json",
+            &cors_headers(),
+            &api_error_body(code, message),
+        );
+    };
+
+    if !enabled {
+        let flag = if wants_write { "--do" } else { "--ask" };
+        answer_early(
+            403,
+            "ASK_DISABLED",
+            &format!("this route is off by default — start the server with `dbmd api {flag}`"),
+        );
+        return;
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            answer_early(
+                400,
+                "BAD_REQUEST",
+                "body must be JSON: {\"prompt\": \"...\"}",
+            );
+            return;
+        }
+    };
+    let Some(prompt) = parsed
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.trim().is_empty())
+    else {
+        answer_early(400, "MISSING_PARAM", "`prompt` is required");
+        return;
+    };
+    let max_turns = parsed
+        .get("max_turns")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(15)
+        .clamp(1, 25) as usize;
+
+    let mask = if wants_write { Mask::Write } else { Mask::Read };
+    let provider = match config::resolve(store_root, &config::Overrides::default()) {
+        Ok(provider) => provider,
+        Err(error) => {
+            answer_early(400, "ASK_CONFIG", &error.to_string());
+            return;
+        }
+    };
+    let store = match open_store(&store_root.to_string_lossy()) {
+        Ok(store) => store,
+        Err(error) => {
+            answer_early(500, "EXEC_FAILED", &error.message);
+            return;
+        }
+    };
+    let system = crate::cmd::ask::build_system_prompt(&store, exe, store_root, mask);
+    drop(store);
+
+    // Long-lived stream: idle write timeout only (the `stream_events` shape).
+    let _ = stream.set_write_timeout(Some(Timing::default().idle));
+    let mut head = String::from(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\nconnection: close\r\n",
+    );
+    for (name, value) in cors_headers() {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+
+    let mut executor = crate::cmd::ask::VerbExecutor {
+        exe: exe.clone(),
+        store_root: store_root.clone(),
+        workspace: None, // `build` is CLI-only by design — never over HTTP
+        mask,
+    };
+    let options = RunOptions {
+        max_turns,
+        max_tokens: 4096,
+        mask,
+        delegate_cwd: Some(store_root.clone()),
+    };
+    let mut emit = |event: Event| {
+        if let Ok(json) = serde_json::to_string(&event) {
+            // A gone client makes these writes fail; the run still ends on
+            // its own caps (there is no abort channel by design — bounded).
+            let _ = stream
+                .write_all(format!("data: {json}\n\n").as_bytes())
+                .and_then(|()| stream.flush());
+        }
+    };
+    let specs = tools::registry(mask);
+    let result = harness::run(
+        &provider,
+        &options,
+        &system,
+        vec![Msg::user(prompt.to_string())],
+        &specs,
+        &mut executor,
+        &mut emit,
+    );
+    // Errors already rode the stream as an `error` event; nothing to add.
+    let _ = result;
 }
 
 /// `/v1/emit?ndjson=1` — the whole-store dump, streamed line-by-line so

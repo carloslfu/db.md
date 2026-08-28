@@ -12,6 +12,49 @@ Two things version independently:
 
 ## Unreleased
 
+### Added
+
+- **`dbmd ask` / `dbmd do` / `dbmd build` — the embedded harness.** One
+  stateless tool-calling engine (dbmd-core feature `harness`), three tool
+  masks, running the **user's own** model against the store's verb surface.
+  `ask` exposes the read verbs only (guaranteed no mutation — on untrusted
+  content a prompt injection can at worst produce a wrong answer); `do`
+  adds the store write verbs (every mutation rides the full contract:
+  schema enforcement, frozen pages, the per-call cross-process transaction
+  lock, write-through indexes, and a log.md audit trail); `build` adds
+  file tools confined beneath a DECLARED workspace root (`--workspace` /
+  `DBMD_WORKSPACE` / `workspace =` in `.dbmd/config`) with the store
+  subtree, symlink crossings, and `..` all refused — and no shell tool at
+  any mask. Tool calls execute as `dbmd` verb invocations (the api's ONE
+  SEMANTICS rule), so the harness can never drift from the CLI.
+- **Two hand-rolled wire protocols, no SDK crates.** OpenAI-compatible
+  Chat Completions — with a tolerance layer for real servers: whole-arg
+  tool calls, `index` stuck at 0 for parallel calls, missing ids
+  (synthesized), `finish_reason` lying about tool use, usage-only chunks
+  with empty `choices`, SSE comment keep-alives — and Anthropic Messages
+  (full event grammar; also reaches llama.cpp's native `/v1/messages`).
+  Both ride the `ureq` already in the tree; the deny.toml AI-crate bans
+  now *enforce* the harness covenant. Providers resolve flag > `DBMD_LLM_*`
+  env > non-secret `llm_*` keys in `.dbmd/config` > local autodetect
+  (Ollama, LM Studio, llama.cpp — zero-config), with inert presets for the
+  common key-auth providers and **no default vendor**. The credential is
+  environment-only, and an endpoint chosen by store-local config refuses
+  an ambient key without an explicit `DBMD_LLM_KEY_ORIGIN` binding — a
+  cloned store cannot exfiltrate a key (the hub client's rule, applied to
+  models). Subscription logins (Claude, Codex) work by DELEGATION to the
+  vendor's own logged-in CLI (`--provider claude-code` / `codex`,
+  experimental) — never by reimplementing vendor OAuth here.
+- **`POST /v1/ask` and `POST /v1/do` on `dbmd api`** — the same engine
+  over SSE for local apps, streaming the flat event feed (`text_delta`,
+  `tool_call` with the exact CLI one-liner it executes, `tool_result`,
+  `usage`, `done`). Each route is opt-in (`dbmd api --ask` / `--do`) and
+  off by default — an ask route lets anything on loopback spend the
+  configured model's tokens; `build` is CLI-only and never served.
+- Doctrine: AGENTS.md's hard rule is redrawn to "zero AI/LLM
+  dependencies; zero intelligence in the verbs" — every verb stays
+  deterministic plumbing, and the harness is a *client for user-supplied
+  intelligence*, the way a database ships a shell.
+
 ## [0.10.0] — 2026-08-28
 
 Implements format v0.4 (unchanged).

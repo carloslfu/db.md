@@ -73,6 +73,14 @@ windows-sys = { version = "0.61", features = [
 # `default-features = false` (the store never needs link.md to be valid db.md).
 default = ["link"]
 link = ["dep:ureq", "dep:url", "dep:base64", "dep:ring"]
+# `harness` = the embedded micro-harness (`dbmd ask` / `do` / `build`): a
+# stateless tool-calling loop that runs the USER'S OWN model endpoint against
+# the store's verb surface — two hand-rolled wire protocols (Anthropic
+# Messages, OpenAI-compatible Chat Completions) over the same `ureq` the link
+# client uses. Zero SDK crates, no default vendor or endpoint, key from the
+# environment only (AGENTS.md "Hard rules" carries the full covenant).
+# Optional so a format-only consumer drops it with `default-features = false`.
+harness = ["dep:ureq"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

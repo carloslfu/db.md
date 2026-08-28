@@ -204,6 +204,60 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
   own apps); cross-party verbs (sync, grants, proposals, keys, mirror) are
   not exposed — link.md remains the cross-party surface.
 
+### The embedded harness (ask / do / build)
+
+One engine, three tool masks — a stateless tool-calling loop that runs
+**your own** model against the store's verb surface. Every tool call
+executes as a `dbmd` verb (the api's ONE SEMANTICS rule: same binary,
+same schema enforcement, frozen pages, per-call transaction lock,
+write-through indexes, log.md), and there is no shell tool at any mask.
+
+- `dbmd ask "<question>"` — READ verbs only (query, search, show,
+  schema, tree, log tail). Guaranteed no mutation: on untrusted content
+  a prompt injection can at worst produce a wrong answer.
+- `dbmd do "<request>"` — adds the store WRITE verbs (write, fm set,
+  body set, rm — link-aware, never forced — and log; the store log is
+  the audit trail of what the model did).
+- `dbmd build "<request>"` — adds file tools (list/read/write/edit)
+  confined beneath a DECLARED workspace root (`--workspace`,
+  `DBMD_WORKSPACE`, or `workspace = <path>` in `.dbmd/config`). The
+  store subtree is refused for file tools; symlink and `..` escapes are
+  refused; CLI-only — never exposed over `dbmd api`.
+
+Providers, in three layers. (1) Presets — `--provider anthropic |
+openai | openrouter | groq | together | deepseek | mistral | ollama |
+lmstudio | llamacpp` — each just a base URL + wire protocol + the
+provider's conventional key env var. Two hand-rolled protocols cover
+them all: OpenAI-compatible Chat Completions and Anthropic Messages
+(which also reaches llama.cpp's native `/v1/messages`). (2) Local,
+zero-config: with nothing configured the well-known local servers
+(Ollama, LM Studio, llama.cpp) are autodetected and their models
+listed. (3) Subscription logins by DELEGATION — `--provider
+claude-code` / `codex` spawns the vendor's own logged-in CLI headless
+(`claude -p` / `codex exec`, read-only sandbox for `ask`); dbmd ships
+zero OAuth code and never impersonates a vendor client (experimental:
+headless flags drift across vendor releases).
+
+Config: flag > `DBMD_LLM_*` env > non-secret `llm_*` keys in
+`.dbmd/config` (`llm_provider`, `llm_base_url`, `llm_protocol`,
+`llm_model`). **The key is environment-only** (`DBMD_LLM_KEY`, or the
+preset's conventional variable) — never a file in the store — and an
+endpoint selected by store-local config refuses an ambient key unless
+`DBMD_LLM_KEY_ORIGIN` binds it to that exact origin, so a cloned store
+cannot exfiltrate a credential (the hub client's rule, applied to
+models). Plain http is loopback-only unless
+`DBMD_LLM_ALLOW_INSECURE_HTTP=1`. No default vendor or endpoint,
+anywhere.
+
+Caps: `--max-turns` (default 15; the capped final call carries no tools
+and answers with what it has), `--max-tokens` per call, per-tool result
+truncation with explicit re-query markers. Stateless one-shot: nothing
+persists; `--json` streams the flat event feed (`text_delta`,
+`tool_call` with the exact CLI one-liner it executes, `tool_result`,
+`usage`, `done`) as NDJSON. Over HTTP the same feed is `POST /v1/ask`
+and `POST /v1/do` on `dbmd api` — SSE, each opt-in via `dbmd api
+--ask` / `--do` and off by default.
+
 ### Interconnect (the link.md client)
 
 One binary, two specs: `dbmd` also speaks the link.md client verbs
