@@ -19,7 +19,7 @@ version="$(
 )"
 test -n "$version"
 grep -Fqx \
-    "dbmd-core = { path = \"../dbmd-core\", version = \"=${version}\", features = [\"link\"] }" \
+    "dbmd-core = { path = \"../dbmd-core\", version = \"=${version}\", features = [\"link\", \"harness\"] }" \
     crates/dbmd-cli/Cargo.toml || {
     printf 'dbmd-cli must require the exact same-release dbmd-core =%s\n' "$version" >&2
     exit 1
