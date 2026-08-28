@@ -458,7 +458,9 @@
       "key": null,
       "line": 19,
       "message": "wiki-link target `records/contacts/ghost` doesn't exist",
-      "related": [],
+      "related": [
+        "records/contacts/ghost"
+      ],
       "severity": "error",
       "suggestion": "create `records/contacts/ghost.md`, or point the link at an existing file"
     },

@@ -16,13 +16,15 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset};
-use dbmd_core::validate::{validate_all, validate_working_set};
+use dbmd_core::validate::{apply_projection_policy, validate_all, validate_working_set};
 use dbmd_core::{Config, Issue, Severity, Store};
 
 use crate::cli::ValidateArgs;
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 use crate::sanitize::sanitize_single_line;
+
+use super::projection::{load as load_projection, load_manifest as load_projection_manifest};
 
 /// Run `dbmd validate`.
 pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
@@ -39,11 +41,24 @@ pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
     };
 
     let scoped_view = dbmd_core::linkmd::has_verified_local_scoped_view(&store);
-    let scope = match (args.all, scoped_view) {
-        (true, true) => "scoped-all",
-        (false, true) => "scoped-working-set",
-        (true, false) => "all",
-        (false, false) => "working-set",
+    let projection = match (
+        args.projection_excludes.as_deref(),
+        args.projection_manifest.as_deref(),
+    ) {
+        (Some(path), None) => Some(load_projection(&store, path)?),
+        (None, Some(path)) => Some(load_projection_manifest(&store, path)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting projection inputs"),
+    };
+    let scope = match (args.all, scoped_view, projection.is_some()) {
+        (true, true, true) => "scoped-projection-all",
+        (false, true, true) => "scoped-projection-working-set",
+        (true, true, false) => "scoped-all",
+        (false, true, false) => "scoped-working-set",
+        (true, false, true) => "projection-all",
+        (false, false, true) => "projection-working-set",
+        (true, false, false) => "all",
+        (false, false, false) => "working-set",
     };
 
     let mut issues = if args.all {
@@ -54,6 +69,9 @@ pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
     };
     if scoped_view {
         make_scoped_link_findings_non_disclosing(&mut issues);
+    }
+    if let Some(excludes) = projection.as_ref() {
+        apply_projection_policy(&mut issues, excludes);
     }
 
     let counts = Counts::of(&issues);

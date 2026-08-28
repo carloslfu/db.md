@@ -14,6 +14,7 @@ mod common;
 use std::collections::BTreeSet;
 
 use common::{corpus_a, corpus_b, dbmd, write_db_md, write_file};
+use dbmd_core::projection::projection_path_sha256;
 
 /// Parse a `--json` validate run's stdout into its envelope.
 fn run_validate_json(dir: &std::path::Path, all: bool) -> (i32, serde_json::Value) {
@@ -291,6 +292,144 @@ fn single_broken_link_is_one_error_exit_six() {
     assert_eq!(broken.len(), 1, "one broken link: {}", json["issues"]);
     assert_eq!(broken[0]["file"], "records/notes/n.md");
     assert_eq!(broken[0]["severity"], "error");
+}
+
+#[test]
+fn projection_excludes_downgrades_only_the_exact_missing_target() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_db_md(tmp.path());
+    write_file(
+        tmp.path(),
+        "records/notes/n.md",
+        "---\ntype: note\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: a note\n---\n\nAllowed [[records/contacts/private]]. Broken [[records/contacts/other]].\n",
+    );
+    write_file(tmp.path(), ".projection", "records/contacts/private.md\n");
+    dbmd()
+        .args(["index", "rebuild"])
+        .arg("--dir")
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    let output = dbmd()
+        .arg("--json")
+        .arg("validate")
+        .arg("--all")
+        .arg("--projection-excludes")
+        .arg(".projection")
+        .arg(tmp.path())
+        .output()
+        .expect("run projection validation");
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "the unlisted target still blocks"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["scope"], "projection-all");
+    assert_eq!(json["summary"]["errors"], 1);
+    assert_eq!(json["summary"]["info"], 1);
+    let issues = json["issues"].as_array().unwrap();
+    assert!(issues.iter().any(|issue| {
+        issue["code"] == "WIKI_LINK_PROJECTION_UNRESOLVED"
+            && issue["severity"] == "info"
+            && issue["related"] == serde_json::json!(["records/contacts/private"])
+    }));
+    assert!(issues.iter().any(|issue| {
+        issue["code"] == "WIKI_LINK_BROKEN"
+            && issue["severity"] == "error"
+            && issue["related"] == serde_json::json!(["records/contacts/other"])
+    }));
+}
+
+#[test]
+fn projection_excludes_can_establish_a_clean_partial_projection() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_db_md(tmp.path());
+    write_file(
+        tmp.path(),
+        "records/notes/n.md",
+        "---\ntype: note\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: a note\n---\n\nSee [[records/contacts/private]].\n",
+    );
+    write_file(tmp.path(), ".projection", "records/contacts/private.md\n");
+    dbmd()
+        .args(["index", "rebuild"])
+        .arg("--dir")
+        .arg(tmp.path())
+        .assert()
+        .success();
+
+    let output = dbmd()
+        .arg("--json")
+        .arg("validate")
+        .arg("--all")
+        .arg("--projection-excludes")
+        .arg(".projection")
+        .arg(tmp.path())
+        .output()
+        .expect("run projection validation");
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["summary"]["errors"], 0);
+    assert_eq!(json["summary"]["info"], 1);
+}
+
+#[test]
+fn projection_manifest_reclassifies_a_committed_target_from_stdin() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_db_md(tmp.path());
+    write_file(
+        tmp.path(),
+        "records/notes/n.md",
+        "---\ntype: note\ncreated: 2026-05-01T00:00:00Z\nupdated: 2026-05-01T00:00:00Z\nsummary: a note\n---\n\nSee [[records/contacts/private]].\n",
+    );
+    dbmd()
+        .args(["index", "rebuild"])
+        .arg("--dir")
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let hash = projection_path_sha256("records/contacts/private.md");
+    let manifest =
+        format!("{{\"version\":1,\"algorithm\":\"sha256\",\"path_hashes\":[\"{hash}\"]}}");
+    let accepted = dbmd()
+        .args(["--json", "validate", "--all", "--projection-manifest", "-"])
+        .arg(tmp.path())
+        .write_stdin(manifest)
+        .assert()
+        .success();
+    let report: serde_json::Value = serde_json::from_slice(&accepted.get_output().stdout).unwrap();
+    assert_eq!(report["scope"], "projection-all");
+    assert_eq!(report["summary"]["errors"], 0);
+    assert_eq!(report["summary"]["info"], 1);
+}
+
+#[test]
+fn projection_excludes_requires_all_and_rejects_unsafe_paths() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    write_db_md(tmp.path());
+    write_file(tmp.path(), ".projection", "../outside.md\n");
+
+    dbmd()
+        .arg("validate")
+        .arg("--projection-excludes")
+        .arg(".projection")
+        .arg(tmp.path())
+        .assert()
+        .failure();
+
+    let output = dbmd()
+        .arg("--json")
+        .arg("validate")
+        .arg("--all")
+        .arg("--projection-excludes")
+        .arg(".projection")
+        .arg(tmp.path())
+        .output()
+        .expect("run malformed projection validation");
+    assert_eq!(output.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "BAD_PROJECTION_EXCLUDES");
 }
 
 #[test]

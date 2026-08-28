@@ -56,6 +56,7 @@ mod linkmd_sync_policy;
 pub mod linkmd_v2;
 pub mod log;
 pub mod parser;
+pub mod projection;
 pub mod query;
 pub mod render;
 pub mod stats;

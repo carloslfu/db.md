@@ -8,9 +8,32 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.36**.
+  `Cargo.toml`, currently **v0.8.37**.
 
 ## Unreleased
+
+## [0.8.37] — 2026-08-27
+
+### Added
+
+- `dbmd validate --all --projection-excludes <file>` validates an intentionally
+  partial store without pretending it is complete. The bounded policy file
+  uses `.sevralocal`'s case-sensitive glob, blank-line, and comment syntax.
+  Only a broken wiki-link whose exact structured target matches a rule becomes the explicit info
+  finding `WIKI_LINK_PROJECTION_UNRESOLVED`; unlisted links, unsafe targets,
+  stale indexes, malformed content, schema failures, and every other error
+  remain blocking. This gives higher-level restore tools a db.md-native way to
+  prove hosted projections whose local-only paths were withheld deliberately.
+- `dbmd assets verify --projection-excludes <file>` applies the same exact
+  partial-view policy to byte completeness. Matched assets may be absent and are
+  returned as `projected_missing`; `complete` remains false while any such byte
+  is absent, while `projection_complete` proves the materialized view. A listed
+  asset that is present is still hashed, and corruption or every unlisted
+  missing asset remains blocking.
+- `--projection-manifest <file|->` on both gates accepts a canonical, bounded
+  manifest of domain-separated SHA-256 path commitments. This lets a signed
+  recovery package prove exact intentional omissions without publishing its
+  source `.sevralocal` rules; `-` reads the manifest from bounded stdin.
 
 ## [0.8.36] — 2026-08-27
 

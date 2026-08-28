@@ -233,6 +233,49 @@ fn validate_all_matches_expected_golden_issue_for_issue_and_exits_six() {
     }
 }
 
+#[test]
+fn projection_validation_reclassifies_only_the_declared_corpus_target() {
+    let out = dbmd()
+        .args([
+            "--json",
+            "validate",
+            "--all",
+            "--projection-excludes",
+            ".projection-excludes",
+        ])
+        .arg(corpus_b())
+        .assert()
+        .failure()
+        .code(6)
+        .get_output()
+        .clone();
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("projection validate JSON envelope");
+    assert_eq!(report["scope"], "projection-all");
+    let issues = report["issues"].as_array().expect("issues array");
+    let projection: Vec<_> = issues
+        .iter()
+        .filter(|issue| issue["code"] == "WIKI_LINK_PROJECTION_UNRESOLVED")
+        .collect();
+    assert_eq!(projection.len(), 1);
+    assert_eq!(projection[0]["severity"], "info");
+    assert_eq!(projection[0]["file"], "records/misc/broken-link.md");
+    assert_eq!(
+        projection[0]["related"],
+        serde_json::json!(["records/contacts/ghost"])
+    );
+    assert!(
+        issues
+            .iter()
+            .all(|issue| issue["code"] != "WIKI_LINK_BROKEN"),
+        "the corpus has one broken target and its exact declared coordinate is reclassified"
+    );
+    assert!(
+        report["summary"]["errors"].as_u64().unwrap() > 0,
+        "unrelated corpus errors remain blocking"
+    );
+}
+
 /// `{code -> count}` over an issue array.
 fn code_histogram(issues: &[serde_json::Value]) -> BTreeMap<String, usize> {
     let mut h = BTreeMap::new();

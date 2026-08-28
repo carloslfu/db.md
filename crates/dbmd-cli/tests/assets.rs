@@ -11,6 +11,7 @@
 mod common;
 
 use common::{dbmd, write_db_md, write_file};
+use dbmd_core::projection::projection_path_sha256;
 use serde_json::Value;
 
 const WRAPPER: &str = "\
@@ -520,6 +521,111 @@ fn verify_fails_and_status_reports_missing_required() {
     let v = json_stdout(assert.get_output());
     assert_eq!(v["missing"], 1);
     assert_eq!(v["required_missing"], 1);
+}
+
+#[test]
+fn verify_projection_reports_exact_absence_but_never_hides_loss_or_corruption() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let asset = tmp.path().join("sources/docs/2026/06/contract.pdf");
+    std::fs::remove_file(&asset).unwrap();
+    write_file(
+        tmp.path(),
+        ".projection",
+        "# private docs\nsources/docs/**\n",
+    );
+
+    let accepted = dbmd()
+        .args([
+            "--json",
+            "assets",
+            "verify",
+            "--projection-excludes",
+            ".projection",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    let report = json_stdout(accepted.get_output());
+    assert_eq!(report["complete"], false);
+    assert_eq!(report["projection_complete"], true);
+    assert_eq!(report["checked"], 0);
+    assert_eq!(
+        report["projected_missing"],
+        serde_json::json!(["sources/docs/2026/06/contract.pdf"])
+    );
+
+    write_file(
+        tmp.path(),
+        ".projection",
+        "sources/docs/2026/06/other.pdf\n",
+    );
+    dbmd()
+        .args([
+            "assets",
+            "verify",
+            "--projection-excludes",
+            ".projection",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .failure();
+
+    write_file(tmp.path(), "sources/docs/2026/06/contract.pdf", "CORRUPT");
+    write_file(tmp.path(), ".projection", "sources/docs/**\n");
+    dbmd()
+        .args([
+            "assets",
+            "verify",
+            "--projection-excludes",
+            ".projection",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .assert()
+        .failure();
+}
+
+#[test]
+fn verify_projection_manifest_accepts_bounded_stdin_without_claiming_full_completeness() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    dbmd()
+        .args(["assets", "scan", "--dir"])
+        .arg(tmp.path())
+        .assert()
+        .success();
+    std::fs::remove_file(tmp.path().join("sources/docs/2026/06/contract.pdf")).unwrap();
+    let hash = projection_path_sha256("sources/docs/2026/06/contract.pdf");
+    let manifest =
+        format!("{{\"version\":1,\"algorithm\":\"sha256\",\"path_hashes\":[\"{hash}\"]}}");
+    let accepted = dbmd()
+        .args([
+            "--json",
+            "assets",
+            "verify",
+            "--projection-manifest",
+            "-",
+            "--dir",
+        ])
+        .arg(tmp.path())
+        .write_stdin(manifest)
+        .assert()
+        .success();
+    let report = json_stdout(accepted.get_output());
+    assert_eq!(report["complete"], false);
+    assert_eq!(report["projection_complete"], true);
+    assert_eq!(
+        report["projected_missing"],
+        serde_json::json!(["sources/docs/2026/06/contract.pdf"])
+    );
 }
 
 #[test]

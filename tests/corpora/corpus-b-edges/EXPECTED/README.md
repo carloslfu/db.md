@@ -21,10 +21,10 @@ independent source of truth the tool is measured against.
 diffing. The runner should compare as a **set** of issue objects (order
 independent) OR sort the tool output the same way before diffing.
 
-## Coverage — 40 of the SPEC § Validation codes are seeded
+## Coverage — 41 of the SPEC § Validation codes are seeded
 
-The SPEC § Validation table defines **51** codes. This corpus seeds
-**40** of them (the seeding table below has 40 rows) and deliberately
+The SPEC § Validation table defines **52** codes. This corpus seeds
+**41** of them (the seeding table below has 41 rows) and deliberately
 leaves the rest uncovered — the five `ASSET_*` asset-manifest codes,
 `FM_UNREADABLE`, `FM_MISSING_CREATED`, `FM_MISSING_UPDATED`,
 `FM_BAD_META_TYPE` (every seeded records file carries a valid, or
@@ -32,7 +32,7 @@ absent-defaulting-to-`fact`, `meta-type`), and the v0.4 `FM_BAD_ID`
 (every explicit id in this corpus is a legal opaque token — v0.4 keeps
 hand-authored slug ids silent by design, so they must NOT fire it; the
 structural trigger is unit-tested in `dbmd-core`). One of the
-40, `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md
+41, `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md
 line 494) and is grouped under `plan_extensions` in `coverage.json` for
 provenance — it still counts as a seeded SPEC code. `coverage.json`
 therefore records `all_spec_codes_covered: false` and lists those eleven
@@ -74,6 +74,7 @@ separate invocation on the `bad-db-md/` sub-store (`bad-db-md.json`);
 | `WIKI_LINK_SHORT_FORM` | error | `records/contacts/sarah-chen.md` | `[[acme-co]]` line 19 |
 | `WIKI_LINK_HAS_EXTENSION` | warning | `records/contacts/sarah-chen.md` | `[[…northstar.md]]` line 20 |
 | `WIKI_LINK_BROKEN` | error | `records/misc/broken-link.md` | `[[…/ghost]]` line 19 |
+| `WIKI_LINK_PROJECTION_UNRESOLVED` | info | `.projection-excludes` + `records/misc/broken-link.md` | exact missing `records/contacts/ghost` target in the projection-only invocation |
 | `WIKI_LINK_AMBIGUOUS` | error | `records/misc/ambiguous-link.md` | `[[northstar]]` line 19 |
 | `WIKI_LINK_FLOW_FORM_LIST` | error | `records/synthesis/flow-form-list.md` | `derived_from` line 9 |
 | `DUP_ID` | error | `records/contacts/dup-id-{one,two}.md` | `id` line 3 |

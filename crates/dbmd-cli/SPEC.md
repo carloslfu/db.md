@@ -1226,6 +1226,28 @@ which the working-set pass leaves to the pre-write checks and to
 `--all`. Both
 modes emit the same issue vocabulary below.
 
+An intentionally partial materialization can run `dbmd validate --all
+--projection-excludes <file>`, where the bounded file uses `.sevralocal`'s
+case-sensitive store-path glob syntax (blank lines and `#` comments are
+ignored). This never weakens the ordinary sweep: only a `WIKI_LINK_BROKEN`
+finding whose exact structured target matches a rule is reclassified as
+`WIKI_LINK_PROJECTION_UNRESOLVED` info. All unmatched
+broken links, unsafe paths, index drift, schema violations, malformed content,
+and other errors remain blocking. A successful projection validation therefore
+proves the materialized view is internally valid while explicitly preserving
+the fact that it is not a semantically complete store.
+
+The equivalent path-confidential form is `--projection-manifest <file|->`.
+Its bounded canonical JSON shape is
+`{"version":1,"algorithm":"sha256","path_hashes":[...]}`, with strictly
+sorted unique lowercase commitments. Each commitment is SHA-256 over the UTF-8
+bytes `dbmd-projection-path-v1\0` followed by one exact store-relative path.
+`-` reads bounded stdin. The manifest cannot commit `DB.md` or `assets.jsonl`.
+Validation checks both a wiki coordinate and its conventional `.md` path;
+asset verification checks its exact manifest path. This form reveals no source
+glob and no unreferenced path spelling while preserving the same fail-closed
+reclassification rules.
+
 **Canonical issue codes** (the complete vocabulary the agent will
 see; grouped by category):
 
@@ -1252,6 +1274,7 @@ see; grouped by category):
 | `SUMMARY_TOO_LONG` | warning | `summary` > 200 chars |
 | `WIKI_LINK_SHORT_FORM` | error | target isn't a full store-relative path |
 | `WIKI_LINK_BROKEN` | error | target file doesn't exist |
+| `WIKI_LINK_PROJECTION_UNRESOLVED` | info | exact target is absent from an explicitly declared partial projection; restore it for full semantic completeness |
 | `WIKI_LINK_AMBIGUOUS` | error | target matches multiple files (defensive) |
 | `WIKI_LINK_HAS_EXTENSION` | warning | target carries `.md` — drop it |
 | `WIKI_LINK_FLOW_FORM_LIST` | error | frontmatter list uses `[[[a]], [[b]]]` — use block form |
@@ -1700,6 +1723,16 @@ outside the store.
   optional under `--include-optional`) is present locally and matches the
   manifest. `--quick` checks presence and size; the default re-hashes. Exits
   non-zero when anything is missing or corrupt. A SWEEP, not a loop op.
+- `dbmd assets verify --projection-excludes <file>` — the same gate over an
+  intentionally partial materialization. A matched path may be absent and
+  is reported in `projected_missing`; `complete` remains false while any such
+  byte is absent, while `projection_complete` reports whether the materialized
+  view passed. If the asset is present it is still checked, and corruption or
+  any unlisted missing asset still fails. The policy file has the same bounded
+  `.sevralocal`-compatible contract as projection-aware validation.
+- `dbmd assets verify --projection-manifest <file|->` — the same projection
+  gate using the canonical path-commitment manifest defined above. `-` reads
+  bounded stdin.
 - `dbmd assets status` — a non-failing report of present / missing and bytes to
   restore.
 - `dbmd assets paths` — the path list above.
@@ -1841,7 +1874,7 @@ prompt interactively.
 | Warm up   | `dbmd log tail [N]`, `dbmd log since <ts>` |
 | Read      | `dbmd search <q> [--type --in --where --linked-from --linked-to --updated-after --updated-before]`, `dbmd query [--type --in --where --updated-after --updated-before --created-after --created-before --limit]` (frontmatter filter over the sidecar; paths by default, `--json` = full records — the dedup/`--where` lookup folds in the former `fm query`, `--json` the former `index query`), `dbmd fm get <file> <key>`, `dbmd graph <backlinks\|forwardlinks\|neighborhood\|orphans>`, `dbmd tree`, `dbmd outline <file>`, `dbmd stats`, `dbmd extract <file>`, `dbmd index show [<path>]` |
 | Write     | `dbmd write <path> --type <t> [--summary --fm --body-file]`, `dbmd fm set <file> <k>=<v>`, `dbmd fm init <file>`, `dbmd link <from> <to>`, `dbmd rename <old> <new>`, `dbmd format <file>` |
-| Validate  | `dbmd validate [--json]` (working set), `dbmd validate --all` (full sweep) |
+| Validate  | `dbmd validate [--json]` (working set), `dbmd validate --all` (full sweep), `dbmd validate --all --projection-excludes <file>` (local declared projection), `dbmd validate --all --projection-manifest <file\|->` (path-commitment projection) |
 | Maintain  | indexes are write-through; `dbmd index rebuild [--layer --folder --dry-run]` repairs / folds in bulk drops |
 | Close     | `dbmd log <kind> <object> [-m <note>]` |
 

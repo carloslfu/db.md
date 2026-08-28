@@ -45,6 +45,7 @@ use chrono::{DateTime, FixedOffset, NaiveDateTime};
 use serde_norway::Value;
 
 use crate::parser::{Schema, Shape};
+use crate::projection::ProjectionPolicy;
 use crate::store::Store;
 
 /// Severity of a validation [`Issue`]. Any [`Severity::Error`] fails validation
@@ -142,6 +143,8 @@ pub mod codes {
     pub const WIKI_LINK_SHORT_FORM: &str = "WIKI_LINK_SHORT_FORM";
     /// wiki-link target file doesn't exist.
     pub const WIKI_LINK_BROKEN: &str = "WIKI_LINK_BROKEN";
+    /// target is absent from an explicitly declared partial store projection.
+    pub const WIKI_LINK_PROJECTION_UNRESOLVED: &str = "WIKI_LINK_PROJECTION_UNRESOLVED";
     /// wiki-link target matches multiple files (defensive).
     pub const WIKI_LINK_AMBIGUOUS: &str = "WIKI_LINK_AMBIGUOUS";
     /// wiki-link target carries a `.md` extension — drop it.
@@ -299,6 +302,33 @@ pub fn validate_working_set(
     }
     issues.sort_by(issue_order);
     Ok(issues)
+}
+
+/// Reclassify only the exact missing wiki-link targets named by a declared
+/// partial-store projection. This is deliberately a post-validation transform:
+/// the ordinary engine still proves every other invariant, while consumers can
+/// distinguish intentional projection incompleteness from a complete store.
+///
+/// Callers must supply normalized wiki-link coordinates without a conventional
+/// `.md` suffix. Unsafe targets carry no structured related coordinate and can
+/// therefore never be downgraded by this function.
+pub fn apply_projection_policy(issues: &mut [Issue], policy: &ProjectionPolicy) {
+    for issue in issues {
+        if issue.code != codes::WIKI_LINK_BROKEN || issue.related.len() != 1 {
+            continue;
+        }
+        let target = issue.related[0].to_string_lossy();
+        if !policy.excludes_wiki_coordinate(target.as_ref()) {
+            continue;
+        }
+        issue.severity = Severity::Info;
+        issue.code = codes::WIKI_LINK_PROJECTION_UNRESOLVED;
+        issue.message =
+            format!("wiki-link target `{target}` is absent from this declared store projection");
+        issue.suggestion = Some(
+            "restore the excluded path to establish full-store semantic completeness".to_string(),
+        );
+    }
 }
 
 fn validate_content_sweep(store: &Store) -> crate::Result<Vec<Issue>> {
@@ -1101,7 +1131,7 @@ fn check_wiki_link(
             Some(format!(
                 "create `{bare}.md`, or point the link at an existing file"
             )),
-            vec![],
+            vec![PathBuf::from(bare)],
         ),
         TargetResolution::Unsafe => push(
             issues,
@@ -1334,7 +1364,7 @@ fn check_schema_link(
                     Some(format!(
                         "create `{bare}.md`, or point the link at an existing file"
                     )),
-                    vec![],
+                    vec![PathBuf::from(bare)],
                 ),
                 TargetResolution::Unsafe => push(
                     issues,

@@ -23,6 +23,8 @@ use crate::error::{CliError, CliResult, ExitCode};
 
 use dbmd_core::{assets, Store};
 
+use super::projection::{load as load_projection, load_manifest as load_projection_manifest};
+
 /// Dispatch `dbmd assets <sub>` to the matching leaf body.
 pub fn run(ctx: &Context, args: &AssetsArgs) -> CliResult {
     match &args.command {
@@ -140,7 +142,21 @@ fn run_scan(ctx: &Context, args: &AssetsScanArgs) -> CliResult {
 /// corrupt.
 fn run_verify(ctx: &Context, args: &AssetsVerifyArgs) -> CliResult {
     let store = Store::open_strict(Path::new(&args.dir))?;
-    let report = assets::verify(&store, args.include_optional, args.quick)?;
+    let projection = match (
+        args.projection_excludes.as_deref(),
+        args.projection_manifest.as_deref(),
+    ) {
+        (Some(path), None) => Some(load_projection(&store, path)?),
+        (None, Some(path)) => Some(load_projection_manifest(&store, path)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting projection inputs"),
+    };
+    let report = match projection.as_ref() {
+        Some(excludes) => {
+            assets::verify_projection(&store, args.include_optional, args.quick, excludes)?
+        }
+        None => assets::verify(&store, args.include_optional, args.quick)?,
+    };
 
     if ctx.json {
         println!(
@@ -149,11 +165,12 @@ fn run_verify(ctx: &Context, args: &AssetsVerifyArgs) -> CliResult {
         );
     } else {
         println!(
-            "{} checked · {} ok · {} missing · {} corrupt ({} mode)",
+            "{} checked · {} ok · {} missing · {} corrupt · {} projection-unresolved ({} mode)",
             report.checked,
             report.ok,
             report.missing.len(),
             report.corrupt.len(),
+            report.projected_missing.len(),
             report.mode
         );
         for m in &report.missing {
@@ -162,17 +179,22 @@ fn run_verify(ctx: &Context, args: &AssetsVerifyArgs) -> CliResult {
         for c in &report.corrupt {
             println!("corrupt: {c}");
         }
+        for p in &report.projected_missing {
+            println!("projection-unresolved: {p}");
+        }
         println!(
             "{}",
             if report.complete {
                 "PASS — byte-complete"
+            } else if report.projection_complete == Some(true) {
+                "PASS — materialized projection is byte-complete; excluded bytes remain unresolved"
             } else {
                 "FAIL — store is not byte-complete"
             }
         );
     }
 
-    if !report.complete {
+    if !report.projection_complete.unwrap_or(report.complete) {
         return Err(CliError::new(
             ExitCode::Runtime,
             "ASSET_INCOMPLETE",

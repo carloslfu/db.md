@@ -113,6 +113,14 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
   validation entrypoint (SPEC.md § Validation lists the codes)
 - `dbmd validate --all [--json]` — full-store SWEEP (every link, every
   index, entity-dedup) — CI / recovery, not the loop
+- `dbmd validate --all --projection-excludes <file> [--json]` — full SWEEP of
+  an intentionally partial projection; only missing wiki-link targets matched
+  by the bounded `.sevralocal`-compatible policy become explicit unresolved info, and
+  every unlisted or unrelated error still fails
+- `dbmd validate --all --projection-manifest <file|-> [--json]` — the same
+  explicit partial-view proof from sorted domain-separated SHA-256 path
+  commitments; `-` reads bounded stdin, so a signed package can retain its
+  private source policy
 
 ### Maintain / repair
 - the catalog is maintained write-through by the write commands; no
@@ -128,6 +136,12 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
   raw binary assets a wrapper declares (`asset:`/`assets:` frontmatter)
   but Git should not carry; maintains the root `assets.jsonl` manifest,
   never transports bytes (SPEC § Assets)
+- `dbmd assets verify --projection-excludes <file>` — verify a declared partial
+  projection: matched absence stays visible as `projected_missing`, while
+  `complete` stays false and `projection_complete` proves only the materialized
+  view; present corruption and every undeclared missing asset still fail
+- `dbmd assets verify --projection-manifest <file|->` — the same byte gate from
+  a canonical path-commitment manifest, with bounded stdin supported by `-`
 
 ### Close
 - `dbmd log <kind> <object> [-m <note>]` — append to the active `log.md`; auto-rotates older months into `log/<YYYY-MM>.md`

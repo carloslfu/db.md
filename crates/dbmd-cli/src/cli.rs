@@ -263,6 +263,31 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub all: bool,
 
+    /// Validate an intentionally partial store projection. FILE is a bounded
+    /// `.sevralocal`-compatible list of case-sensitive store-path globs. Only
+    /// broken wiki-links matched by a rule are downgraded to explicit
+    /// projection-unresolved info; every other error remains blocking. Requires
+    /// `--all`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "all",
+        conflicts_with = "projection_manifest"
+    )]
+    pub projection_excludes: Option<String>,
+
+    /// Validate from a canonical path-confidential projection commitment
+    /// manifest. FILE is store-relative; `-` reads bounded JSON from stdin.
+    /// Requires `--all` and is mutually exclusive with
+    /// `--projection-excludes`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "all",
+        conflicts_with = "projection_excludes"
+    )]
+    pub projection_manifest: Option<String>,
+
     /// Override the working-set cutoff: validate files changed at or after this
     /// RFC3339 timestamp. Ignored when `--all` is set. Date-only is accepted
     /// and treated as `T00:00:00Z`.
@@ -968,6 +993,19 @@ pub struct AssetsVerifyArgs {
     /// Check presence + size only, skipping the full SHA-256 re-hash (fast path).
     #[arg(long)]
     pub quick: bool,
+
+    /// Verify an intentionally partial store projection. FILE is the same
+    /// bounded `.sevralocal`-compatible list of case-sensitive store-path globs
+    /// accepted by `validate --projection-excludes`. Only a matched asset may
+    /// be absent; present corruption and every unmatched missing asset still
+    /// fail.
+    #[arg(long, value_name = "FILE", conflicts_with = "projection_manifest")]
+    pub projection_excludes: Option<String>,
+
+    /// Verify from a canonical path-confidential projection commitment
+    /// manifest. FILE is store-relative; `-` reads bounded JSON from stdin.
+    #[arg(long, value_name = "FILE", conflicts_with = "projection_excludes")]
+    pub projection_manifest: Option<String>,
 }
 
 /// `dbmd assets status`.

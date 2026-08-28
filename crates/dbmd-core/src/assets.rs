@@ -43,6 +43,7 @@ use serde_norway::Value;
 use sha2::{Digest, Sha256};
 
 use crate::parser;
+use crate::projection::ProjectionPolicy;
 use crate::store::Store;
 
 /// The manifest file name at the store root.
@@ -179,6 +180,15 @@ pub struct VerifyReport {
     pub ok: usize,
     pub missing: Vec<String>,
     pub corrupt: Vec<String>,
+    /// Exact absent paths declared outside this materialized projection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub projected_missing: Vec<String>,
+    /// Whether every byte that belongs to this materialized projection passed.
+    /// Present only for projection-aware verification; unlike `complete`, this
+    /// may be true while explicitly excluded bytes remain absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_complete: Option<bool>,
+    /// True only when every considered required byte is present and valid.
     pub complete: bool,
 }
 
@@ -854,20 +864,43 @@ pub fn refresh_wrapper(store: &Store, raw_wrapper: &str) -> crate::Result<Refres
 /// deep mode), never a loop op. `complete` is true iff nothing is missing or
 /// corrupt in the considered set.
 pub fn verify(store: &Store, include_optional: bool, quick: bool) -> crate::Result<VerifyReport> {
+    verify_inner(store, include_optional, quick, None)
+}
+
+/// Verify the byte completeness of an intentionally partial projection.
+/// Exact listed paths may be absent and are reported as `projected_missing`;
+/// if a listed path is present it is still hashed and any corruption blocks.
+/// Unlisted missing assets and every corrupt asset remain blocking.
+pub fn verify_projection(
+    store: &Store,
+    include_optional: bool,
+    quick: bool,
+    projection: &ProjectionPolicy,
+) -> crate::Result<VerifyReport> {
+    verify_inner(store, include_optional, quick, Some(projection))
+}
+
+fn verify_inner(
+    store: &Store,
+    include_optional: bool,
+    quick: bool,
+    projection: Option<&ProjectionPolicy>,
+) -> crate::Result<VerifyReport> {
     let records = read_manifest(store)?;
     let mut missing = Vec::new();
     let mut corrupt = Vec::new();
+    let mut projected_missing = Vec::new();
     let mut checked = 0usize;
 
     for rec in &records {
         if !rec.required && !include_optional {
             continue;
         }
-        checked += 1;
         let abs = match store.capability_relative(Path::new(&rec.path)) {
             Ok(p) => p,
             Err(_) => {
                 // A manifest path that escapes the store is not restorable here.
+                checked += 1;
                 corrupt.push(rec.path.clone());
                 continue;
             }
@@ -875,14 +908,21 @@ pub fn verify(store: &Store, include_optional: bool, quick: bool) -> crate::Resu
         let file = match store.open_regular(abs) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(rec.path.clone());
+                if projection.is_some_and(|policy| policy.excludes_path(&rec.path)) {
+                    projected_missing.push(rec.path.clone());
+                } else {
+                    checked += 1;
+                    missing.push(rec.path.clone());
+                }
                 continue;
             }
             Err(_) => {
+                checked += 1;
                 corrupt.push(rec.path.clone());
                 continue;
             }
         };
+        checked += 1;
         if quick {
             let len = file.metadata()?.len();
             if len != rec.bytes {
@@ -897,13 +937,16 @@ pub fn verify(store: &Store, include_optional: bool, quick: bool) -> crate::Resu
     }
 
     let ok = checked - missing.len() - corrupt.len();
-    let complete = missing.is_empty() && corrupt.is_empty();
+    let projection_complete = projection.map(|_| missing.is_empty() && corrupt.is_empty());
+    let complete = missing.is_empty() && corrupt.is_empty() && projected_missing.is_empty();
     Ok(VerifyReport {
         mode: if quick { "quick" } else { "deep" }.to_string(),
         checked,
         ok,
         missing,
         corrupt,
+        projected_missing,
+        projection_complete,
         complete,
     })
 }
