@@ -8,9 +8,19 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.38**.
+  `Cargo.toml`, currently **v0.8.39**.
 
 ## Unreleased
+
+## [0.8.39] — 2026-08-27
+
+### Fixed
+
+- Converges every public release channel on the large-asset pull-journal fix
+  introduced in 0.8.38. That immutable GitHub/crates.io release remains valid,
+  but its controller correctly stopped before Homebrew/latest when two newer
+  documentation commits landed on `main`; 0.8.39 preserves those commits and
+  advances the remaining channels without bypassing the stale-source fence.
 
 ## [0.8.38] — 2026-08-27
 
