@@ -323,77 +323,13 @@ logs merge by union, and the derived indexes regenerate with `dbmd index
 rebuild` rather than merge. Want SQLite or a search index on top? Build one;
 the files stay the source of truth.
 
-## Sync, if you want it
-
-A db.md store does not need a server. The `dbmd` binary also speaks
-[link.md](https://github.com/carloslfu/link.md) to a hub you choose. Run
-`dbmd sync @brain` to pull a new checkout. Run it again from that checkout
-to reconcile remote and local changes.
-
-Permissioned v2 sync transfers changed files rather than whole snapshots,
-verifies the signed remote state, and compares both sides with the last
-accepted baseline. A clean change or deletion can move in either direction.
-A divergent edit changes neither side and leaves a private conflict bundle
-for explicit resolution. The canonical curator timeline (`log.md` plus rotated
-`log/*.md` archives) rides sync; derived `index.*` catalogs rebuild locally.
-Typed post-commit projection lag is retried in place. If a receipt was lost but
-the complete local riding tree exactly matches the verified head, dbmd safely
-recovers the private baseline without downloading historical blobs; a single
-difference still follows the ordinary conflict path. Historical base bodies are
-optional context in a bundle, while current local/remote bodies and exact base
-coordinates remain binding.
-
-`DB.md` authority changes are automatically phased as one strict-head contract
-commit followed by the recomputed content/asset delta, because a contract must
-never silently authorize the other mutations travelling beside it. The second
-phase re-verifies the new head and reuses only the first phase's in-memory,
-racy-clean-safe local scan; concurrent contract edits stop for a fresh retry.
-An exact mutation whose response was lost also waits through the hub's typed
-validation-recovery lag and asks again for the same idempotent receipt.
-
-Repeated scans of a stable Unix checkout are locally incremental too. The
-private baseline caches a content hash and the `.sevralocal`-filtered link
-result behind the exact device/inode/length/mtime/ctime tuple. Files inside a
-racy timestamp window, files changed by bytes or metadata, policy changes, and
-platforms without an equivalent identity tuple are re-read and re-hashed. This
-is private disposable acceleration, never signed state and never a substitute
-for content-addressed verification at upload/commit boundaries.
-
-Cold pulls use the same principle in the other direction: verified blobs are
-staged by hash in a private resumable cache, and independent ≤8 MiB bulk
-windows run with a bounded four-worker ceiling. An interrupted clone therefore
-reuses only exact proof-bound bytes, while the destination remains unpublished
-until the complete store and declared asset set verify.
-
-The private incremental baseline is deliberately bound to the checkout's
-absolute path. A higher-level tool that publishes a verified checkout by
-atomically renaming a private stage must immediately run
-`dbmd sync <canonical-brain-id> relocate --from <old-store> --to <new-store>`.
-Relocation is local-only and atomic: the old path must be gone, the new store
-must still match every baseline content and asset coordinate, and an existing
-destination baseline is never overwritten. This preserves the next ordinary
-sync as an incremental operation instead of misclassifying a moved clone as a
-baseline-less concurrent edit.
-
-Grants can expose a whole brain or a path-scoped view. Writes that require
-review become proposals. `.sevralocal` keeps selected content and assets at
-home; making them eligible for hosting, or withdrawing an already-hosted
-file, requires explicit intent. `resolve` reads one remote record,
-`subscribe` follows new heads, and `mirror` plus `serve` make a verified
-read-only copy whose original signatures survive re-hosting.
-
-These are optional client features, not a second storage format. No hub is
-baked in, local commands stay local, and link.md is not required for a valid
-db.md store. Run `dbmd sync --help` for the exact options; the
-[interconnect reference](TOOLS.md#interconnect-the-linkmd-client) explains
-the model.
-
 ## Safe to paste
 
 Start with the fact that matters most: **the binary makes no background
 network calls.** There is no telemetry, AI SDK, model call, or auto-update.
-Local format commands stay local. The explicit link.md verbs connect only to
-the hub you select and may carry the credential you configured. You don't
+Local format commands stay local. The explicit
+[sync commands](#sync-if-you-want-it) connect only to the hub you select
+and may carry the credential you configured. You don't
 have to take this page's word for anything. The audit is one more prompt:
 
 ```text
@@ -453,7 +389,8 @@ toolkit is one Rust binary, `dbmd`, in the git / cargo / kubectl shape.
   index, emit, and audit a store without a daemon.
 - **An optional network client.** Address and sync brains, grant access,
   review proposals, manage keys, follow changes, and mirror or re-serve a
-  verified copy through link.md when you select a hub.
+  verified copy through [link.md](https://github.com/carloslfu/link.md)
+  when you select a hub.
 - **Zero AI dependencies.** No provider SDKs, no API keys, no model calls
   in the binary. The agent runtime is yours.
 - **A library underneath.** All the logic lives in `dbmd-core`. Run
@@ -496,6 +433,34 @@ db.md needs no host. If you want one anyway, [Sevra](https://sevrahq.com)
 is the hosted home: your store kept always on, indexed, and curated. The
 standard stays neutral, Apache-2.0, and self-hostable no matter where a
 store lives.
+
+## Sync, if you want it
+
+When a store should live in more than one place, `dbmd` speaks
+[link.md](https://github.com/carloslfu/link.md) to a hub you choose. Run
+`dbmd sync @brain` to pull a new checkout. Run it again from that checkout
+to reconcile remote and local changes.
+
+Sync moves changed files, never whole snapshots. Every transfer verifies
+the hub's signed state and compares both sides against the last baseline
+you accepted. Clean edits and deletions flow in either direction; a
+divergent edit moves nothing and leaves a private conflict bundle for you
+to resolve explicitly. Nothing is silently overwritten, and no model is
+ever asked to invent a merge.
+
+Access is permissioned. A grant exposes a whole store or a path-scoped
+view, and writes that need review arrive as proposals rather than landing
+directly. `.sevralocal` keeps selected files on your machine; moving one
+into hosting takes explicit intent. Beyond sync, `resolve` reads one
+remote record, `subscribe` follows new heads, and `mirror` plus `serve`
+republish a verified read-only copy with its original signatures intact.
+
+All of it is optional client machinery, not a second storage format. No
+hub is baked in, local commands stay local, and link.md is not required
+for a valid db.md store. Run `dbmd sync --help` for the exact options; the
+[interconnect reference](TOOLS.md#interconnect-the-linkmd-client) covers
+the deeper mechanics: incremental scans, resumable pulls, phased `DB.md`
+changes, and recovery.
 
 ## License
 
