@@ -1,7 +1,7 @@
 ---
 name: db-md
 description: Operate a db.md store, the open standard for databases in plain files, with the `dbmd` CLI. Use when reading, writing, searching, validating, or curating any folder that has a DB.md at its root. Run `dbmd spec` for the full contract.
-version: 0.3.6
+version: 0.4.0
 license: Apache-2.0
 ---
 
@@ -49,13 +49,19 @@ dbmd log tail 20                                    # what was done lately (avoi
 # Read — find and hydrate context (every command takes --json)
 dbmd search "(renewal|contract|ARR)" --in records   # ripgrep; the regex IS your query expansion (no embeddings)
 dbmd query --type contact --where company=Acme       # structured frontmatter query via the sidecar
+dbmd show <file>                                     # one file, fully structured (fm + body + links + sha)
+dbmd schema                                          # the store's declared type contracts, parsed
 dbmd graph neighborhood records/contacts/sarah-chen --hops 2   # context in one call
 dbmd graph backlinks records/contacts/sarah-chen               # who points here (blast radius)
+dbmd watch                                           # follow local changes (NDJSON events under --json)
 
 # Write — create and connect (frontmatter is composed for you, incl. a stable ULID id — minted by the tool, never composed by you)
 dbmd write records/meetings/standup.md --type meeting --summary "weekly sync"
 dbmd fm set <file> <key>=<value>                     # update one field, atomically
+dbmd body set <file> --text "..."                    # replace the body (append adds; updated re-stamps)
+dbmd section set <file> "<heading>" --text "..."     # replace one section (get reads it; --create upserts)
 dbmd link <from> <to>                                # append a wiki-link
+dbmd rm <path>                                       # link-aware delete (refuses while linked; --force overrides)
 
 # Validate — before you close
 dbmd validate                                        # the working set (changed files)

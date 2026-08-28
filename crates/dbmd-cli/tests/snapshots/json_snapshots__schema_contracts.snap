@@ -1,0 +1,268 @@
+---
+source: crates/dbmd-cli/tests/json_snapshots.rs
+expression: out
+---
+{
+  "types": {
+    "company": {
+      "fields": [
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "name",
+          "required": true,
+          "shape": "string",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "domain",
+          "required": true,
+          "shape": "string",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "industry",
+          "required": false,
+          "shape": "string",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": [
+            "customer",
+            "vendor",
+            "partner",
+            "prospect"
+          ],
+          "link_prefix": null,
+          "name": "relationship",
+          "required": false,
+          "shape": null,
+          "unknown_modifiers": []
+        }
+      ],
+      "shard": null,
+      "summary_template": null,
+      "unique": []
+    },
+    "contact": {
+      "fields": [
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "name",
+          "required": true,
+          "shape": "string",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "email",
+          "required": true,
+          "shape": "email",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": "records/companies",
+          "name": "company",
+          "required": true,
+          "shape": null,
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "role",
+          "required": false,
+          "shape": "string",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "first_touch",
+          "required": false,
+          "shape": "date",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "last_touch",
+          "required": false,
+          "shape": "date",
+          "unknown_modifiers": []
+        }
+      ],
+      "shard": null,
+      "summary_template": null,
+      "unique": []
+    },
+    "expense": {
+      "fields": [
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "date",
+          "required": true,
+          "shape": "date",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "amount",
+          "required": true,
+          "shape": "currency",
+          "unknown_modifiers": []
+        },
+        {
+          "default": "USD",
+          "enum": null,
+          "link_prefix": null,
+          "name": "currency",
+          "required": false,
+          "shape": null,
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "category",
+          "required": false,
+          "shape": "string",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": "records/companies",
+          "name": "vendor",
+          "required": true,
+          "shape": null,
+          "unknown_modifiers": []
+        }
+      ],
+      "shard": null,
+      "summary_template": null,
+      "unique": []
+    },
+    "invoice": {
+      "fields": [
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "date",
+          "required": true,
+          "shape": "date",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "amount",
+          "required": true,
+          "shape": "currency",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": "records/companies",
+          "name": "vendor",
+          "required": true,
+          "shape": null,
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": [
+            "paid",
+            "unpaid",
+            "void"
+          ],
+          "link_prefix": null,
+          "name": "status",
+          "required": true,
+          "shape": null,
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "paid_at",
+          "required": false,
+          "shape": "date",
+          "unknown_modifiers": []
+        }
+      ],
+      "shard": null,
+      "summary_template": null,
+      "unique": []
+    },
+    "meeting": {
+      "fields": [
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "date",
+          "required": true,
+          "shape": "date",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "attendees",
+          "required": true,
+          "shape": null,
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "location",
+          "required": false,
+          "shape": "string",
+          "unknown_modifiers": []
+        },
+        {
+          "default": null,
+          "enum": null,
+          "link_prefix": null,
+          "name": "duration_min",
+          "required": false,
+          "shape": "int",
+          "unknown_modifiers": []
+        }
+      ],
+      "shard": null,
+      "summary_template": null,
+      "unique": []
+    }
+  }
+}

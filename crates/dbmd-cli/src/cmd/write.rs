@@ -348,6 +348,15 @@ pub(crate) fn index_on_rename(store: &Store, old: &Path, new: &Path) -> Option<S
     }
 }
 
+/// Drop a removed file's entry from its type-folder indexes write-through.
+/// Non-fatal on failure, same as [`index_on_write`].
+pub(crate) fn index_on_remove(store: &Store, file: &Path) -> Option<String> {
+    match dbmd_core::index::Index::on_remove(store, file) {
+        Ok(()) => None,
+        Err(e) => Some(index_warning_text(&e)),
+    }
+}
+
 /// The structured `POLICY_FROZEN_PAGE` refusal (exit `4`). Names the policy
 /// source (`DB.md ## Policies → ### Frozen pages`) and the frozen path so the
 /// agent can branch on `code` without scraping prose.

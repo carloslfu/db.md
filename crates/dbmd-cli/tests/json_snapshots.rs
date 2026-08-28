@@ -171,3 +171,15 @@ fn graph_backlinks_json() {
     ]);
     insta::assert_snapshot!("graph_backlinks_northstar_renewal", out);
 }
+
+// ── schema ──────────────────────────────────────────────────────────────────
+
+/// `dbmd schema --json` on the canonical store: the parsed `## Schemas`
+/// contracts (five declared types, uniform per-field shape). Deterministic —
+/// the parse is pure and corpus-a's `DB.md` is committed — so this locks the
+/// introspection surface an app builds forms from.
+#[test]
+fn schema_json_contracts() {
+    let out = json_stdout(&["schema"]);
+    insta::assert_snapshot!("schema_contracts", out);
+}

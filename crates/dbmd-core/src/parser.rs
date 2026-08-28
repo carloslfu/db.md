@@ -1410,9 +1410,26 @@ pub fn detect_flow_form_link_lists(frontmatter_yaml: &str) -> Vec<String> {
     out
 }
 
-/// Extract the `##`/`###` sections of a markdown body into a flat list with
-/// body slices.
-pub fn extract_sections(body: &str) -> Vec<Section> {
+/// One extracted section plus its verbatim line span: `[start, end)` as
+/// 0-based indices into `body.split_inclusive('\n')` — exactly the slice the
+/// section's `body` field was concatenated from. The span is what the
+/// section editors (`dbmd section set` / `append`) splice against, so the
+/// read views (`sections`, `outline`) and the write path share one boundary
+/// rule (including the H1 terminator, which ends a span without ever being a
+/// section itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionSpan {
+    /// The extracted section.
+    pub section: Section,
+    /// First line of the span — the heading line — 0-based.
+    pub start: usize,
+    /// One past the last line of the span, 0-based.
+    pub end: usize,
+}
+
+/// Extract the `##`/`###` sections of a markdown body with their verbatim
+/// line spans. [`extract_sections`] is the span-less projection of this.
+pub fn extract_section_spans(body: &str) -> Vec<SectionSpan> {
     // Keep each line's start so we can slice the body verbatim (exact newlines).
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
 
@@ -1455,14 +1472,27 @@ pub fn extract_sections(body: &str) -> Vec<Section> {
             }
         }
 
-        sections.push(Section {
-            heading,
-            level: lvl,
-            line: (i + 1) as u32,
-            body: lines[i..end].concat(),
+        sections.push(SectionSpan {
+            section: Section {
+                heading,
+                level: lvl,
+                line: (i + 1) as u32,
+                body: lines[i..end].concat(),
+            },
+            start: i,
+            end,
         });
     }
     sections
+}
+
+/// Extract the `##`/`###` sections of a markdown body into a flat list with
+/// body slices.
+pub fn extract_sections(body: &str) -> Vec<Section> {
+    extract_section_spans(body)
+        .into_iter()
+        .map(|s| s.section)
+        .collect()
 }
 
 /// Extract the `##`/`###` sections of a **whole file** (frontmatter + body),

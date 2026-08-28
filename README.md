@@ -338,8 +338,9 @@ toolkit is one Rust binary, `dbmd`, in the git / cargo / kubectl shape.
 - **Embedded ripgrep.** Fast search with no separate tool to install.
 - **Built-in extraction.** `dbmd extract` pulls text out of PDF, docx,
   xlsx, epub, and html.
-- **Local operations.** Read, write, query, validate, link, rename,
-  index, emit, and audit a store without a daemon.
+- **Local operations.** Read, write, edit, query, validate, link, rename,
+  delete, index, emit, watch, introspect schemas, and audit a store without
+  a daemon.
 - **An optional network client.** Address and sync brains, grant access,
   review proposals, manage keys, follow changes, and mirror or re-serve a
   verified copy through [link.md](https://github.com/carloslfu/link.md)

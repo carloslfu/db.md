@@ -20,8 +20,10 @@
 //! returns it.)
 
 pub mod assets;
+pub mod body;
 pub mod emit;
 pub mod extract;
+mod file_target;
 pub mod fm;
 pub mod format;
 pub mod grant;
@@ -39,13 +41,18 @@ pub mod propose;
 pub mod query;
 pub mod rename;
 pub mod resolve;
+pub mod rm;
+pub mod schema;
 pub mod search;
+pub mod section;
 pub mod sections;
 pub mod serve;
+pub mod show;
 pub mod spec;
 pub mod stats;
 pub mod subscribe;
 pub mod sync;
 pub mod tree;
 pub mod validate;
+pub mod watch;
 pub mod write;

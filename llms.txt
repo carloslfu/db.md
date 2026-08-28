@@ -81,8 +81,11 @@ is text and the model does the rest.
 
 ## 4. Operate
 
-Read with `dbmd search` / `dbmd query` / `dbmd graph`; write with `dbmd write` /
-`dbmd fm set` / `dbmd link`; validate with `dbmd validate`; record with
+Read with `dbmd search` / `dbmd query` / `dbmd show` / `dbmd graph` (and
+`dbmd schema` for the store's declared type contracts); write with
+`dbmd write` / `dbmd fm set` / `dbmd body set` / `dbmd section set` /
+`dbmd link`; delete link-aware with `dbmd rm`; follow local changes with
+`dbmd watch`; validate with `dbmd validate`; record with
 `dbmd log` (store-wide actions like `validate` take a `-` object:
 `dbmd log validate - -m "..."`). Every command takes `--json`. Read the store's `DB.md` (identity,
 policies, schemas) before writing. `dbmd write` mints a stable lowercase-ULID

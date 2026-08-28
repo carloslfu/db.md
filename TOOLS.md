@@ -69,7 +69,23 @@ loop. See SPEC.md § Scale.
 ### Read
 - `dbmd search <query> [--type --in --where --linked-from --linked-to --updated-after --updated-before --created-after --created-before]` — embedded ripgrep over content + the frontmatter block; filters never parse the whole store
 - `dbmd query [--type --in --where <k>=<v> --updated/created-after/-before --limit]` — sidecar-backed frontmatter filtering (the pre-write dedup primitive; `--where id=<id>` is the id lookup)
+- `dbmd show <file>` — one file as its full structured record: parsed
+  frontmatter, derived fields, verbatim body, link spans, file-bytes
+  SHA-256 — the random-access, single-file form of `dbmd emit` (equal
+  under `--json` to that dump's entry for the file). O(one file), loop-safe
 - `dbmd fm get <file> <key>` — read one frontmatter key
+- `dbmd section get <file> <heading>` — print one section verbatim (heading
+  line + content, deeper sub-sections included); store-free, any markdown file
+- `dbmd schema [<type>]` — the store's declared `DB.md ## Schemas` contracts,
+  parsed: fields with modifiers, `unique:` keys, `summary_template`, `shard`.
+  The introspection twin of validate's enforcement — an app renders forms
+  from this instead of re-parsing `DB.md`
+- `dbmd watch [--path <prefix>] [--interval <secs>]` — the local change
+  feed: poll the emit membership and print one event line per created /
+  modified / removed content file (NDJSON under `--json`, a `baseline` line
+  first) — the local-filesystem sibling of `subscribe`. Dependency-free
+  polling, no locks (a watcher never blocks a writer); each tick re-stats
+  the membership, so scope very large stores with `--path`
 - `dbmd graph backlinks|forwardlinks|neighborhood|orphans` — relationship retrieval; `orphans` is the SWEEP curation worklist
 - `dbmd tree [--layer --type]`
 - `dbmd outline <file>`
@@ -102,8 +118,22 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
   `summary`; the reconcile primitive for externally-dropped sources.
   Never mints an `id` — adding ids to existing files is the agent's
   call (SPEC § The `id` field)
+- `dbmd body set|append <file> (--text | --body-file <path|->)` — replace or
+  extend the body (everything after the frontmatter). `updated` re-stamps,
+  frozen pages refuse, the indexes update write-through; `summary` is never
+  recomputed (the catalog line stays the agent's explicit judgment)
+- `dbmd section set|append <file> <heading> (--text | --body-file <path|->)
+  [--create --level <2-6>]` — section-addressed body edit: exact heading
+  match, span = heading → next sibling-or-shallower heading (fence-aware;
+  H1 terminates), so `set` replaces the whole subtree; `--create` upserts a
+  missing section; duplicate headings refuse as `SECTION_AMBIGUOUS`
 - `dbmd link <from> <to>`
 - `dbmd rename <old> <new>` — move + rewrite incoming wiki-links
+- `dbmd rm <path> [--force]` — link-aware delete of one content file:
+  refuses while other content files still wiki-link to it (`RM_LINKED`,
+  backlinks listed), `--force` deletes anyway; reserved meta files and
+  frozen pages never deletable; the catalog row drops write-through (no
+  `index rebuild` needed)
 - `dbmd format <file>` — re-emit frontmatter + body canonically (key
   order, YAML style, whitespace); writes back in place
 
@@ -280,7 +310,7 @@ overrides come from `DB.md` on every operation.
 ## Status
 
 The format (SPEC.md) is at v0.4; the toolkit versions independently
-(currently 0.6.2 — see the [CHANGELOG](CHANGELOG.md) for both axes).
+(see the [CHANGELOG](CHANGELOG.md) for both axes and the current number).
 The single-binary all-Rust
 `dbmd` described here is the active build target — treat this
 document as the toolkit contract the binary implements. The

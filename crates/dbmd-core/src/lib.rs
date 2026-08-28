@@ -35,6 +35,7 @@
 //!   `index.jsonl` sidecars instead, never a frontmatter tree scan.
 
 pub mod assets;
+pub mod edit;
 pub mod emit;
 pub mod extract;
 pub mod fsx;
@@ -65,6 +66,7 @@ pub mod summary;
 pub mod time;
 pub mod ulid;
 pub mod validate;
+pub mod watch;
 
 // ── Shared public types, re-exported at the crate root ──────────────────────
 //

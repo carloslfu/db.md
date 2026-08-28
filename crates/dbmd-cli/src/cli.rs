@@ -16,7 +16,7 @@
 //! (Block 2 + Block 5). The parsed-arg structs are the contract each
 //! `cmd/<name>.rs` body reads from.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::context::ColorChoice;
 
@@ -89,8 +89,28 @@ pub enum Command {
     /// (For incoming wiki-links use `graph backlinks`.)
     Query(QueryArgs),
 
+    /// Print one file as its full structured record: parsed frontmatter,
+    /// derived fields (layer, type, effective meta-type, title, summary,
+    /// timestamps), verbatim body, normalized wiki-link targets with byte
+    /// spans, and the file-bytes SHA-256 — the single-file form of
+    /// `dbmd emit`, byte-identical under `--json` to that dump's entry for
+    /// the file. The store root is found from the file itself (nearest
+    /// ancestor `DB.md`). (For the catalog row instead use `query`; for
+    /// incoming links, `graph backlinks`.)
+    Show(ShowArgs),
+
     /// List the `##` sections of a single file.
     Sections(SectionsArgs),
+
+    /// Print the store's declared type contracts (`DB.md ## Schemas`), parsed:
+    /// each field with its modifiers (`required`, shape, `link to`, `default`,
+    /// `enum`), plus the `unique:` keys, `summary_template`, and `shard`
+    /// directives. The introspection twin of schema *enforcement*
+    /// (`dbmd validate`) — an app or agent renders forms and client-side
+    /// checks from this instead of re-parsing `DB.md`. A bare call prints
+    /// every declared type; `dbmd schema <type>` narrows to one. A type with
+    /// no `### <type>` block is unconstrained and prints nothing.
+    Schema(SchemaArgs),
 
     // ── Read: extraction ─────────────────────────────────────────────────────
     /// Extract plain text from a document (PDF / docx / xlsx / epub / html) to
@@ -113,6 +133,23 @@ pub enum Command {
     /// Read, write, or initialize file frontmatter. (For frontmatter queries /
     /// pre-write dedup lookups use `query --where key=value`.)
     Fm(FmArgs),
+
+    // ── Read / Write: the body ───────────────────────────────────────────────
+    /// Edit a file's body — everything after the frontmatter block. `set`
+    /// replaces it verbatim; `append` adds raw content at the end. Both
+    /// re-stamp `updated` and update the type-folder indexes write-through;
+    /// `summary` is never recomputed (retitle explicitly with `fm set`). The
+    /// store root is found from the file itself (nearest ancestor `DB.md`).
+    /// (For section-addressed edits use `section`; to create a file, `write`.)
+    Body(BodyArgs),
+
+    /// Read or edit one `##`–`######` section of a file's body, addressed by
+    /// its exact heading text: `get` prints it verbatim, `set` replaces its
+    /// content (the whole subtree, deeper sub-sections included), `append`
+    /// adds at its end. Edits re-stamp `updated` and update the indexes
+    /// write-through; `--create` appends the section when the heading is
+    /// absent. (`sections` lists the addressable headings.)
+    Section(SectionArgs),
 
     // ── Read: structural views ───────────────────────────────────────────────
     /// Pretty-print the store as a tree, optionally scoped by layer or type.
@@ -138,6 +175,17 @@ pub enum Command {
     /// Print the section / sub-section outline of a single file.
     Outline(OutlineArgs),
 
+    // ── Read: the local change feed ──────────────────────────────────────────
+    /// Follow the store's files for changes: poll the emit membership (every
+    /// content file plus `DB.md`) and print one event line per created /
+    /// modified / removed file (one JSON object per line under `--json`) —
+    /// the local-filesystem sibling of `subscribe`, which follows a hub feed.
+    /// Poll-based and dependency-free: each tick re-stats the membership, so
+    /// narrow very large stores with `--path`. Derived catalogs (`index.*`,
+    /// `log.md`) are not content and are never reported. Purely observational
+    /// (no locks — a watcher never blocks a writer); runs until interrupted.
+    Watch(WatchArgs),
+
     // ── Read / Maintain: the index catalog ───────────────────────────────────
     /// Maintain or read the write-through index catalog (`index.md` +
     /// `index.jsonl`): rebuild or show. (For structured reads over the sidecar
@@ -161,6 +209,14 @@ pub enum Command {
     /// Move a file and rewrite every incoming wiki-link across the store.
     /// Updates both affected type-folder indexes write-through.
     Rename(RenameArgs),
+
+    /// Delete one content file, link-aware: refuses while other content files
+    /// still wiki-link to it (listing them), `--force` deletes anyway. Updates
+    /// the type-folder indexes write-through — the delete twin of `rename`,
+    /// replacing the raw `rm` + `dbmd index rebuild` dance. Reserved meta
+    /// files (`DB.md`, `log.md`, `index.md`, `index.jsonl`) and frozen pages
+    /// are never deletable.
+    Rm(RmArgs),
 
     // ── Assets: the heavy-binary manifest ────────────────────────────────────
     /// Catalog, verify, and report raw assets (PDFs, recordings, large exports
@@ -352,6 +408,18 @@ pub struct QueryArgs {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// show
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd show <file>` — one file as its full structured record.
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// The file to show. Its store is the nearest ancestor carrying `DB.md`.
+    #[arg(value_name = "FILE")]
+    pub file: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // sections
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -361,6 +429,23 @@ pub struct SectionsArgs {
     /// The file whose sections to list.
     #[arg(value_name = "FILE")]
     pub file: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// schema
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd schema [<type>]` — the declared type contracts, parsed.
+#[derive(Debug, Args)]
+pub struct SchemaArgs {
+    /// Print only this type's schema. A type with no `### <type>` block in
+    /// `DB.md ## Schemas` is unconstrained and prints nothing.
+    #[arg(value_name = "TYPE")]
+    pub r#type: Option<String>,
+
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -870,6 +955,163 @@ pub struct RenameArgs {
     /// The new store-relative path.
     #[arg(value_name = "NEW")]
     pub new: String,
+
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// watch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd watch` — follow the store's files for changes.
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    /// Only report changes under this store-relative path prefix (e.g.
+    /// `records/todos`). Bounds the per-poll scan on very large stores.
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<String>,
+
+    /// Poll interval in seconds. Minimum 1.
+    #[arg(long, value_name = "SECS", default_value_t = 1)]
+    pub interval: u64,
+
+    /// Store root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// body
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd body <set|append> <file>` — whole-body edit.
+#[derive(Debug, Args)]
+pub struct BodyArgs {
+    /// The body operation to run.
+    #[command(subcommand)]
+    pub command: BodyCommand,
+}
+
+/// The `body` sub-verbs.
+#[derive(Debug, Subcommand)]
+pub enum BodyCommand {
+    /// Replace the whole body with the given content, stored verbatim.
+    Set(BodyEditArgs),
+
+    /// Append raw content at the end of the body (the joint gains a newline
+    /// when the existing body lacks one; the content itself rides verbatim).
+    Append(BodyEditArgs),
+}
+
+/// Shared arguments of the `body` edit sub-verbs.
+#[derive(Debug, Args)]
+#[command(group = ArgGroup::new("content").required(true).args(["text", "body_file"]))]
+pub struct BodyEditArgs {
+    /// The file whose body to edit. Its store is the nearest ancestor
+    /// carrying `DB.md`.
+    #[arg(value_name = "FILE")]
+    pub file: String,
+
+    /// The content, inline. Hyphen-leading values (list items) are accepted.
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    pub text: Option<String>,
+
+    /// Read the content from this file; `-` reads standard input.
+    #[arg(long, value_name = "PATH")]
+    pub body_file: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd section <get|set|append> <file> <heading>` — section-addressed ops.
+#[derive(Debug, Args)]
+pub struct SectionArgs {
+    /// The section operation to run.
+    #[command(subcommand)]
+    pub command: SectionCommand,
+}
+
+/// The `section` sub-verbs.
+#[derive(Debug, Subcommand)]
+pub enum SectionCommand {
+    /// Print the addressed section verbatim — heading line plus content,
+    /// deeper sub-sections included. Store-free: works on any markdown file.
+    Get(SectionGetArgs),
+
+    /// Replace the addressed section's content (its whole subtree), keeping
+    /// the heading line itself.
+    Set(SectionEditArgs),
+
+    /// Append content at the end of the addressed section, before the next
+    /// sibling-or-shallower heading.
+    Append(SectionEditArgs),
+}
+
+/// Arguments of `section get`.
+#[derive(Debug, Args)]
+pub struct SectionGetArgs {
+    /// The file to read.
+    #[arg(value_name = "FILE")]
+    pub file: String,
+
+    /// The exact heading text, without the leading `#`s.
+    #[arg(value_name = "HEADING")]
+    pub heading: String,
+}
+
+/// Shared arguments of the `section` edit sub-verbs.
+#[derive(Debug, Args)]
+#[command(group = ArgGroup::new("content").required(true).args(["text", "body_file"]))]
+pub struct SectionEditArgs {
+    /// The file whose section to edit. Its store is the nearest ancestor
+    /// carrying `DB.md`.
+    #[arg(value_name = "FILE")]
+    pub file: String,
+
+    /// The exact heading text, without the leading `#`s. Duplicate headings
+    /// are refused as ambiguous.
+    #[arg(value_name = "HEADING")]
+    pub heading: String,
+
+    /// The content, inline. Hyphen-leading values (list items) are accepted.
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    pub text: Option<String>,
+
+    /// Read the content from this file; `-` reads standard input.
+    #[arg(long, value_name = "PATH")]
+    pub body_file: Option<String>,
+
+    /// When the heading is absent, create the section at the end of the body
+    /// (one separating blank line) instead of failing.
+    #[arg(long)]
+    pub create: bool,
+
+    /// Heading level for a section created by `--create` (2–6).
+    #[arg(long, value_name = "N", default_value_t = 2,
+          value_parser = clap::value_parser!(u8).range(2..=6))]
+    pub level: u8,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// rm
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd rm <path>` — link-aware delete of one content file.
+#[derive(Debug, Args)]
+pub struct RmArgs {
+    /// The content file to delete.
+    #[arg(value_name = "PATH")]
+    pub path: String,
+
+    /// Delete even while other content files still wiki-link to the target.
+    /// Each such link is left dangling; `dbmd validate --all` then reports
+    /// `WIKI_LINK_BROKEN` on its file.
+    #[arg(long)]
+    pub force: bool,
 
     /// Store root. Defaults to the current directory.
     #[arg(long, value_name = "DIR", default_value = ".")]

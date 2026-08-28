@@ -8,9 +8,61 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.8.39**.
+  `Cargo.toml`, currently **v0.9.0**.
 
 ## Unreleased
+
+## [0.9.0] — 2026-08-28
+
+Implements format v0.4 (unchanged).
+
+### Added
+
+- **Five new local verbs — the store as a backend.** The toolkit grows the
+  operations an application (or an agent-built app server) needs to treat a
+  db.md store as its database. The CLI's original verb set silently assumed a
+  filesystem co-author (`cat`, an editor, `rm`, a watcher); these make those
+  implicit operations explicit, each carrying the structural obligations a
+  naked filesystem op would skip:
+  - `dbmd show <file>` — one file as its full structured record (parsed
+    frontmatter, derived fields, verbatim body, link spans, file-bytes
+    SHA-256): the random-access twin of `dbmd emit`, equal under `--json` to
+    that dump's entry for the file, and pinned to it by test.
+  - `dbmd body set|append <file>` and `dbmd section get|set|append <file>
+    <heading>` — corpus reads and writes with the full edit contract:
+    `updated` re-stamped, frozen pages refused, the type-folder indexes
+    maintained write-through, and `summary` never recomputed (the catalog
+    line stays the agent's explicit judgment). Sections are addressed by
+    exact heading text and span from the heading to the next
+    sibling-or-shallower heading (fence-aware; an H1 terminates), so `set`
+    replaces a section's whole subtree; `--create` upserts a missing section
+    and a duplicated heading refuses as `SECTION_AMBIGUOUS` rather than
+    guessing. Content arrives via `--text`, `--body-file`, or stdin (`-`).
+  - `dbmd rm <path>` — link-aware delete: refuses while other content files
+    still wiki-link to the target (exit 5, `RM_LINKED`, backlinks listed) so
+    the graph never silently breaks, `--force` deletes anyway and reports
+    the now-broken linkers; reserved meta files (`DB.md`, `log.md`,
+    `index.*`) and frozen pages are never deletable; the catalog row drops
+    write-through — retiring the raw-`rm`-plus-`index rebuild` dance.
+  - `dbmd watch` — the local change feed: poll the emit membership (content
+    files plus `DB.md`) and print one event line per created / modified /
+    removed file (NDJSON under `--json`, a `baseline` line first) — the
+    local-filesystem sibling of `subscribe`. Dependency-free polling, no
+    locks (a watcher never blocks a writer); `--path` scopes very large
+    stores; derived catalogs are not reported.
+  - `dbmd schema [<type>]` — the store's declared `DB.md ## Schemas`
+    contracts, parsed: each field with its modifiers plus the `unique:`,
+    `summary_template`, and `shard` directives, as JSON or as round-trippable
+    schema source. The introspection twin of validate's enforcement — an app
+    renders forms and client-side checks from this instead of re-parsing
+    `DB.md`.
+- `dbmd-core` grows the matching library surface: `edit` (section splices),
+  `watch` (snapshot/diff), and `parser::extract_section_spans` /
+  `parser::SectionSpan` — the one section-boundary rule the read views and
+  the editors now share.
+
+The format is untouched — these are toolkit read/write surfaces, not SPEC
+changes; the format stays v0.4, and no existing verb changed shape.
 
 ## [0.8.39] — 2026-08-27
 

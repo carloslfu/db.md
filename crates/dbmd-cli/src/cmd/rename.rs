@@ -754,12 +754,13 @@ fn rewrite_links_in_file(abs: &Path, old_rel: &Path, new_rel: &Path) -> Result<b
 /// root destroys the store. `log.md` / `index.md` / `index.jsonl` are the
 /// catalog's own derived files; the index machinery owns them, so a rename must
 /// not relocate one or clobber another file onto one of these names.
-const RESERVED_META_BASENAMES: [&str; 4] = ["DB.md", "log.md", "index.md", "index.jsonl"];
+pub(crate) const RESERVED_META_BASENAMES: [&str; 4] =
+    ["DB.md", "log.md", "index.md", "index.jsonl"];
 
 /// The reserved meta-file basename a store-relative path carries, if any —
 /// matched on the final path component (case-sensitive, the same spelling the
 /// content walks skip). Returns `None` for an ordinary content path.
-fn reserved_meta_name(rel: &Path) -> Option<&'static str> {
+pub(crate) fn reserved_meta_name(rel: &Path) -> Option<&'static str> {
     let name = rel.file_name().and_then(|n| n.to_str())?;
     RESERVED_META_BASENAMES
         .into_iter()

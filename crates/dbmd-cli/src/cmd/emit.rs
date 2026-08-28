@@ -117,7 +117,7 @@ fn json_dump(store_dir: &str, dump: &Emit) -> String {
 /// (uniform shape for loaders); `layer` is the singular word (`source` /
 /// `record`), `null` for the root `DB.md`; timestamps render canonical
 /// RFC3339 (the raw spellings ride verbatim inside `frontmatter`).
-fn file_json(f: &EmittedFile) -> serde_json::Value {
+pub(crate) fn file_json(f: &EmittedFile) -> serde_json::Value {
     serde_json::json!({
         "path": f.path,
         "layer": f.layer.map(layer_word),
