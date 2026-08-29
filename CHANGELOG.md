@@ -25,7 +25,11 @@ Two things version independently:
   `--provider codex` then spends the subscription against the ChatGPT
   backend's **Responses** wire format (a third adapter, reachable only after
   an explicit login), with the full tool loop, event stream, and masks the
-  other providers get. No vendor CLI required.
+  other providers get. No vendor CLI required. Verified end to end against
+  the live endpoint: a real browser sign-in, then `ask` and `do` runs that
+  queried and wrote through the store contract on a Pro account.
+- A store may pin a model per provider — `llm_model_codex = …` in
+  `.dbmd/config` — which survives an explicit `--provider` override.
 - **The identity line, written down.** dbmd identifies itself honestly on
   every subscription request (`originator: dbmd`, a `dbmd/<version>`
   User-Agent) and implements a native login only where the vendor's flow is
@@ -45,6 +49,11 @@ Two things version independently:
 
 ### Fixed
 
+- **A provider named by `--provider`/env now overrides the store's whole
+  configured setup**, not just its name: a store carrying `llm_model` for a
+  local server no longer sends that model name to a different provider. Found
+  against the live ChatGPT backend, which rejected a store's Ollama model
+  name; only provider-scoped keys (`llm_model_codex`) survive an override.
 - `codex exec` delegation passes `--skip-git-repo-check`: a db.md store need
   not be a git repository, and headless codex refuses an untrusted directory
   without it.

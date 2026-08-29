@@ -218,6 +218,11 @@ pub fn stream_turn(
             let mut detail = response.into_string().unwrap_or_default();
             detail.truncate(600);
             let hint = match status {
+                400 if detail.contains("not supported") => {
+                    " — pick one your plan exposes with `--model` (or \
+                     `llm_model_codex` in .dbmd/config); `codex --help` and \
+                     ~/.codex/config.toml name what this account uses"
+                }
                 401 => " — the login may have expired; run `dbmd login codex` again",
                 403 => " — this ChatGPT account may not include Codex access",
                 429 => " — the account's rate or usage limit was reached",

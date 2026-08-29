@@ -321,6 +321,97 @@ fn a_pasted_state_from_another_attempt_is_refused() {
     assert!(!state.path().join("auth.json").exists());
 }
 
+#[test]
+fn an_explicit_provider_ignores_the_stores_model_for_another_one() {
+    // Found live: a store configured for a local Ollama model sent that name
+    // to the ChatGPT backend, which rejected it. An explicitly named provider
+    // overrides the store's setup, and only a provider-scoped key survives.
+    let (_tmp, store) = seeded_store();
+    let state = tempfile::TempDir::new().expect("state");
+    write_credentials(
+        state.path(),
+        &fake_jwt("acct_live", "pro"),
+        now_ms() + 3_600_000,
+    );
+    std::fs::create_dir_all(store.join(".dbmd")).expect(".dbmd");
+    std::fs::write(
+        store.join(".dbmd/config"),
+        "llm_provider = ollama\nllm_model = qwen3.8-27b-32k\nllm_base_url = http://127.0.0.1:11434/v1\n",
+    )
+    .expect("config");
+
+    let backend = MockEndpoint::serve(vec![responses_sse(&[
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":"ok"}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"ok"}]}}"#,
+        r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+    ])]);
+
+    hermetic(state.path())
+        .current_dir(&store)
+        .args([
+            "--json",
+            "ask",
+            "hi",
+            "--provider",
+            "codex",
+            "--base-url",
+            &backend.url,
+        ])
+        .assert()
+        .success();
+
+    let requests = backend.finish();
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).expect("json");
+    assert_ne!(
+        body["model"], "qwen3.8-27b-32k",
+        "a local model name must not ride to the ChatGPT backend"
+    );
+    assert_eq!(body["model"], "gpt-5.6-sol");
+}
+
+#[test]
+fn a_provider_scoped_model_survives_an_explicit_override() {
+    let (_tmp, store) = seeded_store();
+    let state = tempfile::TempDir::new().expect("state");
+    write_credentials(
+        state.path(),
+        &fake_jwt("acct_live", "pro"),
+        now_ms() + 3_600_000,
+    );
+    std::fs::create_dir_all(store.join(".dbmd")).expect(".dbmd");
+    std::fs::write(
+        store.join(".dbmd/config"),
+        "llm_provider = ollama\nllm_model = qwen3.8-27b-32k\nllm_model_codex = gpt-5.3-codex\n",
+    )
+    .expect("config");
+
+    let backend = MockEndpoint::serve(vec![responses_sse(&[
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":"ok"}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"ok"}]}}"#,
+        r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+    ])]);
+
+    hermetic(state.path())
+        .current_dir(&store)
+        .args([
+            "--json",
+            "ask",
+            "hi",
+            "--provider",
+            "codex",
+            "--base-url",
+            &backend.url,
+        ])
+        .assert()
+        .success();
+
+    let requests = backend.finish();
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).expect("json");
+    assert_eq!(body["model"], "gpt-5.3-codex");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ask --provider codex
 // ─────────────────────────────────────────────────────────────────────────────

@@ -43,6 +43,15 @@ pub const ALLOW_INSECURE_ENV: &str = "DBMD_LLM_ALLOW_INSECURE_HTTP";
 /// never read).
 const CONFIG_KEYS: [&str; 4] = ["llm_provider", "llm_base_url", "llm_protocol", "llm_model"];
 
+/// A store may also pin a value per provider (`llm_model_ollama`,
+/// `llm_model_codex`), which survives an explicit `--provider` override.
+fn is_config_key(key: &str) -> bool {
+    CONFIG_KEYS.contains(&key)
+        || CONFIG_KEYS
+            .iter()
+            .any(|base| key.starts_with(&format!("{base}_")))
+}
+
 /// Flag-level overrides from the CLI (all optional).
 #[derive(Debug, Default, Clone)]
 pub struct Overrides {
@@ -149,9 +158,12 @@ const PRESETS: [Preset; 13] = [
     },
 ];
 
-/// The default model for a `dbmd login codex` session when the user names
-/// none. Codex-backed accounts resolve this on the server side.
-pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.1-codex";
+/// The default model for a ChatGPT-subscription session when the user names
+/// none. ChatGPT accounts accept only the models their plan exposes through
+/// Codex, and that set moves: a rejected name comes back as a plain HTTP 400
+/// naming the model, and `--model` (or `llm_model_codex` in `.dbmd/config`)
+/// picks another without a new release.
+pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.6-sol";
 
 /// Where a resolved value came from — the origin-binding rule keys on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +196,7 @@ fn store_config(store_root: &Path) -> Vec<(String, String)> {
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let value = value.trim();
-            if CONFIG_KEYS.contains(&key) && !value.is_empty() {
+            if is_config_key(key) && !value.is_empty() {
                 out.push((key.to_string(), value.to_string()));
             }
         }
@@ -249,14 +261,36 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
     let config = store_config(store_root);
 
     // ── provider preset ──────────────────────────────────────────────────
-    let preset_name = overrides
+    // A provider named by flag or env OVERRIDES the store's configured setup.
+    // The store's other `llm_*` values were written for whatever provider that
+    // store expects (a local model name, say), so they must not silently ride
+    // to a different one — a ChatGPT account rejecting `qwen3.8-27b-32k` is the
+    // friendly version of that mistake; a wrong endpoint would be the ugly one.
+    // A provider-scoped key (`llm_model_codex`) is honored either way.
+    let overriding_provider = overrides
         .provider
         .clone()
-        .or_else(|| env_nonempty(PROVIDER_ENV))
-        .or_else(|| config_value(&config, "llm_provider"));
+        .or_else(|| env_nonempty(PROVIDER_ENV));
+    let provider_is_overridden = overriding_provider.is_some();
+    let preset_name = overriding_provider.or_else(|| config_value(&config, "llm_provider"));
     let preset: Option<&Preset> = match &preset_name {
         Some(name) => Some(find_preset(name)?),
         None => None,
+    };
+    // Store-local values that still apply after an explicit override: only the
+    // ones scoped to the provider actually in use.
+    let scoped = |config: &[(String, String)], key: &str| -> Option<String> {
+        let name = preset_name.as_deref()?;
+        config_value(config, &format!("{key}_{name}"))
+    };
+    let store_value = |config: &[(String, String)], key: &str| -> Option<String> {
+        scoped(config, key).or_else(|| {
+            if provider_is_overridden {
+                None
+            } else {
+                config_value(config, key)
+            }
+        })
     };
 
     if let Some(preset) = preset {
@@ -295,7 +329,7 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
                     .model
                     .clone()
                     .or_else(|| env_nonempty(MODEL_ENV))
-                    .or_else(|| config_value(&config, "llm_model"))
+                    .or_else(|| store_value(&config, "llm_model"))
                     .unwrap_or_else(|| CODEX_DEFAULT_MODEL.to_string()),
                 key: Some(access),
                 source: format!("ChatGPT subscription{plan}"),
@@ -308,7 +342,7 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
         (Some(url), Source::Flag)
     } else if let Some(url) = env_nonempty(BASE_URL_ENV) {
         (Some(url), Source::Env)
-    } else if let Some(url) = config_value(&config, "llm_base_url") {
+    } else if let Some(url) = store_value(&config, "llm_base_url") {
         (Some(url), Source::StoreConfig)
     } else if let Some(preset) = preset {
         (Some(preset.base_url.to_string()), Source::Preset)
@@ -321,7 +355,7 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
         .protocol
         .clone()
         .or_else(|| env_nonempty(PROTOCOL_ENV))
-        .or_else(|| config_value(&config, "llm_protocol"))
+        .or_else(|| store_value(&config, "llm_protocol"))
     {
         Some(parse_protocol(&raw)?)
     } else {
@@ -333,7 +367,7 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
         .model
         .clone()
         .or_else(|| env_nonempty(MODEL_ENV))
-        .or_else(|| config_value(&config, "llm_model"));
+        .or_else(|| store_value(&config, "llm_model"));
 
     // ── key: ENVIRONMENT ONLY ────────────────────────────────────────────
     let key =
