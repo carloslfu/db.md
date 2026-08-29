@@ -33,9 +33,37 @@ impact. Do not open a public issue for an unpatched vulnerability.
   before commit. It installs the new target while the old target remains valid,
   commits all linkers, then removes the old target; restart recovery is
   idempotent and a destination race never clobbers an existing file.
-- `dbmd` runs no model and makes no provider calls. Prompt injection and data
-  disclosure by the agent that invokes `dbmd` remain properties of that agent
-  harness.
+- `dbmd` runs no model of its own and calls no provider on its own. Prompt
+  injection and data disclosure by the agent that invokes `dbmd` remain
+  properties of that agent harness.
+- The embedded harness (`dbmd ask` / `do` / `build`) is the one surface that
+  calls a model, only when invoked, only to the endpoint the operator
+  configured, and never with a credential read from inside a store (see
+  "Harness boundary" below).
+
+## Harness boundary
+
+`dbmd ask` / `do` / `build` run a tool-calling loop whose tools are `dbmd`
+verbs. The boundary is the tool registry, not the prompt:
+
+- **`ask` has no write tools at all**, so content injected through an
+  ingested source can at worst produce a wrong answer.
+- **`do` writes only through the same verbs a person would run**, so schema
+  enforcement, frozen pages, link-aware deletes, the store transaction lock,
+  and the append-only log all still apply, and every action is logged.
+- **`build` adds file operations confined beneath a workspace root the
+  operator declares** — absolute paths, `..`, symlinked components, and the
+  store subtree are all refused. It is CLI-only and never served over HTTP.
+- **There is no shell tool at any level**, and record content is passed to
+  the model as data, never folded into the system prompt.
+- **Credentials never come from a store.** API keys are read from the
+  environment only; subscription tokens live in the toolkit state directory
+  at 0600. An endpoint selected by a store's own `.dbmd/config` cannot
+  borrow an ambient key unless the operator explicitly binds that key to
+  that origin, so a cloned store cannot exfiltrate one.
+- **The `/v1/ask` and `/v1/do` routes are off unless started explicitly**
+  (`dbmd api --ask` / `--do`), because they let anything on loopback spend
+  the configured model's tokens.
 
 ## link.md boundary
 

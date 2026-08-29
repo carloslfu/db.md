@@ -104,6 +104,7 @@ Then, from inside a store:
 dbmd spec                                  # print the whole standard
 dbmd search "renewal" --in records         # search content and frontmatter
 dbmd query --type contact --where status=active   # filter by frontmatter
+dbmd ask "who is up for renewal this quarter?"    # the same store, in English
 ```
 
 Every command speaks `--json`, so anything you build on top reads it
@@ -278,12 +279,14 @@ the files stay the source of truth.
 
 ## Safe to paste
 
-Start with the fact that matters most: **the binary makes no background
-network calls.** There is no telemetry, AI SDK, model call, or auto-update.
-Local format commands stay local. The explicit
-[sync commands](#sync-if-you-want-it) connect only to the hub you select
-and may carry the credential you configured. You don't
-have to take this page's word for anything. The audit is one more prompt:
+Start with the fact that matters most: **the binary makes no network call
+you did not ask for.** There is no telemetry, no auto-update, no AI SDK,
+and no endpoint baked in. Local format commands stay local. Exactly two
+command families reach the network, both only when you run them and both
+only to a place you named: the [sync commands](#sync-if-you-want-it) talk
+to the hub you select, and [`ask` / `do` / `build`](#ask-it-in-english)
+talk to the model endpoint you configure. You don't have to take this
+page's word for anything. The audit is one more prompt:
 
 ```text
 Read scripts/install.sh, scripts/install.ps1, and .github/workflows/release.yml
@@ -330,6 +333,32 @@ skill ([`skills/db-md/SKILL.md`](skills/db-md/SKILL.md), in the open
 skills. There is no install command for this, on purpose: copy the file,
 use your agent's own skill installer, or tell the agent to set itself up.
 
+## Ask it in English
+
+Bring your own agent and it operates the store natively. When there isn't
+one — an app calling the store, a machine with a model but no agent —
+`dbmd` carries a small harness of its own: a tool-calling loop whose only
+tools are the same `dbmd` verbs you just saw.
+
+```bash
+dbmd ask   "which invoices are unpaid and older than 60 days?"   # read-only
+dbmd do    "mark the Lumio invoice paid and log it"              # + writes
+dbmd build "add a kanban view to the app"                        # + the app's files
+```
+
+The verb is the permission. `ask` has no write tools at all, so a prompt
+injected through an ingested source can produce a wrong answer and nothing
+more. `do` writes only through the same `dbmd` verbs you would run by
+hand, so schema checks, frozen pages, link-aware deletes, and the store
+log all still apply. There is no shell tool at any level.
+
+The model is yours: a local server is found automatically
+(Ollama, LM Studio, llama.cpp), an API key works through
+`--provider anthropic|openai|openrouter|…`, and a ChatGPT subscription
+signs in with `dbmd login codex`. No default vendor, no key ever stored
+inside a store, nothing metered. Apps get the same loop over
+loopback HTTP with `dbmd api --ask`.
+
 ## The toolkit
 
 db.md is plain files, so any tool that reads files works. The reference
@@ -342,12 +371,17 @@ toolkit is one Rust binary, `dbmd`, in the git / cargo / kubectl shape.
   delete, index, emit, watch, introspect schemas, and audit a store without
   a daemon — and serve that whole surface to local apps over HTTP
   (`dbmd api`) when one is wanted.
+- **A harness when you need one.** [`ask` / `do` / `build`](#ask-it-in-english)
+  run those same verbs from a plain-English request, against the model you
+  configure.
 - **An optional network client.** Address and sync brains, grant access,
   review proposals, manage keys, follow changes, and mirror or re-serve a
   verified copy through [link.md](https://github.com/carloslfu/link.md)
   when you select a hub.
-- **Zero AI dependencies.** No provider SDKs, no API keys, no model calls
-  in the binary. The agent runtime is yours.
+- **No AI dependencies, no vendor.** No provider SDKs, no bundled model,
+  no endpoint baked in, nothing metered. Every verb is deterministic; the
+  one part that calls a model is [`ask` / `do` / `build`](#ask-it-in-english),
+  and it calls the model *you* configure.
 - **A library underneath.** All the logic lives in `dbmd-core`. Run
   `cargo add dbmd-core` to build your own db.md-aware tool.
 

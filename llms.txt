@@ -31,12 +31,14 @@ curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/instal
 The script is about 160 lines of POSIX sh: it downloads a tarball from this
 repo's GitHub Releases, verifies its SHA-256 against the release's
 `SHA256SUMS`, and installs to `~/.dbmd/bin` with no sudo and no shell-config
-edits. The binary never phones home: no telemetry, no auto-update, no AI
-SDKs. Its only network I/O is the link.md client verbs (`dbmd
+edits. The binary never phones home: no telemetry, no auto-update, no AI SDKs,
+no endpoint baked in. It reaches the network only through commands you
+invoke, against a place you named: the link.md client verbs (`dbmd
 resolve/sync/grant/propose/subscribe`, plus `key`/`mirror`/`serve` for
-identity and the reference node), which run solely when you invoke them
-against a hub you configure. (The link.md client shipped in v0.8.0; its
-spec — a v0 draft — is public at github.com/carloslfu/link.md.)
+identity and the reference node) talk to a hub you configure, and
+`dbmd ask`/`do`/`build` talk to the model endpoint you configure. (The
+link.md client shipped in v0.8.0; its spec — a v0 draft — is public at
+github.com/carloslfu/link.md.)
 
 Alternatives: `brew install carloslfu/tap/dbmd` for the prebuilt release, or
 `cargo install dbmd-cli` to build from crates.io if you already have Rust.
@@ -91,10 +93,20 @@ Read with `dbmd search` / `dbmd query` / `dbmd show` / `dbmd graph` (and
 application can consume the same surface over loopback HTTP: `dbmd api`
 serves every local verb as a route (`GET /v1` lists them; `/v1/events`
 streams changes as SSE) so a local app — a browser page included — uses
-the store as its backend without shelling out. Read the store's `DB.md` (identity,
-policies, schemas) before writing. `dbmd write` mints a stable lowercase-ULID
-`id` for each new record (recommended, not required — files without one stay
-fully valid); ids are minted by tooling — never compose a ULID by hand.
+the store as its backend without shelling out. Read the store's `DB.md`
+(identity, policies, schemas) before writing. `dbmd write` mints a stable
+lowercase-ULID `id` for each new record (recommended, not required — files
+without one stay fully valid); ids are minted by tooling — never compose a
+ULID by hand.
+
+You are the operator, so you do not need this yourself: the toolkit also
+carries a small harness for callers that cannot host one. `dbmd ask`
+(read verbs only), `dbmd do` (adds writes), and `dbmd build` (adds files
+under a declared workspace) run these same verbs from a plain-English
+request, against a model the operator configures — a local server is
+autodetected, `--provider <name>` uses an API key, and `dbmd login codex`
+uses a ChatGPT subscription. Raise it only when the operator wants their
+app or another machine to ask the store directly.
 
 ## Where a new store lives
 

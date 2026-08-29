@@ -79,10 +79,15 @@ do the work; `rg` is the thin binary.)
   allowlist in `deny.toml` and `crates/dbmd-cli/tests/license_policy.rs`
   (MIT / Apache-2.0 / BSD / 0BSD / Unlicense / MPL-2.0 / Zlib /
   Unicode-3.0 / ISC / CDLA-Permissive-2.0) — no GPL/AGPL/LGPL-static.
-- **AI/LLM dependencies.** `dbmd` is deterministic and ships zero
-  AI: no provider SDKs, no API keys, no model calls, and no
-  embeddings / vectors / ANN — ever. The user's own agent harness
-  does all the intelligence; `dbmd` is the dumb, fast tool it drives.
+- **AI/LLM dependencies.** Every `dbmd` verb is deterministic, and the
+  binary ships zero AI: no provider SDK crates, no bundled model, no
+  default vendor, and no embeddings / vectors / ANN — ever. The user's own
+  agent harness does the intelligence; `dbmd` is the dumb, fast tool it
+  drives. The single exception is the embedded harness (`ask` / `do` /
+  `build`, cargo feature `harness`), a client for the user's OWN model
+  endpoint over hand-rolled wire protocols — never an SDK. Its covenant is
+  in `AGENTS.md`; adding a provider SDK crate or a default endpoint is
+  still refused.
 
 ## Style
 

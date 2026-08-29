@@ -1823,10 +1823,13 @@ required. The spec is the contract; the runtime is replaceable.
 The format is the spec. The reference toolkit is one Rust binary,
 `dbmd`, with subcommands for read / write / validate / extract
 operations. Embeds `ripgrep` (via the `grep` crate) for fast search.
-**Zero LLM dependencies**: no provider SDKs, no API keys, no model
-calls anywhere in the binary. The agent runtime — Claude Code,
-Codex, or any harness — is BYO and calls `dbmd` for file/data
-operations. See `TOOLS.md` for the full toolkit reference.
+**Zero LLM dependencies**: no provider SDKs, no bundled model, no
+endpoint baked in, and every verb deterministic. The agent runtime —
+Claude Code, Codex, or any harness — is BYO and calls `dbmd` for
+file/data operations. (The toolkit also carries an optional harness of
+its own, `dbmd ask` / `do` / `build`, for callers that cannot host one;
+it drives the same verbs with a model the user configures and is a
+toolkit feature, not part of this format. See `TOOLS.md`.)
 
 **Agent bootstrap — the installer is text.** db.md is installed and
 integrated by reading plain markdown and acting on it; a capable agent is
