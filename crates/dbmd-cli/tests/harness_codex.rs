@@ -45,12 +45,25 @@ struct MockEndpoint {
 
 impl MockEndpoint {
     fn serve(responses: Vec<(&'static str, String)>) -> Self {
+        Self::serve_with_status(
+            responses
+                .into_iter()
+                .map(|(ct, body)| (200, ct, body))
+                .collect(),
+        )
+    }
+
+    /// Script responses with explicit statuses. Every request is read in
+    /// full BEFORE the response is written: a server that closes while the
+    /// client is still sending resets the connection on Linux, which would
+    /// surface as a transport error instead of the status under test.
+    fn serve_with_status(responses: Vec<(u16, &'static str, String)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let url = format!("http://{}", listener.local_addr().expect("addr"));
         let requests: Arc<Mutex<Vec<Captured>>> = Arc::default();
         let captured = Arc::clone(&requests);
         let handle = std::thread::spawn(move || {
-            for (content_type, body) in responses {
+            for (status, content_type, body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept");
                 let mut reader = BufReader::new(stream.try_clone().expect("clone"));
                 let mut line = String::new();
@@ -81,8 +94,16 @@ impl MockEndpoint {
                     headers,
                     body: String::from_utf8_lossy(&raw).into_owned(),
                 });
+                let reason = match status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    429 => "Too Many Requests",
+                    _ => "Error",
+                };
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
                 stream.write_all(head.as_bytes()).expect("head");
@@ -638,19 +659,11 @@ fn a_backend_refusal_is_reported_with_its_remedy() {
         now_ms() + 3_600_000,
     );
 
-    // A 401 from the backend: the login is stale.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let url = format!("http://{}", listener.local_addr().expect("addr"));
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let body = r#"{"error":{"message":"token expired"}}"#;
-        let head = format!(
-            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(body.as_bytes());
-    });
+    let backend = MockEndpoint::serve_with_status(vec![(
+        401,
+        "application/json",
+        r#"{"error":{"message":"token expired"}}"#.to_string(),
+    )]);
 
     let assert = hermetic(state.path())
         .current_dir(&store)
@@ -661,14 +674,51 @@ fn a_backend_refusal_is_reported_with_its_remedy() {
             "--provider",
             "codex",
             "--base-url",
-            &url,
-            "--model",
-            "gpt-5.1-codex",
+            &backend.url,
         ])
         .assert()
         .failure();
-    server.join().expect("server");
+    backend.finish();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
-    assert!(stderr.contains("HTTP 401"));
-    assert!(stderr.contains("dbmd login codex"));
+    assert!(stderr.contains("HTTP 401"), "stderr was: {stderr}");
+    assert!(stderr.contains("dbmd login codex"), "stderr was: {stderr}");
+}
+
+#[test]
+fn an_unsupported_model_says_how_to_pick_another() {
+    // The set of models a ChatGPT plan exposes moves; a rejection must be
+    // fixable without a release. (Seen live on a Pro account.)
+    let (_tmp, store) = seeded_store();
+    let state = tempfile::TempDir::new().expect("state");
+    write_credentials(
+        state.path(),
+        &fake_jwt("acct_live", "pro"),
+        now_ms() + 3_600_000,
+    );
+
+    let backend = MockEndpoint::serve_with_status(vec![(
+        400,
+        "application/json",
+        r#"{"detail":"The 'x' model is not supported when using Codex with a ChatGPT account."}"#
+            .to_string(),
+    )]);
+
+    let assert = hermetic(state.path())
+        .current_dir(&store)
+        .args([
+            "--json",
+            "ask",
+            "hi",
+            "--provider",
+            "codex",
+            "--base-url",
+            &backend.url,
+            "--model",
+            "x",
+        ])
+        .assert()
+        .failure();
+    backend.finish();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(stderr.contains("--model"), "stderr was: {stderr}");
 }
