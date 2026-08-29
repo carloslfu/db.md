@@ -39,6 +39,9 @@ pub fn state_dir() -> Result<PathBuf, HarnessError> {
         }
         return Ok(path);
     }
+    // Each branch is the function's tail expression on its own platform, so
+    // neither carries a `return` (clippy::needless_return is Windows-only
+    // otherwise — it never compiles this block elsewhere).
     #[cfg(windows)]
     {
         let base = env_nonempty("LOCALAPPDATA").ok_or_else(|| {
@@ -46,7 +49,7 @@ pub fn state_dir() -> Result<PathBuf, HarnessError> {
                 "cannot locate user state; set {STATE_DIR_ENV} or LOCALAPPDATA"
             ))
         })?;
-        return Ok(PathBuf::from(base).join("dbmd").join("state"));
+        Ok(PathBuf::from(base).join("dbmd").join("state"))
     }
     #[cfg(not(windows))]
     {
