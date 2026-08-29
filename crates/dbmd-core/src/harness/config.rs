@@ -68,7 +68,7 @@ struct Preset {
 
 /// The preset table. Data, not code: every row rides one of the two wire
 /// adapters (or a delegation backend). No row is a default.
-const PRESETS: [Preset; 12] = [
+const PRESETS: [Preset; 13] = [
     Preset {
         name: "anthropic",
         protocol: Protocol::Anthropic,
@@ -130,18 +130,28 @@ const PRESETS: [Preset; 12] = [
         key_env: None,
     },
     Preset {
+        name: "codex",
+        protocol: Protocol::Codex,
+        base_url: super::codex::DEFAULT_BASE_URL,
+        key_env: None,
+    },
+    Preset {
         name: "claude-code",
         protocol: Protocol::ClaudeCli,
         base_url: "",
         key_env: None,
     },
     Preset {
-        name: "codex",
+        name: "codex-cli",
         protocol: Protocol::CodexCli,
         base_url: "",
         key_env: None,
     },
 ];
+
+/// The default model for a `dbmd login codex` session when the user names
+/// none. Codex-backed accounts resolve this on the server side.
+pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.1-codex";
 
 /// Where a resolved value came from — the origin-binding rule keys on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,8 +203,9 @@ fn parse_protocol(raw: &str) -> Result<Protocol, HarnessError> {
     match raw {
         "openai" | "openai-completions" => Ok(Protocol::OpenAi),
         "anthropic" | "anthropic-messages" => Ok(Protocol::Anthropic),
+        "codex" | "codex-responses" => Ok(Protocol::Codex),
         other => Err(HarnessError::Config(format!(
-            "unknown protocol `{other}` — use `openai` or `anthropic`"
+            "unknown protocol `{other}` — use `openai`, `anthropic`, or `codex`"
         ))),
     }
 }
@@ -256,6 +267,38 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
                 model: String::new(),
                 key: None,
                 source: format!("delegation to the `{}` CLI", preset.name),
+            });
+        }
+        // The ChatGPT backend takes a subscription token from `dbmd login
+        // codex`, never an API key: the credential comes from the toolkit
+        // state dir (refreshed in place), not from the environment.
+        if preset.protocol == Protocol::Codex {
+            let access = super::auth::access_token("codex")?.ok_or_else(|| {
+                HarnessError::Config(
+                    "not signed in to ChatGPT — run `dbmd login codex` to use your \
+                     subscription (or `--provider codex-cli` to delegate to an \
+                     installed, logged-in codex CLI)"
+                        .to_string(),
+                )
+            })?;
+            let plan = super::oauth::plan_type(&access)
+                .map(|plan| format!(" ({plan})"))
+                .unwrap_or_default();
+            return Ok(Provider {
+                protocol: Protocol::Codex,
+                base_url: overrides
+                    .base_url
+                    .clone()
+                    .or_else(|| env_nonempty(BASE_URL_ENV))
+                    .unwrap_or_else(|| preset.base_url.to_string()),
+                model: overrides
+                    .model
+                    .clone()
+                    .or_else(|| env_nonempty(MODEL_ENV))
+                    .or_else(|| config_value(&config, "llm_model"))
+                    .unwrap_or_else(|| CODEX_DEFAULT_MODEL.to_string()),
+                key: Some(access),
+                source: format!("ChatGPT subscription{plan}"),
             });
         }
     }

@@ -12,6 +12,43 @@ Two things version independently:
 
 ## Unreleased
 
+### Added
+
+- **`dbmd login codex` — a ChatGPT subscription, natively.** OpenAI's public
+  PKCE authorization-code flow (the one endorsed for third-party OSS
+  clients): the browser opens, dbmd serves the loopback callback on
+  `127.0.0.1:1455`, and the tokens land in the toolkit state directory at
+  0600 — never inside a store — refreshed in place a minute before expiry and
+  persisted for the next process. `--code` skips the browser entirely for
+  headless machines (paste the code or the whole redirect URL back);
+  `dbmd login --status` lists what is signed in and `dbmd logout` forgets it.
+  `--provider codex` then spends the subscription against the ChatGPT
+  backend's **Responses** wire format (a third adapter, reachable only after
+  an explicit login), with the full tool loop, event stream, and masks the
+  other providers get. No vendor CLI required.
+- **The identity line, written down.** dbmd identifies itself honestly on
+  every subscription request (`originator: dbmd`, a `dbmd/<version>`
+  User-Agent) and implements a native login only where the vendor's flow is
+  built for third-party clients. Anthropic's and GitHub Copilot's OAuth paths
+  are deliberately NOT implemented: both work only by borrowing that vendor's
+  own first-party client id and asserting its identity (a "You are Claude
+  Code" system block and `claude-code-*` betas; a `vscode-chat`
+  Copilot-Integration-Id). Those subscriptions stay on delegation.
+
+### Changed
+
+- **`--provider codex` now means the native ChatGPT login** (after
+  `dbmd login codex`). The delegation backend that drives an installed,
+  logged-in `codex` CLI is renamed **`codex-cli`**; `claude-code` is
+  unchanged. A one-day-old name, renamed so the primary spelling names the
+  better path.
+
+### Fixed
+
+- `codex exec` delegation passes `--skip-git-repo-check`: a db.md store need
+  not be a git repository, and headless codex refuses an untrusted directory
+  without it.
+
 ## [0.11.0] — 2026-08-28
 
 Implements format v0.4 (unchanged).

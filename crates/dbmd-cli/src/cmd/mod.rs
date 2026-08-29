@@ -36,6 +36,7 @@ pub mod install_verified;
 pub mod key;
 pub mod link;
 pub mod log;
+pub mod login;
 pub mod mirror;
 pub mod outline;
 mod projection;

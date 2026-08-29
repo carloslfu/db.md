@@ -224,7 +224,7 @@ write-through indexes, log.md), and there is no shell tool at any mask.
   store subtree is refused for file tools; symlink and `..` escapes are
   refused; CLI-only — never exposed over `dbmd api`.
 
-Providers, in three layers. (1) Presets — `--provider anthropic |
+Providers, in four layers. (1) Presets — `--provider anthropic |
 openai | openrouter | groq | together | deepseek | mistral | ollama |
 lmstudio | llamacpp` — each just a base URL + wire protocol + the
 provider's conventional key env var. Two hand-rolled protocols cover
@@ -232,11 +232,28 @@ them all: OpenAI-compatible Chat Completions and Anthropic Messages
 (which also reaches llama.cpp's native `/v1/messages`). (2) Local,
 zero-config: with nothing configured the well-known local servers
 (Ollama, LM Studio, llama.cpp) are autodetected and their models
-listed. (3) Subscription logins by DELEGATION — `--provider
-claude-code` / `codex` spawns the vendor's own logged-in CLI headless
-(`claude -p` / `codex exec`, read-only sandbox for `ask`); dbmd ships
-zero OAuth code and never impersonates a vendor client (experimental:
-headless flags drift across vendor releases).
+listed. (3) A ChatGPT subscription, natively: `dbmd login codex` runs
+OpenAI's public PKCE flow (the one endorsed for third-party OSS
+clients), stores the tokens in the toolkit state dir at 0600 — never
+in a store — refreshes them automatically, and `--provider codex`
+then spends them against the ChatGPT backend's Responses API. No
+vendor CLI needed. (4) Every other subscription by DELEGATION —
+`--provider claude-code` / `codex-cli` spawns the vendor's own
+logged-in CLI headless (`claude -p` / `codex exec`, read-only sandbox
+for `ask`); experimental, since headless flags drift across vendor
+releases.
+
+**The identity line.** dbmd always identifies itself honestly:
+`originator: dbmd` and a `dbmd/<version>` User-Agent on every
+subscription request. It implements a native login only where the
+vendor's flow is designed for third-party clients, and it will not
+implement one that requires posing as a vendor's own first-party
+client — Anthropic's and GitHub Copilot's OAuth paths both work only
+by borrowing that vendor's client id and asserting its identity
+(a "You are Claude Code" system block, a `vscode-chat` integration
+id), so those subscriptions are reached by delegation instead. Using
+your subscription is your right; pretending to be someone else's
+software is not something this toolkit does.
 
 Config: flag > `DBMD_LLM_*` env > non-secret `llm_*` keys in
 `.dbmd/config` (`llm_provider`, `llm_base_url`, `llm_protocol`,

@@ -120,6 +120,8 @@ fn dispatch(ctx: &Context, command: &Command) -> CliResult {
         Command::Emit(args) => cmd::emit::run(ctx, args),
         Command::Outline(args) => cmd::outline::run(ctx, args),
         Command::Watch(args) => cmd::watch::run(ctx, args),
+        Command::Login(args) => cmd::login::run(ctx, args),
+        Command::Logout(args) => cmd::login::run_logout(ctx, args),
         Command::Ask(args) => cmd::ask::run(ctx, args, dbmd_core::harness::Mask::Read),
         Command::Do(args) => cmd::ask::run(ctx, args, dbmd_core::harness::Mask::Write),
         Command::Build(args) => cmd::ask::run(ctx, args, dbmd_core::harness::Mask::Build),

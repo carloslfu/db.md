@@ -9,10 +9,13 @@
 //! plumbing; this module adds a *client for user-supplied intelligence*, the
 //! way a database ships a shell. The covenant, enforced by construction:
 //!
-//! - **Two wire protocols, hand-rolled.** Anthropic Messages and
-//!   OpenAI-compatible Chat Completions, raw JSON over the `ureq` already in
-//!   the tree ([`openai`], [`anthropic`], [`sse`]). No SDK crates — the
-//!   `deny.toml` bans now enforce this covenant rather than contradict it.
+//! - **Hand-rolled wire protocols, no SDK crates.** Two neutral ones —
+//!   Anthropic Messages and OpenAI-compatible Chat Completions ([`openai`],
+//!   [`anthropic`], [`sse`]) — plus the ChatGPT backend's Responses format
+//!   ([`codex`]), which exists only to spend a ChatGPT subscription and is
+//!   reached only after an explicit `dbmd login codex`. All raw JSON over the
+//!   `ureq` already in the tree; the `deny.toml` bans now enforce this
+//!   covenant rather than contradict it.
 //! - **No default vendor or endpoint** ([`config`]) — like the hub client, a
 //!   model is whatever the user points the toolkit at. The API key is read
 //!   from the environment ONLY, never from a file inside the store, and an
@@ -32,14 +35,25 @@
 //!   with what you have" call, per-tool output truncation, and a bounded
 //!   response reader.
 //!
-//! Subscription logins (Claude, Codex) are reached by *delegation* — spawning
-//! the vendor's own logged-in CLI headless ([`delegate`]) — never by
-//! reimplementing a vendor OAuth flow here.
+//! **Subscriptions, and the identity line.** A ChatGPT subscription is used
+//! natively: [`oauth`] runs OpenAI's public PKCE flow (the one endorsed for
+//! third-party OSS clients), [`auth`] stores the tokens outside any store,
+//! and [`codex`] spends them — always identifying this toolkit honestly
+//! (`originator: dbmd`), never posing as another vendor's first-party client.
+//! Every other subscription (Claude Pro/Max, Copilot) is reached by
+//! *delegation* — spawning the vendor's own logged-in CLI headless
+//! ([`delegate`]). Anthropic's OAuth path is deliberately NOT implemented:
+//! it only works by injecting a "You are Claude Code" system block and
+//! `claude-code-*` beta headers so a subscription token is accepted, and
+//! impersonating a vendor's own client is not something this toolkit does.
 
 pub mod anthropic;
+pub mod auth;
+pub mod codex;
 pub mod config;
 pub mod delegate;
 pub mod files;
+pub mod oauth;
 pub mod openai;
 pub mod sse;
 pub mod tools;
@@ -71,6 +85,9 @@ pub enum Protocol {
     /// Anthropic Messages (`POST <base>/v1/messages`). Covers the Claude API
     /// and llama.cpp's native Anthropic endpoint.
     Anthropic,
+    /// The ChatGPT backend's Responses API, driven by a subscription token
+    /// from `dbmd login codex` ([`oauth`]).
+    Codex,
     /// Delegate the whole request to a logged-in `claude` CLI (headless).
     ClaudeCli,
     /// Delegate the whole request to a logged-in `codex` CLI (headless).
@@ -399,6 +416,7 @@ pub fn run(
             Protocol::Anthropic => {
                 anthropic::stream_turn(provider, opts, system, &messages, specs, emit)
             }
+            Protocol::Codex => codex::stream_turn(provider, opts, system, &messages, specs, emit),
             Protocol::ClaudeCli | Protocol::CodexCli => unreachable!("delegates handled above"),
         };
         let turn = match turn {

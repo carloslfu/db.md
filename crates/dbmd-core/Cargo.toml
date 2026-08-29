@@ -80,7 +80,7 @@ link = ["dep:ureq", "dep:url", "dep:base64", "dep:ring"]
 # client uses. Zero SDK crates, no default vendor or endpoint, key from the
 # environment only (AGENTS.md "Hard rules" carries the full covenant).
 # Optional so a format-only consumer drops it with `default-features = false`.
-harness = ["dep:ureq"]
+harness = ["dep:ureq", "dep:base64", "dep:ring"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

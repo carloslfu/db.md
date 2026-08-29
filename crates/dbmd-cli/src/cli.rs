@@ -186,6 +186,22 @@ pub enum Command {
     /// (no locks — a watcher never blocks a writer); runs until interrupted.
     Watch(WatchArgs),
 
+    // ── Harness: subscription sign-in ────────────────────────────────────────
+    /// Sign in to a provider that bills a SUBSCRIPTION rather than an API key.
+    /// `dbmd login codex` runs OpenAI's public PKCE flow so a ChatGPT
+    /// Plus/Pro subscription drives `dbmd ask` with no vendor CLI installed:
+    /// your browser opens, this process serves the loopback callback, and the
+    /// tokens land in the toolkit state directory (0600) — never inside a
+    /// store, and refreshed automatically when they expire. `--code` skips
+    /// the browser for headless machines (paste the code back yourself), and
+    /// `--status` lists what is signed in. Claude Pro/Max and Copilot
+    /// subscriptions need no login here: they are used by delegating to their
+    /// own logged-in CLI (`--provider claude-code`).
+    Login(LoginArgs),
+
+    /// Forget a provider's stored subscription credentials.
+    Logout(LogoutArgs),
+
     // ── Harness: the embedded operator ───────────────────────────────────────
     /// Ask the store a question in natural language. Runs the embedded
     /// micro-harness: a stateless tool-calling loop against YOUR model (a
@@ -1041,6 +1057,36 @@ pub struct ApiArgs {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// login / logout (subscription sign-in)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `dbmd login [codex]`.
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Which provider to sign in to. Only `codex` (ChatGPT Plus/Pro) has a
+    /// native login today; defaults to it.
+    #[arg(value_name = "PROVIDER")]
+    pub provider: Option<String>,
+
+    /// Do not open a browser or bind the callback port: print the URL and
+    /// read the authorization code (or full redirect URL) from stdin.
+    #[arg(long)]
+    pub code: bool,
+
+    /// List the providers with stored credentials instead of signing in.
+    #[arg(long)]
+    pub status: bool,
+}
+
+/// `dbmd logout [codex]`.
+#[derive(Debug, Args)]
+pub struct LogoutArgs {
+    /// Which provider's credentials to forget (defaults to `codex`).
+    #[arg(value_name = "PROVIDER")]
+    pub provider: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ask / do / build (the embedded harness)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1051,10 +1097,12 @@ pub struct AskArgs {
     #[arg(value_name = "PROMPT")]
     pub prompt: String,
 
-    /// Provider preset (anthropic, openai, openrouter, groq, together,
-    /// deepseek, mistral, ollama, lmstudio, llamacpp) or a delegation
-    /// backend (claude-code, codex). No default: with nothing configured,
-    /// local servers are autodetected.
+    /// Provider preset: an API-key provider (anthropic, openai, openrouter,
+    /// groq, together, deepseek, mistral), a local server (ollama, lmstudio,
+    /// llamacpp), your ChatGPT subscription (`codex`, after `dbmd login
+    /// codex`), or a delegation backend that drives an installed, logged-in
+    /// vendor CLI (claude-code, codex-cli). No default: with nothing
+    /// configured, local servers are autodetected.
     #[arg(long, value_name = "NAME")]
     pub provider: Option<String>,
 
