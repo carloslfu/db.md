@@ -240,8 +240,11 @@ Providers, in four layers. (1) Presets — `--provider anthropic |
 openai | openrouter | groq | together | deepseek | mistral | ollama |
 lmstudio | llamacpp` — each just a base URL + wire protocol + the
 provider's conventional key env var. Two hand-rolled protocols cover
-them all: OpenAI-compatible Chat Completions and Anthropic Messages
-(which also reaches llama.cpp's native `/v1/messages`). (2) Local,
+these: OpenAI-compatible Chat Completions and Anthropic Messages
+(which also reaches llama.cpp's native `/v1/messages`); a third, the
+ChatGPT backend's Responses format, arrives with layer 3 below. The
+`codex`, `claude-code`, and `codex-cli` presets are named there too,
+since they carry a subscription or a delegation rather than a key. (2) Local,
 zero-config: with nothing configured the well-known local servers
 (Ollama, LM Studio, llama.cpp) are autodetected and their models
 listed. (3) A ChatGPT subscription, natively: `dbmd login codex` runs
@@ -257,8 +260,11 @@ sends it as `Authorization: Bearer` plus the required
 `anthropic-beta: oauth-2025-04-20`. That is the vendor's published
 handoff for third-party HTTP clients; the profile stays owned by `ant`,
 nothing is copied into this toolkit, and an explicit
-`ANTHROPIC_API_KEY` still wins. (5) Every other subscription by
-DELEGATION — `--provider claude-code` / `codex-cli` spawns the
+`ANTHROPIC_API_KEY` still wins. `dbmd login --status` lists what is signed in, and `dbmd logout
+[provider]` forgets it — for `codex` by deleting the stored tokens,
+for `anthropic` by running `ant auth logout`, so the two tools never
+disagree about whether a profile is live. (5) Every other subscription
+by DELEGATION — `--provider claude-code` / `codex-cli` spawns the
 vendor's own logged-in CLI headless (`claude -p` / `codex exec`,
 read-only sandbox for `ask`); experimental, since headless flags drift
 across vendor releases.
@@ -326,9 +332,10 @@ Qwen3.8 defaults to its top rung.
 Caps: `--max-turns` (default 15; the capped final call carries no tools
 and answers with what it has), `--max-tokens` per call, per-tool result
 truncation with explicit re-query markers. Stateless one-shot: nothing
-persists; `--json` streams the flat event feed (`text_delta`,
-`tool_call` with the exact CLI one-liner it executes, `tool_result`,
-`usage`, `notice`, `done`) as NDJSON. Over HTTP the same feed is `POST /v1/ask`
+persists; `--json` streams the flat event feed as NDJSON — the nine
+events are `text_delta`, `thinking_delta`, `tool_call` (carrying the
+exact CLI one-liner it executes), `tool_result`, `usage`, `turn_end`,
+`notice`, `done`, and `error`. Over HTTP the same feed is `POST /v1/ask`
 and `POST /v1/do` on `dbmd api` — SSE, each opt-in via `dbmd api
 --ask` / `--do` and off by default.
 

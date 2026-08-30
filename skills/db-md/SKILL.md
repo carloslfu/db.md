@@ -1,7 +1,7 @@
 ---
 name: db-md
 description: Operate a db.md store, the open standard for databases in plain files, with the `dbmd` CLI. Use when reading, writing, searching, validating, or curating any folder that has a DB.md at its root. Run `dbmd spec` for the full contract.
-version: 0.5.0
+version: 0.6.0
 license: Apache-2.0
 ---
 
@@ -22,7 +22,7 @@ reasoning, synthesis, and judgment are yours.
 1. **You're here.** This skill fired because a db.md store is in play (a `DB.md`
    at a folder root). The skill is only the doorway — it carries no contract.
 2. **Contract.** Run `dbmd spec` once this session. It prints the canonical SPEC
-   — format, curator role, session lifecycle, validation codes, every command —
+   — format, curator role, session lifecycle, validation codes, every store verb —
    the single source of truth. This skill points at it; don't guess from memory.
 3. **Store config.** Read this store's own `DB.md` (`dbmd fm get DB.md scope`,
    then its `## Agent instructions` / `## Policies` / `## Schemas`). It overrides
@@ -54,6 +54,7 @@ dbmd schema                                          # the store's declared type
 dbmd graph neighborhood records/contacts/sarah-chen --hops 2   # context in one call
 dbmd graph backlinks records/contacts/sarah-chen               # who points here (blast radius)
 dbmd watch                                           # follow local changes (NDJSON events under --json)
+dbmd extract <file.pdf|docx|xlsx|epub|html>          # plain text out of a document, to stdout — how evidence enters sources/
 
 # Write — create and connect (frontmatter is composed for you, incl. a stable ULID id — minted by the tool, never composed by you)
 dbmd write records/meetings/standup.md --type meeting --summary "weekly sync"
@@ -61,6 +62,7 @@ dbmd fm set <file> <key>=<value>                     # update one field, atomica
 dbmd body set <file> --text "..."                    # replace the body (append adds; updated re-stamps)
 dbmd section set <file> "<heading>" --text "..."     # replace one section (get reads it; --create upserts)
 dbmd link <from> <to>                                # append a wiki-link
+dbmd rename <from> <to>                              # move a file and rewrite every incoming wiki-link (never delete-and-recreate)
 dbmd rm <path>                                       # link-aware delete (refuses while linked; --force overrides)
 
 # Validate — before you close
