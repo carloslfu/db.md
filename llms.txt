@@ -105,8 +105,10 @@ carries a small harness for callers that cannot host one. `dbmd ask`
 under a declared workspace) run these same verbs from a plain-English
 request, against a model the operator configures — a local server is
 autodetected, `--provider <name>` uses an API key, and `dbmd login codex`
-uses a ChatGPT subscription. Raise it only when the operator wants their
-app or another machine to ask the store directly.
+or `dbmd login anthropic` uses a subscription. `--effort
+off|minimal|low|medium|high|xhigh|max` sets how hard it thinks. Raise it
+only when the operator wants their app or another machine to ask the
+store directly.
 
 ## Where a new store lives
 

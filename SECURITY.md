@@ -57,10 +57,15 @@ verbs. The boundary is the tool registry, not the prompt:
 - **There is no shell tool at any level**, and record content is passed to
   the model as data, never folded into the system prompt.
 - **Credentials never come from a store.** API keys are read from the
-  environment only; subscription tokens live in the toolkit state directory
-  at 0600. An endpoint selected by a store's own `.dbmd/config` cannot
-  borrow an ambient key unless the operator explicitly binds that key to
-  that origin, so a cloned store cannot exfiltrate one.
+  environment only; ChatGPT subscription tokens live in the toolkit state
+  directory at 0600, and an Anthropic OAuth session is not copied here at all
+  — it stays owned by Anthropic's `ant` CLI, which is asked for a fresh
+  short-lived token per request. An endpoint selected by a store's own
+  `.dbmd/config` cannot borrow an ambient key unless the operator explicitly
+  binds that key to that origin, so a cloned store cannot exfiltrate one.
+- **`.dbmd/config` cannot redirect a credential or a request.** The harness
+  keys it may set are non-secret knobs only (provider, base URL, protocol,
+  model, effort); a key line there is never read.
 - **The `/v1/ask` and `/v1/do` routes are off unless started explicitly**
   (`dbmd api --ask` / `--do`), because they let anything on loopback spend
   the configured model's tokens.

@@ -722,3 +722,126 @@ fn an_unsupported_model_says_how_to_pick_another() {
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
     assert!(stderr.contains("--model"), "stderr was: {stderr}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reasoning effort on the Responses backend
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A scripted answer with no tool calls.
+fn plain_answer() -> (&'static str, String) {
+    responses_sse(&[
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":"ok"}"#,
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"ok"}]}}"#,
+        r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+    ])
+}
+
+#[test]
+fn effort_rides_as_the_responses_reasoning_object() {
+    // `summary: "auto"` is not decoration: without it the backend streams no
+    // reasoning summaries at all, so the thinking deltas this adapter parses
+    // would never arrive.
+    let (_tmp, store) = seeded_store();
+    let state = tempfile::TempDir::new().expect("state");
+    write_credentials(
+        state.path(),
+        &fake_jwt("acct_live", "pro"),
+        now_ms() + 3_600_000,
+    );
+    let backend = MockEndpoint::serve(vec![plain_answer()]);
+
+    hermetic(state.path())
+        .current_dir(&store)
+        .args([
+            "--json",
+            "ask",
+            "hi",
+            "--provider",
+            "codex",
+            "--base-url",
+            &backend.url,
+            "--effort",
+            "max",
+        ])
+        .assert()
+        .success();
+
+    let requests = backend.finish();
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).expect("json");
+    // The backend's own set, learned from a live 400: none, low, medium,
+    // high, xhigh, max. `max` is a real rung above `xhigh` here.
+    assert_eq!(body["reasoning"]["effort"], "max");
+    assert_eq!(body["reasoning"]["summary"], "auto");
+}
+
+#[test]
+fn no_effort_leaves_the_chatgpt_backend_on_its_own_default() {
+    let (_tmp, store) = seeded_store();
+    let state = tempfile::TempDir::new().expect("state");
+    write_credentials(
+        state.path(),
+        &fake_jwt("acct_live", "pro"),
+        now_ms() + 3_600_000,
+    );
+    let backend = MockEndpoint::serve(vec![plain_answer()]);
+
+    hermetic(state.path())
+        .current_dir(&store)
+        .args([
+            "--json",
+            "ask",
+            "hi",
+            "--provider",
+            "codex",
+            "--base-url",
+            &backend.url,
+        ])
+        .assert()
+        .success();
+
+    let requests = backend.finish();
+    let body: serde_json::Value = serde_json::from_str(&requests[0].body).expect("json");
+    assert!(
+        body.get("reasoning").is_none(),
+        "an unset effort must send no reasoning object: {body}"
+    );
+}
+
+#[test]
+fn a_refused_effort_level_explains_itself() {
+    let (_tmp, store) = seeded_store();
+    let state = tempfile::TempDir::new().expect("state");
+    write_credentials(
+        state.path(),
+        &fake_jwt("acct_live", "pro"),
+        now_ms() + 3_600_000,
+    );
+    let backend = MockEndpoint::serve_with_status(vec![(
+        400,
+        "application/json",
+        r#"{"detail":"Unsupported reasoning effort for this model."}"#.to_string(),
+    )]);
+
+    let assert = hermetic(state.path())
+        .current_dir(&store)
+        .args([
+            "--json",
+            "ask",
+            "hi",
+            "--provider",
+            "codex",
+            "--base-url",
+            &backend.url,
+            "--effort",
+            "max",
+        ])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("--effort"),
+        "the 400 must name the knob to change: {stderr}"
+    );
+}

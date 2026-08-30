@@ -24,13 +24,17 @@ workspace:
   agent driving `dbmd` is the intelligence. The one deliberate exception is
   the embedded micro-harness (`dbmd ask` / `do` / `build`, cargo feature
   `harness`): an optional, stateless tool-calling loop that runs the **user's
-  own** model endpoint against the store's verb surface — two hand-rolled wire
+  own** model endpoint against the store's verb surface — hand-rolled wire
   protocols over the HTTP client already in the tree (never an SDK crate), no
   default endpoint or vendor, the API key read from the environment only, and
   its tools are dbmd verbs plus workspace-scoped file operations (never a
   shell). It is a client for user-supplied intelligence, the way a database
   ships a shell: the toolkit still contains no model, meters nothing, and
-  never phones home on its own.
+  never phones home on its own. A vendor's own auth flow is used only where
+  that flow is published for third-party clients (OpenAI's public PKCE client
+  id; Anthropic's `ant auth print-credentials` handoff); a flow that requires
+  asserting a vendor's first-party identity is refused, whichever vendor it
+  is.
 - **All logic in `dbmd-core`; `dbmd-cli` is thin wrappers.**
 - **Embedded ripgrep** via the `grep` + `ignore` crates — never bundle or shell
   out to `rg`.

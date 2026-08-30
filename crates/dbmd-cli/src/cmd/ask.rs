@@ -50,16 +50,17 @@ pub fn run(ctx: &Context, args: &AskArgs, mask: Mask) -> CliResult {
         }
     };
 
-    let provider = config::resolve(
-        &store_root,
-        &Overrides {
-            provider: args.provider.clone(),
-            base_url: args.base_url.clone(),
-            protocol: args.protocol.clone(),
-            model: args.model.clone(),
-        },
-    )
-    .map_err(config_error)?;
+    let overrides = Overrides {
+        provider: args.provider.clone(),
+        base_url: args.base_url.clone(),
+        protocol: args.protocol.clone(),
+        model: args.model.clone(),
+        effort: args.effort.clone(),
+    };
+    // Effort resolves before the provider so a typo'd level fails fast, with
+    // the valid rungs listed, instead of after a network round-trip.
+    let effort = config::resolve_effort(&store_root, &overrides).map_err(config_error)?;
+    let provider = config::resolve(&store_root, &overrides).map_err(config_error)?;
 
     let exe = current_exe();
     let system = build_system_prompt(&store, &exe, &store_root, mask);
@@ -67,6 +68,7 @@ pub fn run(ctx: &Context, args: &AskArgs, mask: Mask) -> CliResult {
         max_turns: args.max_turns,
         max_tokens: args.max_tokens.unwrap_or(4096),
         mask,
+        effort,
         delegate_cwd: Some(workspace.clone().unwrap_or_else(|| store_root.clone())),
     };
     let mut executor = VerbExecutor {
@@ -77,7 +79,14 @@ pub fn run(ctx: &Context, args: &AskArgs, mask: Mask) -> CliResult {
     };
 
     if !ctx.json {
-        eprintln!("· {} — model {}", provider.source, display_model(&provider));
+        let effort_note = effort
+            .map(|e| format!(", effort {}", e.as_str()))
+            .unwrap_or_default();
+        eprintln!(
+            "· {} — model {}{effort_note}",
+            provider.source,
+            display_model(&provider)
+        );
     }
 
     let json = ctx.json;
@@ -94,6 +103,13 @@ pub fn run(ctx: &Context, args: &AskArgs, mask: Mask) -> CliResult {
                 print!("{text}");
                 let _ = std::io::stdout().flush();
                 printed_any = true;
+            }
+            Event::Notice { message } => {
+                if printed_any {
+                    println!();
+                    printed_any = false;
+                }
+                eprintln!("· {message}");
             }
             Event::ToolCall { display, .. } => {
                 if printed_any {

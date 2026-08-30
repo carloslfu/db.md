@@ -20,7 +20,7 @@
 
 use serde_json::{json, Value};
 
-use super::openai::{send_with_retries, streaming_agent};
+use super::openai::{send_with_variants, streaming_agent, Variant};
 use super::sse::read_events;
 use super::tools::ToolSpec;
 use super::{Block, Event, HarnessError, Msg, Provider, Role, RunOptions, Stop, Turn};
@@ -138,11 +138,75 @@ pub fn stream_turn(
         ("accept", "text/event-stream".to_string()),
     ];
     if let Some(key) = &provider.key {
-        headers.push(("x-api-key", key.clone()));
+        if provider.oauth {
+            // An OAuth token goes on Authorization: Bearer, and /v1/messages
+            // rejects it without this beta header. Never both headers at once
+            // — the API refuses a request carrying an API key AND a token.
+            headers.push(("authorization", format!("Bearer {key}")));
+            headers.push(("anthropic-beta", super::ant::OAUTH_BETA.to_string()));
+        } else {
+            headers.push(("x-api-key", key.clone()));
+        }
     }
 
+    // Reasoning depth, in three descending shapes.
+    //
+    // Current models take `output_config.effort` alongside adaptive thinking;
+    // `budget_tokens` is *rejected with a 400* on them. Models older than 4.6
+    // are the mirror image: no `output_config`, thinking only via
+    // `budget_tokens`. Rather than pin a model list that goes stale with every
+    // release — the thing this toolkit refuses to do everywhere else — the
+    // request degrades on the wire: modern shape, then legacy shape, then no
+    // reasoning at all. `--effort off` disables thinking outright instead.
+    let mut variants = Vec::new();
+    if let Some(effort) = opts.effort {
+        match effort.anthropic() {
+            Some(level) => {
+                let mut modern = body.clone();
+                modern.insert(
+                    "thinking".into(),
+                    json!({ "type": "adaptive", "display": "summarized" }),
+                );
+                modern.insert("output_config".into(), json!({ "effort": level }));
+                variants.push(Variant {
+                    body: Value::Object(modern).to_string(),
+                    label: format!("output_config.effort={level}"),
+                });
+                if let Some(budget) = effort.anthropic_budget() {
+                    let mut legacy = body.clone();
+                    legacy.insert(
+                        "thinking".into(),
+                        json!({ "type": "enabled", "budget_tokens": budget }),
+                    );
+                    // A thinking budget must leave room for an answer, so the
+                    // ceiling rises with it rather than starving the response.
+                    legacy.insert(
+                        "max_tokens".into(),
+                        json!(opts.max_tokens.saturating_add(budget)),
+                    );
+                    variants.push(Variant {
+                        body: Value::Object(legacy).to_string(),
+                        label: format!("thinking.budget_tokens={budget}"),
+                    });
+                }
+            }
+            None => {
+                let mut disabled = body.clone();
+                disabled.insert("thinking".into(), json!({ "type": "disabled" }));
+                variants.push(Variant {
+                    body: Value::Object(disabled).to_string(),
+                    label: "thinking disabled".to_string(),
+                });
+            }
+        }
+    }
+    variants.push(Variant {
+        body: Value::Object(body).to_string(),
+        label: "no reasoning parameter".to_string(),
+    });
+
     let agent = streaming_agent();
-    let response = send_with_retries(&agent, &url, &headers, &Value::Object(body).to_string())?;
+    let response = send_with_variants(&agent, &url, &headers, &variants, emit)?;
 
     let mut open: Vec<(u64, PendingBlock)> = Vec::new();
     let mut blocks: Vec<Block> = Vec::new();

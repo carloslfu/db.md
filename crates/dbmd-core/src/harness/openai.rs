@@ -195,6 +195,59 @@ fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
+/// One candidate request body, plus how to describe it if we have to move on.
+pub(super) struct Variant {
+    /// The serialized request body.
+    pub body: String,
+    /// Short human phrase, e.g. "reasoning_effort=max".
+    pub label: String,
+}
+
+/// Send a request whose reasoning parameter the endpoint may not accept,
+/// degrading through `variants` in order.
+///
+/// Only an HTTP 400 (or 422) advances to the next variant — the "you sent a
+/// field I do not know" shape. Every other outcome, including the retryable
+/// 429/5xx handled inside [`send_with_retries`], propagates from the variant
+/// that produced it. When a fallback is taken the user is told through a
+/// [`Event::Notice`], because a run that silently lost the effort it asked
+/// for must not look like a run that honored it.
+///
+/// This is what makes `--effort` safe to point at an arbitrary
+/// OpenAI-compatible server: the mapping tables in [`Effort`] are a good
+/// guess, and this is the correction when a guess is wrong.
+pub(super) fn send_with_variants(
+    agent: &ureq::Agent,
+    url: &str,
+    headers: &[(&str, String)],
+    variants: &[Variant],
+    emit: &mut dyn FnMut(Event),
+) -> Result<ureq::Response, HarnessError> {
+    let last = variants.len().saturating_sub(1);
+    for (index, variant) in variants.iter().enumerate() {
+        match send_with_retries(agent, url, headers, &variant.body) {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let rejected = matches!(&error, HarnessError::Provider(m)
+                    if m.contains("HTTP 400") || m.contains("HTTP 422"));
+                if !rejected || index == last {
+                    return Err(error);
+                }
+                let next = &variants[index + 1];
+                emit(Event::Notice {
+                    message: format!(
+                        "provider refused {}; retrying with {}",
+                        variant.label, next.label
+                    ),
+                });
+            }
+        }
+    }
+    Err(HarnessError::Provider(
+        "no request variant was attempted".to_string(),
+    ))
+}
+
 pub(super) fn send_with_retries(
     agent: &ureq::Agent,
     url: &str,
@@ -296,8 +349,30 @@ pub fn stream_turn(
         headers.push(("authorization", format!("Bearer {key}")));
     }
 
+    // The reasoning parameter rides as a variant rather than a plain field:
+    // `reasoning_effort` is standard-ish, but plenty of compat servers 400 on
+    // it, and an unknown local server must not be bricked by asking it to
+    // think harder.
+    let mut variants = Vec::new();
+    if let Some(effort) = opts.effort {
+        let primary = effort.openai(provider.effort_dialect);
+        let fallback = effort.openai_fallback(provider.effort_dialect);
+        for level in std::iter::once(primary).chain(fallback) {
+            let mut with_effort = body.clone();
+            with_effort.insert("reasoning_effort".into(), json!(level));
+            variants.push(Variant {
+                body: Value::Object(with_effort).to_string(),
+                label: format!("reasoning_effort={level}"),
+            });
+        }
+    }
+    variants.push(Variant {
+        body: Value::Object(body).to_string(),
+        label: "no reasoning_effort".to_string(),
+    });
+
     let agent = streaming_agent();
-    let response = send_with_retries(&agent, &url, &headers, &Value::Object(body).to_string())?;
+    let response = send_with_variants(&agent, &url, &headers, &variants, emit)?;
 
     let mut text = String::new();
     let mut thinking = String::new();

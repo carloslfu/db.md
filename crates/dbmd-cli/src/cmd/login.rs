@@ -11,20 +11,29 @@
 //! browser entirely for headless machines: run the printed URL anywhere, then
 //! paste back the code (or the whole redirect URL).
 //!
-//! Other subscriptions (Claude Pro/Max, Copilot) are reached by delegating to
-//! their own logged-in CLI — `--provider claude-code` / `codex-cli` — which
-//! needs no login here.
+//! `dbmd login anthropic` is the second path, and it delegates: it runs
+//! Anthropic's own `ant auth login`, which stores an OAuth profile under
+//! `~/.config/anthropic/`. Nothing is copied here — at request time the
+//! Anthropic adapter asks `ant` for a fresh short-lived token. This is the
+//! vendor's published handoff for third-party HTTP clients, which is why it
+//! needs no client id of ours and no impersonation.
+//!
+//! A Copilot subscription, or a Claude subscription the user would rather
+//! drive through its own agent, is reached by delegating to that CLI —
+//! `--provider claude-code` / `codex-cli` — which needs no login here.
 
 use std::time::Duration;
 
-use dbmd_core::harness::{auth, oauth};
+use dbmd_core::harness::{ant, auth, oauth};
 
 use crate::cli::{LoginArgs, LogoutArgs};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
-/// The only provider with a native login today.
+/// The provider with a native, in-process PKCE login.
 const CODEX: &str = "codex";
+/// The provider whose login is delegated to the vendor's own CLI.
+const ANTHROPIC: &str = "anthropic";
 
 fn config_error(error: dbmd_core::harness::HarnessError) -> CliError {
     CliError::new(ExitCode::Runtime, "LOGIN_FAILED", error.to_string())
@@ -37,9 +46,11 @@ fn unknown_provider(name: &str) -> CliError {
         format!("`{name}` has no native login"),
     )
     .with_hint(
-        "the only native login is `dbmd login codex` (a ChatGPT Plus/Pro \
-         subscription). Claude Pro/Max and Copilot subscriptions are used by \
-         delegating to their own logged-in CLI: `dbmd ask … --provider claude-code`",
+        "logins are `dbmd login codex` (a ChatGPT Plus/Pro subscription, \
+         native PKCE) and `dbmd login anthropic` (runs Anthropic's own `ant \
+         auth login`). A Copilot subscription, or a Claude subscription you \
+         would rather drive through its own agent, is reached by delegating \
+         to that CLI: `dbmd ask … --provider claude-code`",
     )
 }
 
@@ -55,10 +66,11 @@ pub fn run(ctx: &Context, args: &LoginArgs) -> CliResult {
                 "{}",
                 serde_json::json!({
                     "logged_in": providers,
+                    "anthropic": anthropic_status(),
                     "credentials": auth::auth_path().map_err(config_error)?.to_string_lossy(),
                 })
             );
-        } else if providers.is_empty() {
+        } else if providers.is_empty() && anthropic_status().is_none() {
             println!("not signed in to any provider");
         } else {
             for provider in &providers {
@@ -70,11 +82,17 @@ pub fn run(ctx: &Context, args: &LoginArgs) -> CliResult {
                     .unwrap_or_default();
                 println!("signed in: {provider}{detail}");
             }
+            if let Some(line) = anthropic_status() {
+                println!("signed in: anthropic — {line}");
+            }
         }
         return Ok(());
     }
 
     let provider = args.provider.as_deref().unwrap_or(CODEX);
+    if provider == ANTHROPIC {
+        return anthropic_login(ctx, args);
+    }
     if provider != CODEX {
         return Err(unknown_provider(provider));
     }
@@ -176,6 +194,24 @@ pub fn run(ctx: &Context, args: &LoginArgs) -> CliResult {
 /// Run `dbmd logout`.
 pub fn run_logout(ctx: &Context, args: &LogoutArgs) -> CliResult {
     let provider = args.provider.as_deref().unwrap_or(CODEX);
+    // Anthropic's session is owned by `ant`, not by this toolkit — sign out
+    // through the CLI that holds it, so `ant` and `dbmd` never disagree about
+    // whether a profile is live.
+    if provider == ANTHROPIC {
+        let was_active = anthropic_status().is_some();
+        ant::logout().map_err(config_error)?;
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::json!({ "provider": provider, "removed": was_active })
+            );
+        } else if was_active {
+            println!("signed out of anthropic (`ant auth logout`)");
+        } else {
+            println!("not signed in to anthropic");
+        }
+        return Ok(());
+    }
     let removed = auth::clear(provider).map_err(config_error)?;
     if ctx.json {
         println!(
@@ -186,6 +222,49 @@ pub fn run_logout(ctx: &Context, args: &LogoutArgs) -> CliResult {
         println!("signed out of {provider}");
     } else {
         println!("not signed in to {provider}");
+    }
+    Ok(())
+}
+
+/// A one-line summary of the active `ant` profile, or `None` when Anthropic's
+/// CLI is absent or signed out.
+fn anthropic_status() -> Option<String> {
+    ant::access_token().ok().flatten()?;
+    ant::status_line().or_else(|| Some("active profile".to_string()))
+}
+
+/// `dbmd login anthropic` — hand off to Anthropic's own CLI.
+///
+/// No token is copied into this toolkit's state: `ant` owns the profile, and
+/// the harness asks it for a fresh access token per request.
+fn anthropic_login(ctx: &Context, args: &LoginArgs) -> CliResult {
+    if !ant::installed() {
+        return Err(CliError::new(
+            ExitCode::Runtime,
+            "LOGIN_MISSING_CLI",
+            "Anthropic's `ant` CLI is not installed",
+        )
+        .with_hint(ant::INSTALL_HINT));
+    }
+    ant::login(args.code).map_err(config_error)?;
+    let token = ant::access_token().map_err(config_error)?;
+    if token.is_none() {
+        return Err(CliError::new(
+            ExitCode::Runtime,
+            "LOGIN_FAILED",
+            "`ant auth login` finished but no credential is active",
+        )
+        .with_hint("run `ant auth status` to see which credential source won"));
+    }
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({ "provider": "anthropic", "status": anthropic_status() })
+        );
+    } else {
+        let detail = anthropic_status().unwrap_or_else(|| "active profile".to_string());
+        println!("signed in: anthropic — {detail}");
+        println!("`dbmd ask --provider anthropic` now uses this session.");
     }
     Ok(())
 }

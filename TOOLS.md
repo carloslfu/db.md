@@ -249,27 +249,38 @@ OpenAI's public PKCE flow (the one endorsed for third-party OSS
 clients), stores the tokens in the toolkit state dir at 0600 — never
 in a store — refreshes them automatically, and `--provider codex`
 then spends them against the ChatGPT backend's Responses API. No
-vendor CLI needed. (4) Every other subscription by DELEGATION —
-`--provider claude-code` / `codex-cli` spawns the vendor's own
-logged-in CLI headless (`claude -p` / `codex exec`, read-only sandbox
-for `ask`); experimental, since headless flags drift across vendor
-releases.
+vendor CLI needed. (4) An Anthropic session, through Anthropic's own
+CLI: `dbmd login anthropic` runs `ant auth login`, and thereafter an
+Anthropic endpoint with no API key in the environment asks `ant auth
+print-credentials --access-token` for a fresh short-lived token and
+sends it as `Authorization: Bearer` plus the required
+`anthropic-beta: oauth-2025-04-20`. That is the vendor's published
+handoff for third-party HTTP clients; the profile stays owned by `ant`,
+nothing is copied into this toolkit, and an explicit
+`ANTHROPIC_API_KEY` still wins. (5) Every other subscription by
+DELEGATION — `--provider claude-code` / `codex-cli` spawns the
+vendor's own logged-in CLI headless (`claude -p` / `codex exec`,
+read-only sandbox for `ask`); experimental, since headless flags drift
+across vendor releases.
 
 **The identity line.** dbmd always identifies itself honestly:
 `originator: dbmd` and a `dbmd/<version>` User-Agent on every
-subscription request. It implements a native login only where the
-vendor's flow is designed for third-party clients, and it will not
-implement one that requires posing as a vendor's own first-party
-client — Anthropic's and GitHub Copilot's OAuth paths both work only
-by borrowing that vendor's client id and asserting its identity
-(a "You are Claude Code" system block, a `vscode-chat` integration
-id), so those subscriptions are reached by delegation instead. Using
-your subscription is your right; pretending to be someone else's
-software is not something this toolkit does.
+subscription request. It uses a vendor's own flow only where
+that flow is published for third-party clients — OpenAI's public PKCE
+client id for ChatGPT, Anthropic's documented `ant` token handoff for
+Anthropic — and it will not implement one that requires posing as a
+vendor's first-party client. The rejected shape is specific: the
+*other* Anthropic OAuth path, and Copilot's, work only by borrowing
+that vendor's client id and asserting its identity (a "You are Claude
+Code" system block, a `vscode-chat` integration id). Those are refused;
+Copilot is reached by delegation instead. Using your subscription is
+your right; pretending to be someone else's software is not something
+this toolkit does.
 
 Config: flag > `DBMD_LLM_*` env > non-secret `llm_*` keys in
 `.dbmd/config` (`llm_provider`, `llm_base_url`, `llm_protocol`,
-`llm_model`). **The key is environment-only** (`DBMD_LLM_KEY`, or the
+`llm_model`, `llm_effort`; a `<key>_<provider>` suffix pins a value to
+one provider and survives an explicit `--provider`). **The key is environment-only** (`DBMD_LLM_KEY`, or the
 preset's conventional variable) — never a file in the store — and an
 endpoint selected by store-local config refuses an ambient key unless
 `DBMD_LLM_KEY_ORIGIN` binds it to that exact origin, so a cloned store
@@ -278,12 +289,31 @@ models). Plain http is loopback-only unless
 `DBMD_LLM_ALLOW_INSECURE_HTTP=1`. No default vendor or endpoint,
 anywhere.
 
+Reasoning effort: `--effort off | minimal | low | medium | high | xhigh
+| max` (also `DBMD_LLM_EFFORT`, `llm_effort`). One ladder, translated
+per protocol — `reasoning.effort` + `summary: "auto"` on the ChatGPT
+Responses backend, `output_config.effort` alongside adaptive thinking
+on Anthropic, `reasoning_effort` on OpenAI-compatible servers — and
+each vendor's own vocabulary underneath, probed against the live
+endpoints rather than assumed: the ChatGPT backend takes
+`none|low|medium|high|xhigh|max` and has no `minimal`; Ollama 0.32.15
+takes a superset of the whole ladder, so every rung passes through by
+name; OpenAI proper stops at `high`, so the top rungs collapse onto it
+instead of erroring. If the endpoint refuses
+the field anyway, the request is retried without it (Anthropic tries a
+legacy `thinking.budget_tokens` shape first, for models older than
+4.6), and a `notice` event says so — a downgraded run never looks like
+a clean one. **Unset is not a level**: with no effort configured no
+reasoning field is sent at all, which matters because the defaults
+differ sharply (Ollama enables thinking for capable models on its own,
+and Qwen3.8 defaults to its top rung).
+
 Caps: `--max-turns` (default 15; the capped final call carries no tools
 and answers with what it has), `--max-tokens` per call, per-tool result
 truncation with explicit re-query markers. Stateless one-shot: nothing
 persists; `--json` streams the flat event feed (`text_delta`,
 `tool_call` with the exact CLI one-liner it executes, `tool_result`,
-`usage`, `done`) as NDJSON. Over HTTP the same feed is `POST /v1/ask`
+`usage`, `notice`, `done`) as NDJSON. Over HTTP the same feed is `POST /v1/ask`
 and `POST /v1/do` on `dbmd api` — SSE, each opt-in via `dbmd api
 --ask` / `--do` and off by default.
 

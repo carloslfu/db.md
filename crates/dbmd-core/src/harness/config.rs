@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::{HarnessError, Protocol, Provider};
+use super::{Effort, EffortDialect, HarnessError, Protocol, Provider};
 
 /// Env var: explicit provider preset name (or a delegation backend).
 pub const PROVIDER_ENV: &str = "DBMD_LLM_PROVIDER";
@@ -30,6 +30,9 @@ pub const BASE_URL_ENV: &str = "DBMD_LLM_BASE_URL";
 pub const PROTOCOL_ENV: &str = "DBMD_LLM_PROTOCOL";
 /// Env var: model id.
 pub const MODEL_ENV: &str = "DBMD_LLM_MODEL";
+
+/// Environment override for the reasoning effort (`off`…`max`).
+pub const EFFORT_ENV: &str = "DBMD_LLM_EFFORT";
 /// Env var: the credential. The ONLY file-independent key source; wins over
 /// preset key variables.
 pub const KEY_ENV: &str = "DBMD_LLM_KEY";
@@ -41,7 +44,13 @@ pub const ALLOW_INSECURE_ENV: &str = "DBMD_LLM_ALLOW_INSECURE_HTTP";
 
 /// `.dbmd/config` keys (non-secret knobs only — a key line in this file is
 /// never read).
-const CONFIG_KEYS: [&str; 4] = ["llm_provider", "llm_base_url", "llm_protocol", "llm_model"];
+const CONFIG_KEYS: [&str; 5] = [
+    "llm_provider",
+    "llm_base_url",
+    "llm_protocol",
+    "llm_model",
+    "llm_effort",
+];
 
 /// A store may also pin a value per provider (`llm_model_ollama`,
 /// `llm_model_codex`), which survives an explicit `--provider` override.
@@ -63,6 +72,8 @@ pub struct Overrides {
     pub protocol: Option<String>,
     /// `--model`.
     pub model: Option<String>,
+    /// `--effort`.
+    pub effort: Option<String>,
 }
 
 /// One inert preset row: a name, the protocol it speaks, its base URL, and
@@ -300,7 +311,9 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
                 base_url: String::new(),
                 model: String::new(),
                 key: None,
+                oauth: false,
                 source: format!("delegation to the `{}` CLI", preset.name),
+                effort_dialect: EffortDialect::Standard,
             });
         }
         // The ChatGPT backend takes a subscription token from `dbmd login
@@ -332,7 +345,9 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
                     .or_else(|| store_value(&config, "llm_model"))
                     .unwrap_or_else(|| CODEX_DEFAULT_MODEL.to_string()),
                 key: Some(access),
+                oauth: true,
                 source: format!("ChatGPT subscription{plan}"),
+                effort_dialect: EffortDialect::Standard,
             });
         }
     }
@@ -372,6 +387,23 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
     // ── key: ENVIRONMENT ONLY ────────────────────────────────────────────
     let key =
         env_nonempty(KEY_ENV).or_else(|| preset.and_then(|p| p.key_env).and_then(env_nonempty));
+    // An Anthropic endpoint with no API key in the environment falls back to
+    // the user's `ant auth login` session — Anthropic's own published handoff
+    // for third-party HTTP clients. An explicit key still wins, matching the
+    // vendor's documented precedence (and avoiding the trap where both an API
+    // key and a bearer token are sent and the API rejects the request).
+    let mut oauth = false;
+    let key = match key {
+        Some(key) => Some(key),
+        None if protocol == Some(Protocol::Anthropic) => match super::ant::access_token()? {
+            Some(token) => {
+                oauth = true;
+                Some(token)
+            }
+            None => None,
+        },
+        None => None,
+    };
 
     let (base_url, protocol, model, source) = match base_url {
         Some(url) => {
@@ -441,13 +473,77 @@ pub fn resolve(store_root: &Path, overrides: &Overrides) -> Result<Provider, Har
         )));
     }
 
+    let effort_dialect = effort_dialect_for(preset_name.as_deref(), &base_url);
+
+    let source = if oauth {
+        format!("{source}, Anthropic OAuth via `ant`")
+    } else {
+        source
+    };
+
     Ok(Provider {
         protocol,
         base_url,
         model,
         key,
+        oauth,
         source,
+        effort_dialect,
     })
+}
+
+/// Resolve the reasoning effort for a run.
+///
+/// Same precedence chain as every other knob — flag, then environment, then
+/// `.dbmd/config` (a provider-scoped `llm_effort_codex` first, then a plain
+/// `llm_effort` when no provider was explicitly overridden). `None` means the
+/// caller sends no reasoning field at all and the provider keeps its own
+/// default.
+pub fn resolve_effort(
+    store_root: &Path,
+    overrides: &Overrides,
+) -> Result<Option<Effort>, HarnessError> {
+    if let Some(raw) = &overrides.effort {
+        return Effort::parse(raw).map(Some);
+    }
+    if let Some(raw) = env_nonempty(EFFORT_ENV) {
+        return Effort::parse(&raw).map(Some);
+    }
+    let config = store_config(store_root);
+    let overriding_provider = overrides
+        .provider
+        .clone()
+        .or_else(|| env_nonempty(PROVIDER_ENV));
+    let provider_is_overridden = overriding_provider.is_some();
+    let preset_name = overriding_provider.or_else(|| config_value(&config, "llm_provider"));
+    if let Some(name) = preset_name.as_deref() {
+        if let Some(raw) = config_value(&config, &format!("llm_effort_{name}")) {
+            return Effort::parse(&raw).map(Some);
+        }
+    }
+    if provider_is_overridden {
+        return Ok(None);
+    }
+    match config_value(&config, "llm_effort") {
+        Some(raw) => Effort::parse(&raw).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Which `reasoning_effort` vocabulary an endpoint speaks.
+///
+/// Ollama is the one compat server that diverges (`none`/`max` instead of
+/// `minimal`, and thinking already on by default), and it is identifiable
+/// either by preset name or by its well-known port — including when the
+/// endpoint arrived through autodetect rather than `--provider ollama`.
+/// Everything else gets the standard vocabulary plus the drop-and-retry
+/// recovery in the adapter.
+fn effort_dialect_for(preset_name: Option<&str>, base_url: &str) -> EffortDialect {
+    if preset_name == Some("ollama") || origin_of(base_url).contains(":11434") {
+        EffortDialect::Ollama
+    } else {
+        EffortDialect::Standard
+    }
 }
 
 struct Detected {

@@ -960,6 +960,24 @@ fn stream_harness(
         .unwrap_or(15)
         .clamp(1, 25) as usize;
 
+    // `effort` is the one model knob the HTTP surface accepts. Endpoint,
+    // model, and key stay server-side: a browser calling /v1/ask may say how
+    // hard to think, never where to think.
+    let overrides = config::Overrides {
+        effort: parsed
+            .get("effort")
+            .and_then(|e| e.as_str())
+            .map(str::to_string),
+        ..Default::default()
+    };
+    let effort = match config::resolve_effort(store_root, &overrides) {
+        Ok(effort) => effort,
+        Err(error) => {
+            answer_early(400, "ASK_CONFIG", &error.to_string());
+            return;
+        }
+    };
+
     let mask = if wants_write { Mask::Write } else { Mask::Read };
     let provider = match config::resolve(store_root, &config::Overrides::default()) {
         Ok(provider) => provider,
@@ -1004,6 +1022,7 @@ fn stream_harness(
         max_turns,
         max_tokens: 4096,
         mask,
+        effort,
         delegate_cwd: Some(store_root.clone()),
     };
     let mut emit = |event: Event| {

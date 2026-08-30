@@ -363,10 +363,13 @@ the store's own contract.
 
 The model is yours: a local server is found automatically (Ollama, LM
 Studio, llama.cpp), an API key works through
-`--provider anthropic|openai|openrouter|…`, and a ChatGPT subscription
-signs in with `dbmd login codex`. No default vendor, no key ever stored
-inside a store, nothing metered. Apps get the same loop over loopback HTTP
-with `dbmd api --ask`.
+`--provider anthropic|openai|openrouter|…`, and a subscription signs in
+with `dbmd login codex` (ChatGPT) or `dbmd login anthropic` (which runs
+Anthropic's own `ant auth login`). `--effort off|minimal|low|medium|high|xhigh|max`
+sets how hard it thinks, translated to whatever the provider calls that,
+and dropped automatically if the provider has no such knob. No default
+vendor, no key ever stored inside a store, nothing metered. Apps get the
+same loop over loopback HTTP with `dbmd api --ask`.
 
 ## The toolkit
 

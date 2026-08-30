@@ -8,9 +8,63 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.12.0**.
+  `Cargo.toml`, currently **v0.13.0**.
 
 ## Unreleased
+
+## [0.13.0] — 2026-08-30
+
+Implements format v0.4 (unchanged).
+
+### Added
+
+- **`--effort` — how hard the model thinks.** One ladder for the whole
+  toolkit — `off | minimal | low | medium | high | xhigh | max` — on
+  `dbmd ask` / `do` / `build`, also settable as `DBMD_LLM_EFFORT` or
+  `llm_effort` in `.dbmd/config` (and `llm_effort_<provider>` to pin it to
+  one provider). It is translated per protocol rather than passed through:
+  `reasoning.effort` with `summary: "auto"` on the ChatGPT Responses
+  backend, `output_config.effort` alongside adaptive thinking on Anthropic,
+  `reasoning_effort` on OpenAI-compatible servers. Each target's own
+  vocabulary is respected underneath, probed against the live endpoints
+  rather than assumed: the ChatGPT backend accepts
+  `none|low|medium|high|xhigh|max` and rejects `minimal`; Ollama 0.32.15
+  accepts a superset of the whole ladder, so every rung passes through by
+  name (with the older `none|low|medium|high|max` set as a retry); OpenAI
+  proper stops at `high`, so the top rungs collapse onto it instead of
+  erroring. `--effort` also reaches the
+  delegation backends (`codex exec -c model_reasoning_effort=…`), and
+  `POST /v1/ask` accepts an `effort` field.
+- **Graceful degradation when a provider refuses the field.** An arbitrary
+  OpenAI-compatible server may not know `reasoning_effort` at all, and
+  Anthropic models older than 4.6 reject `output_config` in favour of
+  `thinking.budget_tokens` (which current models reject in turn). Rather
+  than pin a model list that goes stale, the request degrades on the wire:
+  the preferred shape, then the legacy shape where one exists, then no
+  reasoning parameter, with a `notice` event naming what was dropped. A
+  downgraded run never looks like a clean one.
+- **`dbmd login anthropic`.** Runs Anthropic's own `ant auth login`;
+  thereafter an Anthropic endpoint with no `ANTHROPIC_API_KEY` in the
+  environment asks `ant auth print-credentials --access-token` for a fresh
+  short-lived token and sends it as `Authorization: Bearer` plus the
+  required `anthropic-beta: oauth-2025-04-20`. This is the vendor's
+  published handoff for third-party HTTP clients: no client id is borrowed,
+  nothing poses as Claude Code, and the profile stays owned by `ant` rather
+  than being copied into this toolkit. An explicit API key still wins.
+  `dbmd logout anthropic` signs out through `ant`.
+
+### Notes
+
+- **An unset effort is not a level.** With none configured, no reasoning
+  field is sent and every provider keeps its own default — which is not
+  "off": Ollama enables thinking for capable models on its own, and
+  Qwen3.8 defaults to `xhigh`. Setting `--effort` is therefore how you turn
+  thinking *down* as well as up.
+- The identity line is unchanged and now stated precisely: a vendor's own
+  flow is used only where that flow is published for third-party clients.
+  The Anthropic OAuth path that works only by injecting a "You are Claude
+  Code" system block, and Copilot's `vscode-chat` integration id, remain
+  refused; Copilot is still reached by delegation.
 
 ## [0.12.0] — 2026-08-29
 

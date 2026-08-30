@@ -190,6 +190,15 @@ pub fn stream_turn(
     // `max_tokens` has no Responses equivalent the backend accepts here; the
     // engine's turn cap and the account's own limits bound a run instead.
     let _ = opts.max_tokens;
+    // Reasoning depth. `summary: "auto"` is what makes the backend stream
+    // reasoning summaries at all — without it the thinking deltas this
+    // adapter already parses simply never arrive.
+    if let Some(effort) = opts.effort {
+        body.insert(
+            "reasoning".into(),
+            json!({ "effort": effort.codex(), "summary": "auto" }),
+        );
+    }
 
     let url = responses_url(&provider.base_url);
     let agent = streaming_agent();
@@ -218,6 +227,10 @@ pub fn stream_turn(
             let mut detail = response.into_string().unwrap_or_default();
             detail.truncate(600);
             let hint = match status {
+                400 if detail.contains("reasoning") || detail.contains("effort") => {
+                    " — this model or plan does not accept that reasoning \
+                     effort; try `--effort high` or drop `--effort`"
+                }
                 400 if detail.contains("not supported") => {
                     " — pick one your plan exposes with `--model` (or \
                      `llm_model_codex` in .dbmd/config); `codex --help` and \

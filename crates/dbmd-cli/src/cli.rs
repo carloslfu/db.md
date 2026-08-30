@@ -192,11 +192,20 @@ pub enum Command {
     /// Plus/Pro subscription drives `dbmd ask` with no vendor CLI installed:
     /// your browser opens, this process serves the loopback callback, and the
     /// tokens land in the toolkit state directory (0600) — never inside a
-    /// store, and refreshed automatically when they expire. `--code` skips
-    /// the browser for headless machines (paste the code back yourself), and
-    /// `--status` lists what is signed in. Claude Pro/Max and Copilot
-    /// subscriptions need no login here: they are used by delegating to their
-    /// own logged-in CLI (`--provider claude-code`).
+    /// store, and refreshed automatically when they expire.
+    ///
+    /// `dbmd login anthropic` is the second path and delegates: it runs
+    /// Anthropic's own `ant auth login`, after which the harness asks `ant`
+    /// for a fresh short-lived token per request — the vendor's published
+    /// handoff for third-party HTTP clients, so nothing here poses as another
+    /// vendor's first-party client. An explicit `ANTHROPIC_API_KEY` still
+    /// wins.
+    ///
+    /// `--code` skips the browser for headless machines (paste the code back
+    /// yourself), and `--status` lists what is signed in. A Copilot
+    /// subscription, or a Claude subscription you would rather drive through
+    /// its own agent, needs no login here: delegate to that CLI
+    /// (`--provider claude-code`).
     Login(LoginArgs),
 
     /// Forget a provider's stored subscription credentials.
@@ -1063,8 +1072,9 @@ pub struct ApiArgs {
 /// `dbmd login [codex]`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Which provider to sign in to. Only `codex` (ChatGPT Plus/Pro) has a
-    /// native login today; defaults to it.
+    /// Which provider to sign in to: `codex` (a ChatGPT Plus/Pro
+    /// subscription, native PKCE flow) or `anthropic` (delegates to
+    /// Anthropic's own `ant auth login`). Defaults to `codex`.
     #[arg(value_name = "PROVIDER")]
     pub provider: Option<String>,
 
@@ -1119,6 +1129,16 @@ pub struct AskArgs {
     /// `openai` or `anthropic`.
     #[arg(long, value_name = "PROTO")]
     pub protocol: Option<String>,
+
+    /// How hard the model should think: `off`, `minimal`, `low`, `medium`,
+    /// `high`, `xhigh`, or `max`. Translated per provider (ChatGPT
+    /// `reasoning.effort`, Anthropic `output_config.effort`, Ollama and other
+    /// OpenAI-compatible servers `reasoning_effort`), and dropped
+    /// automatically if the endpoint refuses it. Unset leaves each provider
+    /// on its own default. Also `DBMD_LLM_EFFORT`, or `llm_effort` in
+    /// `.dbmd/config`.
+    #[arg(long, value_name = "LEVEL")]
+    pub effort: Option<String>,
 
     /// Maximum model round-trips before the final forced answer.
     #[arg(long, value_name = "N", default_value_t = 15)]

@@ -49,12 +49,19 @@ struct MockLlm {
 
 impl MockLlm {
     fn serve(responses: Vec<String>) -> Self {
+        Self::serve_with_status(responses.into_iter().map(|body| (200, body)).collect())
+    }
+
+    /// Script the status codes too, so a provider that refuses a field can be
+    /// reproduced exactly. Every response still drains its request first —
+    /// writing before the body is read gives ECONNRESET on Linux.
+    fn serve_with_status(responses: Vec<(u16, String)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock llm");
         let url = format!("http://{}", listener.local_addr().expect("mock addr"));
         let requests: Arc<Mutex<Vec<Captured>>> = Arc::default();
         let captured = Arc::clone(&requests);
         let handle = std::thread::spawn(move || {
-            for sse_body in responses {
+            for (status, sse_body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept");
                 let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
                 let mut line = String::new();
@@ -85,8 +92,13 @@ impl MockLlm {
                     headers,
                     body: String::from_utf8_lossy(&body).into_owned(),
                 });
+                let content_type = if status == 200 {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     sse_body.len()
                 );
                 stream.write_all(head.as_bytes()).expect("response head");
@@ -157,6 +169,7 @@ fn harness_cmd(store: &std::path::Path, mock_url: &str, protocol: &str) -> asser
         "DBMD_LLM_KEY",
         "DBMD_LLM_KEY_ORIGIN",
         "DBMD_LLM_ALLOW_INSECURE_HTTP",
+        "DBMD_LLM_EFFORT",
         "DBMD_WORKSPACE",
     ] {
         command.env_remove(var);
@@ -745,4 +758,266 @@ fn the_turn_cap_forces_a_final_no_tools_answer() {
     );
     let flattened = last["messages"].to_string();
     assert!(flattened.contains("tool-call limit"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reasoning effort: the wire field, the per-protocol shape, and the fallback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One scripted OpenAI-compat answer with no tool calls.
+fn openai_answer(text: &str) -> String {
+    sse(&[
+        &format!(
+            r#"{{"choices":[{{"delta":{{"content":{}}},"index":0}}]}}"#,
+            serde_json::Value::String(text.to_string())
+        ),
+        r#"{"choices":[{"delta":{},"finish_reason":"stop","index":0}]}"#,
+        "[DONE]",
+    ])
+}
+
+/// One scripted Anthropic answer with no tool calls.
+fn anthropic_answer(text: &str) -> String {
+    sse(&[
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        &format!(
+            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}}}}}"#,
+            serde_json::Value::String(text.to_string())
+        ),
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        r#"{"type":"message_stop"}"#,
+    ])
+}
+
+#[test]
+fn openai_effort_rides_as_reasoning_effort() {
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve(vec![openai_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?", "--effort", "high"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    assert_eq!(requests.len(), 1);
+    let body = requests[0].body_json();
+    assert_eq!(body["reasoning_effort"], "high");
+}
+
+#[test]
+fn no_effort_flag_sends_no_reasoning_field() {
+    // The load-bearing default: an unset effort must leave the provider on
+    // its own, because "unset" and "low" are very different on a server that
+    // already has thinking switched on.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve(vec![openai_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    let body = requests[0].body_json();
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "unset effort must send no field: {body}"
+    );
+}
+
+#[test]
+fn effort_is_dropped_when_the_endpoint_refuses_it() {
+    // An arbitrary OpenAI-compatible server may not know the field at all.
+    // Asking it to think harder must not brick the run — the request retries
+    // without the field, and the user is told it happened.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve_with_status(vec![
+        (
+            400,
+            r#"{"error":{"message":"unrecognized request argument: reasoning_effort"}}"#
+                .to_string(),
+        ),
+        (200, openai_answer("ok")),
+    ]);
+
+    let output = harness_cmd(&store, &mock.url, "openai")
+        .args(["--json", "ask", "how many todos?", "--effort", "max"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let requests = mock.finish();
+    assert_eq!(requests.len(), 2, "the refused request must be retried");
+    assert_eq!(requests[0].body_json()["reasoning_effort"], "high");
+    assert!(
+        requests[1].body_json().get("reasoning_effort").is_none(),
+        "the retry must drop the refused field"
+    );
+
+    let notices: Vec<serde_json::Value> = events(&output.stdout)
+        .into_iter()
+        .filter(|e| e["event"] == "notice")
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "a silently downgraded run must not look like a clean one"
+    );
+    let message = notices[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("reasoning_effort=high"),
+        "the notice must name what was refused: {message}"
+    );
+}
+
+#[test]
+fn anthropic_effort_uses_output_config_and_adaptive_thinking() {
+    // The current Anthropic shape. `budget_tokens` is a 400 on these models,
+    // so it must not appear in the first attempt.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve(vec![anthropic_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "anthropic")
+        .args(["ask", "how many todos?", "--effort", "xhigh"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    let body = requests[0].body_json();
+    assert_eq!(body["output_config"]["effort"], "xhigh");
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert!(body["thinking"].get("budget_tokens").is_none());
+}
+
+#[test]
+fn anthropic_effort_off_disables_thinking() {
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve(vec![anthropic_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "anthropic")
+        .args(["ask", "how many todos?", "--effort", "off"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    let body = requests[0].body_json();
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert!(body.get("output_config").is_none());
+}
+
+#[test]
+fn anthropic_falls_back_to_budget_tokens_on_older_models() {
+    // Pre-4.6 models reject `output_config` and take a thinking budget
+    // instead. Rather than pin a model list that goes stale, the request
+    // degrades on the wire.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve_with_status(vec![
+        (
+            400,
+            r#"{"type":"error","error":{"message":"output_config: unexpected field"}}"#.to_string(),
+        ),
+        (200, anthropic_answer("ok")),
+    ]);
+
+    harness_cmd(&store, &mock.url, "anthropic")
+        .args(["ask", "how many todos?", "--effort", "medium"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    assert_eq!(requests.len(), 2);
+    let legacy = requests[1].body_json();
+    assert_eq!(legacy["thinking"]["type"], "enabled");
+    assert_eq!(legacy["thinking"]["budget_tokens"], 8192);
+    // The budget must not eat the answer's room.
+    assert_eq!(legacy["max_tokens"], 4096 + 8192);
+}
+
+#[test]
+fn unknown_effort_is_refused_before_any_request() {
+    // Fail fast and name the rungs — never after a network round-trip.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve(vec![]);
+
+    let output = harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?", "--effort", "turbo"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("turbo"), "{stderr}");
+    assert!(
+        stderr.contains("xhigh"),
+        "the valid rungs go in the error: {stderr}"
+    );
+    assert!(mock.finish().is_empty(), "nothing may reach the provider");
+}
+
+#[test]
+fn store_config_can_pin_the_effort() {
+    // Same precedence chain as every other knob: `.dbmd/config` supplies it
+    // when no flag and no environment variable do.
+    let (_tmp, store) = seeded_store();
+    std::fs::create_dir_all(store.join(".dbmd")).expect("config dir");
+    std::fs::write(store.join(".dbmd").join("config"), "llm_effort = low\n").expect("config");
+    let mock = MockLlm::serve(vec![openai_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    assert_eq!(requests[0].body_json()["reasoning_effort"], "low");
+}
+
+#[test]
+fn the_flag_beats_the_store_config() {
+    let (_tmp, store) = seeded_store();
+    std::fs::create_dir_all(store.join(".dbmd")).expect("config dir");
+    std::fs::write(store.join(".dbmd").join("config"), "llm_effort = low\n").expect("config");
+    let mock = MockLlm::serve(vec![openai_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?", "--effort", "medium"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    assert_eq!(requests[0].body_json()["reasoning_effort"], "medium");
+}
+
+#[test]
+fn the_ollama_dialect_and_provider_scoped_effort_reach_the_wire() {
+    // Two things at once, both previously wrong in this codebase:
+    // 1. Ollama's vocabulary differs — `max`, not `high`, is its top rung,
+    //    and that is what a Qwen3.8 chat template reads as `xhigh`.
+    // 2. A provider-scoped `llm_effort_<name>` survives an explicit
+    //    `--provider`, while an unscoped one would not.
+    let (_tmp, store) = seeded_store();
+    std::fs::create_dir_all(store.join(".dbmd")).expect("config dir");
+    std::fs::write(
+        store.join(".dbmd").join("config"),
+        "llm_effort = low\nllm_effort_ollama = max\n",
+    )
+    .expect("config");
+    let mock = MockLlm::serve(vec![openai_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?", "--provider", "ollama"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    let body = requests[0].body_json();
+    assert_eq!(
+        body["reasoning_effort"], "max",
+        "the scoped effort must win, in Ollama's own vocabulary: {body}"
+    );
 }

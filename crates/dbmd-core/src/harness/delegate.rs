@@ -100,6 +100,13 @@ pub fn run(
                     command.arg("--permission-mode").arg("acceptEdits");
                 }
             }
+            // The vendor agent owns its own thinking configuration; the one
+            // knob it exposes headlessly is the effort level.
+            if let Some(effort) = opts.effort {
+                if let Some(level) = effort.anthropic() {
+                    command.arg("--effort").arg(level);
+                }
+            }
             command
         }
         Protocol::CodexCli => {
@@ -117,6 +124,14 @@ pub fn run(
                 Mask::Write | Mask::Build => {
                     command.arg("--sandbox").arg("workspace-write");
                 }
+            }
+            // `-c` overrides one config key for this invocation, so an
+            // explicit `--effort` beats whatever ~/.codex/config.toml pins
+            // while an unset one leaves that file in charge.
+            if let Some(effort) = opts.effort {
+                command
+                    .arg("-c")
+                    .arg(format!("model_reasoning_effort=\"{}\"", effort.codex()));
             }
             // Codex has no append-system flag; the operating contract rides
             // ahead of the prompt.

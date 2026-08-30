@@ -40,13 +40,23 @@
 //! third-party OSS clients), [`auth`] stores the tokens outside any store,
 //! and [`codex`] spends them — always identifying this toolkit honestly
 //! (`originator: dbmd`), never posing as another vendor's first-party client.
-//! Every other subscription (Claude Pro/Max, Copilot) is reached by
-//! *delegation* — spawning the vendor's own logged-in CLI headless
-//! ([`delegate`]). Anthropic's OAuth path is deliberately NOT implemented:
-//! it only works by injecting a "You are Claude Code" system block and
-//! `claude-code-*` beta headers so a subscription token is accepted, and
-//! impersonating a vendor's own client is not something this toolkit does.
+//! Anthropic is reached through **Anthropic's own CLI** ([`ant`]): `ant auth
+//! login` mints an OAuth profile, `ant auth print-credentials --access-token`
+//! hands the short-lived token to a third-party process, and [`anthropic`]
+//! spends it as `Authorization: Bearer` plus the documented
+//! `anthropic-beta: oauth-2025-04-20`. That is the vendor's published
+//! handoff for raw-HTTP clients, so no client id is borrowed and nothing
+//! pretends to be Claude Code. What stays unimplemented is the *other*
+//! Anthropic OAuth path — the one that works only by injecting a "You are
+//! Claude Code" system block and `claude-code-*` beta headers so a
+//! subscription token is accepted. Impersonating a vendor's first-party
+//! client is not something this toolkit does, whichever vendor it is.
+//!
+//! Copilot, and a Claude Pro/Max subscription that the user would rather
+//! drive through its own agent, are reached by *delegation* — spawning the
+//! vendor's logged-in CLI headless ([`delegate`]).
 
+pub mod ant;
 pub mod anthropic;
 pub mod auth;
 pub mod codex;
@@ -102,6 +112,192 @@ impl Protocol {
     }
 }
 
+/// Which spelling of `reasoning_effort` an OpenAI-compatible server accepts.
+///
+/// The field name is standard; the accepted *values* are not. Ollama takes
+/// `none|low|medium|high|max`, OpenAI takes `minimal|low|medium|high`, and an
+/// arbitrary compat server may take neither — which is why every mapping is
+/// paired with the drop-and-retry recovery in [`openai::stream_turn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortDialect {
+    /// OpenAI proper and most hosted compat servers.
+    Standard,
+    /// Ollama, which added `max` and `none` and has no `minimal`.
+    Ollama,
+}
+
+/// How hard the model should think before answering.
+///
+/// One ladder for the whole toolkit, translated per protocol because no two
+/// vendors spell the rungs the same way. `dbmd ask --effort max` means "the
+/// most this provider offers", not a literal string on the wire.
+///
+/// Nothing here is a default: an unset effort sends **no** reasoning field at
+/// all, leaving each provider on its own default (which for Ollama and for
+/// Qwen3.8 means thinking already on, at `xhigh`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Effort {
+    /// Think as little as the provider allows; on backends with a true switch
+    /// this disables reasoning outright.
+    Off,
+    /// The shortest real reasoning pass.
+    Minimal,
+    /// Brief reasoning.
+    Low,
+    /// Balanced.
+    Medium,
+    /// Thorough; the Anthropic API's own default.
+    High,
+    /// Above `high`. The best setting for most coding and agentic work on the
+    /// providers that expose it.
+    Xhigh,
+    /// The most a provider offers, cost be damned.
+    Max,
+}
+
+impl Effort {
+    /// Every rung, lowest first — the order `--effort` documents and tests
+    /// iterate.
+    pub const ALL: [Effort; 7] = [
+        Effort::Off,
+        Effort::Minimal,
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ];
+
+    /// The canonical name, as accepted by `--effort` and printed back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Off => "off",
+            Effort::Minimal => "minimal",
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+
+    /// Parse a user-supplied level. Accepts each vendor's spelling as an
+    /// alias so a value copied out of `~/.codex/config.toml` or an Ollama
+    /// flag just works.
+    pub fn parse(raw: &str) -> Result<Effort, HarnessError> {
+        let normalized = raw.trim().to_ascii_lowercase().replace(['-', '_'], "");
+        Ok(match normalized.as_str() {
+            "off" | "none" | "disabled" | "false" => Effort::Off,
+            "minimal" | "min" => Effort::Minimal,
+            "low" => Effort::Low,
+            "medium" | "med" | "default" => Effort::Medium,
+            "high" => Effort::High,
+            "xhigh" | "extrahigh" | "veryhigh" => Effort::Xhigh,
+            "max" | "maximum" | "highest" => Effort::Max,
+            _ => {
+                let names: Vec<&str> = Effort::ALL.iter().map(|e| e.as_str()).collect();
+                return Err(HarnessError::Config(format!(
+                    "unknown effort `{raw}` — use one of: {}",
+                    names.join(", ")
+                )));
+            }
+        })
+    }
+
+    /// The value for an OpenAI-compatible `reasoning_effort` field.
+    ///
+    /// Rungs a dialect lacks collapse onto its nearest neighbour rather than
+    /// erroring, so `--effort max` against OpenAI proper means `high` instead
+    /// of a 400.
+    pub fn openai(self, dialect: EffortDialect) -> &'static str {
+        match dialect {
+            // Probed live against Ollama 0.32.15, whose validator names its
+            // own set: minimal, low, medium, high, xhigh, ultra, max, none.
+            // That is a superset of this ladder, so every rung passes through
+            // by name. (`ultra` sits between xhigh and max there; the ladder
+            // does not expose it, because `max` already means "the most this
+            // provider offers" on every other backend.)
+            EffortDialect::Ollama => match self {
+                Effort::Off => "none",
+                Effort::Minimal => "minimal",
+                Effort::Low => "low",
+                Effort::Medium => "medium",
+                Effort::High => "high",
+                Effort::Xhigh => "xhigh",
+                Effort::Max => "max",
+            },
+            EffortDialect::Standard => match self {
+                Effort::Off | Effort::Minimal => "minimal",
+                Effort::Low => "low",
+                Effort::Medium => "medium",
+                Effort::High | Effort::Xhigh | Effort::Max => "high",
+            },
+        }
+    }
+
+    /// A second spelling to try when [`Effort::openai`] is refused, before
+    /// giving up on the field entirely.
+    ///
+    /// Older Ollama builds accepted only `none|low|medium|high|max`, so a
+    /// rung outside that set retries as its nearest member instead of losing
+    /// the setting. `None` means the primary spelling is the only one worth
+    /// trying.
+    pub fn openai_fallback(self, dialect: EffortDialect) -> Option<&'static str> {
+        match dialect {
+            EffortDialect::Ollama => match self {
+                Effort::Minimal => Some("low"),
+                Effort::Xhigh => Some("max"),
+                _ => None,
+            },
+            EffortDialect::Standard => None,
+        }
+    }
+
+    /// The value for the ChatGPT Responses `reasoning.effort` field.
+    ///
+    /// The backend rejected `minimal` live on `gpt-5.6-sol` and named its own
+    /// set in the 400: `none, low, medium, high, xhigh, max`. So this is the
+    /// one dialect that carries the whole ladder except `minimal`, and `max`
+    /// is a real rung above `xhigh` rather than an alias for it.
+    pub fn codex(self) -> &'static str {
+        match self {
+            Effort::Off => "none",
+            Effort::Minimal | Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+
+    /// The value for Anthropic's `output_config.effort`, or `None` for
+    /// [`Effort::Off`] (which disables thinking instead of setting a level).
+    pub fn anthropic(self) -> Option<&'static str> {
+        match self {
+            Effort::Off => None,
+            Effort::Minimal | Effort::Low => Some("low"),
+            Effort::Medium => Some("medium"),
+            Effort::High => Some("high"),
+            Effort::Xhigh => Some("xhigh"),
+            Effort::Max => Some("max"),
+        }
+    }
+
+    /// The `thinking.budget_tokens` value for pre-4.6 Anthropic models, which
+    /// predate `output_config.effort`. Only used by the legacy retry.
+    pub fn anthropic_budget(self) -> Option<u32> {
+        match self {
+            Effort::Off => None,
+            Effort::Minimal => Some(1024),
+            Effort::Low => Some(2048),
+            Effort::Medium => Some(8192),
+            Effort::High => Some(16384),
+            Effort::Xhigh => Some(24576),
+            Effort::Max => Some(32768),
+        }
+    }
+}
+
 /// One resolved model endpoint. Produced by [`config::resolve`]; consumed by
 /// [`run`].
 #[derive(Debug, Clone)]
@@ -114,11 +310,19 @@ pub struct Provider {
     pub base_url: String,
     /// Model id sent on the wire (may be empty for delegates).
     pub model: String,
-    /// Bearer / x-api-key credential. Environment-only by construction.
+    /// Bearer / x-api-key credential. Environment-only by construction,
+    /// except the two subscription paths ([`oauth`] for ChatGPT, [`ant`] for
+    /// Anthropic), which mint their own short-lived tokens.
     pub key: Option<String>,
+    /// Whether `key` is an OAuth bearer token rather than an API key. Selects
+    /// the auth header shape, and on Anthropic also the required beta header.
+    pub oauth: bool,
     /// One-line provenance note ("preset ollama, autodetected", …) for
     /// diagnostics; never contains the key.
     pub source: String,
+    /// Which `reasoning_effort` vocabulary this endpoint accepts. Only
+    /// consulted by the OpenAI-compatible adapter.
+    pub effort_dialect: EffortDialect,
 }
 
 /// Run limits and mode for one conversation.
@@ -131,6 +335,9 @@ pub struct RunOptions {
     pub max_tokens: u32,
     /// The tool registry mask this run exposes.
     pub mask: Mask,
+    /// How hard the model should think. `None` sends no reasoning field at
+    /// all, leaving the provider on its own default.
+    pub effort: Option<Effort>,
     /// Working directory for delegation backends (the store root, or the
     /// workspace for `build`). Unused by wire protocols.
     pub delegate_cwd: Option<std::path::PathBuf>,
@@ -142,6 +349,7 @@ impl Default for RunOptions {
             max_turns: 15,
             max_tokens: 4096,
             mask: Mask::Read,
+            effort: None,
             delegate_cwd: None,
         }
     }
@@ -295,6 +503,13 @@ pub enum Event {
         text: String,
         /// Model round-trips used.
         turns: usize,
+    },
+    /// A non-fatal adjustment the harness made on the user's behalf — a
+    /// reasoning parameter the provider refused and we dropped, say. Surfaced
+    /// so a silently-downgraded run never looks like a clean one.
+    Notice {
+        /// Human-readable note.
+        message: String,
     },
     /// The run failed. Emitted just before the error return.
     Error {
@@ -519,6 +734,114 @@ pub fn run(
             role: Role::User,
             blocks: results,
         });
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_each_vendors_spelling() {
+        // A level copied out of ~/.codex/config.toml, an Ollama flag, or an
+        // Anthropic doc must all land on the same rung.
+        assert_eq!(Effort::parse("xhigh").unwrap(), Effort::Xhigh);
+        assert_eq!(Effort::parse("x-high").unwrap(), Effort::Xhigh);
+        assert_eq!(Effort::parse("  HIGH ").unwrap(), Effort::High);
+        assert_eq!(Effort::parse("none").unwrap(), Effort::Off);
+        assert_eq!(Effort::parse("maximum").unwrap(), Effort::Max);
+        assert_eq!(Effort::parse("min").unwrap(), Effort::Minimal);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_and_lists_the_rungs() {
+        let error = Effort::parse("turbo").expect_err("turbo is not a level");
+        let message = error.to_string();
+        for rung in Effort::ALL {
+            assert!(
+                message.contains(rung.as_str()),
+                "error should list `{}`: {message}",
+                rung.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn ollama_dialect_passes_every_rung_through_by_name() {
+        // Ollama 0.32.15's validator accepts a superset of this ladder, so
+        // nothing is lost in translation. `off` is `none`, not a dropped
+        // field, because Ollama enables thinking on its own otherwise.
+        assert_eq!(Effort::Off.openai(EffortDialect::Ollama), "none");
+        assert_eq!(Effort::Minimal.openai(EffortDialect::Ollama), "minimal");
+        assert_eq!(Effort::Xhigh.openai(EffortDialect::Ollama), "xhigh");
+        assert_eq!(Effort::Max.openai(EffortDialect::Ollama), "max");
+    }
+
+    #[test]
+    fn ollama_rungs_outside_the_older_set_have_a_fallback() {
+        // Older builds took only none|low|medium|high|max. A refused rung
+        // retries as its nearest member rather than losing the setting.
+        assert_eq!(
+            Effort::Minimal.openai_fallback(EffortDialect::Ollama),
+            Some("low")
+        );
+        assert_eq!(
+            Effort::Xhigh.openai_fallback(EffortDialect::Ollama),
+            Some("max")
+        );
+        assert_eq!(Effort::High.openai_fallback(EffortDialect::Ollama), None);
+        assert_eq!(Effort::Max.openai_fallback(EffortDialect::Standard), None);
+    }
+
+    #[test]
+    fn standard_dialect_clamps_rungs_openai_lacks() {
+        // OpenAI proper has no xhigh/max on chat completions, so the top of
+        // the ladder collapses onto `high` rather than erroring.
+        assert_eq!(Effort::Off.openai(EffortDialect::Standard), "minimal");
+        assert_eq!(Effort::Xhigh.openai(EffortDialect::Standard), "high");
+        assert_eq!(Effort::Max.openai(EffortDialect::Standard), "high");
+    }
+
+    #[test]
+    fn codex_and_anthropic_expose_their_top_rungs() {
+        // Verified against the live ChatGPT backend, which rejected `minimal`
+        // and listed: none, low, medium, high, xhigh, max.
+        assert_eq!(Effort::Max.codex(), "max");
+        assert_eq!(Effort::Xhigh.codex(), "xhigh");
+        assert_eq!(Effort::Off.codex(), "none");
+        assert_ne!(
+            Effort::Minimal.codex(),
+            "minimal",
+            "the Responses backend has no `minimal` rung"
+        );
+        assert_eq!(Effort::Max.anthropic(), Some("max"));
+        assert_eq!(Effort::Xhigh.anthropic(), Some("xhigh"));
+        // Off is the one rung with no Anthropic effort value: it disables
+        // thinking instead of naming a level.
+        assert_eq!(Effort::Off.anthropic(), None);
+        assert_eq!(Effort::Off.anthropic_budget(), None);
+    }
+
+    #[test]
+    fn budgets_rise_with_the_ladder() {
+        let budgets: Vec<u32> = Effort::ALL
+            .iter()
+            .filter_map(|e| e.anthropic_budget())
+            .collect();
+        assert!(
+            budgets.windows(2).all(|w| w[0] < w[1]),
+            "legacy budgets must increase monotonically: {budgets:?}"
+        );
+        // The Anthropic minimum for an enabled thinking budget is 1024.
+        assert!(budgets.iter().all(|b| *b >= 1024));
+    }
+
+    #[test]
+    fn default_run_options_send_no_reasoning_field() {
+        // The whole point of `None`: an unset effort must not silently pick a
+        // level, because each provider's own default differs (Ollama already
+        // thinks; OpenAI does not).
+        assert_eq!(RunOptions::default().effort, None);
     }
 }
 
