@@ -64,6 +64,12 @@ checksums, and the resulting tap formula.
    "currently **vX.Y.Z**" line near the top.
 4. Run `cargo build --workspace` so **`Cargo.lock`** updates to the new version, and commit it.
 
+**If you edited `SPEC.md`, run `make sync` before committing.** The spec is
+mirrored into `crates/dbmd-cli/SPEC.md` and bundled into the binary, so
+`dbmd spec` prints it — a spec edit is a user-visible change that reaches
+readers only through a release, and the mirror test fails the build if the two
+copies drift.
+
 **The tag must match the `Cargo.toml` version.** `release.yml`'s `version`
 job hard-fails if `vX.Y.Z` ≠ the workspace version, so a stale tag can't ship.
 

@@ -286,8 +286,15 @@ command families reach the network, both only when you run them and both
 only to a place you named: the [sync commands](#sync-if-you-want-it) talk
 to the hub you select, and the [harness commands](#ask-it-in-english)
 (`ask` / `do` / `build`, plus `login` for a subscription sign-in) talk to
-the model endpoint you configure. You don't have to take this
-page's word for anything. The audit is one more prompt:
+the model endpoint you configure.
+
+One case is worth stating precisely, because it is the binary handing off
+rather than calling out: `dbmd login anthropic` runs Anthropic's own `ant`
+CLI, and an Anthropic endpoint with no API key in the environment asks that
+same CLI for a fresh token per request. Those calls go to Anthropic, made by
+their software, only after you ran the login. If `ant` is not installed,
+nothing happens at all. You don't have to take this page's word for any of
+it. The audit is one more prompt:
 
 ```text
 Read scripts/install.sh, scripts/install.ps1, and .github/workflows/release.yml
