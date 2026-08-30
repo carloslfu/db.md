@@ -195,6 +195,29 @@ fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
+/// Whether a failure is the endpoint rejecting the *parameter* rather than
+/// failing the request.
+///
+/// Usually that is a 400 or 422. But a value can also survive the server's own
+/// validator and be rejected later by the model's chat template, which raises
+/// server-side and surfaces as a **500** — exactly what Qwen3.8 does with
+/// Ollama's `xhigh` and `max`. Treating every 500 as a parameter problem would
+/// mask real outages and re-send billable work, so a 500 counts only when the
+/// body names the parameter.
+fn refused_the_parameter(error: &HarnessError) -> bool {
+    let HarnessError::Provider(message) = error else {
+        return false;
+    };
+    if message.contains("HTTP 400") || message.contains("HTTP 422") {
+        return true;
+    }
+    if message.contains("HTTP 500") {
+        let lowered = message.to_ascii_lowercase();
+        return lowered.contains("reasoning") || lowered.contains("effort");
+    }
+    false
+}
+
 /// One candidate request body, plus how to describe it if we have to move on.
 pub(super) struct Variant {
     /// The serialized request body.
@@ -235,9 +258,7 @@ pub(super) fn send_with_variants(
                 return Ok(response);
             }
             Err(error) => {
-                let rejected = matches!(&error, HarnessError::Provider(m)
-                    if m.contains("HTTP 400") || m.contains("HTTP 422"));
-                if !rejected || index == last {
+                if !refused_the_parameter(&error) || index == last {
                     return Err(error);
                 }
                 let next = &variants[index + 1];

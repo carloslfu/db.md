@@ -1082,3 +1082,47 @@ fn effort_off_disables_thinking_rather_than_shortening_it() {
     let requests = mock.finish();
     assert_eq!(requests[0].body_json()["reasoning_effort"], "none");
 }
+
+#[test]
+fn a_template_that_raises_on_the_effort_value_is_a_refusal_not_an_outage() {
+    // Found by running a real local model: Ollama's own validator accepts
+    // `xhigh`, then Qwen3.8's chat template raises on it — server-side, so it
+    // arrives as HTTP 500, not 400. Treating that as a hard failure killed the
+    // run outright. It must degrade like any other refused parameter.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve_with_status(vec![
+        (
+            500,
+            r#"{"error":{"message":"Jinja Exception: Unexpected reasoning effort xhigh. Supported types are medium and low."}}"#
+                .to_string(),
+        ),
+        (200, openai_answer("ok")),
+    ]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?", "--effort", "xhigh"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    assert_eq!(requests.len(), 2, "the raised template must be retried");
+    assert_eq!(requests[1].body_json()["reasoning_effort"], "high");
+}
+
+#[test]
+fn an_ordinary_server_error_is_still_a_failure() {
+    // The other half of that fix: a 500 that says nothing about reasoning is a
+    // real outage. Retrying it would mask the fault and re-send billable work.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve_with_status(vec![(
+        500,
+        r#"{"error":{"message":"internal server error"}}"#.to_string(),
+    )]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?", "--effort", "xhigh"])
+        .assert()
+        .failure();
+
+    assert_eq!(mock.finish().len(), 1, "a real 500 must not be retried");
+}

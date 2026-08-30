@@ -8,9 +8,31 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.13.1**.
+  `Cargo.toml`, currently **v0.13.2**.
 
 ## Unreleased
+
+## [0.13.2] — 2026-08-30
+
+Implements format v0.4 (unchanged).
+
+### Fixed
+
+- **A chat template that rejects an effort value no longer kills the run.**
+  Found by running a real local model rather than probing the endpoint: a
+  server's own validator is not the last word — the model's chat template runs
+  after it and can reject a value the server accepted. Ollama 0.32.15 takes
+  `xhigh` and `max` at the door; Qwen3.8's template then raises on both, which
+  surfaces as an HTTP **500**, not a 400. The variant fallback only advanced on
+  400/422, so the 500 propagated and `--effort xhigh` failed outright against a
+  local model. A 500 now counts as a refused parameter **when the body names
+  the parameter**; a 500 that says nothing about reasoning is still a real
+  outage and is not retried, so an endpoint fault is never masked and billable
+  work is never silently re-sent.
+- **Ollama's top rungs fall back to `high`, not to each other.** `xhigh`
+  previously degraded to `max` — two values the same template rejects, so the
+  fallback was no fallback at all. Both now degrade to `high`, the level
+  reasoning templates actually understand.
 
 ## [0.13.1] — 2026-08-30
 

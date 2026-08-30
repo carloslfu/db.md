@@ -299,8 +299,14 @@ endpoints rather than assumed: the ChatGPT backend takes
 `none|low|medium|high|xhigh|max` and has no `minimal`; Ollama 0.32.15
 takes a superset of the whole ladder, so every rung passes through by
 name; OpenAI proper stops at `high`, so the top rungs collapse onto it
-instead of erroring. If the endpoint refuses
-the field anyway, the request is retried without it (Anthropic tries a
+instead of erroring. A server's own
+validator is not the last word: the model's chat template runs after
+it and can reject a value the server accepted, which arrives as a 500
+rather than a 400 (Ollama takes `xhigh`, then Qwen3.8's template
+raises). Both shapes of refusal degrade the same way — a 500 counts
+only when the body names the parameter, so a real outage still fails
+loudly. If the endpoint refuses the field anyway, the request is
+retried without it (Anthropic tries a
 legacy `thinking.budget_tokens` shape first, for models older than
 4.6), and a `notice` event says so — a downgraded run never looks like
 a clean one. That negotiation is remembered for the rest of the run, so

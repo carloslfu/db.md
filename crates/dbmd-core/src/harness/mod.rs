@@ -251,9 +251,16 @@ impl Effort {
     /// trying.
     pub fn openai_fallback(self, dialect: EffortDialect) -> Option<&'static str> {
         match dialect {
+            // Ollama's own validator is NOT the real gate — the model's chat
+            // template is, and it runs after. Qwen3.8 accepts Ollama's
+            // `xhigh`/`max` at the door and then raises inside the template,
+            // so the top rungs fall back to `high`, the level every reasoning
+            // template in practice understands. (An earlier version fell back
+            // from `xhigh` to `max`, which is two values the same template
+            // rejects — no fallback at all.)
             EffortDialect::Ollama => match self {
                 Effort::Minimal => Some("low"),
-                Effort::Xhigh => Some("max"),
+                Effort::Xhigh | Effort::Max => Some("high"),
                 _ => None,
             },
             // Endpoints predating `none` still take `minimal`, the closest
@@ -820,16 +827,22 @@ mod effort_tests {
     }
 
     #[test]
-    fn ollama_rungs_outside_the_older_set_have_a_fallback() {
-        // Older builds took only none|low|medium|high|max. A refused rung
-        // retries as its nearest member rather than losing the setting.
+    fn ollama_top_rungs_fall_back_to_high_not_to_each_other() {
+        // Found live: Ollama accepts `xhigh` and `max` at its own validator,
+        // then Qwen3.8's chat template raises on both. A fallback from
+        // `xhigh` to `max` is therefore no fallback at all — `high` is the
+        // level the templates actually understand.
+        assert_eq!(
+            Effort::Xhigh.openai_fallback(EffortDialect::Ollama),
+            Some("high")
+        );
+        assert_eq!(
+            Effort::Max.openai_fallback(EffortDialect::Ollama),
+            Some("high")
+        );
         assert_eq!(
             Effort::Minimal.openai_fallback(EffortDialect::Ollama),
             Some("low")
-        );
-        assert_eq!(
-            Effort::Xhigh.openai_fallback(EffortDialect::Ollama),
-            Some("max")
         );
         assert_eq!(Effort::High.openai_fallback(EffortDialect::Ollama), None);
         assert_eq!(Effort::Max.openai_fallback(EffortDialect::Standard), None);
