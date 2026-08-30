@@ -52,9 +52,12 @@ pub mod index;
 // The embedded micro-harness (feature `harness`, off core's defaults; the
 // `dbmd` binary requests it): `ask` / `do` / `build` — a stateless
 // tool-calling loop running the USER'S OWN model endpoint against the store's
-// verb surface. Client for user-supplied intelligence only: two hand-rolled
-// wire protocols over the same `ureq` the link client uses, no SDK crates, no
-// default vendor, key from the environment only. The db.md FORMAT is
+// verb surface. Client for user-supplied intelligence only: three hand-rolled
+// wire protocols over the same `ureq` the link client uses (OpenAI-compatible
+// Chat Completions, Anthropic Messages, the ChatGPT backend's Responses), no
+// SDK crates, no default vendor. API keys come from the environment only;
+// the two subscription paths mint short-lived tokens instead, and neither
+// ever reads a credential out of a store. The db.md FORMAT is
 // untouched — a store never needs a model to be valid db.md, and the verbs
 // stay deterministic plumbing (AGENTS.md "Hard rules" carries the covenant).
 #[cfg(feature = "harness")]

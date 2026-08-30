@@ -293,30 +293,35 @@ Reasoning effort: `--effort off | minimal | low | medium | high | xhigh
 | max` (also `DBMD_LLM_EFFORT`, `llm_effort`). One ladder, translated
 per protocol — `reasoning.effort` + `summary: "auto"` on the ChatGPT
 Responses backend, `output_config.effort` alongside adaptive thinking
-on Anthropic, `reasoning_effort` on OpenAI-compatible servers — and
-each vendor's own vocabulary underneath, probed against the live
-endpoints rather than assumed: the ChatGPT backend takes
-`none|low|medium|high|xhigh|max` and has no `minimal`; Ollama 0.32.15
-takes a superset of the whole ladder, so every rung passes through by
-name; OpenAI proper stops at `high`, so the top rungs collapse onto it
-instead of erroring. A server's own
-validator is not the last word: the model's chat template runs after
-it and can reject a value the server accepted, which arrives as a 500
-rather than a 400 (Ollama takes `xhigh`, then Qwen3.8's template
-raises). Both shapes of refusal degrade the same way — a 500 counts
-only when the body names the parameter, so a real outage still fails
-loudly. If the endpoint refuses the field anyway, the request is
-retried without it (Anthropic tries a
-legacy `thinking.budget_tokens` shape first, for models older than
-4.6), and a `notice` event says so — a downgraded run never looks like
-a clean one. That negotiation is remembered for the rest of the run, so
-a server with no support for the field (LM Studio today) costs one
-rejected round-trip, not one per turn. `off` sends `none`, the value
+on Anthropic, `reasoning_effort` on OpenAI-compatible servers, `-c
+model_reasoning_effort=` on the codex delegate and `--effort` on the
+claude one.
+
+Each vendor spells the rungs differently, so a level a target lacks
+collapses onto its nearest neighbour instead of erroring: the ChatGPT
+backend takes `none|low|medium|high|xhigh|max` and has no `minimal`;
+OpenAI proper stops at `high`. **`off` sends `none`**, the value
 llama.cpp and vLLM document as disabling reasoning — not `minimal`,
-which is a short think. **Unset is not a level**: with no effort configured no
-reasoning field is sent at all, which matters because the defaults
-differ sharply (Ollama enables thinking for capable models on its own,
-and Qwen3.8 defaults to its top rung).
+which is a short think, not off.
+
+Two layers can reject a value, and both are handled. A server's own
+validator is the first; the model's chat template is the second, and
+it runs *after*, so it can reject a value the server accepted. Ollama
+0.32.15's validator takes the whole ladder by name, and Qwen3.8's
+template then raises on `xhigh` and `max` — which, because it raises
+server-side, arrives as a **500** rather than a 400. Both refusals
+degrade the same way: nearest neighbour, then no reasoning parameter
+at all, each step announced by a `notice` event so a downgraded run
+never looks like a clean one. A 500 counts as a refusal only when the
+body names the parameter, so a genuine outage still fails loudly. The
+outcome is remembered for the rest of the run, so an endpoint with no
+support for the field (LM Studio today) costs one rejected round-trip,
+not one per turn.
+
+**Unset is not a level.** With no effort configured, no reasoning field
+is sent at all and each provider keeps its own default — which is not
+"off": Ollama enables thinking for capable models on its own, and
+Qwen3.8 defaults to its top rung.
 
 Caps: `--max-turns` (default 15; the capped final call carries no tools
 and answers with what it has), `--max-tokens` per call, per-tool result
