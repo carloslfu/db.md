@@ -31,7 +31,12 @@ Implements format v0.4 (unchanged).
   an explicit login), with the full tool loop, event stream, and masks the
   other providers get. No vendor CLI required. Verified end to end against
   the live endpoint: a real browser sign-in, then `ask` and `do` runs that
-  queried and wrote through the store contract on a Pro account.
+  queried and wrote through the store contract on a Pro account. The flow
+  and the credential-file shape are ported from the
+  [pi coding agent](https://github.com/earendil-works/pi)
+  (`@earendil-works/pi-ai`, MIT), whose implementation is the reference for
+  this login; pi's Anthropic and Copilot OAuth paths are deliberately not
+  ported, for the impersonation reason above.
 - A store may pin a model per provider — `llm_model_codex = …` in
   `.dbmd/config` — which survives an explicit `--provider` override.
 - **The identity line, written down.** dbmd identifies itself honestly on
