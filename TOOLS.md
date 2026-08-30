@@ -207,9 +207,8 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 
 ### The embedded harness (ask / do / build)
 
-One engine, three tool masks — a stateless tool-calling loop, a few
-hundred lines, that runs **your own** model against the store's verb
-surface. Every tool call executes as a `dbmd` verb (the api's ONE
+One engine, three tool masks — a stateless tool-calling loop that runs
+**your own** model against the store's verb surface. Every tool call executes as a `dbmd` verb (the api's ONE
 SEMANTICS rule: same binary, same schema enforcement, frozen pages,
 per-call transaction lock, write-through indexes, log.md), and there is
 no shell tool at any mask.

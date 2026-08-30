@@ -284,8 +284,9 @@ you did not ask for.** There is no telemetry, no auto-update, no AI SDK,
 and no endpoint baked in. Local format commands stay local. Exactly two
 command families reach the network, both only when you run them and both
 only to a place you named: the [sync commands](#sync-if-you-want-it) talk
-to the hub you select, and [`ask` / `do` / `build`](#ask-it-in-english)
-talk to the model endpoint you configure. You don't have to take this
+to the hub you select, and the [harness commands](#ask-it-in-english)
+(`ask` / `do` / `build`, plus `login` for a subscription sign-in) talk to
+the model endpoint you configure. You don't have to take this
 page's word for anything. The audit is one more prompt:
 
 ```text
@@ -338,9 +339,8 @@ use your agent's own skill installer, or tell the agent to set itself up.
 Bring your own agent and it operates the store natively. That is the main
 path and the better one. But some callers cannot host an agent: an app
 talking to the store, or a machine with a model on it and nothing to drive
-it. For those, `dbmd` carries a deliberately tiny harness of its own — a
-tool-calling loop, a few hundred lines, whose only tools are the same
-`dbmd` verbs you just saw.
+it. For those, `dbmd` carries a deliberately small harness of its own: a
+tool-calling loop whose only tools are the same `dbmd` verbs you just saw.
 
 ```bash
 dbmd ask   "which invoices are unpaid and older than 60 days?"   # read verbs
