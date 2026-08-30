@@ -3,9 +3,10 @@
 db.md is plain files. Any tool that reads files works. The reference
 toolkit is **one binary** — `dbmd` — that performs every
 db.md-specific file/data operation. **Zero LLM dependencies**; the
-agent runtime is BYO. The optional embedded harness (`dbmd ask` /
-`do` / `build`) is a client for **your own** model — point it at a key
-or a local server; the toolkit still ships no SDK and no vendor.
+agent runtime is BYO. A minimal embedded harness (`dbmd ask` / `do` /
+`build`) covers the case where there is no agent to bring: it drives
+the same verbs with **your own** model. It is a scoped fallback, not a
+coding agent, and the toolkit still ships no SDK and no vendor.
 
 ## One binary, many subcommands
 
@@ -206,11 +207,21 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
 
 ### The embedded harness (ask / do / build)
 
-One engine, three tool masks — a stateless tool-calling loop that runs
-**your own** model against the store's verb surface. Every tool call
-executes as a `dbmd` verb (the api's ONE SEMANTICS rule: same binary,
-same schema enforcement, frozen pages, per-call transaction lock,
-write-through indexes, log.md), and there is no shell tool at any mask.
+One engine, three tool masks — a stateless tool-calling loop, a few
+hundred lines, that runs **your own** model against the store's verb
+surface. Every tool call executes as a `dbmd` verb (the api's ONE
+SEMANTICS rule: same binary, same schema enforcement, frozen pages,
+per-call transaction lock, write-through indexes, log.md), and there is
+no shell tool at any mask.
+
+**Scope, stated plainly.** This is the fallback operator for callers
+that cannot host a real one: an app calling the store, or a machine
+with a model and no agent installed. It is not a coding agent and does
+not aim to be. With no shell it cannot install a dependency, run a
+build, run tests, or verify its own work; a BYO agent (Claude Code,
+Codex, pi) does that, and remains the primary and better path. Keep it
+small: sessions, memory, subagents, and plugins belong to real
+harnesses, not here.
 
 - `dbmd ask "<question>"` — READ verbs only (query, search, show,
   schema, tree, log tail). Guaranteed no mutation: on untrusted content
@@ -222,7 +233,9 @@ write-through indexes, log.md), and there is no shell tool at any mask.
   confined beneath a DECLARED workspace root (`--workspace`,
   `DBMD_WORKSPACE`, or `workspace = <path>` in `.dbmd/config`). The
   store subtree is refused for file tools; symlink and `..` escapes are
-  refused; CLI-only — never exposed over `dbmd api`.
+  refused; CLI-only — never exposed over `dbmd api`. It edits source and
+  stops there: a running dev server picks the change up, and anything
+  that needs a command (installs, builds, tests) is the BYO agent's job.
 
 Providers, in four layers. (1) Presets — `--provider anthropic |
 openai | openrouter | groq | together | deepseek | mistral | ollama |

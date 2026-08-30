@@ -335,29 +335,38 @@ use your agent's own skill installer, or tell the agent to set itself up.
 
 ## Ask it in English
 
-Bring your own agent and it operates the store natively. When there isn't
-one — an app calling the store, a machine with a model but no agent —
-`dbmd` carries a small harness of its own: a tool-calling loop whose only
-tools are the same `dbmd` verbs you just saw.
+Bring your own agent and it operates the store natively. That is the main
+path and the better one. But some callers cannot host an agent: an app
+talking to the store, or a machine with a model on it and nothing to drive
+it. For those, `dbmd` carries a deliberately tiny harness of its own — a
+tool-calling loop, a few hundred lines, whose only tools are the same
+`dbmd` verbs you just saw.
 
 ```bash
-dbmd ask   "which invoices are unpaid and older than 60 days?"   # read-only
-dbmd do    "mark the Lumio invoice paid and log it"              # + writes
-dbmd build "add a kanban view to the app"                        # + the app's files
+dbmd ask   "which invoices are unpaid and older than 60 days?"   # read verbs
+dbmd do    "mark the Lumio invoice paid and log it"              # + write verbs
+dbmd build "make the invoice view group by client"               # + workspace files
 ```
 
-The verb is the permission. `ask` has no write tools at all, so a prompt
+The verb is the permission. `ask` has no write tools at all, so content
 injected through an ingested source can produce a wrong answer and nothing
-more. `do` writes only through the same `dbmd` verbs you would run by
-hand, so schema checks, frozen pages, link-aware deletes, and the store
-log all still apply. There is no shell tool at any level.
+further. `do` writes only through the same verbs you would run by hand, so
+schema checks, frozen pages, link-aware deletes, and the store log all
+still apply. `build` adds file edits inside a workspace you declare.
 
-The model is yours: a local server is found automatically
-(Ollama, LM Studio, llama.cpp), an API key works through
+**It is not a coding agent, and it is not trying to become one.** There is
+no shell at any level, so it cannot install a dependency, run your build,
+run your tests, or check its own work — a real agent does that, and this
+one is a doorbell rather than a tenant. What it is good at is the thing it
+is scoped to: answering questions about a store, and making changes through
+the store's own contract.
+
+The model is yours: a local server is found automatically (Ollama, LM
+Studio, llama.cpp), an API key works through
 `--provider anthropic|openai|openrouter|…`, and a ChatGPT subscription
 signs in with `dbmd login codex`. No default vendor, no key ever stored
-inside a store, nothing metered. Apps get the same loop over
-loopback HTTP with `dbmd api --ask`.
+inside a store, nothing metered. Apps get the same loop over loopback HTTP
+with `dbmd api --ask`.
 
 ## The toolkit
 
