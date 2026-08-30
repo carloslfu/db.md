@@ -8,9 +8,30 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.13.2**.
+  `Cargo.toml`, currently **v0.13.3**.
 
 ## Unreleased
+
+## [0.13.3] — 2026-08-30
+
+Implements format v0.4 (unchanged). Documentation only; no behavior change.
+
+### Changed
+
+- **`dbmd spec` now defines `dbmd emit`.** The spec described `show` as "the
+  single-file `emit`" while never introducing `emit` itself — a dangling
+  reference in the document agents are told to treat as the contract. It is now
+  defined alongside the other read verbs. This ships in the binary because the
+  spec is bundled, which is the only reason a docs-only change gets a release.
+- **`dbmd logout` is documented.** It was a shipped subcommand that appeared in
+  no user-facing document.
+- **The event feed is listed in full.** The docs named six events; the harness
+  emits nine — `thinking_delta`, `turn_end`, and `error` were missing from the
+  list an app codes against.
+- **The bundled db.md Agent Skill goes to 0.6.0**, adding `dbmd extract` and
+  `dbmd rename`, and correcting a claim that `dbmd spec` documents "every
+  command" (it documents every store verb; the harness commands exist for
+  callers with no agent).
 
 ## [0.13.2] — 2026-08-30
 
