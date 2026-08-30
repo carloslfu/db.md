@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use super::openai::{send_with_variants, streaming_agent, Variant};
 use super::sse::read_events;
 use super::tools::ToolSpec;
-use super::{Block, Event, HarnessError, Msg, Provider, Role, RunOptions, Stop, Turn};
+use super::{Block, Event, HarnessError, Msg, Negotiated, Provider, Role, RunOptions, Stop, Turn};
 
 /// Build the wire `messages` array (system rides separately).
 fn wire_messages(messages: &[Msg]) -> Vec<Value> {
@@ -110,6 +110,7 @@ pub fn stream_turn(
     system: &str,
     messages: &[Msg],
     tools: &[ToolSpec],
+    negotiated: &Negotiated,
     emit: &mut dyn FnMut(Event),
 ) -> Result<Turn, HarnessError> {
     let url = format!("{}/v1/messages", provider.base_url.trim_end_matches('/'));
@@ -206,7 +207,7 @@ pub fn stream_turn(
     });
 
     let agent = streaming_agent();
-    let response = send_with_variants(&agent, &url, &headers, &variants, emit)?;
+    let response = send_with_variants(&agent, &url, &headers, &variants, negotiated, emit)?;
 
     let mut open: Vec<(u64, PendingBlock)> = Vec::new();
     let mut blocks: Vec<Block> = Vec::new();

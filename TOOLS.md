@@ -303,7 +303,11 @@ instead of erroring. If the endpoint refuses
 the field anyway, the request is retried without it (Anthropic tries a
 legacy `thinking.budget_tokens` shape first, for models older than
 4.6), and a `notice` event says so — a downgraded run never looks like
-a clean one. **Unset is not a level**: with no effort configured no
+a clean one. That negotiation is remembered for the rest of the run, so
+a server with no support for the field (LM Studio today) costs one
+rejected round-trip, not one per turn. `off` sends `none`, the value
+llama.cpp and vLLM document as disabling reasoning — not `minimal`,
+which is a short think. **Unset is not a level**: with no effort configured no
 reasoning field is sent at all, which matters because the defaults
 differ sharply (Ollama enables thinking for capable models on its own,
 and Qwen3.8 defaults to its top rung).

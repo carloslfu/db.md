@@ -1021,3 +1021,64 @@ fn the_ollama_dialect_and_provider_scoped_effort_reach_the_wire() {
         "the scoped effort must win, in Ollama's own vocabulary: {body}"
     );
 }
+
+#[test]
+fn a_refused_effort_is_not_re_offered_every_turn() {
+    // Found by asking whether this holds up on open-model servers: the
+    // adapter had no memory across turns, so an endpoint that refuses
+    // `reasoning_effort` paid the rejected round-trip on EVERY turn — up to
+    // max_turns wasted requests per run. It must be refused once.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve_with_status(vec![
+        (
+            400,
+            r#"{"error":{"message":"unrecognized request argument: reasoning_effort"}}"#
+                .to_string(),
+        ),
+        (
+            200,
+            sse(&[
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"query","arguments":"{\"type\":\"todo\"}"}}]}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "[DONE]",
+            ]),
+        ),
+        (200, openai_answer("three todos")),
+    ]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "what is on the list?", "--effort", "high"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    assert_eq!(
+        requests.len(),
+        3,
+        "one refusal, then two accepted turns — not a refusal per turn"
+    );
+    assert_eq!(requests[0].body_json()["reasoning_effort"], "high");
+    for (index, request) in requests.iter().enumerate().skip(1) {
+        assert!(
+            request.body_json().get("reasoning_effort").is_none(),
+            "turn {index} must not re-offer the refused field"
+        );
+    }
+}
+
+#[test]
+fn effort_off_disables_thinking_rather_than_shortening_it() {
+    // `minimal` is a short think; `none` is off. Local reasoning models
+    // default thinking on, so this is the difference between `--effort off`
+    // working and silently doing nothing.
+    let (_tmp, store) = seeded_store();
+    let mock = MockLlm::serve(vec![openai_answer("ok")]);
+
+    harness_cmd(&store, &mock.url, "openai")
+        .args(["ask", "how many todos?", "--effort", "off"])
+        .assert()
+        .success();
+
+    let requests = mock.finish();
+    assert_eq!(requests[0].body_json()["reasoning_effort"], "none");
+}

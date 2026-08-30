@@ -8,9 +8,31 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.13.0**.
+  `Cargo.toml`, currently **v0.13.1**.
 
 ## Unreleased
+
+## [0.13.1] — 2026-08-30
+
+Implements format v0.4 (unchanged).
+
+### Fixed
+
+- **`--effort off` now actually disables reasoning on local servers.** It sent
+  `reasoning_effort: "minimal"` to every non-Ollama OpenAI-compatible
+  endpoint, and `minimal` is a short think, not off. llama.cpp documents
+  `none` as the value that disables reasoning, vLLM accepts it, and GPT-5.1
+  added it — so `none` is what goes on the wire now, with `minimal` retained
+  as the retry for endpoints that predate it. This mattered most exactly where
+  it was worst: local reasoning models default thinking *on*, so `off` was
+  silently doing almost nothing for the models people reach for it to quiet.
+- **A refused reasoning parameter is refused once per run, not once per
+  turn.** The adapters kept no memory across turns, so an endpoint that
+  rejects `reasoning_effort` — LM Studio has no support for it today — paid
+  the rejected round-trip on every turn, up to `max_turns` wasted requests per
+  run and twice that on Anthropic, which has two shapes to try. A per-run
+  negotiation memo now starts each turn at the shape the endpoint already
+  accepted. The harness remains stateless across runs.
 
 ## [0.13.0] — 2026-08-30
 

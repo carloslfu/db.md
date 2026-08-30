@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use super::sse::read_events;
 use super::tools::ToolSpec;
-use super::{Block, Event, HarnessError, Msg, Provider, Role, RunOptions, Stop, Turn};
+use super::{Block, Event, HarnessError, Msg, Negotiated, Provider, Role, RunOptions, Stop, Turn};
 
 /// Build the wire `messages` array from the internal conversation.
 fn wire_messages(system: &str, messages: &[Msg]) -> Vec<Value> {
@@ -221,12 +221,19 @@ pub(super) fn send_with_variants(
     url: &str,
     headers: &[(&str, String)],
     variants: &[Variant],
+    negotiated: &Negotiated,
     emit: &mut dyn FnMut(Event),
 ) -> Result<ureq::Response, HarnessError> {
     let last = variants.len().saturating_sub(1);
-    for (index, variant) in variants.iter().enumerate() {
+    // Start where the last turn left off: a shape this endpoint already
+    // refused is not offered again for the rest of the run.
+    let start = negotiated.start().min(last);
+    for (index, variant) in variants.iter().enumerate().skip(start) {
         match send_with_retries(agent, url, headers, &variant.body) {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                negotiated.accepted(index);
+                return Ok(response);
+            }
             Err(error) => {
                 let rejected = matches!(&error, HarnessError::Provider(m)
                     if m.contains("HTTP 400") || m.contains("HTTP 422"));
@@ -315,6 +322,7 @@ pub fn stream_turn(
     system: &str,
     messages: &[Msg],
     tools: &[ToolSpec],
+    negotiated: &Negotiated,
     emit: &mut dyn FnMut(Event),
 ) -> Result<Turn, HarnessError> {
     let url = format!(
@@ -372,7 +380,7 @@ pub fn stream_turn(
     });
 
     let agent = streaming_agent();
-    let response = send_with_variants(&agent, &url, &headers, &variants, emit)?;
+    let response = send_with_variants(&agent, &url, &headers, &variants, negotiated, emit)?;
 
     let mut text = String::new();
     let mut thinking = String::new();

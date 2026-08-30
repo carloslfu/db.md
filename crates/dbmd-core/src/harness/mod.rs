@@ -227,7 +227,14 @@ impl Effort {
                 Effort::Max => "max",
             },
             EffortDialect::Standard => match self {
-                Effort::Off | Effort::Minimal => "minimal",
+                // `none` is the only value that actually DISABLES reasoning:
+                // llama.cpp documents it exactly that way, vLLM accepts it,
+                // and GPT-5.1 added it. `minimal` is a short think, not off —
+                // sending it for `--effort off` would leave thinking on for
+                // the local models that default it on, which is the main
+                // reason to reach for `off` at all.
+                Effort::Off => "none",
+                Effort::Minimal => "minimal",
                 Effort::Low => "low",
                 Effort::Medium => "medium",
                 Effort::High | Effort::Xhigh | Effort::Max => "high",
@@ -249,7 +256,12 @@ impl Effort {
                 Effort::Xhigh => Some("max"),
                 _ => None,
             },
-            EffortDialect::Standard => None,
+            // Endpoints predating `none` still take `minimal`, the closest
+            // thing to off they have.
+            EffortDialect::Standard => match self {
+                Effort::Off => Some("minimal"),
+                _ => None,
+            },
         }
     }
 
@@ -295,6 +307,31 @@ impl Effort {
             Effort::Xhigh => Some(24576),
             Effort::Max => Some(32768),
         }
+    }
+}
+
+/// Per-run memory of which request variant an endpoint actually accepted.
+///
+/// Without this, a server that refuses `reasoning_effort` pays the rejected
+/// round-trip on *every* turn of a run — up to `max_turns` wasted requests,
+/// and up to twice that on Anthropic, which has two shapes to try. The
+/// harness stays stateless across runs; this is scoped to one [`run`] call.
+#[derive(Debug, Default)]
+pub struct Negotiated {
+    /// Index of the first variant worth trying, learned from earlier turns.
+    first: std::cell::Cell<usize>,
+}
+
+impl Negotiated {
+    /// The variant index to start from.
+    pub fn start(&self) -> usize {
+        self.first.get()
+    }
+
+    /// Record the variant the endpoint accepted, so later turns skip the
+    /// ones it already refused.
+    pub fn accepted(&self, index: usize) {
+        self.first.set(index);
     }
 }
 
@@ -614,6 +651,9 @@ pub fn run(
 
     let mut turns = 0usize;
     let mut final_text = String::new();
+    // One negotiation memo for the whole run: what the endpoint refused on
+    // turn one is not offered again on turn two.
+    let negotiated = Negotiated::default();
     loop {
         turns += 1;
         let capped = turns > opts.max_turns;
@@ -627,9 +667,11 @@ pub fn run(
         }
         let specs: &[tools::ToolSpec] = if capped { &[] } else { tool_specs };
         let turn = match provider.protocol {
-            Protocol::OpenAi => openai::stream_turn(provider, opts, system, &messages, specs, emit),
+            Protocol::OpenAi => {
+                openai::stream_turn(provider, opts, system, &messages, specs, &negotiated, emit)
+            }
             Protocol::Anthropic => {
-                anthropic::stream_turn(provider, opts, system, &messages, specs, emit)
+                anthropic::stream_turn(provider, opts, system, &messages, specs, &negotiated, emit)
             }
             Protocol::Codex => codex::stream_turn(provider, opts, system, &messages, specs, emit),
             Protocol::ClaudeCli | Protocol::CodexCli => unreachable!("delegates handled above"),
@@ -797,9 +839,32 @@ mod effort_tests {
     fn standard_dialect_clamps_rungs_openai_lacks() {
         // OpenAI proper has no xhigh/max on chat completions, so the top of
         // the ladder collapses onto `high` rather than erroring.
-        assert_eq!(Effort::Off.openai(EffortDialect::Standard), "minimal");
         assert_eq!(Effort::Xhigh.openai(EffortDialect::Standard), "high");
         assert_eq!(Effort::Max.openai(EffortDialect::Standard), "high");
+    }
+
+    #[test]
+    fn off_means_off_on_local_servers_not_a_short_think() {
+        // The bug this pins: `minimal` is a short think, not off. llama.cpp
+        // documents `none` as the value that disables reasoning, vLLM takes
+        // it, and local reasoning models default thinking ON — so sending
+        // `minimal` for `--effort off` would leave it on for exactly the
+        // models people reach for `off` to quiet.
+        assert_eq!(Effort::Off.openai(EffortDialect::Standard), "none");
+        assert_eq!(Effort::Off.openai(EffortDialect::Ollama), "none");
+        // Endpoints predating `none` still get the nearest thing they have.
+        assert_eq!(
+            Effort::Off.openai_fallback(EffortDialect::Standard),
+            Some("minimal")
+        );
+    }
+
+    #[test]
+    fn the_negotiation_memo_starts_at_zero_and_remembers() {
+        let memo = Negotiated::default();
+        assert_eq!(memo.start(), 0);
+        memo.accepted(1);
+        assert_eq!(memo.start(), 1, "a refused shape is not re-offered");
     }
 
     #[test]
