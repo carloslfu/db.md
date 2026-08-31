@@ -944,6 +944,11 @@ pub(crate) use dir_listings::Scope as DirListingScope;
 /// `(st_dev, st_ino)` of an open directory — its identity, independent of the
 /// pathname used to reach it.
 #[cfg(unix)]
+// `st_dev` and `st_ino` are already `u64` on Linux, where these casts are
+// no-ops, but narrower (and `st_dev` signed) on macOS, where they are not. The
+// widening is what makes the key type portable; clippy only ever sees one
+// platform at a time and calls the other one redundant.
+#[allow(clippy::unnecessary_cast)]
 fn directory_identity(directory: &File) -> std::io::Result<(u64, u64)> {
     use std::os::fd::AsRawFd as _;
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
