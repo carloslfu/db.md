@@ -15,10 +15,10 @@ extrapolation math stated per scaling class.
 
 | | |
 |---|---|
-| Machine | Apple M3 Pro, 12 cores, 18 GB RAM |
-| OS | macOS 26.5.1 |
+| Machine | Apple M5 Pro, 18 cores, 48 GB RAM |
+| OS | macOS 26.6.2 |
 | Toolchain | rustc 1.96.0 |
-| Binary | `target/release/dbmd` **0.6.1** (`--release`: LTO, codegen-units=1, strip) |
+| Binary | `target/release/dbmd` **0.13.4** (`--release`: LTO, codegen-units=1, strip) |
 | Corpus | `tests/corpora/corpus-d-scale` — 10,020 `.md` files (10,000 content: sources + records across date shards, two-layer v0.3+ layout) |
 | Precondition | corpus regenerated (`tests/gen-scale.rs`, deterministic seed), then `dbmd index rebuild` once to the fixed point → `validate --all` = 0 errors |
 | Startup floor | bare `dbmd --version` ≈ 3.2 ms (process spawn, included in every number) |
@@ -43,23 +43,28 @@ rustc -O tests/gen-scale.rs -o /tmp/gen-scale
 python3 tests/perf.py --bin target/release/dbmd --corpus tests/corpora/corpus-d-scale
 ```
 
-## Results — loop ops (budgets @10k, measured 2026-07-02 on 0.6.1)
+## Results — loop ops (budgets @10k, measured 2026-08-31 on 0.13.4)
 
-| op | p50 | mean | max | budget | verdict | 0.3.5 published |
+The `0.6.1` column is the previous run of this table (2026-07-02, Apple M3 Pro
+/ 12 cores). It is a different machine, so read it for shape, not for a precise
+delta — except where a row moved by far more than a machine can explain, which
+is the point of keeping it.
+
+| op | p50 | mean | max | budget | verdict | 0.6.1 published |
 |---|---:|---:|---:|---:|:---|---:|
-| `query --where status=active --type company` ¹ | **27.9 ms** | 27.8 | 28.3 | 300 ms | PASS | 3.5 (`fm query`) |
-| `search Kickoff --type email` | **73.5 ms** | 73.6 | 74.6 | 300 ms | PASS | 43 |
-| `search Kickoff` (free-text, whole store) | **179.4 ms** | 180.0 | 184.2 | 300 ms | PASS | 151 |
-| `log tail 20` | **3.4 ms** | 3.4 | 3.6 | 50 ms | PASS | 2.0 |
-| `graph backlinks <company>` (unscoped) | **180.2 ms** | 180.4 | 182.9 | 200 ms | PASS | 210 |
-| `graph backlinks <company> --type contact` | **49.2 ms** | 49.2 | 49.7 | 200 ms | PASS | 35 |
-| `graph neighborhood <company> --hops 1` | **181.1 ms** | 181.3 | 182.4 | 200 ms | PASS | 218 |
-| `fm set status=<alt> <contact>` | **60.1 ms** | 61.2 | 69.0 | 100 ms | **PASS** ² | 108 (OVER) |
-| `write <new email source>` | **65.5 ms** | 65.6 | 66.8 | 100 ms | **PASS** ² | 123 (OVER) |
-| `validate` (working set, **empty** → full sweep) ³ | **907.7 ms** | 907.2 | 910.8 | 1,000 ms | PASS | 1.9 (stale row) |
-| `validate --since` (~14 changed) | **219.8 ms** | 219.6 | 221.0 | 1,000 ms | PASS | 180 |
-| `validate --since` (~64 changed) | **320.0 ms** | 320.0 | 322.5 | 1,000 ms | PASS | 220 |
-| `validate --since` (~264 changed) | **711.7 ms** | 710.7 | 818.9 | 1,000 ms | PASS | 370 |
+| `query --where status=active --type company` ¹ | **45.4 ms** | 46.9 | 54.6 | 300 ms | PASS | 27.9 |
+| `search Kickoff --type email` | **81.4 ms** | 81.6 | 85.9 | 300 ms | PASS | 73.5 |
+| `search Kickoff` (free-text, whole store) | **170.6 ms** | 170.7 | 176.9 | 300 ms | PASS | 179.4 |
+| `log tail 20` | **4.3 ms** | 4.3 | 4.5 | 50 ms | PASS | 3.4 |
+| `graph backlinks <company>` (unscoped) | **187.5 ms** | 185.9 | 194.1 | 200 ms | PASS | 180.2 |
+| `graph backlinks <company> --type contact` | **53.2 ms** | 53.8 | 60.6 | 200 ms | PASS | 49.2 |
+| `graph neighborhood <company> --hops 1` | **175.0 ms** | 175.9 | 184.7 | 200 ms | PASS | 181.1 |
+| `fm set status=<alt> <contact>` | **31.3 ms** | 31.2 | 31.9 | 100 ms | PASS ² | 60.1 |
+| `write <new email source>` | **39.2 ms** | 39.0 | 39.7 | 100 ms | PASS ² | 65.5 |
+| `validate` (working set, **empty** → full sweep) ³ | **961.8 ms** | 956.8 | 995.9 | 1,000 ms | PASS | 907.7 |
+| `validate --since` (~14 changed) | **221.8 ms** | 222.4 | 226.4 | 1,000 ms | PASS | 219.8 |
+| `validate --since` (~64 changed) | **327.7 ms** | 328.7 | 334.7 | 1,000 ms | PASS | 320.0 |
+| `validate --since` (~264 changed) | **610.1 ms** | 609.5 | 614.1 | 1,000 ms | PASS | 711.7 |
 
 ¹ Not comparable 1:1 to the 0.3.5 row: `fm query` printed paths off one
 sidecar; the 0.5.0 read-surface fold replaced it with `dbmd query`, which
@@ -75,16 +80,24 @@ met with the compacted-rewrite design intact.
 
 ## Results — sweep ops (budgets @10k, off-loop)
 
-| op | p50 | mean | max | budget | verdict | 0.3.5 published |
+| op | p50 | mean | max | budget | verdict | 0.6.1 published |
 |---|---:|---:|---:|---:|:---|---:|
-| `validate --all` ⁴ | **1,454.9 ms** | 1,461.2 | 1,495.4 | 5,000 ms | PASS | 903 |
-| `index rebuild` (full) | **478.2 ms** | 478.5 | 480.2 | 10,000 ms | PASS | 515 |
-| `stats` | **295.9 ms** | 295.8 | 297.9 | 5,000 ms | PASS | 366 |
+| `validate --all` ⁴ | **1,602.7 ms** | 1,619.6 | 1,719.8 | 5,000 ms | PASS | 1,454.9 |
+| `index rebuild` (full) | **378.0 ms** | 380.5 | 395.3 | 10,000 ms | PASS | 478.2 |
+| `stats` | **342.9 ms** | 343.0 | 347.4 | 5,000 ms | PASS | 295.9 |
 
 ⁴ `validate --all` grew ~60% across 0.4–0.6 as it gained checks (loose-file
 layer sidecars, `FM_BAD_ID`/`DUP_ID` on the id contract, jsonl desync
-classes) — honestly O(store) with a rising constant, still 3.4× inside
-budget.
+classes) — honestly O(store) with a rising constant.
+
+It then spent 0.8.3 through 0.13.3 at **~9,200 ms** on this corpus, a 4×
+regression nothing caught, and this row is the reason it was eventually
+found: the number here is the only record of what the op used to cost.
+`ac12a06` (0.8.3) replaced the wiki-link exact-casing check with a walk that
+re-read whole directories per link — O(links × directory size), and this
+corpus carries 25,696 links over type folders holding thousands of entries.
+0.13.4 scoped a directory-listing cache to the sweep and brought it back to
+the number above. Full account: [§ the 0.8.3 regression](#the-083-regression-a-security-fix-that-cost-4x).
 
 ## The 0.6.0 interlude — how a regression hid, and the fix (0.6.1)
 
@@ -110,6 +123,59 @@ the acceptance/rejection set is identical, pinned by an equivalence test
 poisoned-sidecar regression tests. Free-text: 402 → **179 ms**; typed:
 143 → **74 ms**. CI now asserts the free-text scan too
 (`BUDGET_SEARCH_FREETEXT`), so this class of drift trips the gate next time.
+
+## The 0.8.3 regression — a security fix that cost 4x
+
+The same shape as the 0.6.0 interlude above, two years of releases apart, and
+it survived far longer because the guard that should have caught it was
+looking at the wrong number.
+
+`ac12a06` (0.8.3, 2026-07-30, "security: harden dbmd trust and filesystem
+boundaries") replaced the wiki-link exact-casing check. That check earns its
+keep: on case-insensitive macOS, `[[Records/Foo]]` opens a file that Linux
+would call broken, so `validate` confirms the on-disk spelling character for
+character and reports the same broken links everywhere.
+
+- **Before**: `canonicalize()` the target and the root, `strip_prefix`,
+  compare. Two syscall chains per link. O(path depth).
+- **After**: for each path component, a full `readdir` of the directory, then
+  `directory_contains_exact_regular` scanning the same directory again, then
+  on descent a third scan checking for a nested `DB.md`. Always restarting
+  from the store root. **O(directory size) per component, per link.**
+
+`resolve_wiki_target` calls it for every wiki-link and up to twice each
+(literal path, then `.md`-appended). This corpus carries 25,696 links over
+only 3,967 distinct targets, in type folders holding thousands of entries.
+`validate --all` went **2,435 ms → 9,820 ms in that one commit** and stayed
+there through 0.13.3. Verified by bisect on release builds, with both sides
+reporting identical results (36 issues, 0 errors).
+
+**Why nothing tripped.** `perf_budget.rs` asserted `5 s × BUDGET_SLACK 6` =
+a 30 s guard, so a 4x regression fit inside it with room to spare. Worse, the
+slack was being spent unevenly: measured against the plan budgets, headroom
+ranged from 79x on `log tail` to 2.1x on `validate`, so the guard was
+simultaneously too loose to catch a real regression and tight enough on the
+validate rows to flake under load. It did flake, and chasing that flake is
+how this was found.
+
+**Fixed in 0.13.4** — a directory-listing cache scoped to one sweep
+(`fsx::DirListingScope`, opened by `validate_all` and `validate_working_set`).
+The fd-based descent, `O_NOFOLLOW`, and the nested-`DB.md` boundary check are
+untouched; only the repeated reads are removed, and the `fstatat` that decides
+regular-file-ness is deliberately still per call. The cache is off unless a
+scope is open, because `Store` outlives a single operation in `dbmd watch` and
+`dbmd api` — a listing cached across a process's life would report a file
+that exists as missing for as long as the process ran. Three tests pin that
+scoping, and each was verified to fail when the cache is allowed to leak.
+
+`validate --all`: 9,236 → **1,602 ms**. Working set (~264 changed):
+712 → **610 ms**.
+
+`perf_budget.rs`'s budgets are now the measured debug medians rather than the
+plan's aspirational numbers, so `BUDGET_SLACK` (3) means one thing on every
+row. The plan budgets remain the contract and live here and in
+`plans/db-md-rust-toolkit.md`; meeting them is a separate question from not
+regressing, and that file only answers the second.
 
 ## validate's empty-set sweep is by design
 

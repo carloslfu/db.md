@@ -8,9 +8,62 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.13.3**.
+  `Cargo.toml`, currently **v0.13.4**.
 
 ## Unreleased
+
+## [0.13.4] — 2026-08-31
+
+Implements format v0.4 (unchanged).
+
+### Fixed
+
+- **`dbmd validate` is ~4x faster again; a regression that shipped in 0.8.3 is
+  gone.** `validate --all` on the 10k corpus goes **9,236 ms → 1,602 ms**
+  (release), and the working-set validate at ~264 changed goes 712 → 610 ms.
+
+  `ac12a06` (0.8.3, "security: harden dbmd trust and filesystem boundaries")
+  replaced the wiki-link exact-casing check — the one that makes macOS report
+  the same broken links Linux would — with a walk that, for each path
+  component, read the whole directory, then read it again, then read each
+  descended directory checking for a nested `DB.md`, always restarting from the
+  store root and caching nothing. Cost went from O(path depth) to **O(links ×
+  directory size)**; `resolve_wiki_target` calls it for every wiki-link and up
+  to twice each. Bisected to that single commit: 2,435 ms before it, 9,820 ms
+  after, identical validation output on both sides.
+
+  The fix is a directory-listing cache scoped to one sweep
+  (`fsx::DirListingScope`, opened by `validate_all` and `validate_working_set`).
+  **No security property changed**: the fd-based descent, `O_NOFOLLOW`, the
+  nested-`DB.md` boundary check, and the per-call `fstatat` that decides
+  regular-file-ness are all untouched — only the repeated directory reads are
+  removed. The cache is off unless a scope is open, because `Store` outlives a
+  single operation in `dbmd watch` and `dbmd api` and a listing held across a
+  process's life would report an existing file as missing for as long as it
+  ran. Three tests pin that scoping, and each was checked to fail when the
+  cache is allowed to leak past its scope.
+
+- **The perf guard can no longer absorb a regression of this size.**
+  `perf_budget.rs` asserted the plan's aspirational budgets widened by
+  `BUDGET_SLACK = 6`, which gave `validate --all` a 30 s guard — roomy enough
+  to hide a 4x regression for eight releases. Because several ops had drifted
+  from those budgets by different amounts, effective headroom ranged from 79x
+  on `log tail` to 2.1x on `validate`, so the guard was simultaneously too
+  loose to catch a real regression and tight enough on the validate rows to
+  flake under load. The budgets are now the measured debug medians and
+  `BUDGET_SLACK` is 3, so headroom is uniform and the number means one thing:
+  how much slower a shared CI runner may be. The plan budgets remain the
+  contract, documented in `tests/PERF.md`.
+
+### Changed
+
+- `tests/PERF.md` re-measured on 0.13.4 and its Environment table corrected (it
+  still described dbmd 0.6.1 on an Apple M3 Pro). Adds a full account of the
+  0.8.3 regression next to the 0.6.0 one it rhymes with — both are a security
+  pass adding uncached per-candidate filesystem work that no budget covered.
+- `perf_budget.rs` now states that it times the **debug** binary while every
+  number in `tests/PERF.md` is `--release`; the two are not comparable, and
+  conflating them is part of how the drift stayed invisible.
 
 ## [0.13.3] — 2026-08-30
 

@@ -854,13 +854,119 @@ pub(crate) fn open_directory_nofollow(_path: &Path) -> std::io::Result<File> {
 /// directory. This is deliberately descriptor-relative: on a case-insensitive
 /// filesystem `openat(dir, "DB.md")` can open a lowercase `db.md`, while the
 /// db.md format requires the uppercase marker spelling.
+/// A directory-listing cache, explicitly scoped to one read-only operation.
+///
+/// The exact-casing checks below answer one question — "does directory D hold
+/// an entry named exactly N?" — and answering it means reading D's entries.
+/// A store-wide sweep asks that question once per path component per wiki-link,
+/// which made the cost O(links × directory size): on the 10k corpus, 25,696
+/// links against type folders holding thousands of entries.
+///
+/// **The cache is off by default and must be opened explicitly.** A listing is
+/// only stable while nothing writes to the directory, so caching one across a
+/// process's whole life is wrong — `Store` outlives individual operations in
+/// `dbmd watch` and `dbmd api`, and `Store::is_db_md_store` is expected to
+/// notice a `DB.md` that appears between two calls. Openers are therefore
+/// read-only sweeps that already treat the store as a point-in-time snapshot.
+/// Outside a scope every lookup reads the filesystem exactly as before.
 #[cfg(unix)]
-pub(crate) fn directory_contains_exact_regular(
-    directory: &File,
-    wanted: &std::ffi::OsStr,
-) -> std::io::Result<bool> {
+mod dir_listings {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
+
+    type Listing = Rc<HashSet<Vec<u8>>>;
+    /// `(scope depth, listings)`. Depth 0 means no scope is open and the map is
+    /// empty; nesting is counted so an inner scope closing does not strand an
+    /// outer one without its cache.
+    type State = (usize, HashMap<(u64, u64), Listing>);
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new((0, HashMap::new()));
+    }
+
+    /// Open a caching scope for the current thread. Cleared on drop.
+    pub(crate) struct Scope {
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl Scope {
+        pub(crate) fn open() -> Self {
+            STATE.with(|state| state.borrow_mut().0 += 1);
+            Scope {
+                _not_send: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.0 = state.0.saturating_sub(1);
+                if state.0 == 0 {
+                    state.1.clear();
+                }
+            });
+        }
+    }
+
+    /// The cached listing for `key`, or `None` when no scope is open.
+    pub(super) fn get(key: (u64, u64)) -> Option<Listing> {
+        STATE.with(|state| {
+            let state = state.borrow();
+            if state.0 == 0 {
+                None
+            } else {
+                state.1.get(&key).cloned()
+            }
+        })
+    }
+
+    /// Remember `listing` for `key`, but only inside a scope.
+    pub(super) fn put(key: (u64, u64), listing: &Listing) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.0 > 0 {
+                state.1.insert(key, Rc::clone(listing));
+            }
+        });
+    }
+
+    pub(super) fn wrap(names: HashSet<Vec<u8>>) -> Listing {
+        Rc::new(names)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) use dir_listings::Scope as DirListingScope;
+
+/// `(st_dev, st_ino)` of an open directory — its identity, independent of the
+/// pathname used to reach it.
+#[cfg(unix)]
+fn directory_identity(directory: &File) -> std::io::Result<(u64, u64)> {
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(directory.as_raw_fd(), &mut info) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((info.st_dev as u64, info.st_ino as u64))
+}
+
+/// Every entry name in `directory`, read through a fresh no-follow descriptor.
+///
+/// Inside a [`DirListingScope`] the result is remembered per directory; outside
+/// one this reads the directory every time, exactly as the uncached code did.
+#[cfg(unix)]
+fn directory_entry_names(
+    directory: &File,
+) -> std::io::Result<std::rc::Rc<std::collections::HashSet<Vec<u8>>>> {
+    use std::os::fd::AsRawFd as _;
+
+    let identity = directory_identity(directory)?;
+    if let Some(hit) = dir_listings::get(identity) {
+        return Ok(hit);
+    }
 
     let dot = c_name(std::ffi::OsStr::new("."))?;
     let scan_fd = unsafe {
@@ -881,37 +987,51 @@ pub(crate) fn directory_contains_exact_regular(
         }
         return Err(error);
     }
-
-    let mut found = false;
+    let mut names = std::collections::HashSet::new();
     loop {
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
             break;
         }
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() != wanted.as_bytes() {
-            continue;
-        }
-        let c_wanted = c_name(wanted)?;
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                c_wanted.as_ptr(),
-                &mut stat,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-            && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
-        {
-            found = true;
-        }
-        break;
+        names.insert(name.to_bytes().to_vec());
     }
     if unsafe { libc::closedir(stream) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(found)
+
+    let listing = dir_listings::wrap(names);
+    dir_listings::put(identity, &listing);
+    Ok(listing)
+}
+
+#[cfg(unix)]
+pub(crate) fn directory_contains_exact_regular(
+    directory: &File,
+    wanted: &std::ffi::OsStr,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // Exact-name membership first (a directory read, cached inside a
+    // `DirListingScope`), then one `fstatat` to confirm it is a regular file.
+    // The `stat` is O(1) and deliberately not cached: it is the security-
+    // relevant half, and it re-checks the entry through the held descriptor.
+    if !directory_entry_names(directory)?.contains(wanted.as_bytes()) {
+        return Ok(false);
+    }
+    let c_wanted = c_name(wanted)?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            c_wanted.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+        && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG;
+    Ok(ok)
 }
 
 #[cfg(windows)]
@@ -1969,40 +2089,7 @@ pub(crate) fn path_case_matches_beneath(root: &File, relative: &Path) -> std::io
         .collect();
     let mut directory = root.try_clone()?;
     for (index, name) in components.iter().enumerate() {
-        let scan_fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                c_name(std::ffi::OsStr::new("."))?.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if scan_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let stream = unsafe { libc::fdopendir(scan_fd) };
-        if stream.is_null() {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(scan_fd);
-            }
-            return Err(error);
-        }
-        let mut exact = false;
-        loop {
-            let entry = unsafe { libc::readdir(stream) };
-            if entry.is_null() {
-                break;
-            }
-            let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if bytes == name.as_bytes() {
-                exact = true;
-                break;
-            }
-        }
-        if unsafe { libc::closedir(stream) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if !exact {
+        if !directory_entry_names(&directory)?.contains(name.as_bytes()) {
             return Ok(false);
         }
         if index + 1 == components.len() {
@@ -2026,6 +2113,84 @@ pub(crate) fn path_case_matches_beneath(root: &File, relative: &Path) -> std::io
     Ok(false)
 }
 
+/// The Windows half of the scoped directory-listing cache.
+///
+/// Same contract as the Unix module above: off unless a [`DirListingScope`] is
+/// open, cleared when the outermost scope closes. Keyed by directory path
+/// because the Windows walk addresses directories by path rather than by a
+/// held descriptor.
+#[cfg(windows)]
+mod dir_listings {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    type Listing = Rc<HashSet<OsString>>;
+    /// `(scope depth, listings)` — see the Unix module for the contract.
+    type State = (usize, HashMap<PathBuf, Listing>);
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new((0, HashMap::new()));
+    }
+
+    /// Open a caching scope for the current thread. Cleared on drop.
+    pub(crate) struct Scope {
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl Scope {
+        pub(crate) fn open() -> Self {
+            STATE.with(|state| state.borrow_mut().0 += 1);
+            Scope {
+                _not_send: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.0 = state.0.saturating_sub(1);
+                if state.0 == 0 {
+                    state.1.clear();
+                }
+            });
+        }
+    }
+
+    /// Entry names of `path`, read once per directory inside a scope.
+    pub(super) fn names(path: &Path) -> std::io::Result<Listing> {
+        if let Some(hit) = STATE.with(|state| {
+            let state = state.borrow();
+            if state.0 == 0 {
+                None
+            } else {
+                state.1.get(path).cloned()
+            }
+        }) {
+            return Ok(hit);
+        }
+        let mut set = HashSet::new();
+        for entry in std::fs::read_dir(path)? {
+            set.insert(entry?.file_name());
+        }
+        let listing: Listing = Rc::new(set);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.0 > 0 {
+                state.1.insert(path.to_path_buf(), Rc::clone(&listing));
+            }
+        });
+        Ok(listing)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use dir_listings::Scope as DirListingScope;
+
 #[cfg(windows)]
 pub(crate) fn path_case_matches_beneath(root: &File, relative: &Path) -> std::io::Result<bool> {
     if relative.is_absolute() {
@@ -2041,19 +2206,20 @@ pub(crate) fn path_case_matches_beneath(root: &File, relative: &Path) -> std::io
     let mut directory = root.try_clone()?;
     for (index, name) in components.iter().enumerate() {
         let path = windows_fs::directory_path(&directory)?;
-        let exact = std::fs::read_dir(&path)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .find(|entry| entry.file_name() == *name);
-        let Some(entry) = exact else { return Ok(false) };
+        if !dir_listings::names(&path)?.contains(name) {
+            return Ok(false);
+        }
+        // The listing confirmed the exact spelling; the entry's own path is
+        // that spelling joined to the directory we just read.
+        let entry_path = path.join(name);
         if index + 1 == components.len() {
-            let attrs = windows_fs::entry_attributes(&entry.path())?;
+            let attrs = windows_fs::entry_attributes(&entry_path)?;
             return Ok(attrs
                 & (windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
                     | windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY)
                 == 0);
         }
-        directory = windows_fs::open_directory(&entry.path())?;
+        directory = windows_fs::open_directory(&entry_path)?;
         if directory_contains_exact_regular(&directory, "DB.md".as_ref())? {
             return Ok(false);
         }
@@ -2896,6 +3062,132 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&source).unwrap(), b"source");
         assert_eq!(std::fs::read(&destination).unwrap(), b"existing");
+    }
+
+    /// The listing cache must be invisible unless a scope is open, and must
+    /// stop being consulted the moment the outermost scope closes. Both halves
+    /// matter: `Store` outlives a single operation in `dbmd watch` and
+    /// `dbmd api`, so a stale listing there would report a file that exists as
+    /// missing (or the reverse) for the life of the process.
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_cache_only_applies_inside_a_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = open_directory_nofollow(dir.path()).unwrap();
+
+        // No scope: each call reads the directory, so a new file is seen.
+        assert!(!directory_contains_exact_regular(&held, "late.md".as_ref()).unwrap());
+        std::fs::write(dir.path().join("late.md"), b"x").unwrap();
+        assert!(
+            directory_contains_exact_regular(&held, "late.md".as_ref()).unwrap(),
+            "outside a scope the listing must never be reused"
+        );
+
+        // Inside a scope: the first read is remembered, so a file created
+        // afterwards is deliberately not observed by this sweep.
+        {
+            let _scope = DirListingScope::open();
+            assert!(directory_contains_exact_regular(&held, "late.md".as_ref()).unwrap());
+            std::fs::write(dir.path().join("later.md"), b"x").unwrap();
+            assert!(
+                !directory_contains_exact_regular(&held, "later.md".as_ref()).unwrap(),
+                "within one scope the listing is a point-in-time snapshot"
+            );
+        }
+
+        // Scope closed: the snapshot is gone and the file is visible again.
+        assert!(
+            directory_contains_exact_regular(&held, "later.md".as_ref()).unwrap(),
+            "closing the scope must discard every cached listing"
+        );
+
+        // The failure that actually bites: a LATER scope must start from a
+        // clean slate rather than inherit the previous sweep's snapshot. This
+        // is the in-process shape of two `validate` runs on one long-lived
+        // `Store`, and it is what fails if the cache is ever left uncleared.
+        {
+            let _second = DirListingScope::open();
+            std::fs::write(dir.path().join("newest.md"), b"x").unwrap();
+            let _ = directory_contains_exact_regular(&held, "newest.md".as_ref());
+        }
+        {
+            let _third = DirListingScope::open();
+            assert!(
+                directory_contains_exact_regular(&held, "later.md".as_ref()).unwrap(),
+                "a new scope must re-read the directory, not inherit an older \
+                 scope's listing"
+            );
+        }
+    }
+
+    /// Nested scopes must not strand the outer one: the cache survives until
+    /// the outermost guard drops.
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_scope_closing_does_not_clear_the_outer_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = open_directory_nofollow(dir.path()).unwrap();
+
+        let _outer = DirListingScope::open();
+        assert!(!directory_contains_exact_regular(&held, "a.md".as_ref()).unwrap());
+        {
+            let _inner = DirListingScope::open();
+            std::fs::write(dir.path().join("a.md"), b"x").unwrap();
+        }
+        assert!(
+            !directory_contains_exact_regular(&held, "a.md".as_ref()).unwrap(),
+            "the outer scope's snapshot must outlive an inner scope closing"
+        );
+    }
+
+    /// The Windows twin of `directory_listing_cache_only_applies_inside_a_scope`.
+    /// Named `windows_*` so the native Windows CI job, which runs only
+    /// `fsx::tests::windows_`, actually exercises the cache there.
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_listing_cache_only_applies_inside_a_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = open_directory_nofollow(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("leaf.md"), b"x").unwrap();
+
+        let target = Path::new("sub").join("leaf.md");
+        assert!(path_case_matches_beneath(&root, &target).unwrap());
+
+        // Wrong casing is still refused with the cache in play.
+        let wrong = Path::new("sub").join("Leaf.md");
+        {
+            let _scope = DirListingScope::open();
+            assert!(path_case_matches_beneath(&root, &target).unwrap());
+            assert!(
+                !path_case_matches_beneath(&root, &wrong).unwrap(),
+                "a cached listing must not soften the exact-casing check"
+            );
+        }
+
+        // A file added after the scope closed is visible again.
+        std::fs::write(dir.path().join("sub").join("fresh.md"), b"x").unwrap();
+        assert!(
+            path_case_matches_beneath(&root, &Path::new("sub").join("fresh.md")).unwrap(),
+            "closing the scope must discard every cached listing"
+        );
+
+        // The failure that actually bites: a LATER scope must start clean
+        // rather than inherit the previous sweep's snapshot — the in-process
+        // shape of two `validate` runs on one long-lived `Store`.
+        {
+            let _second = DirListingScope::open();
+            let _ = path_case_matches_beneath(&root, &Path::new("sub").join("newest.md"));
+        }
+        std::fs::write(dir.path().join("sub").join("newest.md"), b"x").unwrap();
+        {
+            let _third = DirListingScope::open();
+            assert!(
+                path_case_matches_beneath(&root, &Path::new("sub").join("newest.md")).unwrap(),
+                "a new scope must re-read the directory, not inherit an older \
+                 scope's listing"
+            );
+        }
     }
 
     #[cfg(windows)]

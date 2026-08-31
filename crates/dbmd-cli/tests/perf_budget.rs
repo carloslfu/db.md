@@ -69,12 +69,11 @@
 //!   * `validate` (working set) was `O(changed × store)` — a full store read per
 //!     changed object (2.4 s at 14 changed, 31 s at 264). It now finds incoming
 //!     linkers for the whole changed set in ONE embedded-ripgrep pass
-//!     (`Store::find_links_to_any`), so it is flat in the changed-set size
-//!     (~0.2 s at both 14 and 278 changed @10k). It is asserted below at a
-//!     deliberately LARGE changed set — see `BUDGET_VALIDATE_WORKING` and
-//!     `grow_changed_set` — so a revert to the per-object loop (tens of seconds
-//!     at hundreds of changed objects) fails CI while the fixed single-pass cost
-//!     stays comfortably inside the guard.
+//!     (`Store::find_links_to_any`), so it is flat in the changed-set size. It
+//!     is asserted below at a deliberately LARGE changed set — see
+//!     `BUDGET_VALIDATE_WORKING` and `grow_changed_set` — so a revert to the
+//!     per-object loop (tens of seconds at hundreds of changed objects) fails
+//!     CI.
 //!
 //! OPT-OUT
 //! -------
@@ -94,59 +93,90 @@ use assert_cmd::cargo::CommandCargoExt;
 // headroom so this guard catches order-of-magnitude regressions, not noise.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Loop op: `fm query` resolves via the `index.jsonl` sidecar — must stay flat
-/// in store size. Plan budget: 300 ms @10k.
+/// # What these numbers are
+///
+/// Each constant is the op's MEASURED median on the 10k tier, rounded up to a
+/// round number — not the plan's aspirational budget. That distinction is the
+/// point: this guard previously asserted the plan budgets, which several ops
+/// had quietly stopped meeting, so `BUDGET_SLACK` was silently spent covering
+/// the gap instead of covering CI variance. Headroom ranged from 79x on
+/// `log tail` to 2.1x on `validate`, and a real 4x regression in
+/// `validate --all` (the uncached exact-casing walk, fixed in 0.13.4) sat
+/// inside the guard for months.
+///
+/// Keying the guard to measured reality makes the headroom uniform, so
+/// `BUDGET_SLACK` means one thing everywhere: how much slower a shared CI
+/// runner may be before this test is wrong about the code.
+///
+/// **These are DEBUG-binary numbers.** `cargo test` builds and times
+/// `target/debug/dbmd`; every figure in `tests/PERF.md` is `--release` with
+/// LTO. They are not comparable, and the release numbers are the ones quoted
+/// publicly. Re-measure with `cargo test --test perf_budget -- --nocapture`.
+///
+/// The plan's aspirational budgets still live in
+/// `plans/db-md-rust-toolkit.md` and `tests/PERF.md`; meeting them is a
+/// separate question from not regressing, and this file only answers the
+/// second.
+/// Loop op: `query --where` resolves via the `index.jsonl` sidecar — must stay
+/// flat in store size. Plan budget 300 ms; measured ~145 ms.
 const BUDGET_FM_QUERY: Duration = Duration::from_millis(300);
-/// Loop op: `search --type` resolves candidates via the sidecar, then scans only
-/// that set with embedded ripgrep. Plan budget: 300 ms @10k.
+/// Loop op: `search --type` resolves candidates via the sidecar, then scans
+/// only that set with embedded ripgrep. Plan budget 300 ms; measured ~200 ms.
 const BUDGET_SEARCH_TYPED: Duration = Duration::from_millis(300);
-
 /// Loop op: `search` FREE-TEXT (unscoped) walks + scans every content file —
 /// the documented whole-store scan class. Asserted since the 0.6.1 containment
 /// fix: the 0.3.9 security gate silently tripled this op (2 realpath chains
-/// per candidate, ~375 ms @10k vs the ~150 ms rg floor) and no CI budget
-/// timed the free-text path, so nothing tripped. `StoreContainment` (root
-/// canonicalized once, parent dirs memoized) restored the floor; this row
-/// keeps the whole-store scan pinned to it.
+/// per candidate) and no CI budget timed the free-text path, so nothing
+/// tripped. `StoreContainment` (root canonicalized once, parent dirs memoized)
+/// restored the floor. Plan budget 300 ms; measured ~225 ms.
 const BUDGET_SEARCH_FREETEXT: Duration = Duration::from_millis(300);
-/// Loop op: `log tail` reverse-reads from EOF, never a full parse. Plan budget:
-/// 50 ms. (Held to a generous floor below because, unlike the other loop ops,
-/// 50 ms is on the order of cold process-spawn on a shared CI box.)
+/// Loop op: `log tail` reverse-reads from EOF, never a full parse. Measured
+/// ~4 ms, but held at the plan's 50 ms because cold process spawn — included
+/// in every number here — dominates anything smaller.
 const BUDGET_LOG_TAIL: Duration = Duration::from_millis(50);
 /// Loop op: unscoped `graph backlinks` / `graph neighborhood --hops 1` — one
-/// embedded-ripgrep pass for `[[<target>]]` over the store (the same scan class
-/// `search` free-text rides), NOT a `read_to_string` of every content file once
-/// per candidate. Plan budget: 200 ms @10k. This assertion exists because the
-/// fix for the documented O(store) `graph` finding landed (PERF.md § "graph
-/// backlinks (unscoped) and graph neighborhood are O(store)"); per this file's
-/// "WHAT IT DELIBERATELY DOES NOT ASSERT" note, a fixed op gets its guard added
-/// here so a revert to the per-candidate confirm-read fails CI.
-const BUDGET_GRAPH_UNSCOPED: Duration = Duration::from_millis(200);
-/// Loop op: `validate` (working set). The changed set + per-file checks are
-/// O(changed); the incoming-linker discovery is a single embedded-ripgrep pass
-/// over the store for the whole changed set at once (`Store::find_links_to_any`),
-/// so the op is flat in the changed-set size. Plan budget: 1 s @10k (measured
-/// "~10 changed files"). This assertion exists because the fix for the
-/// documented `O(changed × store)` finding landed (PERF.md § "validate (working
-/// set) is O(changed × store)"); it is exercised at a LARGE changed set (see
-/// `grow_changed_set`) so a revert to the per-object full-store loop — tens of
-/// seconds there — fails the `× BUDGET_SLACK` guard, which the flat ~0.2 s
-/// fixed cost clears with wide headroom.
-const BUDGET_VALIDATE_WORKING: Duration = Duration::from_millis(1000);
-/// Sweep op: full-store validate. Plan budget: 5 s @10k.
-const BUDGET_VALIDATE_ALL: Duration = Duration::from_secs(5);
-/// Sweep op: full from-scratch index rebuild. Plan budget: 10 s @10k.
-const BUDGET_INDEX_REBUILD: Duration = Duration::from_secs(10);
-/// Sweep op: full-store stats. Plan budget: 5 s @10k.
-const BUDGET_STATS: Duration = Duration::from_secs(5);
+/// embedded-ripgrep pass for `[[<target>]]` over the store, NOT a
+/// `read_to_string` of every content file once per candidate.
+///
+/// Plan budget 200 ms; measured ~340 ms HERE, in debug. The op does meet the
+/// plan budget in release (187 ms, `tests/PERF.md`) — the gap is the profile,
+/// not a regression, which is exactly why this file records debug numbers and
+/// PERF.md records release ones. Budgeted at the debug measurement so the
+/// guard tracks regression rather than re-litigating the plan.
+const BUDGET_GRAPH_UNSCOPED: Duration = Duration::from_millis(400);
+/// Loop op: `validate` (working set). The changed set and per-file checks are
+/// O(changed); incoming-linker discovery is a single embedded-ripgrep pass for
+/// the whole changed set (`Store::find_links_to_any`). Plan budget 1 s;
+/// measured ~1.13 s at ~250 changed.
+const BUDGET_VALIDATE_WORKING: Duration = Duration::from_millis(1_200);
+/// Sweep op: full-store validate. Plan budget 5 s; measured ~3.5 s.
+///
+/// Was ~12.3 s from 0.8.3 through 0.13.3, when the exact-casing check for
+/// wiki-link targets re-read whole directories per link (O(links x directory
+/// size)). 0.13.4 scoped a directory-listing cache to the sweep. The budget is
+/// set just above the fixed measurement so that regression could not hide here
+/// again.
+const BUDGET_VALIDATE_ALL: Duration = Duration::from_millis(4_000);
+/// Sweep op: full from-scratch index rebuild. Plan budget 10 s; measured
+/// ~1.3 s.
+const BUDGET_INDEX_REBUILD: Duration = Duration::from_millis(1_500);
+/// Sweep op: full-store stats. Plan budget 5 s; measured ~1.1 s.
+const BUDGET_STATS: Duration = Duration::from_millis(1_200);
 
-/// CI-variance headroom multiplier applied to every budget. A shared CI runner
-/// is routinely 2–4× slower than the dev machine PERF.md was measured on, and a
-/// cold process spawn dominates the tightest (50 ms) budget. We assert at
-/// `budget × SLACK` so the guard fires on a *structural* regression (an
-/// O(changed) op turning O(store), a sweep blowing into double-digit seconds)
-/// rather than on scheduler noise. The tight, honest numbers are PERF.md's job.
-const BUDGET_SLACK: u32 = 6;
+/// CI-variance headroom multiplier applied to every budget above.
+///
+/// Was 6 against the plan budgets, which made the effective headroom range
+/// from 79x to 2.1x depending on how far each op had drifted. Against measured
+/// budgets the headroom is uniform, so this number now means only "how much
+/// slower a shared runner may be".
+///
+/// At 3 the guard trips on roughly a 3.4x regression. It is deliberately NOT
+/// tight enough to catch a 2x drift: this test runs on shared GitHub runners
+/// whose timing varies several-fold, and a guard that flakes gets skipped,
+/// which is how a real regression survives. Catching smaller drift is
+/// `tests/PERF.md`'s job — re-measure it deliberately when touching these
+/// paths.
+const BUDGET_SLACK: u32 = 3;
 
 /// Warmup iterations (discarded) to prime the page cache before timing — matches
 /// the PERF.md method (cold-cache is the documented engine gap, not measured).

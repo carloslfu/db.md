@@ -256,6 +256,12 @@ pub fn validate_working_set(
     store: &Store,
     since: Option<DateTime<FixedOffset>>,
 ) -> crate::Result<Vec<Issue>> {
+    // Both validate entry points are read-only sweeps over a point-in-time
+    // store, so the exact-casing checks below may reuse directory listings for
+    // the length of the run instead of re-reading a folder once per wiki-link.
+    // The scope closes on return; nothing outside it is cached.
+    #[cfg(any(unix, windows))]
+    let _listings = crate::fsx::DirListingScope::open();
     if !store_marker_present(store) {
         return Ok(vec![not_a_store_issue(store)]);
     }
@@ -373,6 +379,12 @@ fn nested_store_issues(store: &Store) -> crate::Result<Vec<Issue>> {
 /// every-index sync (md + jsonl), and `log.md` ordering. CI / recovery, not the
 /// loop.
 pub fn validate_all(store: &Store) -> crate::Result<Vec<Issue>> {
+    // Both validate entry points are read-only sweeps over a point-in-time
+    // store, so the exact-casing checks below may reuse directory listings for
+    // the length of the run instead of re-reading a folder once per wiki-link.
+    // The scope closes on return; nothing outside it is cached.
+    #[cfg(any(unix, windows))]
+    let _listings = crate::fsx::DirListingScope::open();
     if !store_marker_present(store) {
         return Ok(vec![not_a_store_issue(store)]);
     }
@@ -7025,6 +7037,50 @@ mod tests {
         assert!(
             has(&issues, codes::INDEX_JSONL_MISSING),
             "a loose file with no layer index.jsonl must raise INDEX_JSONL_MISSING, got: {issues:?}"
+        );
+    }
+
+    /// The exact-casing checks reuse directory listings for the length of one
+    /// sweep. That cache must not outlive the sweep: a `Store` is long-lived in
+    /// `dbmd watch` and `dbmd api`, so a second validate on the same `Store`
+    /// has to see whatever changed on disk since the first.
+    ///
+    /// Guards the scoping, not the caching — if the listings are ever hoisted
+    /// to the process or to `Store`, the second sweep below keeps reporting the
+    /// first sweep's broken link and this fails.
+    #[test]
+    fn a_second_sweep_on_the_same_store_sees_files_written_since_the_first() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("store");
+        fs::create_dir_all(root.join("records/notes")).unwrap();
+        fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        fs::write(
+            root.join("records/notes/linker.md"),
+            "---\ntype: note\n---\nsee [[records/notes/target.md]]\n",
+        )
+        .unwrap();
+
+        let store = Store::open_strict(&root).unwrap();
+
+        // First sweep: the target does not exist yet, so the link is broken.
+        let before = validate_all(&store).unwrap();
+        assert!(
+            before.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
+            "the target is absent, so the first sweep must report a broken link"
+        );
+
+        // The target appears between sweeps, through the same live Store.
+        fs::write(
+            root.join("records/notes/target.md"),
+            "---\ntype: note\n---\ntarget body\n",
+        )
+        .unwrap();
+
+        let after = validate_all(&store).unwrap();
+        assert!(
+            !after.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
+            "the second sweep must see the file written since the first — a \
+             directory listing cached beyond one sweep would still call it broken"
         );
     }
 
