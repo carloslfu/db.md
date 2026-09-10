@@ -8,9 +8,21 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.13.4**.
+  `Cargo.toml`, currently **v0.13.5**.
 
 ## Unreleased
+
+## [0.13.5] — 2026-09-10
+
+### Fixed
+
+- Read nonempty JSON path arrays saved as text under `assets:` by older
+  string-valued CLI writes. Immutable source wrappers remain byte-identical;
+  each decoded asset retains required status and normal path, custody and
+  manifest checks. New records should use YAML lists. Other scalar forms and
+  the singular `asset:` key keep their existing interpretation.
+
+- Update the locked transitive `chacha20` dependency to 0.10.2 because 0.10.1 was yanked. The advisory check passes.
 
 ## [0.13.4] — 2026-08-31
 

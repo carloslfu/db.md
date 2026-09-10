@@ -1632,6 +1632,13 @@ an asset optional — a regenerable or nice-to-have artifact the store does not
 need to be byte-complete. The manager writes these keys on ingest; operators
 don't write frontmatter by hand.
 
+For compatibility with older string-valued CLI writes, a nonempty JSON array
+of path strings stored as a scalar under `assets:` is decoded once as required
+paths. New records should use the YAML list form. The singular `asset:` key,
+list entries, malformed JSON, empty arrays and mixed-type arrays retain their
+normal interpretation. Normalization, custody and manifest integrity checks
+still apply to every decoded path; historical source bytes need not change.
+
 When an immutable wrapper already requires an asset but a later, portable asset
 must replace it without rewriting that earlier evidence, the new wrapper may
 carry one `supersedes-asset: <old-path>` line alongside exactly one required

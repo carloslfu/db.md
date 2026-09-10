@@ -1062,7 +1062,7 @@ pub fn declared_assets(fm: &parser::Frontmatter) -> Vec<Declaration> {
         collect_declarations(&v, &mut out);
     }
     if let Some(v) = fm.get("assets") {
-        collect_declarations(&v, &mut out);
+        collect_assets_list(&v, &mut out);
     }
     out
 }
@@ -1076,7 +1076,7 @@ pub fn declarations_from_yaml_map(map: &BTreeMap<String, Value>) -> Vec<Declarat
         collect_declarations(v, &mut out);
     }
     if let Some(v) = map.get("assets") {
-        collect_declarations(v, &mut out);
+        collect_assets_list(v, &mut out);
     }
     out
 }
@@ -1124,6 +1124,26 @@ fn asset_supersession_from_parts(
         original,
         replacement,
     }))
+}
+
+/// Older string-valued CLI writes could preserve a JSON path array as a YAML
+/// scalar. Decode only a nonempty array of strings in the plural key, once.
+/// Every path still passes the ordinary normalization and custody checks.
+fn collect_assets_list(v: &Value, out: &mut Vec<Declaration>) {
+    if let Value::String(s) = v {
+        if s.trim_start().starts_with('[') {
+            if let Ok(paths) = serde_json::from_str::<Vec<String>>(s) {
+                if !paths.is_empty() {
+                    out.extend(paths.into_iter().map(|path| Declaration {
+                        path,
+                        required: true,
+                    }));
+                    return;
+                }
+            }
+        }
+    }
+    collect_declarations(v, out);
 }
 
 fn collect_declarations(v: &Value, out: &mut Vec<Declaration>) {
@@ -1318,6 +1338,85 @@ fn find_untracked(store: &Store, declared: &BTreeSet<String>) -> crate::Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_json_assets_scalar_preserves_paths_and_requiredness() {
+        let map = BTreeMap::from([(
+            "assets".to_string(),
+            Value::String(r#"["sources/a.txt","sources/b.json"]"#.to_string()),
+        )]);
+        let declarations = declarations_from_yaml_map(&map);
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[0].path, "sources/a.txt");
+        assert_eq!(declarations[1].path, "sources/b.json");
+        assert!(declarations.iter().all(|d| d.required));
+    }
+
+    #[test]
+    fn legacy_json_assets_scalar_keeps_invalid_paths_subject_to_guards() {
+        let map = BTreeMap::from([(
+            "assets".to_string(),
+            Value::String(r#"["../outside.txt","/etc/passwd"]"#.to_string()),
+        )]);
+        let declarations = declarations_from_yaml_map(&map);
+        assert_eq!(declarations.len(), 2);
+        assert!(declarations
+            .iter()
+            .all(|d| normalize_asset_path(&d.path).is_err()));
+    }
+
+    #[test]
+    fn legacy_json_assets_scalar_does_not_reinterpret_other_forms() {
+        for raw in ["sources/a.txt", "[]", "[broken", r#"["a",42]"#] {
+            let mut declarations = Vec::new();
+            collect_assets_list(&Value::String(raw.to_string()), &mut declarations);
+            assert_eq!(declarations.len(), 1);
+            assert_eq!(declarations[0].path, raw);
+        }
+        let raw = r#"["sources/a.txt"]"#;
+        let map = BTreeMap::from([("asset".to_string(), Value::String(raw.to_string()))]);
+        assert_eq!(declarations_from_yaml_map(&map)[0].path, raw);
+        let mut declarations = Vec::new();
+        collect_assets_list(
+            &Value::Sequence(vec![Value::String(raw.to_string())]),
+            &mut declarations,
+        );
+        assert_eq!(declarations[0].path, raw);
+    }
+
+    #[test]
+    fn legacy_json_assets_scalar_refresh_preserves_wrapper_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sources")).unwrap();
+        std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
+        let wrapper = "---\ntype: source-artifact\nsummary: captured email\nassets: '[\"sources/a.txt\",\"sources/b.json\"]'\n---\noriginal evidence\n";
+        std::fs::write(root.join("sources/email.md"), wrapper).unwrap();
+        std::fs::write(root.join("sources/a.txt"), "original body").unwrap();
+        std::fs::write(root.join("sources/b.json"), "{}").unwrap();
+        let store = Store::from_root_and_config(root, crate::parser::Config::default()).unwrap();
+        let report = refresh_wrapper(&store, "sources/email.md").unwrap();
+        assert_eq!(report.cataloged, 2);
+        let manifest = read_manifest(&store).unwrap();
+        assert_eq!(manifest.len(), 2);
+        assert!(manifest.iter().all(|r| r.required));
+        assert_eq!(
+            std::fs::read_to_string(root.join("sources/email.md")).unwrap(),
+            wrapper
+        );
+        std::fs::remove_file(root.join("sources/a.txt")).unwrap();
+        let refreshed = refresh_wrapper(&store, "sources/email.md").unwrap();
+        assert_eq!(refreshed.preserved, 1);
+        assert!(
+            read_manifest(&store)
+                .unwrap()
+                .iter()
+                .find(|r| r.path == "sources/a.txt")
+                .unwrap()
+                .required
+        );
+        assert!(refresh(&store, "sources/a.txt", "sources/email.md").is_err());
+    }
 
     #[test]
     fn supersession_cycles_exclude_only_cycle_members() {
