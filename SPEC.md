@@ -429,6 +429,14 @@ keeps agent-driven resolution deterministic.
   parser but `dbmd validate` warns (code `WIKI_LINK_HAS_EXTENSION`)
   and the canonical writers (`dbmd write`, `dbmd link`,
   `dbmd rename`) always emit the bare form.
+- Resolution appends `.md` and nothing else: a target names a
+  Markdown node, never a raw file. A binary kept under `sources/` is
+  reached through its wrapper (`[[sources/contracts/msa.pdf]]`
+  resolves to `sources/contracts/msa.pdf.md`), or declared under
+  `assets:` and cited as a plain path. A link whose only match is the
+  raw file is `WIKI_LINK_BROKEN` (see [Assets](#assets)). A hosted
+  brain stores no binaries as nodes, so this keeps `validate`, the
+  graph verbs and sync in agreement.
 - Optional `|display` segment overrides display text.
 - Wiki-links appear in:
   - **Scalar frontmatter fields** that reference other files —

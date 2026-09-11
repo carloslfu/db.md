@@ -12,6 +12,18 @@ Two things version independently:
 
 ## Unreleased
 
+### Changed
+
+- Wiki-link resolution appends `.md` only. A target that matches a raw file
+  but no Markdown node (`[[sources/x/thing.zip]]` with no `thing.zip.md`) is
+  now `WIKI_LINK_BROKEN` with a hint naming the wrapper, in `validate`, the
+  graph verbs and `stats` alike. This aligns the toolkit with SPEC § Assets
+  and with hosted sync, which stores no binaries as nodes and refused such
+  links with "mutation introduces a broken wiki-link" while local validation
+  passed. Migration: create `<file>.md` as the wrapper, or declare the file
+  under `assets:` and cite the path in prose. Local development build:
+  `0.13.5-dev.4`.
+
 ## [0.13.5] — 2026-09-10
 
 ### Fixed

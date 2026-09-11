@@ -537,8 +537,8 @@ pub fn orphans(store: &Store, layer: Option<Layer>) -> Result<Vec<PathBuf>, Stor
             if target.is_empty() || edge_key(&target) == self_key {
                 continue;
             }
-            // A live edge: resolves on disk (handles raw `.eml`/`.pdf` sources and
-            // store containment) OR matches a walked content file by NFC-folded
+            // A live edge: resolves to a Markdown node on disk (with store
+            // containment) OR matches a walked content file by NFC-folded
             // key (the cross-normalization case `resolve_existing` misses on a
             // byte-exact filesystem).
             if resolve_existing(store, Path::new(&target)).is_none()
@@ -952,16 +952,16 @@ fn is_within_store_target(target: &str) -> bool {
 }
 
 /// Resolve the store root + a store-relative path to the absolute on-disk file,
-/// trying the path as written and then with a `.md` extension. `None` if neither
-/// exists **or if the target resolves outside the store root** — a `..`-laden or
+/// with a `.md` extension appended: a wiki-link names a Markdown node, and a raw
+/// file at the literal path is an asset, never a node (SPEC § Assets). `None` if
+/// it does not exist **or if the target resolves outside the store root** — a `..`-laden or
 /// symlink-escaping wiki-link must never turn a graph read/traversal into a read
 /// of an arbitrary file outside the store (the `dbmd graph neighborhood`
 /// disclosure vector). Containment is enforced via the shared
 /// [`ensure_path_within_store`] gate, matching validate's safe-path guard.
 fn resolve_existing(store: &Store, store_relative: &Path) -> Option<PathBuf> {
-    if store.regular_file_exists(store_relative).ok()? {
-        return Some(store_relative.to_path_buf());
-    }
+    // `.md`-appended only. Mirrors `validate` and the hosted brain, so
+    // backlinks/orphans/neighborhood never report an edge a push would refuse.
     let normalized = normalize_target(store_relative);
     let with_md = PathBuf::from(format!("{normalized}.md"));
     if store.regular_file_exists(&with_md).ok()? {

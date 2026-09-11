@@ -1126,12 +1126,24 @@ fn check_wiki_link(
         );
     }
 
-    // Broken: target file doesn't exist (O(1) stat). Resolve the target the
-    // same way the graph engine does — the literal path first (so a link to a
-    // raw `.eml`/`.pdf` source kept verbatim under `sources/` resolves), then
-    // the `.md`-appended path.
+    // Broken: no Markdown node for the target (O(1) stat). Resolution appends
+    // `.md` only; a raw file at the literal path is an asset, not a node, and
+    // gets its own hint naming the wrapper it needs.
     match resolve_wiki_target(store, bare) {
         TargetResolution::Exists => {}
+        TargetResolution::NotMarkdown => push(
+            issues,
+            Severity::Error,
+            codes::WIKI_LINK_BROKEN,
+            rel,
+            line,
+            key.map(str::to_string),
+            format!("wiki-link target `{bare}` is a file but not a Markdown node"),
+            Some(format!(
+                "create `{bare}.md` as its wrapper, or declare the file under `assets:` and cite the path in prose instead of a wiki-link"
+            )),
+            vec![PathBuf::from(bare)],
+        ),
         TargetResolution::Missing => push(
             issues,
             Severity::Error,
@@ -1360,11 +1372,24 @@ fn check_schema_link(
             );
         } else {
             // Correct prefix — still surface a broken target so the agent sees
-            // one consistent vocabulary. Resolve like the graph engine (literal
-            // path first, then `.md`) so a `link to sources/` field pointing at a
-            // raw `.eml`/`.pdf` source isn't wrongly flagged broken.
+            // one consistent vocabulary. Resolution appends `.md` only: a
+            // `link to sources/` field must name the source's Markdown wrapper,
+            // not the raw `.eml`/`.pdf` bytes.
             match resolve_wiki_target(store, bare) {
                 TargetResolution::Exists => {}
+                TargetResolution::NotMarkdown => push(
+                    issues,
+                    Severity::Error,
+                    codes::WIKI_LINK_BROKEN,
+                    rel,
+                    line,
+                    Some(field.to_string()),
+                    format!("wiki-link target `{bare}` is a file but not a Markdown node"),
+                    Some(format!(
+                        "create `{bare}.md` as its wrapper, or declare the file under `assets:` and cite the path in prose instead of a wiki-link"
+                    )),
+                    vec![PathBuf::from(bare)],
+                ),
                 TargetResolution::Missing => push(
                     issues,
                     Severity::Error,
@@ -1860,8 +1885,8 @@ fn check_type_folder_index_md(
     // Stale entries + summary mismatch.
     for entry in &entries {
         let bare = entry.target.trim_end_matches(".md");
-        // Resolve like the graph engine (literal path first, then `.md`) so an
-        // index entry naming a raw `.eml`/`.pdf` source isn't reported stale.
+        // Resolve like the graph engine (`.md`-appended only): an index entry
+        // names a content file, and a raw `.eml`/`.pdf` is an asset, not one.
         let target_abs = match resolved_target_abs(store, bare) {
             Some(abs) => abs,
             None => {
@@ -3220,8 +3245,13 @@ fn safe_md_target_rel(bare: &str) -> Option<PathBuf> {
 
 /// How a wiki-link / index-entry target resolves on disk.
 enum TargetResolution {
-    /// The target exists (either as the literal path or with a `.md` suffix).
+    /// The target resolves to a Markdown node (`{bare}.md`).
     Exists,
+    /// A regular file exists at the literal path but it is not a Markdown node
+    /// (a raw `.pdf`/`.zip`/`.eml`): the link cannot resolve here or on a hosted
+    /// brain, which stores no binaries as nodes. Reported with a hint naming
+    /// the wrapper the link needs.
+    NotMarkdown,
     /// The target is a safe store-relative path but no file exists for it.
     Missing,
     /// The target escapes the store (absolute, `..`, prefix) — never probe it.
@@ -3229,13 +3259,14 @@ enum TargetResolution {
 }
 
 /// Resolve a bare wiki-link / index-entry target the way the graph engine does
-/// ([`crate::graph`]'s `resolve_existing`): try the path **as written** first
-/// (so a link to a raw non-`.md` source file kept verbatim under `sources/` —
-/// `[[sources/emails/x.eml]]`, `[[sources/contracts/y.pdf]]` — resolves to the
-/// real file), then the `.md`-appended path (the common case for content
-/// pages). Without trying the literal path first, a legal link to a raw source
-/// file is wrongly flagged `WIKI_LINK_BROKEN` even though `graph backlinks`
-/// resolves it.
+/// ([`crate::graph`]'s `resolve_existing`): the `.md`-appended path, and only
+/// that. A wiki-link is an edge between Markdown nodes; a raw non-`.md` file
+/// under `sources/` is an asset, never a node (SPEC § Assets), so
+/// `[[sources/contracts/y.pdf]]` resolves to the wrapper `y.pdf.md` and to
+/// nothing else. The hosted brain applies the same rule, so resolving the
+/// literal file here would pass a link locally that every push then refuses.
+/// A literal file that does exist is reported as
+/// [`TargetResolution::NotMarkdown`] so the hint can name the wrapper.
 fn resolve_wiki_target(store: &Store, bare: &str) -> TargetResolution {
     // The literal path and the `.md`-appended path share the same safety check
     // (`safe_md_target_rel` only differs by appending `.md`), so an unsafe bare
@@ -3243,10 +3274,20 @@ fn resolve_wiki_target(store: &Store, bare: &str) -> TargetResolution {
     if !is_safe_store_relative_path(Path::new(bare)) {
         return TargetResolution::Unsafe;
     }
-    match resolved_target_abs(store, bare) {
-        Some(_) => TargetResolution::Exists,
-        None => TargetResolution::Missing,
+    if resolved_target_abs(store, bare).is_some() {
+        return TargetResolution::Exists;
     }
+    // Tell "nothing there" apart from "a raw file is there", so the hint can
+    // name the wrapper. Exact-case, like the `.md` probe, so a wrong-case raw
+    // file stays Missing on every platform.
+    let literal = Path::new(bare);
+    if !bare.ends_with(".md")
+        && store.regular_file_exists(literal).unwrap_or(false)
+        && disk_case_matches(store, literal, bare)
+    {
+        return TargetResolution::NotMarkdown;
+    }
+    TargetResolution::Missing
 }
 
 /// The absolute on-disk path a bare wiki-link / index-entry target resolves to,
@@ -3278,13 +3319,11 @@ fn resolved_target_abs(store: &Store, bare: &str) -> Option<PathBuf> {
     if !is_safe_store_relative_path(Path::new(bare)) {
         return None;
     }
-    // The literal path, as written (e.g. an `.eml`/`.pdf` source file kept
-    // verbatim under `sources/`).
-    let literal = PathBuf::from(bare);
-    if store.regular_file_exists(&literal).ok()? && disk_case_matches(store, &literal, bare) {
-        return Some(literal);
-    }
-    // The `.md`-appended path (a content page referenced without its extension).
+    // Only the `.md`-appended path. A wiki-link names a Markdown node; a raw
+    // file at the literal path is an asset, never a node (SPEC § Assets), and
+    // is reached through its wrapper (`thing.pdf` → `thing.pdf.md`). The hosted
+    // brain applies exactly this rule, so a literal-file match here would pass a
+    // link locally that every push then refuses.
     let with_md_rel = format!("{bare}.md");
     let with_md = PathBuf::from(&with_md_rel);
     if store.regular_file_exists(&with_md).ok()? && disk_case_matches(store, &with_md, &with_md_rel)
@@ -6525,10 +6564,14 @@ mod tests {
     // ── Regression: WIKI_LINK_BROKEN on raw source files ─────────────────────
 
     #[test]
-    fn wiki_link_to_raw_source_file_resolves() {
-        // Regression: a body link to a raw `.eml`/`.pdf` source kept verbatim
-        // under `sources/` was flagged WIKI_LINK_BROKEN because the existence
-        // probe only ever stat'd `{bare}.md`. It must resolve the literal path.
+    fn wiki_link_to_raw_source_file_is_broken_with_wrapper_hint() {
+        // A wiki-link is an edge between Markdown nodes. A raw `.eml`/`.pdf`
+        // kept verbatim under `sources/` is an asset, never a node (SPEC
+        // § Assets), and a hosted brain stores no binaries as nodes: a link to
+        // the bare file passed here while every push carrying it was refused
+        // with "mutation introduces a broken wiki-link". This inverts the earlier
+        // regression that made the literal path resolve; the hint must name the
+        // wrapper so the repair is one file away.
         let fx = Fixture::new();
         fx.write("sources/emails/2026-05-22-elena.eml", "raw email bytes\n");
         fx.write(
@@ -6536,9 +6579,40 @@ mod tests {
             "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\nSee [[sources/emails/2026-05-22-elena.eml]] for context.\n",
         );
         let issues = fx.store_all();
+        let issue = find(&issues, codes::WIKI_LINK_BROKEN);
+        assert!(issue.is_error());
+        assert!(
+            issue.message.contains("not a Markdown node"),
+            "a bare raw-source link must be reported as a non-node target: {issues:#?}"
+        );
+        assert!(
+            issue
+                .suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("2026-05-22-elena.eml.md")),
+            "the hint must name the wrapper to create: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn wiki_link_to_raw_source_resolves_through_its_wrapper() {
+        // The sanctioned shape: the raw file plus a Markdown wrapper beside it.
+        // `[[sources/emails/x.eml]]` resolves to `x.eml.md`, exactly as a hosted
+        // brain resolves it, so validate and sync agree.
+        let fx = Fixture::new();
+        fx.write("sources/emails/2026-05-22-elena.eml", "raw email bytes\n");
+        fx.write(
+            "sources/emails/2026-05-22-elena.eml.md",
+            "---\ntype: email\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: wrapper\n---\n\nExtracted text.\n",
+        );
+        fx.write(
+            "records/contacts/a.md",
+            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\nSee [[sources/emails/2026-05-22-elena.eml]] for context.\n",
+        );
+        let issues = fx.store_all();
         assert!(
             !issues.iter().any(|i| i.code == codes::WIKI_LINK_BROKEN),
-            "a link to an existing raw source file must not be broken: {issues:#?}"
+            "a link to a wrapped raw source must resolve clean: {issues:#?}"
         );
     }
 
@@ -6586,10 +6660,9 @@ mod tests {
 
     #[test]
     fn wrong_case_raw_source_wiki_link_is_broken() {
-        // The literal-path candidate (raw `.eml`/`.pdf` sources kept verbatim)
-        // gets the same exact-case treatment as the `.md`-appended candidate: a
-        // wrong-case link to a raw source is broken on a case-sensitive host, so
-        // it must flag on macOS too.
+        // A wrong-case link to a raw source is broken twice over: the literal
+        // file is not a node, and the case does not match. It must flag on macOS
+        // as on Linux, and must never be mistaken for a wrapper.
         let fx = Fixture::new();
         fx.write("sources/emails/2026-05-22-elena.eml", "raw email bytes\n");
         fx.write(

@@ -128,14 +128,11 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
             }
             if existing_nodes.contains(target) {
                 linked_to.insert(target.clone());
-            } else if target_resolves_on_disk(store, target) {
-                // A link to an existing non-`.md` source artifact (a `.eml`,
-                // `.pdf`, …) is a live edge, not a broken one — `sources/` holds
-                // such files by design and `graph` resolves them on disk. The
-                // target has no `.md` node, so it can't be `linked_to` (no `.md`
-                // file is un-orphaned by it), but it must NOT be counted broken.
             } else {
-                // Broken links count occurrences, not distinct targets.
+                // Broken links count occurrences, not distinct targets. A raw
+                // non-`.md` file at the target path is an asset, never a node
+                // (SPEC § Assets), so it counts broken here exactly as
+                // `validate`, `graph` and the hosted brain report it.
                 stats.broken_link_count += 1;
             }
         }
@@ -152,9 +149,9 @@ pub fn compute(store: &Store) -> crate::Result<Stats> {
             *stats.type_distribution.entry(t.clone()).or_insert(0) += 1;
         }
 
-        let has_outgoing = file.resolvable_targets().any(|t| {
-            t != &file.node_id && (existing_nodes.contains(t) || target_resolves_on_disk(store, t))
-        });
+        let has_outgoing = file
+            .resolvable_targets()
+            .any(|t| t != &file.node_id && existing_nodes.contains(t));
         let has_incoming = linked_to.contains(&file.node_id);
         if !has_outgoing && !has_incoming {
             stats.orphan_count += 1;
@@ -361,89 +358,6 @@ fn is_full_path(target: &Path) -> bool {
     };
     let has_rest = parts.next().is_some();
     matches!(first.as_ref(), "sources" | "records") && has_rest
-}
-
-/// True if `target` stays inside the store: every component is `Normal` (a
-/// `CurDir` `.` is harmless and allowed), with no `..` (`ParentDir`), absolute
-/// (`RootDir`), or platform-prefix component. Mirrors
-/// `graph::is_within_store_target` and validate's `is_safe_store_relative_path`,
-/// so the containment decision is identical across the three surfaces. Used to
-/// gate any on-disk probe in [`target_resolves_on_disk`] before a `join`.
-fn is_within_store_target(target: &Path) -> bool {
-    target.components().all(|c| {
-        matches!(
-            c,
-            std::path::Component::Normal(_) | std::path::Component::CurDir
-        )
-    })
-}
-
-/// True if a full-path wiki-link `target` (already `.md`-stripped, store-
-/// relative) resolves to a real **non-`.md`** file on disk — a source artifact
-/// like a `.eml` or `.pdf` under `sources/`. Called only after the `.md` node
-/// set has already been checked, so this exists to reconcile stats with `graph`
-/// (which resolves on disk) and `validate`: a link to an existing source file
-/// is a live edge, never a broken link or an orphan-maker.
-///
-/// Two on-disk shapes are recognized, mirroring `graph::resolve_existing` plus
-/// the bare-stem case sources use:
-///
-/// - the target as written is itself a real file (`[[sources/emails/msg.eml]]`
-///   → `sources/emails/msg.eml`);
-/// - the target is a bare stem and a sibling file shares that stem with a
-///   non-`.md` extension (`[[sources/emails/msg]]` → `sources/emails/msg.eml`).
-///
-/// A bare `.md` target is *not* handled here (an existing `.md` file is already
-/// a node in `existing_nodes`); this is strictly the non-`.md` source case.
-///
-/// **Containment gate.** A target that escapes the store root (any `..`,
-/// absolute, or platform-prefix component) is never probed: it returns `false`
-/// before any `join`/`is_file`/`read_dir`, so `[[sources/../../secret]]` can
-/// never reach the filesystem as a live edge or existence oracle outside the
-/// store. This mirrors `graph::is_within_store_target` and validate's
-/// `is_safe_store_relative_path` (which reject `..` before any probe), keeping
-/// the broken-link surface in agreement: an escaping target is counted broken
-/// (validate's `WIKI_LINK_BROKEN`), never silently treated as resolved.
-fn target_resolves_on_disk(store: &Store, target: &Path) -> bool {
-    // Reject any non-`Normal` component (`..`, RootDir, Prefix) up front — never
-    // let a wiki-link turn a stats probe into a filesystem escape.
-    if !is_within_store_target(target) {
-        return false;
-    }
-    // The target as written points at a real file (e.g. an explicit `.eml`).
-    if store.open_regular(target).is_ok() {
-        return true;
-    }
-    // Bare-stem case: look for a sibling `<stem>.<ext>` with a non-`.md`
-    // extension in the target's parent directory. Restricted to the bare form
-    // (no extension on the target) so an explicit but missing `.pdf` link still
-    // reads as broken rather than silently matching a different file.
-    if target.extension().is_some() {
-        return false;
-    }
-    let stem = match target.file_name() {
-        Some(name) => name,
-        None => return false,
-    };
-    let parent = match target.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-    let entries = match store.regular_file_names(parent) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    for name in entries {
-        let path = Path::new(&name);
-        // Same stem, and an extension that is present and not `.md`.
-        if path.file_stem() == Some(stem) {
-            match path.extension().and_then(|e| e.to_str()) {
-                Some("md") | None => continue,
-                Some(_) => return true,
-            }
-        }
-    }
-    false
 }
 
 /// Read the `type:` value from a file's leading YAML frontmatter block, if the
@@ -1049,42 +963,62 @@ mod tests {
     }
 
     #[test]
-    fn regression_link_to_existing_non_md_source_is_a_live_edge() {
-        // Finding (high): a record that wiki-links to an existing non-`.md`
-        // source artifact (a `.eml`) must read as a LIVE edge, not broken, and
-        // the record is not an orphan. `sources/` holds such files by design.
+    fn link_to_raw_non_md_source_is_broken_and_orphans_the_linker() {
+        // A wiki-link is an edge between Markdown nodes. A raw `.eml` under
+        // `sources/` is an asset, never a node (SPEC § Assets), so a link to it
+        // is broken and gives the linker no outgoing edge, exactly as `validate`,
+        // `graph` and a hosted brain (which stores no binaries as nodes) see it.
+        // This inverts the earlier finding that treated such a link as live.
         let (_d, store) = temp_store();
-        // A real .eml source file (not a .md content file).
         write_rel(
             &store,
             "sources/emails/msg.eml",
             "From: someone@example.com\nSubject: Renewal\n\nBody text.\n",
         );
-        // A record with the SPEC-canonical bare link to that source.
         write_rel(
             &store,
             "records/contacts/sarah.md",
             "---\ntype: contact\nsummary: s\n---\n\nLinked source: [[sources/emails/msg]]\n",
         );
-
         let s = compute(&store).expect("compute");
         assert_eq!(
-            s.broken_link_count, 0,
-            "a link to an existing .eml source is live, not broken: {s:?}"
+            s.broken_link_count, 1,
+            "a bare-stem link to a raw .eml is broken: {s:?}"
         );
         assert_eq!(
-            s.orphan_count, 0,
-            "the linking record has a resolvable outgoing edge to the source: {s:?}"
+            s.orphan_count, 1,
+            "the linker has no live edge and nothing links to it: {s:?}"
         );
-        // The explicit-extension form resolves the same way.
+
+        // The explicit-extension form is broken the same way.
         write_rel(
             &store,
             "records/contacts/sarah.md",
             "---\ntype: contact\nsummary: s\n---\n\nLinked source: [[sources/emails/msg.eml]]\n",
         );
         let s2 = compute(&store).expect("compute");
-        assert_eq!(s2.broken_link_count, 0, "explicit .eml target resolves too");
-        assert_eq!(s2.orphan_count, 0);
+        assert_eq!(
+            s2.broken_link_count, 1,
+            "an explicit .eml target is broken too: {s2:?}"
+        );
+        assert_eq!(s2.orphan_count, 1);
+
+        // The sanctioned shape: a Markdown wrapper beside the raw file. The same
+        // link resolves to `msg.eml.md`, is a live edge, and un-orphans both.
+        write_rel(
+            &store,
+            "sources/emails/msg.eml.md",
+            "---\ntype: email\nsummary: wrapper\n---\n\nExtracted text.\n",
+        );
+        let s3 = compute(&store).expect("compute");
+        assert_eq!(
+            s3.broken_link_count, 0,
+            "a wrapped raw source resolves through its wrapper: {s3:?}"
+        );
+        assert_eq!(
+            s3.orphan_count, 0,
+            "the linker has an outgoing edge and the wrapper an incoming one: {s3:?}"
+        );
     }
 
     #[test]
@@ -1131,73 +1065,6 @@ mod tests {
             );
         }
         // The secret outside the store is untouched (we never followed the link).
-        assert_eq!(
-            fs::read_to_string(outside_dir.join("outside-secret.txt")).unwrap(),
-            "TOP SECRET\n"
-        );
-    }
-
-    #[test]
-    fn regression_target_resolves_on_disk_rejects_traversal_before_any_probe() {
-        // SECURITY regression at the helper level: `target_resolves_on_disk`
-        // must return `false` for any `..`-laden / absolute / prefix target
-        // BEFORE it joins, `is_file`s, or `read_dir`s — so a wiki-link can never
-        // turn a stats existence-probe into a read of a file OUTSIDE the store.
-        // Pre-fix the helper joined the raw target onto the store root with no
-        // containment gate, so a real file above the store made it return
-        // `true`. This asserts the gate directly on the helper (the end-to-end
-        // `compute()` path is covered separately above), exercising BOTH on-disk
-        // branches: the literal `is_file` branch (explicit extension) and the
-        // bare-stem `read_dir` branch.
-        // Nested store: `store.root.parent()` is this test's private tempdir, so
-        // the "above the store" files below never land in the shared `$TMPDIR`
-        // and can never collide with the sibling traversal test's identically
-        // named planted files when both run in parallel.
-        let (_d, store) = temp_store_nested();
-        // A real `sources/` tree exists (the literal/parent joins would have
-        // something to land near), matching a real store.
-        fs::create_dir_all(store.root.join("sources/emails")).unwrap();
-        // Plant matching files ABOVE the store root: one with the exact name the
-        // explicit-extension target points at, and one whose stem the bare-stem
-        // target would discover via `read_dir` of the (escaped) parent dir.
-        let outside_dir = store.root.parent().expect("store has a parent");
-        fs::write(outside_dir.join("outside-secret.txt"), "TOP SECRET\n").unwrap();
-        fs::write(outside_dir.join("outside-secret.eml"), "secret mail\n").unwrap();
-
-        // Explicit-extension traversal -> would hit the literal `is_file` branch.
-        assert!(
-            !target_resolves_on_disk(
-                &store,
-                &strip_md(Path::new("sources/../../outside-secret.txt"))
-            ),
-            "an explicit-extension `..` target escaping the store must not resolve on disk"
-        );
-        // Bare-stem traversal -> would hit the `read_dir(parent)` branch, where a
-        // sibling `outside-secret.eml` (non-`.md`) sits beside the escaped parent.
-        assert!(
-            !target_resolves_on_disk(&store, &strip_md(Path::new("sources/../../outside-secret"))),
-            "a bare-stem `..` target escaping the store must not resolve on disk"
-        );
-        // A `..` that stays nominally under a layer prefix is still an escape and
-        // is rejected before any probe.
-        assert!(
-            !target_resolves_on_disk(&store, Path::new("records/../records/secret")),
-            "any `..` component is rejected before a probe, even one re-entering a layer"
-        );
-
-        // Sanity: a legitimate in-store non-`.md` source DOES still resolve, so
-        // the gate did not over-reject and break the finding #117 behavior.
-        write_rel(
-            &store,
-            "sources/emails/msg.eml",
-            "From: a@b.com\nSubject: x\n\nbody\n",
-        );
-        assert!(
-            target_resolves_on_disk(&store, Path::new("sources/emails/msg")),
-            "a legitimate in-store bare-stem source link still resolves on disk"
-        );
-
-        // The secrets outside the store are untouched (we never followed a link).
         assert_eq!(
             fs::read_to_string(outside_dir.join("outside-secret.txt")).unwrap(),
             "TOP SECRET\n"
