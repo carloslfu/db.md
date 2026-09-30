@@ -249,6 +249,43 @@ const UPLOAD_RETRY_BACKOFF_MS: [u64; UPLOAD_ATTEMPTS - 1] = [200, 600, 1_500, 3_
 /// black-holed object can consume the per-attempt timeout six times, outlive
 /// its presigned capability, and make a large migration appear hung.
 const UPLOAD_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Large evidence files need a transfer budget, not a metadata-request budget.
+/// Allow 256 KiB/s plus the ordinary retry window, capped at one hour. This is
+/// shared by all attempts; a retry never buys another complete transfer window.
+const LARGE_UPLOAD_BYTES: u64 = 8 * 1024 * 1024;
+const UPLOAD_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
+const UPLOAD_MAX_TIMEOUT_SECS: u64 = 3_600;
+
+fn source_upload_budget(bytes: u64) -> std::time::Duration {
+    let seconds = if bytes <= LARGE_UPLOAD_BYTES {
+        UPLOAD_TOTAL_TIMEOUT_SECS
+    } else {
+        UPLOAD_TOTAL_TIMEOUT_SECS
+            .saturating_add(bytes.div_ceil(UPLOAD_MIN_BYTES_PER_SEC))
+            .min(UPLOAD_MAX_TIMEOUT_SECS)
+    };
+    std::time::Duration::from_secs(seconds)
+}
+
+/// ureq 2 checks its absolute deadline when reading the response, but streams
+/// request bodies with an ordinary io::copy. Check between file reads too, so
+/// continuous write progress cannot send the entire file after the deadline.
+struct UploadDeadlineReader<R> {
+    inner: R,
+    deadline: std::time::Instant,
+}
+
+impl<R: std::io::Read> std::io::Read for UploadDeadlineReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upload deadline exceeded",
+            ));
+        }
+        self.inner.read(buffer)
+    }
+}
 
 fn upload_retry_backoff_ms(attempt: usize) -> u64 {
     UPLOAD_RETRY_BACKOFF_MS[attempt.min(UPLOAD_RETRY_BACKOFF_MS.len() - 1)]
@@ -267,6 +304,20 @@ fn upload_attempt_timeout(deadline: std::time::Instant) -> LinkResult<std::time:
         return Err(upload_deadline_error());
     }
     Ok(remaining.min(std::time::Duration::from_secs(OVERALL_REQUEST_TIMEOUT_SECS)))
+}
+
+fn source_upload_attempt_timeout(
+    deadline: std::time::Instant,
+    bytes: u64,
+) -> LinkResult<std::time::Duration> {
+    if bytes <= LARGE_UPLOAD_BYTES {
+        return upload_attempt_timeout(deadline);
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(upload_deadline_error());
+    }
+    Ok(remaining)
 }
 
 fn wait_for_upload_retry(deadline: std::time::Instant, attempt: usize) -> bool {
@@ -8003,7 +8054,7 @@ fn put_presigned_source(
         store,
         source,
         shared,
-        std::time::Duration::from_secs(UPLOAD_TOTAL_TIMEOUT_SECS),
+        source_upload_budget(source.bytes),
     )
 }
 
@@ -8018,6 +8069,10 @@ fn put_presigned_source_with_budget(
 ) -> LinkResult<()> {
     // The URL's own safety checks run either way; only the connection pool is
     // shared, so a batch never trades a check for a warm socket.
+    // ureq 2 clears socket timeouts when returning a connection to its pool and
+    // does not restore them before the next request body. Give large streamed
+    // uploads a fresh pinned connection so their writes retain a finite timeout.
+    let shared = shared.filter(|_| source.bytes <= LARGE_UPLOAD_BYTES);
     let owned = match shared {
         Some(_) => {
             checked_presigned_url(cfg, raw)?;
@@ -8041,7 +8096,8 @@ fn put_presigned_source_with_budget(
         // client de-duplicates headers by exact name, not case, so setting
         // `Content-Length` here as well leaves both on the wire and an edge
         // rejects the request as malformed. Supply it only when absent.
-        let mut req = http.put(raw).timeout(upload_attempt_timeout(deadline)?);
+        let attempt_timeout = source_upload_attempt_timeout(deadline, source.bytes)?;
+        let mut req = http.put(raw).timeout(attempt_timeout);
         let mut has_content_length = false;
         if let Some(map) = headers.as_object() {
             for (name, value) in map {
@@ -8054,7 +8110,11 @@ fn put_presigned_source_with_budget(
         if !has_content_length {
             req = req.set("Content-Length", &source.bytes.to_string());
         }
-        match req.send(file) {
+        let reader = UploadDeadlineReader {
+            inner: file,
+            deadline: std::time::Instant::now() + attempt_timeout,
+        };
+        match req.send(reader) {
             // Every transport failure is retryable here, not only the
             // pre-request kinds: staging an object is idempotent (fixed content
             // address, exact length and checksum, write-once precondition), the
@@ -8135,7 +8195,15 @@ fn put_presigned_source_with_budget(
                     details: None,
                 })
             }
-            ureq::Error::Transport(error) => Err(object_store_transport_error(error)),
+            ureq::Error::Transport(error) => Err(LinkError::Transport {
+                hub: "the object store".to_string(),
+                message: format!(
+                    "network error ({:?}) uploading `{}` ({} bytes)",
+                    error.kind(),
+                    source.path,
+                    source.bytes
+                ),
+            }),
         },
     }
 }
@@ -19157,6 +19225,65 @@ mod tests {
             "stalled upload exceeded the wall-clock budget: {error}"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn source_upload_budgets_cover_large_files_without_unbounded_retries() {
+        use std::time::{Duration, Instant};
+
+        assert_eq!(source_upload_budget(0), Duration::from_secs(300));
+        assert_eq!(
+            source_upload_budget(LARGE_UPLOAD_BYTES),
+            Duration::from_secs(300)
+        );
+        // The real evidence archive that exhausted the old metadata deadline.
+        assert_eq!(
+            source_upload_budget(461_608_658),
+            Duration::from_secs(2_061)
+        );
+        assert_eq!(source_upload_budget(u64::MAX), Duration::from_secs(3_600));
+        let deadline = Instant::now() + source_upload_budget(461_608_658);
+        assert!(
+            source_upload_attempt_timeout(deadline, 461_608_658).unwrap()
+                > Duration::from_secs(2_000),
+            "large uploads must not retain the 120-second metadata deadline"
+        );
+        assert_eq!(
+            source_upload_attempt_timeout(deadline, 100).unwrap(),
+            Duration::from_secs(120)
+        );
+        assert!(source_upload_attempt_timeout(Instant::now(), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn upload_reader_stops_continuous_progress_at_its_deadline() {
+        use std::io::{Read as _, Write as _};
+        use std::time::{Duration, Instant};
+
+        struct SlowSink(usize);
+        impl std::io::Write for SlowSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut input = UploadDeadlineReader {
+            inner: std::io::repeat(0x5a).take(32 * 1024 * 1024),
+            deadline: Instant::now() + Duration::from_millis(100),
+        };
+        let mut sink = SlowSink(0);
+        let error = std::io::copy(&mut input, &mut sink).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            sink.0 < 32 * 1024 * 1024,
+            "expired upload sent the complete body"
+        );
+        sink.flush().unwrap();
     }
 
     #[test]
