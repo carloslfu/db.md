@@ -108,6 +108,8 @@ pub mod codes {
     /// a `DB.md ## Schemas` field declaration is malformed (empty or duplicate
     /// field name) or carries an unrecognized modifier.
     pub const DB_MD_SCHEMA_FIELD: &str = "DB_MD_SCHEMA_FIELD";
+    /// An explicit validation policy is malformed, stale, or not hash-matched.
+    pub const VALIDATION_POLICY_INVALID: &str = "VALIDATION_POLICY_INVALID";
     /// content file has no `type:`.
     pub const FM_MISSING_TYPE: &str = "FM_MISSING_TYPE";
     /// content file has no `created:`.
@@ -306,6 +308,7 @@ pub fn validate_working_set(
         // `--all` sweep does the ambiguity upgrade.
         check_content_file(store, rel, None, &mut issues);
     }
+    store.config.validation_policy.apply(store, &mut issues);
     issues.sort_by(issue_order);
     Ok(issues)
 }
@@ -342,6 +345,7 @@ fn validate_content_sweep(store: &Store) -> crate::Result<Vec<Issue>> {
     for rel in store.walk()? {
         check_content_file(store, &rel, None, &mut issues);
     }
+    store.config.validation_policy.apply(store, &mut issues);
     issues.sort_by(issue_order);
     Ok(issues)
 }
@@ -427,6 +431,7 @@ pub fn validate_all(store: &Store) -> crate::Result<Vec<Issue>> {
     // a fresh clone with no restored bytes still passes here.
     check_assets(store, &parsed, &mut issues);
 
+    store.config.validation_policy.apply(store, &mut issues);
     issues.sort_by(issue_order);
     Ok(issues)
 }
@@ -2312,7 +2317,9 @@ fn check_log_file(
                 vec![],
             ),
             Some((ts, kind, _object)) => {
-                if !RECOGNIZED_LOG_KINDS.contains(&kind.as_str()) {
+                if !RECOGNIZED_LOG_KINDS.contains(&kind.as_str())
+                    && !store.config.validation_policy.recognizes_log_kind(&kind)
+                {
                     push(
                         issues,
                         Severity::Warning,
@@ -2687,6 +2694,11 @@ fn check_db_md_schemas(
                 let name = field.trim();
                 if name.is_empty()
                     || declared.get(name).copied() == Some(true)
+                    || (declared.contains_key(name)
+                        && store
+                            .config
+                            .validation_policy
+                            .allows_optional_unique(type_name, key_fields))
                     || !flagged.insert(name)
                 {
                     continue;

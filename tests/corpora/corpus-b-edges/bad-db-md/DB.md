@@ -32,3 +32,8 @@ every key field should be `required`.
 - date (required, date)
 - vendor (link to records/companies/)
 - unique: date, amount, vendor
+
+## Policies
+
+### Validation log kinds
+- *

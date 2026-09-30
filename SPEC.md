@@ -514,7 +514,8 @@ the canonical collision modes:
   optional field therefore silently stops checking the records that
   omit it: **build `unique:` keys from `required` fields.**
   `dbmd validate` warns (`DB_MD_SCHEMA_FIELD`) when a key names a field
-  the schema does not mark `required`.
+  the schema does not mark `required`, unless the store explicitly declares
+  that exact constraint under `### Optional unique keys` (see Policies).
 
 No type carries a built-in dedup key — the store opts in, per type. A
 `### contact` schema with `unique: email` warns on two contacts sharing
@@ -668,6 +669,34 @@ Don't synthesize conclusion records from sources tagged `transient`.
   - **`### Ignored types`** — type list the curator never
     synthesizes (still readable as ambient context, but no
     derived `meta-type: conclusion` records, no new records).
+  - **`### Validation log kinds`** — additional case-sensitive log-kind
+    tokens, one per bullet. Standard kinds remain valid. Tokens contain only
+    ASCII letters, digits, `_` and `-` (1–128 bytes); duplicates are errors.
+    Unknown labels still warn; timestamp and ordering checks are unchanged.
+  - **`### Optional unique keys`** — one JSON object per bullet, with exactly
+    `type`, `fields` (a nonempty array of distinct field names in the order of
+    an existing `unique:` key), and `reason`. All fields must be declared.
+    This acknowledges intentional NULLS DISTINCT behavior, not exemption from
+    duplicate detection: present complete values still collide normally.
+    Example: `- {"type":"artifact","fields":["original_path"],"reason":"Some evidence has no original path"}`.
+  - **`### Preserved source summaries`** — one JSON object per bullet, with
+    exactly `path`, `sha256`, and `reason`. `path` is an exact, canonical,
+    case-sensitive `sources/…/*.md` content path (no globs, hidden components,
+    traversal, symlinks or nested stores). `sha256` is the lowercase SHA-256
+    of the complete existing UTF-8 file bytes. Only its `SUMMARY_TOO_LONG`
+    warning becomes **info**, retaining the code, original message and reason.
+    All other findings remain unchanged, especially errors. Missing/changed
+    files and no-longer-overlong summaries make the policy invalid; new files
+    never inherit an exception. This preserves immutable historical evidence
+    without claiming its metadata was repaired or suppressing future defects.
+
+    These three policy lists are bounded to 256 entries each. Reasons are
+    required, nonempty single-line strings of at most 1,000 bytes. Malformed,
+    duplicate, stale or mismatched declarations emit `VALIDATION_POLICY_INVALID`
+    (**error**) on both working-set and full validation. Policy checks add
+    bounded policy-file reads, not a whole-store walk. These are opt-in,
+    additive toolkit policies; older validators continue to report the original
+    warnings. No policy can waive an integrity error.
 - **`## Schemas`** — the store's type definitions. This is the **only**
   source of schema enforcement; the toolkit ships no built-in or implicit
   per-type schema. Parseable and enforced by `dbmd validate`.
@@ -703,7 +732,8 @@ Don't synthesize conclusion records from sources tagged `transient`.
     target; a list field compares as a sorted set. A record missing any
     key field (or leaving it empty) is skipped — an incomplete key never
     collides — so **every key field should be `required`**;
-    `dbmd validate` warns (`DB_MD_SCHEMA_FIELD`) otherwise.
+    `dbmd validate` warns (`DB_MD_SCHEMA_FIELD`) otherwise, unless that exact
+    constraint is declared under `### Optional unique keys`.
   - `summary_template: <template>` — the `{field}`-interpolation pattern
     `dbmd fm init` / `dbmd write` use to compose this type's default
     `summary` (see [Example types](#example-types)).
@@ -893,7 +923,7 @@ PASS — 0 errors, 2 warnings (unknown type `proposal` in records/proposals/x.md
 
 **Conventions:**
 - Entry header: `## [YYYY-MM-DD HH:MM] <kind> | <object>` (object optional for store-wide actions like `validate`).
-- Recognized kinds: `ingest`, `create`, `update`, `delete`, `rename`, `link`, `validate`, `index-rebuild`, `contradiction`. Custom kinds are valid; `dbmd validate` warns on unrecognized kinds without failing.
+- Recognized kinds: `ingest`, `create`, `update`, `delete`, `rename`, `link`, `validate`, `index-rebuild`, `contradiction`, plus the store's `### Validation log kinds`. Custom kinds are valid; `dbmd validate` warns on undeclared kinds without failing.
 - Body (one or more lines) explains what happened.
 - Append-only. The curator never rewrites past entries; if a finding is wrong, append a corrective entry below it.
 - Parseable with `grep "^## \[" log.md | tail -5` or any similar pipeline (or `dbmd log tail`).
@@ -1279,7 +1309,8 @@ see; grouped by category):
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |
 | `SUMMARY_EMPTY` | error | `summary` present but empty |
 | `SUMMARY_MULTILINE` | error | `summary` contains newlines |
-| `SUMMARY_TOO_LONG` | warning | `summary` > 200 chars |
+| `SUMMARY_TOO_LONG` | warning / info | `summary` > 200 chars; info only for an exact hash-bound preserved-source acknowledgement |
+| `VALIDATION_POLICY_INVALID` | error | explicit validation policy is malformed, duplicated, stale, refers to an undeclared unique key, or fails its exact source-byte hash |
 | `WIKI_LINK_SHORT_FORM` | error | target isn't a full store-relative path |
 | `WIKI_LINK_BROKEN` | error | target file doesn't exist |
 | `WIKI_LINK_PROJECTION_UNRESOLVED` | info | exact target is absent from an explicitly declared partial projection; restore it for full semantic completeness |

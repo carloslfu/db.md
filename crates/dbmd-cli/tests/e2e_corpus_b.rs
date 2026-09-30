@@ -636,9 +636,8 @@ fn bad_db_md_substore_is_a_boundary_and_emits_its_own_db_md_codes() {
          EXTRA (emitted, not in EXPECTED): {extra:#?}"
     );
 
-    // The exact four codes, with the right severities (2 errors + 3 warnings:
-    // one DB_MD_UNKNOWN_SECTION plus two DB_MD_SCHEMA_FIELD unique-key
-    // warnings — `amount` undeclared, `vendor` declared but optional).
+    // Five codes: 3 errors (identity plus invalid wildcard policy) and
+    // 3 warnings (unknown section and the two optional/undeclared key fields).
     assert_eq!(
         code_histogram(report["issues"].as_array().unwrap()),
         code_histogram(golden["issues"].as_array().unwrap()),
@@ -656,12 +655,13 @@ fn bad_db_md_substore_is_a_boundary_and_emits_its_own_db_md_codes() {
             "DB_MD_BAD_TYPE",
             "DB_MD_MISSING_FIELD",
             "DB_MD_SCHEMA_FIELD",
-            "DB_MD_UNKNOWN_SECTION"
+            "DB_MD_UNKNOWN_SECTION",
+            "VALIDATION_POLICY_INVALID"
         ]),
-        "exactly the four DB.md-structure codes fire"
+        "exactly the five DB.md-structure/policy codes fire"
     );
 
-    // Summary tallies match the golden (2 errors, 3 warnings, 0 info, total 5).
+    // Summary tallies match the golden (3 errors, 3 warnings, 0 info, total 6).
     for k in ["errors", "warnings", "info", "total"] {
         assert_eq!(
             report["summary"][k], golden["summary"][k],

@@ -873,6 +873,8 @@ pub struct Config {
     /// `## Policies` → `### Ignored types`: type names the curator never
     /// synthesizes (still readable as ambient context).
     pub ignored_types: Vec<String>,
+    /// Explicit validation vocabulary and hash-bound source acknowledgements.
+    pub validation_policy: crate::validation_policy::ValidationPolicy,
     /// `## Schemas` → one entry per `### <type>` sub-section.
     pub schemas: BTreeMap<String, Schema>,
     /// `## Folders` → optional per-folder display + description, surfaced in the
@@ -1602,6 +1604,25 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
                             .into_iter()
                             .flat_map(|b| extract_type_list_bullet(&b))
                             .collect();
+                    }
+                    ("policies", "validation log kinds") => {
+                        for b in validation_policy_bullets(&section.body) {
+                            config.validation_policy.add_log_kind(bullet_content(&b));
+                        }
+                    }
+                    ("policies", "optional unique keys") => {
+                        for b in validation_policy_bullets(&section.body) {
+                            config
+                                .validation_policy
+                                .add_optional_unique(bullet_content(&b));
+                        }
+                    }
+                    ("policies", "preserved source summaries") => {
+                        for b in validation_policy_bullets(&section.body) {
+                            config
+                                .validation_policy
+                                .add_preserved_summary(bullet_content(&b));
+                        }
                     }
                     ("schemas", _) => {
                         // The H3 heading text (as written) is the type name.
@@ -2537,6 +2558,33 @@ fn section_prose(section_body: &str) -> String {
 
 /// The bullet lines (`-`/`*`/`+`) of a section body, excluding the heading
 /// line, each returned with its leading whitespace trimmed.
+/// Policy examples in fenced blocks and nested explanatory subsections do not
+/// declare authority. Only direct, unfenced bullets in the named H3 count.
+fn validation_policy_bullets(section_body: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut fence = None;
+    for line in section_body.lines().skip(1) {
+        if let Some(f) = fence {
+            if is_closing_fence(line, f) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(f) = opening_fence(line) {
+            fence = Some(f);
+            continue;
+        }
+        if heading_level(line) != 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ") {
+            result.push(line.to_string());
+        }
+    }
+    result
+}
+
 fn bullet_lines(section_body: &str) -> Vec<String> {
     section_body
         .lines()

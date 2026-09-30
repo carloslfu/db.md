@@ -12,6 +12,15 @@ Two things version independently:
 
 ## Unreleased
 
+### Added
+
+- Explicit `DB.md` validation policies for custom log kinds, intentional
+  optional-field unique keys, and hash-bound acknowledgements of overlong
+  summaries in immutable sources. Duplicate detection and all integrity errors
+  remain enforced; accepted source warnings stay visible as informational
+  findings. Malformed or stale policy fails both full and working-set checks.
+  Local development build: `0.13.5-dev.1` (not a published release).
+
 ### Changed
 
 - Wiki-link resolution appends `.md` only. A target that matches a raw file
@@ -23,6 +32,15 @@ Two things version independently:
   passed. Migration: create `<file>.md` as the wrapper, or declare the file
   under `assets:` and cite the path in prose. Local development build:
   `0.13.5-dev.4`.
+
+### Fixed
+
+- Large streamed sync uploads receive a size-based transfer budget capped at
+  one hour and shared across retries. The client checks the deadline during
+  body streaming and uses a fresh pinned connection for large files, avoiding
+  cleared write timeouts on pooled sockets. Transport errors name the affected
+  local path and byte count without exposing signed URLs. Local development
+  build: `0.13.5-dev.2`, retaining the validation policies above.
 
 ## [0.13.5] — 2026-09-10
 

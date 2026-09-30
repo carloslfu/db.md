@@ -13,7 +13,7 @@ independent source of truth the tool is measured against.
 |------|-----------------|----------------|
 | `validate.json` | The complete issue array for the store sweep. | `dbmd validate --all --json tests/corpora/corpus-b-edges` |
 | `not-a-store.json` | The single `NOT_A_STORE` error for the no-`DB.md` sibling. | `dbmd validate --json tests/corpora/corpus-b-edges/not-a-store` |
-| `bad-db-md.json` | The `DB_MD_*` issues for the `bad-db-md/` sub-store (separate invocation): the three identity-contract issues plus the two `DB_MD_SCHEMA_FIELD` unique-key warnings. | `dbmd validate --all --json tests/corpora/corpus-b-edges/bad-db-md` |
+| `bad-db-md.json` | The nested store's three identity-contract issues, two unique-key warnings, and invalid wildcard validation-policy error. | `dbmd validate --all --json tests/corpora/corpus-b-edges/bad-db-md` |
 | `policy-refusal/*.json` | Write-time `POLICY_FROZEN_PAGE` refusals (one per write surface). | `dbmd write` / `fm set` / `rename` / `link` against a frozen path |
 | `coverage.json` | Maps **every** SPEC code → the fixture(s) that seed it. The e2e test asserts the map contains only real SPEC codes, that every code the golden emits is mapped, and that the bookkeeping (`spec_code_count` / `all_spec_codes_covered` / `uncovered_spec_codes`) agrees with the live SPEC table — so it can't drift or over-claim. | derived from the SPEC table |
 
@@ -21,10 +21,10 @@ independent source of truth the tool is measured against.
 diffing. The runner should compare as a **set** of issue objects (order
 independent) OR sort the tool output the same way before diffing.
 
-## Coverage — 41 of the SPEC § Validation codes are seeded
+## Coverage — 42 of the SPEC § Validation codes are seeded
 
-The SPEC § Validation table defines **52** codes. This corpus seeds
-**41** of them (the seeding table below has 41 rows) and deliberately
+The SPEC § Validation table defines **53** codes. This corpus seeds
+**42** of them (the seeding table below has 42 rows) and deliberately
 leaves the rest uncovered — the five `ASSET_*` asset-manifest codes,
 `FM_UNREADABLE`, `FM_MISSING_CREATED`, `FM_MISSING_UPDATED`,
 `FM_BAD_META_TYPE` (every seeded records file carries a valid, or
@@ -32,7 +32,7 @@ absent-defaulting-to-`fact`, `meta-type`), and the v0.4 `FM_BAD_ID`
 (every explicit id in this corpus is a legal opaque token — v0.4 keeps
 hand-authored slug ids silent by design, so they must NOT fire it; the
 structural trigger is unit-tested in `dbmd-core`). One of the
-41, `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md
+42, `INDEX_JSONL_DESYNC`, is also plan-mandated (db-md-rust-toolkit.md
 line 494) and is grouped under `plan_extensions` in `coverage.json` for
 provenance — it still counts as a seeded SPEC code. `coverage.json`
 therefore records `all_spec_codes_covered: false` and lists those eleven
@@ -52,7 +52,8 @@ clients sidecars each kept a single deliberately-stale projected field;
 `DUP_UNIQUE_KEY` six times — one per dup-pair fixture) in
 `validate.json`; the four `DB_MD_*` codes (the three identity-contract
 codes plus the `DB_MD_SCHEMA_FIELD` unique-key warnings) are a
-separate invocation on the `bad-db-md/` sub-store (`bad-db-md.json`);
+separate invocation on the `bad-db-md/` sub-store (`bad-db-md.json`), together
+with its `VALIDATION_POLICY_INVALID` wildcard log-kind declaration;
 `NOT_A_STORE` is a separate invocation (`not-a-store.json`);
 `POLICY_FROZEN_PAGE` is write-time (`policy-refusal/`).
 
@@ -64,6 +65,7 @@ separate invocation on the `bad-db-md/` sub-store (`bad-db-md.json`);
 | `DB_MD_MISSING_FIELD` | error | `bad-db-md/DB.md` (no `owner`) | block top line 1 — separate invocation |
 | `DB_MD_UNKNOWN_SECTION` | warning | `bad-db-md/DB.md` (`## Glossary`) | heading line 18 — separate invocation |
 | `DB_MD_SCHEMA_FIELD` | warning ×2 | `bad-db-md/DB.md` (`### expense` `unique:` key on `amount` undeclared + `vendor` optional) | heading line 31 — separate invocation |
+| `VALIDATION_POLICY_INVALID` | error | `bad-db-md/DB.md` (`Validation log kinds` wildcard) | DB.md, no single line — separate invocation |
 | `FM_MISSING_TYPE` | error | `records/misc/no-type.md` | no `type:` key (line 1) |
 | `FM_MALFORMED_YAML` | error | `records/misc/malformed-yaml.md` | unparseable block (line 1) |
 | `FM_BAD_TIMESTAMP` | error | `sources/emails/2026/05/bad-timestamp.md` | `created` line 4 |
