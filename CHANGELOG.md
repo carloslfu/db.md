@@ -8,20 +8,60 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.13.5**.
+  `Cargo.toml`, currently **v0.14.0**.
 
 ## Unreleased
 
-### Added
+## [0.14.0] — 2026-09-30
 
-- Explicit `DB.md` validation policies for custom log kinds, intentional
-  optional-field unique keys, and hash-bound acknowledgements of overlong
-  summaries in immutable sources. Duplicate detection and all integrity errors
-  remain enforced; accepted source warnings stay visible as informational
-  findings. Malformed or stale policy fails both full and working-set checks.
-  Local development build: `0.13.5-dev.1` (not a published release).
+Implements format v0.4. The on-disk format is unchanged; SPEC § Validation,
+§ Pre-write checks and the `### Blocking warnings` policy are updated.
+
+A real store accumulated five schema errors and two warnings while every
+session's `dbmd validate` reported zero issues. A script wrote `source-kind`
+for the schema's `source_kind`, `dbmd write` accepted it, two declared assets
+were never cataloged, and the default check never looked at any of those files
+because it read its scope from `log.md`. This release closes each path.
 
 ### Changed
+
+- **`dbmd validate` takes its working set from the filesystem, never from
+  `log.md`.** The default now checks every content file whose size,
+  modification time or change time differs from what the last default run
+  recorded (or that is new), every file that still had an error or warning,
+  and every file linking to a changed or removed path. Previously the scope
+  was the objects named by six standard log kinds since the last `validate`
+  entry, so a file that was never logged, or was logged under a custom or
+  store-declared kind, went unexamined whenever any standard entry existed,
+  and a logged `validate` entry hid everything before it. The record lives in
+  the store-local `.dbmd/validate-state.json`, beside a `.dbmd/.gitignore`
+  that keeps it out of version control. It is bound to the toolkit version,
+  the exact `DB.md` bytes and the store directory's identity, so a new
+  toolkit, a schema or policy change, or a copied store gets a full per-file
+  sweep. Findings now stay visible on every default run until they are fixed.
+  `--since` checks files modified or changed at or after the cutoff plus the
+  objects the log names since then, and records nothing.
+- **Writes refuse what validation would reject.** `dbmd write` refuses a new
+  content file, and `dbmd fm set` an edit that introduces, any file-local
+  finding: a missing required field, an enum or shape violation, a near-miss
+  key, a summary over 200 characters, a malformed timestamp or id, a
+  short-form wiki-link. Nothing is written; the error is `WRITE_INVALID`
+  (exit 6) and lists each finding with its fix. An edit never fails on a
+  finding the file already had, so repairs can proceed one field at a time.
+  `dbmd fm init` refuses an explicit summary over 200 characters. Findings
+  that depend on other files (a link to a page not written yet, duplicates)
+  remain `dbmd validate` findings. Migration: pass a record's required schema
+  fields in the same `dbmd write` call (`--fm field=value`).
+- **Declared assets are cataloged with their wrapper.** `dbmd write` and
+  `dbmd fm set asset=…` refuse a declared asset that is not in the store
+  (`ASSET_NOT_FOUND`) and catalog a present one in `assets.jsonl` in the same
+  step. The default validation now reports `ASSET_UNDECLARED` for a changed
+  wrapper whose asset is not cataloged.
+- **One rule for choosing the store.** `validate`, `stats` and `emit` accept
+  `--dir DIR` as well as their positional `DIR`; `dbmd log <kind> <object>`
+  accepts `--dir` and, without it, appends to the nearest store above the
+  working directory; `dbmd fm set` / `fm init` run from outside every store
+  operate on the file's own store.
 
 - Wiki-link resolution appends `.md` only. A target that matches a raw file
   but no Markdown node (`[[sources/x/thing.zip]]` with no `thing.zip.md`) is
@@ -30,8 +70,23 @@ Two things version independently:
   and with hosted sync, which stores no binaries as nodes and refused such
   links with "mutation introduces a broken wiki-link" while local validation
   passed. Migration: create `<file>.md` as the wrapper, or declare the file
-  under `assets:` and cite the path in prose. Local development build:
-  `0.13.5-dev.4`.
+  under `assets:` and cite the path in prose.
+
+### Added
+
+- `FM_KEY_NEAR_MISS` (warning): a frontmatter key that differs from a schema
+  or core key only by case or `-`/`_`, such as `source-kind` for
+  `source_kind`. `SCHEMA_MISSING_REQUIRED` now suggests the rename when such
+  a key is present.
+- `### Blocking warnings` policy: the bullet `- all` makes every remaining
+  warning fail validation in both scopes, so anything gated on validation
+  refuses it. Any other bullet is `VALIDATION_POLICY_INVALID`.
+
+- Explicit `DB.md` validation policies for custom log kinds, intentional
+  optional-field unique keys, and hash-bound acknowledgements of overlong
+  summaries in immutable sources. Duplicate detection and all integrity errors
+  remain enforced; accepted source warnings stay visible as informational
+  findings. Malformed or stale policy fails both full and working-set checks.
 
 ### Fixed
 
@@ -39,8 +94,7 @@ Two things version independently:
   one hour and shared across retries. The client checks the deadline during
   body streaming and uses a fresh pinned connection for large files, avoiding
   cleared write timeouts on pooled sockets. Transport errors name the affected
-  local path and byte count without exposing signed URLs. Local development
-  build: `0.13.5-dev.2`, retaining the validation policies above.
+  local path and byte count without exposing signed URLs.
 
 ## [0.13.5] — 2026-09-10
 
