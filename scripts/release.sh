@@ -155,6 +155,12 @@ preflight_release_builder() {
         x86_64-pc-windows-msvc >/dev/null
     rustup toolchain install "$LINUX_RUST_TOOLCHAIN" \
         --profile minimal --force-non-host >/dev/null
+    rustup target add --toolchain "$LINUX_RUST_TOOLCHAIN" \
+        x86_64-unknown-linux-musl aarch64-unknown-linux-musl >/dev/null
+    # CI's `cross` installs rust-src for the mounted toolchain, and rustc then
+    # embeds standard-library paths under /rust/lib/rustlib/src/rust instead of
+    # /rustc/<commit>. Without it the Linux rebuild differs from CI in .rodata.
+    rustup component add --toolchain "$LINUX_RUST_TOOLCHAIN" rust-src >/dev/null
 
     for builder_image in \
         'ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99' \
@@ -853,3 +859,17 @@ test "$(
 )" = "$tag" || die "latest did not converge to $tag"
 printf 'Release %s converged: independent rebuild, crates.io, immutable assets, attestations, Homebrew, latest.\n' \
     "$tag"
+
+# The installers resolve `latest` and every digest from an independently
+# deployed manifest that this controller deliberately cannot write (RELEASING.md,
+# "Trust the release for the installers"). Report that remaining manual step
+# instead of letting it be skipped silently; it never changes the exit status.
+trusted_latest_url="${DBMD_TRUSTED_LATEST_URL:-https://www.sevrahq.com/api/hub/releases/dbmd/latest}"
+trusted_latest="$(curl -fsS --max-time 20 "$trusted_latest_url" 2>/dev/null | tr -d '[:space:]')" ||
+    trusted_latest=""
+if [ "$trusted_latest" = "$version" ]; then
+    printf 'Installers trust %s.\n' "$version"
+else
+    printf 'NOT DONE: the installers still serve %s. Trust %s in their independent manifest (RELEASING.md, "Trust the release for the installers").\n' \
+        "${trusted_latest:-an unreadable version}" "$version" >&2
+fi

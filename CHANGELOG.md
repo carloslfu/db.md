@@ -12,6 +12,18 @@ Two things version independently:
 
 ## Unreleased
 
+### Changed
+
+- **Release controller:** after converging, it reads the installers' independent
+  manifest and prints `NOT DONE` while that manifest still serves an older
+  version. `RELEASING.md` documents the manual trust step; 0.13.5 had skipped
+  it, so the installers kept serving 0.13.4.
+- **Release controller preflight** installs the musl standard libraries and
+  `rust-src` for the Linux toolchain before it pushes a tag. The 0.14.0 run found
+  both missing only at the independent Linux rebuild, after the tag push:
+  without `rust-src`, rustc embeds `/rustc/<commit>` standard-library paths where
+  CI's `cross` build embeds `/rust/lib/rustlib/src/rust`, so the binaries differ.
+
 ## [0.14.0] — 2026-09-30
 
 Implements format v0.4. The on-disk format is unchanged; SPEC § Validation,

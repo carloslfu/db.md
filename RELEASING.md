@@ -9,6 +9,9 @@ Bump the version and push `main`, then run the release controller. It creates
 or resumes the exact tag/run, independently rebuilds all four release targets
 and byte-compares their binaries before approving publication, then converges
 crates.io, the immutable GitHub release, Homebrew, and finally `latest`.
+The installers only see the release once it is trusted in their independent
+manifest; that last step is manual by design (see "Trust the release for the
+installers").
 
 ```sh
 # 1. bump version (see "Files to bump" below), then:
@@ -34,6 +37,7 @@ controller has reviewed the independent rebuild.
 | Publish immutable GitHub release (not latest yet) | CI, only after both crates converge |
 | Bump the Homebrew tap formula (`carloslfu/homebrew-tap`) | local controller via optimistic GitHub Contents API |
 | Promote GitHub release to latest | local controller, final convergence step |
+| Trust the release in the installers' independent manifest | **you / agent**, after the controller (see "Trust the release for the installers") |
 | Release authorization | protected-environment approval by the authenticated local controller |
 
 Pushing to `main` never publishes. Only a `vX.Y.Z` tag does.
@@ -101,6 +105,30 @@ Then confirm on the web (crates.io rate-limits scripted curl — use a browser):
 - `https://crates.io/crates/dbmd-cli/versions` — new version shows **"VIA GITHUB"**
   (that label = it was published by Trusted Publishing / OIDC, not a token).
 - `https://docs.rs/crate/dbmd-core/X.Y.Z` — builds within a few minutes of publish.
+
+## Trust the release for the installers
+
+`scripts/install.sh` and `scripts/install.ps1` take `latest` and each asset's
+SHA-256 from an independently deployed manifest
+(`https://www.sevrahq.com/api/hub/releases/dbmd`), not from the release
+itself. A compromised release origin therefore cannot choose both the bytes and
+the digest, and neither CI nor the controller can write that manifest. Until it
+trusts the new version, the installers keep installing the previous one, and
+`DBMD_VERSION=X.Y.Z` fails with "no valid independent checksum".
+
+After the controller converges:
+
+1. Take the five digests from the release's `SHA256SUMS`. By then the
+   controller has byte-compared every binary with its own rebuild.
+2. Add them to the Sevra platform's trusted release list, set its `latest`,
+   and deploy it. Its `DISTRIBUTION.md` names the exact files.
+3. Confirm `curl -fsS https://www.sevrahq.com/api/hub/releases/dbmd/latest`
+   prints `X.Y.Z`, then run `sh scripts/install.sh` and check that it reports
+   `checksum: verified` and installs `X.Y.Z`.
+
+The controller ends by reading that manifest and prints a `NOT DONE` line while
+it still serves an older version. 0.13.5 skipped this step, so the installers
+served 0.13.4 until 0.14.0.
 
 ## crates.io is permanent
 

@@ -64,6 +64,12 @@ require_fixed '"$release_source/THIRD_PARTY_NOTICES"' "$controller"
 require_fixed '"$release_source/LICENSE"' "$controller"
 require_fixed '"$release_source/HomebrewFormula/render.sh"' "$controller"
 reject_fixed 'git worktree add' "$controller"
+# The controller must surface the installers' manual trust step it cannot perform.
+require_fixed 'NOT DONE: the installers still serve' "$controller"
+# The Linux rebuild needs the musl standard libraries before the tag push.
+require_fixed 'rustup target add --toolchain "$LINUX_RUST_TOOLCHAIN"' "$controller"
+# ...and rust-src, which cross installs in CI and which changes embedded std paths.
+require_fixed 'rustup component add --toolchain "$LINUX_RUST_TOOLCHAIN" rust-src' "$controller"
 
 # Both Linux release builders must be content-addressed. A tag-only `cross`
 # image would let a registry retarget the builder after review.
