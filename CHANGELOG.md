@@ -8,9 +8,21 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.14.0**.
+  `Cargo.toml`, currently **v0.14.1**.
 
 ## Unreleased
+
+## [0.14.1] — 2026-10-01
+
+### Fixed
+
+- **`sync --push` names the canonical brain in every receipt.** A push that
+  commits nothing (`no_change`, `local_dirty`, `remote_ahead`) now reports the
+  `brain_id` its head resolved to, as a committed receipt already did. Callers
+  that record a checkout's identity had to fall back to the alias they
+  requested, so Sevra wrote the slug after an unchanged push and the ID after a
+  committed one, and the tracked binding flipped on every checkpoint. An alias
+  can be rebound to another brain; the ID cannot.
 
 ### Changed
 
