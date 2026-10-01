@@ -90,6 +90,10 @@ because it read its scope from `log.md`. This release closes each path.
 
 ### Fixed
 
+- Update the locked `rustls` to 0.23.45 (and `rustls-webpki` to 0.103.15)
+  for RUSTSEC-2026-0285, where TLS 1.3 handshake messages were accepted
+  across encryption level boundaries. The advisory check passes.
+
 - Large streamed sync uploads receive a size-based transfer budget capped at
   one hour and shared across retries. The client checks the deadline during
   body streaming and uses a fresh pinned connection for large files, avoiding
