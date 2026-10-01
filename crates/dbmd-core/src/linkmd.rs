@@ -8371,6 +8371,29 @@ fn stage_oversized_v2_change(
     Ok(())
 }
 
+/// The receipt of a push that commits nothing. Like a committed receipt it
+/// names the canonical `brain_id` the head resolved to, so a caller recording
+/// the checkout's identity never falls back to the alias it requested; an
+/// alias can later be rebound to another brain.
+fn v2_unchanged_push_result(
+    head: &V2VerifiedHead,
+    outcome: &str,
+    sync_status: &str,
+    remote_copy_remains: usize,
+) -> Value {
+    json!({
+        "v": 2,
+        "outcome": outcome,
+        "sync_status": sync_status,
+        "brain_id": head.brain_id,
+        "seq": head.pointer.as_ref().map_or(0, |pointer| pointer.seq),
+        "commit_hash": head.pointer.as_ref().map(|pointer| &pointer.commit_hash),
+        "local_policy": {
+            "remote_copy_remains": remote_copy_remains,
+        },
+    })
+}
+
 fn v2_sync_push(
     cfg: &HubConfig,
     requested_brain: &str,
@@ -8520,17 +8543,9 @@ fn v2_sync_push(
         accept_v2_head(cfg, &final_head)?;
         refresh_scoped_view_marker(store, &head, next.files.len())?;
         save_v2_baseline(cfg, &head.brain_id, &store.root, &next)?;
-        return Ok(json!({
-            "v": 2,
-            "outcome": "no_change",
-            "sync_status": "synced",
-            "baseline_recovered": true,
-            "seq": head.pointer.as_ref().map_or(0, |pointer| pointer.seq),
-            "commit_hash": head.pointer.as_ref().map(|pointer| &pointer.commit_hash),
-            "local_policy": {
-                "remote_copy_remains": split_count,
-            },
-        }));
+        let mut result = v2_unchanged_push_result(&head, "no_change", "synced", split_count);
+        result["baseline_recovered"] = json!(true);
+        return Ok(result);
     }
     let base = match baseline.as_ref() {
         Some(state) => &state.files,
@@ -8908,16 +8923,19 @@ fn v2_sync_push(
             refresh_scoped_view_marker(store, &head, next.files.len())?;
             save_v2_baseline(cfg, &head.brain_id, &store.root, &next)?;
         }
-        return Ok(json!({
-            "v": 2,
-            "outcome": if local_changed { "local_dirty" } else if remote_ahead { "remote_ahead" } else { "no_change" },
-            "sync_status": if local_changed { "local_dirty" } else if remote_ahead { "remote_ahead" } else { "synced" },
-            "seq": head.pointer.as_ref().map_or(0, |pointer| pointer.seq),
-            "commit_hash": head.pointer.as_ref().map(|pointer| &pointer.commit_hash),
-            "local_policy": {
-                "remote_copy_remains": split_count,
-            },
-        }));
+        let (outcome, sync_status) = if local_changed {
+            ("local_dirty", "local_dirty")
+        } else if remote_ahead {
+            ("remote_ahead", "remote_ahead")
+        } else {
+            ("no_change", "synced")
+        };
+        return Ok(v2_unchanged_push_result(
+            &head,
+            outcome,
+            sync_status,
+            split_count,
+        ));
     }
     let includes_contract = operations
         .iter()
@@ -19825,6 +19843,25 @@ mod tests {
             local_view_for_v2_push(&tampered, &head, Some(&baseline), None),
             Err(LinkError::ScopedProjectionModified)
         ));
+    }
+
+    #[test]
+    fn an_unchanged_push_names_the_canonical_brain_not_the_requested_alias() {
+        let mut head = scoped_test_head(&"a".repeat(64));
+        head.requested = "team-brain".to_string();
+        for (outcome, sync_status) in [
+            ("no_change", "synced"),
+            ("local_dirty", "local_dirty"),
+            ("remote_ahead", "remote_ahead"),
+        ] {
+            let result = v2_unchanged_push_result(&head, outcome, sync_status, 2);
+            assert_eq!(result["brain_id"], TEST_BRAIN_ID);
+            assert_eq!(result["outcome"], outcome);
+            assert_eq!(result["sync_status"], sync_status);
+            assert_eq!(result["seq"], 0);
+            assert_eq!(result["local_policy"]["remote_copy_remains"], 2);
+            assert!(result.get("brain").is_none());
+        }
     }
 
     #[test]
