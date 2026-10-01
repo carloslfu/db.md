@@ -1617,6 +1617,13 @@ pub fn parse_db_md(text: &str, file: &Path) -> Result<Config, ParseError> {
                                 .add_optional_unique(bullet_content(&b));
                         }
                     }
+                    ("policies", "blocking warnings") => {
+                        for b in validation_policy_bullets(&section.body) {
+                            config
+                                .validation_policy
+                                .add_blocking_warning(bullet_content(&b));
+                        }
+                    }
                     ("policies", "preserved source summaries") => {
                         for b in validation_policy_bullets(&section.body) {
                             config

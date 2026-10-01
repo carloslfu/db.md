@@ -79,6 +79,7 @@ pub mod summary;
 pub mod time;
 pub mod ulid;
 pub mod validate;
+pub mod validate_state;
 pub mod validation_policy;
 pub mod watch;
 

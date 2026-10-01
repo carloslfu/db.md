@@ -66,7 +66,7 @@ dbmd rename <from> <to>                              # move a file and rewrite e
 dbmd rm <path>                                       # link-aware delete (refuses while linked; --force overrides)
 
 # Validate — before you close
-dbmd validate                                        # the working set (changed files)
+dbmd validate                                        # the working set: whatever changed on disk, logged or not
 dbmd validate --all                                  # full-store sweep
 
 # Maintain / close — record what you did

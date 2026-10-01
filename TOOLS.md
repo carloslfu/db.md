@@ -150,11 +150,13 @@ Each write maintains the `index.md` catalog write-through (no rebuild step in th
   order, YAML style, whitespace); writes back in place
 
 ### Validate
-- `dbmd validate [--json]` — working-set by default (changed files
-  since the last `validate` log entry, O(changed)); the single
-  validation entrypoint (SPEC.md § Validation lists the codes)
+- `dbmd validate [DIR | --dir DIR] [--json]` — working-set by default:
+  every content file changed on disk since the last run, every file that
+  still had findings, and their linkers (never read from `log.md`); the
+  single validation entrypoint (SPEC.md § Validation lists the codes)
 - `dbmd validate --all [--json]` — full-store SWEEP (every link, every
-  index, entity-dedup) — CI / recovery, not the loop
+  index, entity-dedup, the asset manifest) — before a sync or checkpoint,
+  and in CI
 - `dbmd validate --all --projection-excludes <file> [--json]` — full SWEEP of
   an intentionally partial projection; only missing wiki-link targets matched
   by the bounded `.sevralocal`-compatible policy become explicit unresolved info, and

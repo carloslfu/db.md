@@ -24,7 +24,7 @@
 //! `Log::{append,tail,since}`, format output (text or `--json`). The append
 //! timestamp is wall-clock now in UTC; reads render the entry's own timestamp.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
 
@@ -94,10 +94,20 @@ pub fn run_append(ctx: &Context, tokens: &[String]) -> CliResult {
 fn run_append_inner(ctx: &Context, tokens: &[String]) -> CliResult {
     let parsed = ParsedAppend::from_tokens(tokens)?;
 
-    // The store root is not a flag on the append form (clap can't parse flags
-    // inside an external subcommand), so the append form always operates on the
-    // current directory — the documented convention for the loop-side `log`.
-    let store = open_store(".")?;
+    // `--dir` is parsed off the token stream above (clap can't parse flags
+    // inside an external subcommand). Without it, the nearest store at or above
+    // the working directory, the same discovery `fm set` uses, so appending
+    // from a subdirectory of the store works too.
+    let store = match &parsed.dir {
+        Some(dir) => open_store(dir)?,
+        None => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match crate::cmd::fm::nearest_store_root(&cwd) {
+                Some(root) => open_store(&root.to_string_lossy())?,
+                None => open_store(".")?,
+            }
+        }
+    };
     let _transaction = store.transaction()?;
 
     // `-` is the store-wide sentinel: no object slot in the header.
@@ -239,6 +249,10 @@ struct ParsedAppend {
     /// `--color <when>` / `--color=<when>` seen trailing/embedded in the append
     /// form. `None` ⇒ inherit `ctx.color`.
     color: Option<ColorChoice>,
+    /// `--dir <store>` / `--dir=<store>`: the store root, as every other
+    /// store-scoped command accepts. `None` ⇒ the nearest store at or above
+    /// the working directory.
+    dir: Option<String>,
 }
 
 impl ParsedAppend {
@@ -269,6 +283,7 @@ impl ParsedAppend {
         let mut note: Option<String> = None;
         let mut json: Option<bool> = None;
         let mut color: Option<ColorChoice> = None;
+        let mut dir: Option<String> = None;
 
         let mut i = 0;
         while i < tokens.len() {
@@ -314,18 +329,32 @@ impl ParsedAppend {
                 i += 1;
                 continue;
             }
+            // The store root, spelled like every other store-scoped command.
+            if tok == "--dir" {
+                let val = tokens.get(i + 1).ok_or_else(|| {
+                    usage_error("`--dir` requires a store directory: dbmd log <kind> <object> --dir <store>")
+                })?;
+                dir = Some(val.clone());
+                i += 2;
+                continue;
+            }
+            if let Some(rest) = tok.strip_prefix("--dir=") {
+                dir = Some(rest.to_string());
+                i += 1;
+                continue;
+            }
             positionals.push(tok.to_string());
             i += 1;
         }
 
         if positionals.len() < 2 {
             return Err(usage_error(
-                "usage: dbmd log <kind> <object> [-m <note>]  (<object> is a store-relative path, or `-` for store-wide)",
+                "usage: dbmd log <kind> <object> [-m <note>] [--dir <store>]  (<object> is a store-relative path, or `-` for store-wide)",
             ));
         }
         if positionals.len() > 2 {
             return Err(usage_error(
-                "too many arguments: dbmd log <kind> <object> [-m <note>] — quote a multi-word note after -m",
+                "too many arguments: dbmd log <kind> <object> [-m <note>] [--dir <store>] — quote a multi-word note after -m",
             ));
         }
 
@@ -335,6 +364,7 @@ impl ParsedAppend {
             note,
             json,
             color,
+            dir,
         })
     }
 }

@@ -1,6 +1,6 @@
 {
-  "_comment": "Coverage map for 53 SPEC validation codes: 42 seeded and 11 explicitly uncovered. VALIDATION_POLICY_INVALID is seeded by the wildcard log-kind declaration in bad-db-md/DB.md and EXPECTED/bad-db-md.json. The existing nested-store, duplicate, projection, index and refusal fixtures remain unchanged. Tests enforce SPEC-to-fixture parity in both directions.",
-  "spec_code_count": 53,
+  "_comment": "Coverage map for 54 SPEC validation codes: 42 seeded and 12 explicitly uncovered. FM_KEY_NEAR_MISS is regression-tested end to end in crates/dbmd-cli/tests/regression_unseen_writes.rs. VALIDATION_POLICY_INVALID is seeded by the wildcard log-kind declaration in bad-db-md/DB.md and EXPECTED/bad-db-md.json. The existing nested-store, duplicate, projection, index and refusal fixtures remain unchanged. Tests enforce SPEC-to-fixture parity in both directions.",
+  "spec_code_count": 54,
   "all_spec_codes_covered": false,
   "uncovered_spec_codes": [
     "ASSET_MANIFEST_MALFORMED",
@@ -11,6 +11,7 @@
     "FM_BAD_ID",
     "FM_BAD_META_TYPE",
     "FM_IN_BODY",
+    "FM_KEY_NEAR_MISS",
     "FM_MISSING_CREATED",
     "FM_MISSING_UPDATED",
     "FM_UNREADABLE"

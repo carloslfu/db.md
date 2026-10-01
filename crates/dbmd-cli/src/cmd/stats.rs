@@ -16,7 +16,7 @@ use crate::error::CliResult;
 
 /// Run `dbmd stats`.
 pub fn run(ctx: &Context, args: &StatsArgs) -> CliResult {
-    let store = Store::open_strict(Path::new(&args.dir))?;
+    let store = Store::open_strict(Path::new(args.store_dir()))?;
     let s = stats::compute(&store)?;
 
     if ctx.json {

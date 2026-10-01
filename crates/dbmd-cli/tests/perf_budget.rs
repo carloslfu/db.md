@@ -144,11 +144,15 @@ const BUDGET_LOG_TAIL: Duration = Duration::from_millis(50);
 /// PERF.md records release ones. Budgeted at the debug measurement so the
 /// guard tracks regression rather than re-litigating the plan.
 const BUDGET_GRAPH_UNSCOPED: Duration = Duration::from_millis(400);
-/// Loop op: `validate` (working set). The changed set and per-file checks are
-/// O(changed); incoming-linker discovery is a single embedded-ripgrep pass for
-/// the whole changed set (`Store::find_links_to_any`). Plan budget 1 s;
-/// measured ~1.13 s at ~250 changed.
-const BUDGET_VALIDATE_WORKING: Duration = Duration::from_millis(1_200);
+/// Loop op: `validate` (working set). The working set comes from the
+/// filesystem: one metadata pass over every content file against the store's
+/// validation record, then O(changed) per-file checks and a single
+/// embedded-ripgrep pass for the whole changed set's incoming linkers
+/// (`Store::find_links_to_any`). Plan budget 1 s; measured ~1.28 s in debug at
+/// 250 files changed on disk (was ~1.13 s when the set came from `log.md`, which
+/// skipped unlogged files; the metadata pass and record read/write are the
+/// price of never doing that).
+const BUDGET_VALIDATE_WORKING: Duration = Duration::from_millis(1_400);
 /// Sweep op: full-store validate. Plan budget 5 s; measured ~3.5 s.
 ///
 /// Was ~12.3 s from 0.8.3 through 0.13.3, when the exact-casing check for
@@ -431,50 +435,6 @@ fn first_content_targets(store: &Path, limit: usize) -> Vec<String> {
     out
 }
 
-/// Append `count` `update` entries to the store's **active** `log.md`, each
-/// naming a real existing content file, so the working-set changed set has
-/// `count`-ish objects to scan for incoming linkers.
-///
-/// Why this is needed: the generated corpus's active `log.md` has only ~14
-/// mutating entries, and the OLD `O(changed × store)` validate was ~2.4 s there
-/// — UNDER the `1 s × 6` guard, so a small changed set would not catch the
-/// regression. At hundreds of changed objects the old per-object full-store loop
-/// is tens of seconds (PERF.md: 31 s at 264), far past the guard, while the
-/// fixed single-pass cost stays ~0.2 s. So we grow the set, then time with
-/// `--since 2020-01-01` (every mutating entry counts, independent of the
-/// corpus's own `validate` entry).
-///
-/// Entries are timestamped inside the **anchor month** (`2026-05`, the active
-/// `log.md` window — `changed_objects_since` reads only `log.md`, not the
-/// rotated `log/` archives) and name files the fixed-point store already
-/// validates clean, so the timed `validate` stays exit-0. The store is mutated
-/// in place, so callers pass a private copy.
-fn grow_changed_set(store: &Path, count: usize) {
-    let targets = first_content_targets(store, count);
-    assert!(
-        targets.len() >= count,
-        "the 10k corpus must have at least {count} content files to grow the \
-         changed set; found {}",
-        targets.len()
-    );
-    let log_path = store.join("log.md");
-    let mut log = std::fs::read_to_string(&log_path).expect("read active log.md");
-    if !log.ends_with('\n') {
-        log.push('\n');
-    }
-    log.push('\n');
-    for (i, bare) in targets.iter().enumerate() {
-        // Day 01–28 (valid in every month), minute 00–59 — kept inside the
-        // anchor month so the entry lands in the active log.md window.
-        let day = (i % 28) + 1;
-        let minute = i % 60;
-        log.push_str(&format!(
-            "## [2026-05-{day:02} 11:{minute:02}] update | [[{bare}]]\nTouched for the perf changed-set.\n\n"
-        ));
-    }
-    std::fs::write(&log_path, log).expect("write grown log.md");
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Timing harness.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -674,35 +634,54 @@ fn budgets_hold_on_the_10k_scale_corpus() {
     );
     assert_within_budget("graph neighborhood --hops 1", median, BUDGET_GRAPH_UNSCOPED);
 
-    // `validate` (working set) — the O(changed × store) → single-pass fix.
-    // Grow the changed set to a LARGE size in a private copy so the OLD
-    // per-object full-store loop (tens of seconds at hundreds of changed
-    // objects — PERF.md: 31 s at 264) would blow past the `1 s × 6` guard, while
-    // the fixed single ripgrep pass stays flat (~0.2 s). Timed with
-    // `--since 2020-01-01` so every appended `update` counts toward the changed
-    // set regardless of the corpus's own `validate` log entry (PERF.md method).
+    // `validate` (working set) — the loop default. A primed validation record,
+    // then GROWN_CHANGED content files rewritten on disk before every timed run
+    // (identical bytes, new modification and change times), so each run checks
+    // that many changed files plus a single ripgrep pass for their incoming
+    // linkers. The OLD per-object full-store loop took tens of seconds at this
+    // size (PERF.md: 31 s at 264); the filesystem-derived working set must stay
+    // flat in store size apart from one metadata pass.
     const GROWN_CHANGED: usize = 250;
     let validate_store = tmp.path().join("validate-working-target");
     copy_dir_all(&store, &validate_store);
-    grow_changed_set(&validate_store, GROWN_CHANGED);
     let validate_str = validate_store
         .to_str()
         .expect("validate-working path is UTF-8")
         .to_string();
-    let median = median_time(LOOP_ITERS, &|| {
-        vec![
-            "validate".into(),
-            "--since".into(),
-            "2020-01-01".into(),
-            validate_str.clone(),
-        ]
-    });
+    let primed = dbmd_status(&["validate", validate_str.as_str()]);
+    assert!(
+        primed.success(),
+        "priming the validation record must succeed"
+    );
+    let touched: Vec<PathBuf> = first_content_targets(&validate_store, GROWN_CHANGED)
+        .into_iter()
+        .map(|bare| validate_store.join(format!("{bare}.md")))
+        .collect();
+    assert_eq!(
+        touched.len(),
+        GROWN_CHANGED,
+        "the 10k corpus has enough content files"
+    );
+    let (warmup, timed) = LOOP_ITERS;
+    let mut samples = Vec::new();
+    for round in 0..warmup + timed {
+        for path in &touched {
+            let bytes = std::fs::read(path).expect("read a touched file");
+            std::fs::write(path, bytes).expect("rewrite a touched file");
+        }
+        let elapsed = time_once(&["validate".to_string(), validate_str.clone()]);
+        if round >= warmup {
+            samples.push(elapsed);
+        }
+    }
+    samples.sort();
+    let median = samples[samples.len() / 2];
     eprintln!(
-        "[perf] validate (working set, ~{GROWN_CHANGED} changed): median {median:?} \
+        "[perf] validate (working set, {GROWN_CHANGED} changed on disk): median {median:?} \
          (budget {BUDGET_VALIDATE_WORKING:?})"
     );
     assert_within_budget(
-        "validate (working set, grown changed set)",
+        "validate (working set, changed files on disk)",
         median,
         BUDGET_VALIDATE_WORKING,
     );

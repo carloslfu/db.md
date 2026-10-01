@@ -434,6 +434,23 @@ impl Store {
         Ok(())
     }
 
+    /// Identity of the directory this store holds open: `device:inode` on Unix,
+    /// the absolute locator elsewhere. A moved-and-recreated or copied store
+    /// gets a different identity, so store-local derived state bound to it
+    /// (the validation record) is never trusted across copies.
+    pub fn root_identity(&self) -> std::io::Result<String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = self.root_capability.metadata()?;
+            Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(self.root_locator.to_string_lossy().into_owned())
+        }
+    }
+
     /// Metadata for an exact no-follow regular file under the held root.
     pub fn regular_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
         let relative = self.capability_relative(path)?;

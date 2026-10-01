@@ -69,10 +69,12 @@ pub enum Command {
     /// Validate a store: frontmatter conformance, link integrity, layer-typed
     /// rules, `DB.md` sections, and entity collisions.
     ///
-    /// Default = the **working set** (files changed since the last `validate`
-    /// log entry, or since `--since`). `--all` runs a full-store SWEEP that
+    /// Default = the **working set**: every content file changed on disk since
+    /// the last default run (recorded in `.dbmd/validate-state.json`, never read
+    /// from `log.md`), every file that still had findings, and every file linking
+    /// to a changed or removed path. `--all` runs a full-store SWEEP that
     /// additionally checks `log.md` well-formedness, every index level's sync,
-    /// and entity-dedup. Exits non-zero when errors are found.
+    /// entity-dedup and the asset manifest. Exits non-zero when errors are found.
     Validate(ValidateArgs),
 
     // ── Format ──────────────────────────────────────────────────────────────
@@ -388,6 +390,11 @@ pub struct ValidateArgs {
     #[arg(value_name = "DIR", default_value = ".")]
     pub dir: String,
 
+    /// The store root as a flag, spelled like every other store-scoped command
+    /// (`--dir <DIR>`); the same as the positional form.
+    #[arg(long = "dir", value_name = "DIR", conflicts_with = "dir")]
+    pub dir_flag: Option<String>,
+
     /// Run a full-store SWEEP (every file, every index level, `log.md`
     /// well-formedness, entity-dedup) instead of the default working set.
     #[arg(long)]
@@ -418,9 +425,10 @@ pub struct ValidateArgs {
     )]
     pub projection_manifest: Option<String>,
 
-    /// Override the working-set cutoff: validate files changed at or after this
-    /// RFC3339 timestamp. Ignored when `--all` is set. Date-only is accepted
-    /// and treated as `T00:00:00Z`.
+    /// Instead of the recorded working set, validate content files modified or
+    /// changed at or after this RFC3339 timestamp, plus the objects `log.md`
+    /// names since then; records nothing. Ignored when `--all` is set.
+    /// Date-only is accepted and treated as `T00:00:00Z`.
     #[arg(long, value_name = "RFC3339")]
     pub since: Option<String>,
 }
@@ -797,6 +805,11 @@ pub struct StatsArgs {
     /// Store root. Defaults to the current directory.
     #[arg(value_name = "DIR", default_value = ".")]
     pub dir: String,
+
+    /// The store root as a flag, spelled like every other store-scoped command
+    /// (`--dir <DIR>`); the same as the positional form.
+    #[arg(long = "dir", value_name = "DIR", conflicts_with = "dir")]
+    pub dir_flag: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -809,6 +822,11 @@ pub struct EmitArgs {
     /// Store root. Defaults to the current directory.
     #[arg(value_name = "DIR", default_value = ".")]
     pub dir: String,
+
+    /// The store root as a flag, spelled like every other store-scoped command
+    /// (`--dir <DIR>`); the same as the positional form.
+    #[arg(long = "dir", value_name = "DIR", conflicts_with = "dir")]
+    pub dir_flag: Option<String>,
 
     /// Stream the dump as NDJSON: one compact JSON object per line — exactly
     /// the `--json` form's `files[]` element shape, in the same deterministic
@@ -2071,3 +2089,17 @@ mod tests {
         assert_eq!(relocate.to, "/tmp/live/db");
     }
 }
+
+/// The store root a positional-`DIR` command operates on: `--dir` when given,
+/// otherwise the positional (default `.`).
+macro_rules! store_dir_accessor {
+    ($($args:ty),*) => {$(
+        impl $args {
+            /// The effective store root (`--dir` or the positional `DIR`).
+            pub fn store_dir(&self) -> &str {
+                self.dir_flag.as_deref().unwrap_or(&self.dir)
+            }
+        }
+    )*};
+}
+store_dir_accessor!(ValidateArgs, StatsArgs, EmitArgs);

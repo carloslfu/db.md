@@ -127,6 +127,19 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
     // ── policy: also refuse on the resolved path (sharded destination) ───────
     enforce_frozen(&store, &resolved)?;
 
+    // ── content rules: refuse what `dbmd validate` would reject in this file ──
+    // Judged on the exact bytes about to land, by the validator's own per-file
+    // checks, so a missing required field, a near-miss key (`source-kind` for
+    // `source_kind`) or an overlong summary never reaches disk. Declared assets
+    // must exist so the record can be cataloged with them below.
+    // A write onto an existing path is a collision, reported as one by the
+    // atomic create below; content rules judge only a file that can be created.
+    if is_content_type(&args.r#type) && !store.regular_file_exists(&resolved).unwrap_or(false) {
+        let text = dbmd_core::parser::render_file(&fm, &body);
+        refuse_invalid_content(&store, &resolved, &text, None)?;
+        refuse_missing_assets(&store, &fm)?;
+    }
+
     // ── create, then maintain the catalog write-through ──────────────────────
     // The durable writer owns the collision guard: it writes/fsyncs a sibling
     // temp file, then atomically hard-links it into `abs`, which fails with
@@ -140,6 +153,7 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
         return Err(core_err(e));
     }
     let index_warning = index_on_write(&store, &resolved);
+    catalog_declared_assets(&store, &resolved, &fm)?;
     let policy_warning = ignored_type_derivation_warning(&store, &fm);
 
     emit_result(
@@ -155,6 +169,120 @@ pub fn run(ctx: &Context, args: &WriteArgs) -> CliResult {
 // ─────────────────────────────────────────────────────────────────────────────
 // Cross-cutting write-surface helpers (shared by write / link / rename).
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Refuse a content write whose own frontmatter or body breaks a rule `dbmd
+/// validate` enforces: a missing required field, a key such as `source-kind`
+/// that only near-misses the declared `source_kind`, an overlong summary, and
+/// the rest of [`dbmd_core::validate::WRITE_BLOCKING_CODES`]. Nothing is
+/// written. With `before` (an edit of an existing file), only findings the edit
+/// introduces refuse, so repairing one field of a file that has other problems
+/// stays possible.
+pub(crate) fn refuse_invalid_content(
+    store: &Store,
+    rel: &Path,
+    text: &str,
+    before: Option<&str>,
+) -> Result<(), CliError> {
+    use dbmd_core::validate::write_blocking_issues;
+    let mut found = write_blocking_issues(store, rel, text);
+    if let Some(before) = before {
+        let existing: std::collections::BTreeSet<(&'static str, Option<String>)> =
+            write_blocking_issues(store, rel, before)
+                .into_iter()
+                .map(|issue| (issue.code, issue.key))
+                .collect();
+        found.retain(|issue| !existing.contains(&(issue.code, issue.key.clone())));
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    let shown = path_to_unix(rel);
+    let reasons: Vec<String> = found
+        .iter()
+        .map(|issue| match &issue.suggestion {
+            Some(fix) => format!("{}: {} ({fix})", issue.code, issue.message),
+            None => format!("{}: {}", issue.code, issue.message),
+        })
+        .collect();
+    Err(CliError::new(
+        ExitCode::ValidationFailed,
+        "WRITE_INVALID",
+        format!("refused to write `{shown}`: {}", reasons.join("; ")),
+    )
+    .with_hint("fix the frontmatter or body and run the same command again; nothing was written")
+    .with_details(serde_json::json!({
+        "file": shown,
+        "issues": found
+            .iter()
+            .map(crate::cmd::validate::issue_json)
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// The asset paths a wrapper's frontmatter declares, normalized. An invalid
+/// declaration is left to `dbmd validate` and `dbmd assets scan`.
+fn declared_asset_paths(fm: &Frontmatter) -> Vec<String> {
+    dbmd_core::assets::declared_assets(fm)
+        .into_iter()
+        .filter_map(|declaration| dbmd_core::assets::normalize_asset_path(&declaration.path).ok())
+        .collect()
+}
+
+/// Refuse a wrapper that declares an asset which is neither in the store nor
+/// already cataloged: there is nothing to catalog, so the record would be born
+/// broken. Copy the file in first, then write the wrapper.
+pub(crate) fn refuse_missing_assets(store: &Store, fm: &Frontmatter) -> Result<(), CliError> {
+    let declared = declared_asset_paths(fm);
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let cataloged: std::collections::BTreeSet<String> = dbmd_core::assets::read_manifest(store)
+        .map(|rows| rows.into_iter().map(|row| row.path).collect())
+        .unwrap_or_default();
+    let missing: Vec<String> = declared
+        .into_iter()
+        .filter(|path| {
+            !cataloged.contains(path)
+                && !store.regular_file_exists(Path::new(path)).unwrap_or(false)
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::new(
+        ExitCode::ValidationFailed,
+        "ASSET_NOT_FOUND",
+        format!(
+            "declared asset(s) not found in the store: {}",
+            missing.join(", ")
+        ),
+    )
+    .with_hint("copy the file into the store first, then write the wrapper; nothing was written"))
+}
+
+/// Catalog the assets a just-written wrapper declares in `assets.jsonl`, so a
+/// record never exists without its catalog rows. A `supersedes-asset` wrapper
+/// is left to `dbmd assets refresh`, which owns that append-only provenance.
+pub(crate) fn catalog_declared_assets(
+    store: &Store,
+    rel: &Path,
+    fm: &Frontmatter,
+) -> Result<(), CliError> {
+    if declared_asset_paths(fm).is_empty()
+        || matches!(dbmd_core::assets::asset_supersession(fm), Ok(Some(_)))
+    {
+        return Ok(());
+    }
+    let wrapper = path_to_unix(rel);
+    dbmd_core::assets::refresh_wrapper(store, &wrapper)
+        .map(drop)
+        .map_err(|error| {
+            CliError::runtime(format!(
+                "wrote `{wrapper}` but could not catalog its assets: {error}"
+            ))
+            .with_hint(format!("run `dbmd assets refresh-wrapper {wrapper}`"))
+        })
+}
 
 /// Open the store rooted at `dir`, mapping a missing `DB.md` to the structured
 /// `NOT_A_STORE` exit. The single store-open gate every writer in this group

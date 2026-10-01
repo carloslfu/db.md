@@ -28,7 +28,7 @@ use super::projection::{load as load_projection, load_manifest as load_projectio
 
 /// Run `dbmd validate`.
 pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
-    let root = Path::new(&args.dir);
+    let root = Path::new(args.store_dir());
 
     // Open the store if the marker is present; otherwise hand the engine a store
     // rooted at `root` with default config so it emits the `NOT_A_STORE` issue
@@ -77,7 +77,7 @@ pub fn run(ctx: &Context, args: &ValidateArgs) -> CliResult {
     let counts = Counts::of(&issues);
 
     if ctx.json {
-        print!("{}", json_report(scope, &args.dir, &counts, &issues));
+        print!("{}", json_report(scope, args.store_dir(), &counts, &issues));
     } else {
         print!("{}", text_report(&counts, &issues));
     }
@@ -230,7 +230,7 @@ fn json_report(scope: &str, store: &str, counts: &Counts, issues: &[Issue]) -> S
 
 /// One issue as a JSON object matching the corpora's issue shape (`severity`,
 /// `code`, `file`, `line`, `key`, `message`, `suggestion`, `related`).
-fn issue_json(issue: &Issue) -> serde_json::Value {
+pub(crate) fn issue_json(issue: &Issue) -> serde_json::Value {
     let related: Vec<String> = issue
         .related
         .iter()

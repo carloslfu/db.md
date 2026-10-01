@@ -133,6 +133,10 @@ pub mod codes {
     /// as the body). Warning: the file still parses because the real
     /// frontmatter is valid, but the leftover block is body text, not fields.
     pub const FM_IN_BODY: &str = "FM_IN_BODY";
+    /// A frontmatter key differs from a declared key (a `DB.md` schema field or
+    /// a core field) only by letter case or `-`/`_`, e.g. `source-kind` for
+    /// `source_kind`. Warning: schemas, indexes and queries never read it.
+    pub const FM_KEY_NEAR_MISS: &str = "FM_KEY_NEAR_MISS";
     /// content file has no `summary`.
     pub const SUMMARY_MISSING: &str = "SUMMARY_MISSING";
     /// `summary` present but empty.
@@ -233,27 +237,29 @@ const RECOGNIZED_LOG_KINDS: &[&str] = &[
 //  Public entrypoints
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// **Loop default.** Validate the working set: content files changed since
-/// `since` (default: the last `validate` entry in `log.md`), plus any file whose
-/// wiki-links target a changed/renamed/removed path. Per-file *checks* only —
-/// none of the cross-file global passes (entity-dedup, every-index sync,
-/// `log.md` ordering) that `--all` adds. If the default call finds no logged
-/// changed objects, it falls back to a per-file content sweep so an externally
-/// edited or freshly copied store cannot pass vacuously.
+/// **Loop default.** Validate the working set: every content file whose bytes
+/// may have changed since the last default run (observed on disk, never read
+/// from `log.md`), every file that still had an error or warning then, and every
+/// file whose wiki-links target a changed or removed path. Per-file checks,
+/// plus a per-file check that declared assets are cataloged; none of the
+/// cross-file global passes (entity-dedup, every-index sync, `log.md` ordering)
+/// that `--all` adds.
 ///
-/// **Cost.** The changed set is read from `log.md` — O(changed): every
-/// `create`/`update`/`ingest`/`rename`/`delete`/`link` entry newer than the
-/// cutoff names an object. Per-file frontmatter + link-doctrine checks then run
-/// over that set plus its incoming linkers — also O(changed). The one part that
-/// is *not* O(changed) is discovering those incoming linkers: a link to a
-/// changed path can live in the body or a typed frontmatter field of any file,
-/// so it is found by a **single** embedded-ripgrep pass over the store
-/// ([`Store::find_links_to_any`]) for the whole changed set at once — one store
-/// scan, flat in the changed-set size. (It was previously a full store read
-/// *per* changed object — `O(changed × store)`; that is the blow-up this path
-/// no longer pays.) The unavoidable single content scan is the same shape as
-/// free-text `dbmd search`; the sidecar `links` projection can't replace it
-/// because it omits body/typed-field edges.
+/// With `since`, the set is instead every content file modified or changed at
+/// or after that instant, plus the objects `log.md` names since then (so a
+/// logged deletion still pulls in its linkers). That explicit form reads and
+/// writes no validation record.
+///
+/// **Why the filesystem.** The log is written by the same agent whose work is
+/// being checked. Deriving the scope from it let a file that was never logged,
+/// or was logged under a custom or store-declared kind, pass unexamined
+/// whenever any standard entry existed. See [`crate::validate_state`].
+///
+/// **Cost.** One metadata pass over the content files, O(changed) per-file
+/// checks and, when anything changed, a single embedded-ripgrep pass that finds
+/// incoming linkers for the whole changed set ([`Store::find_links_to_any`]).
+/// With no trustworthy record (first run, another toolkit version, a changed
+/// `DB.md`, a copied store) it is a full per-file sweep.
 pub fn validate_working_set(
     store: &Store,
     since: Option<DateTime<FixedOffset>>,
@@ -267,38 +273,146 @@ pub fn validate_working_set(
     if !store_marker_present(store) {
         return Ok(vec![not_a_store_issue(store)]);
     }
+    let files = store.walk()?;
+    match since {
+        Some(cutoff) => validate_changed_since(store, &files, cutoff),
+        None => validate_incremental(store, &files),
+    }
+}
 
-    let cutoff = match since {
-        Some(ts) => Some(ts),
-        None => last_validate_at(store),
+/// The default working set, driven by the validation record.
+fn validate_incremental(store: &Store, files: &[PathBuf]) -> crate::Result<Vec<Issue>> {
+    use crate::validate_state::{stamp, Bindings, Stamp, ValidationState};
+
+    let bindings = Bindings::read(store);
+    let stamps: BTreeMap<PathBuf, Option<Stamp>> = files
+        .iter()
+        .map(|rel| (rel.clone(), stamp(store, rel)))
+        .collect();
+    let prior = bindings
+        .as_ref()
+        .and_then(|bindings| ValidationState::load(store, bindings));
+
+    let (working, mut state) = match (prior, bindings.as_ref()) {
+        (Some(mut state), Some(bindings)) => {
+            let mut changed: BTreeSet<PathBuf> = stamps
+                .iter()
+                .filter(|(rel, now)| match (state.entry(rel), now) {
+                    (Some(entry), Some(now)) => entry.0 != *now,
+                    _ => true,
+                })
+                .map(|(rel, _)| rel.clone())
+                .collect();
+            let removed: Vec<PathBuf> = state
+                .paths()
+                .filter(|path| !stamps.contains_key(path))
+                .collect();
+            // A changed asset manifest can un-catalog an asset some unchanged
+            // wrapper declares: re-check every recorded asset-declaring file.
+            if state.assets != bindings.assets {
+                let declaring: Vec<PathBuf> = state
+                    .asset_declaring_paths()
+                    .filter(|path| stamps.contains_key(path))
+                    .collect();
+                changed.extend(declaring);
+            }
+            for path in &removed {
+                state.forget(path);
+            }
+            let mut working = changed.clone();
+            let targets: Vec<PathBuf> = changed.into_iter().chain(removed).collect();
+            if !targets.is_empty() {
+                working.extend(store.find_links_to_any(&targets)?);
+            }
+            (working, Some(state))
+        }
+        // No trustworthy record: check every content file.
+        (_, bindings) => (
+            files.iter().cloned().collect::<BTreeSet<PathBuf>>(),
+            bindings.map(ValidationState::new),
+        ),
     };
 
-    // 1. Changed objects, straight from the log (O(changed) — never a walk).
-    let changed = changed_objects_since(store, cutoff);
-    if changed.is_empty() && since.is_none() {
-        return validate_content_sweep(store);
-    }
-
-    // 2. Add every file with an incoming wiki-link to a changed/renamed/removed
-    //    path (the linker may now be stale even though it didn't change). The
-    //    incoming-linker scan is `Store::find_links_to_any` — ONE embedded-ripgrep
-    //    pass over the store for the WHOLE changed set (one `.md` walk, one
-    //    presence-only/early-exit scan per file), not one walk per object. This
-    //    is the fix for the `O(changed × store)` blow-up that calling
-    //    `find_links_to` in a loop produced (a full store read per changed
-    //    object); the cost is now a single store scan regardless of how many
-    //    objects changed. A returned self-link is harmlessly deduped by the set
-    //    (the object is already inserted below).
-    let changed_targets: Vec<PathBuf> = changed.iter().cloned().collect();
-    let mut working: BTreeSet<PathBuf> = changed;
-    for linker in store.find_links_to_any(&changed_targets)? {
-        working.insert(linker);
-    }
-
     let mut issues = nested_store_issues(store)?;
-    for rel in &working {
-        // A changed path can be a *deletion* — skip files that no longer exist;
-        // the incoming-linker scan above already flagged links into them.
+    let declaring = check_working_files(store, &working, &mut issues);
+    store.config.validation_policy.apply(store, &mut issues);
+    issues.sort_by(issue_order);
+
+    // Record every checked file that came out clean; forget every file that
+    // still has an error or warning, so it is checked again next run.
+    if let (Some(state), Some(bindings)) = (state.as_mut(), bindings.as_ref()) {
+        let dirty: BTreeSet<&Path> = issues
+            .iter()
+            .filter(|issue| matches!(issue.severity, Severity::Error | Severity::Warning))
+            .map(|issue| issue.file.as_path())
+            .collect();
+        for rel in &working {
+            let Some(Some(now)) = stamps.get(rel) else {
+                continue;
+            };
+            if dirty.contains(rel.as_path()) {
+                state.forget(rel);
+            } else {
+                state.record(rel, *now, declaring.contains(rel));
+            }
+        }
+        state.rebind_assets(bindings);
+        state.save(store);
+    }
+    Ok(issues)
+}
+
+/// The explicit `--since` working set: content files modified or changed at or
+/// after `cutoff`, plus objects the log names since then. No record is read or
+/// written.
+fn validate_changed_since(
+    store: &Store,
+    files: &[PathBuf],
+    cutoff: DateTime<FixedOffset>,
+) -> crate::Result<Vec<Issue>> {
+    let cutoff_ns = u64::try_from(cutoff.timestamp_nanos_opt().unwrap_or(0)).unwrap_or(0);
+    let mut changed: BTreeSet<PathBuf> = files
+        .iter()
+        .filter(|rel| match crate::validate_state::stamp(store, rel) {
+            Some(stamp) => stamp.1 >= cutoff_ns || stamp.2 >= cutoff_ns,
+            None => true,
+        })
+        .cloned()
+        .collect();
+    let mut removed = Vec::new();
+    for rel in logged_objects_since(store, cutoff) {
+        if store.regular_file_exists(&rel).unwrap_or(false) {
+            changed.insert(rel);
+        } else {
+            removed.push(rel);
+        }
+    }
+    let mut working = changed.clone();
+    let targets: Vec<PathBuf> = changed.into_iter().chain(removed).collect();
+    if !targets.is_empty() {
+        working.extend(store.find_links_to_any(&targets)?);
+    }
+    let mut issues = nested_store_issues(store)?;
+    check_working_files(store, &working, &mut issues);
+    store.config.validation_policy.apply(store, &mut issues);
+    issues.sort_by(issue_order);
+    Ok(issues)
+}
+
+/// Run every per-file check over `working`, and check that each file's declared
+/// assets are cataloged in `assets.jsonl` (the rest of the asset manifest's
+/// integrity is an `--all` sweep). Returns the checked files that declare
+/// assets.
+fn check_working_files(
+    store: &Store,
+    working: &BTreeSet<PathBuf>,
+    issues: &mut Vec<Issue>,
+) -> BTreeSet<PathBuf> {
+    let mut declaring = BTreeSet::new();
+    let mut cataloged: Option<BTreeSet<String>> = None;
+    for rel in working {
+        // A changed path can be a *deletion*: skip files that no longer exist;
+        // the incoming-linker scan already pulled in links into them.
         if !store.regular_file_exists(rel).unwrap_or(false) {
             continue;
         }
@@ -306,11 +420,96 @@ pub fn validate_working_set(
         // store-wide basename map (that is a `--all`-only structure), so a bare
         // short-form target is reported as plain `WIKI_LINK_SHORT_FORM` and the
         // `--all` sweep does the ambiguity upgrade.
-        check_content_file(store, rel, None, &mut issues);
+        let Some(parsed) = check_content_file(store, rel, None, issues) else {
+            continue;
+        };
+        let Some(map) = &parsed.fm else {
+            continue;
+        };
+        let declared: Vec<String> = crate::assets::declarations_from_yaml_map(map)
+            .into_iter()
+            .filter_map(|declaration| crate::assets::normalize_asset_path(&declaration.path).ok())
+            .collect();
+        if declared.is_empty() {
+            continue;
+        }
+        declaring.insert(rel.clone());
+        let cataloged = cataloged.get_or_insert_with(|| cataloged_asset_paths(store));
+        for path in declared {
+            if !cataloged.contains(&path) {
+                push(
+                    issues,
+                    Severity::Error,
+                    codes::ASSET_UNDECLARED,
+                    rel,
+                    None,
+                    Some("asset".to_string()),
+                    format!(
+                        "references asset `{path}` with no record in {}",
+                        crate::assets::MANIFEST_FILE
+                    ),
+                    Some("run `dbmd assets scan` to catalog it".to_string()),
+                    vec![PathBuf::from(&path)],
+                );
+            }
+        }
     }
-    store.config.validation_policy.apply(store, &mut issues);
+    declaring
+}
+
+/// The asset paths `assets.jsonl` catalogs. Lenient: a malformed line is an
+/// `--all` finding (`ASSET_MANIFEST_MALFORMED`), not this check's concern.
+fn cataloged_asset_paths(store: &Store) -> BTreeSet<String> {
+    let manifest = Path::new(crate::assets::MANIFEST_FILE);
+    let Ok(text) = store.read_text_bounded(manifest, crate::parser::MAX_DBMD_FILE_BYTES) else {
+        return BTreeSet::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<crate::assets::AssetRecord>(line).ok())
+        .map(|record| record.path)
+        .collect()
+}
+
+/// Codes a content write refuses. Each is decided by the file's own
+/// frontmatter and body alone, so refusing one never blocks a legitimate
+/// multi-file sequence: a link to a file that is not written yet, a duplicate,
+/// or an uncataloged asset stays a `dbmd validate` finding.
+pub const WRITE_BLOCKING_CODES: &[&str] = &[
+    codes::FM_MALFORMED_YAML,
+    codes::FM_MISSING_TYPE,
+    codes::FM_MISSING_CREATED,
+    codes::FM_MISSING_UPDATED,
+    codes::FM_BAD_TIMESTAMP,
+    codes::FM_BAD_META_TYPE,
+    codes::FM_BAD_ID,
+    codes::FM_IN_BODY,
+    codes::FM_KEY_NEAR_MISS,
+    codes::SUMMARY_MISSING,
+    codes::SUMMARY_EMPTY,
+    codes::SUMMARY_MULTILINE,
+    codes::SUMMARY_TOO_LONG,
+    codes::TAGS_MALFORMED,
+    codes::SCHEMA_MISSING_REQUIRED,
+    codes::SCHEMA_SHAPE_MISMATCH,
+    codes::SCHEMA_ENUM_VIOLATION,
+    codes::SCHEMA_LINK_PREFIX_MISMATCH,
+    codes::WIKI_LINK_SHORT_FORM,
+    codes::WIKI_LINK_HAS_EXTENSION,
+    codes::WIKI_LINK_FLOW_FORM_LIST,
+];
+
+/// The findings that make writing `text` to store-relative `rel` a refusal:
+/// every [`WRITE_BLOCKING_CODES`] error or warning the ordinary per-file checks
+/// report. Empty means the write may proceed. Nothing is read from or written
+/// to `rel` itself.
+pub fn write_blocking_issues(store: &Store, rel: &Path, text: &str) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    check_content_text(store, rel, text, None, &mut issues);
+    issues.retain(|issue| {
+        issue.severity != Severity::Info && WRITE_BLOCKING_CODES.contains(&issue.code)
+    });
     issues.sort_by(issue_order);
-    Ok(issues)
+    issues
 }
 
 /// Reclassify only the exact missing wiki-link targets named by a declared
@@ -339,17 +538,6 @@ pub fn apply_projection_policy(issues: &mut [Issue], policy: &ProjectionPolicy) 
         );
     }
 }
-
-fn validate_content_sweep(store: &Store) -> crate::Result<Vec<Issue>> {
-    let mut issues = nested_store_issues(store)?;
-    for rel in store.walk()? {
-        check_content_file(store, &rel, None, &mut issues);
-    }
-    store.config.validation_policy.apply(store, &mut issues);
-    issues.sort_by(issue_order);
-    Ok(issues)
-}
-
 /// Structural issues that every validation scope reports. Nested stores are
 /// pruned from all parent-store reads, but remain an error because a single
 /// filesystem tree must have one unambiguous owning store at every path.
@@ -496,9 +684,22 @@ fn check_content_file(
         }
     };
 
+    check_content_text(store, rel, &text, basenames, issues)
+}
+
+/// The per-file checks over already-read `text` for store-relative `rel`: the
+/// body of [`check_content_file`], shared with [`write_blocking_issues`] so a
+/// write is judged by exactly the rules `dbmd validate` applies.
+fn check_content_text(
+    store: &Store,
+    rel: &Path,
+    text: &str,
+    basenames: Option<&BasenameIndex>,
+    issues: &mut Vec<Issue>,
+) -> Option<Parsed> {
     let is_content = is_content_file(rel);
 
-    let (fm_yaml, body, fm_end_line) = match split_frontmatter(&text) {
+    let (fm_yaml, body, fm_end_line) = match split_frontmatter(text) {
         Some(split) => split,
         None => {
             // No frontmatter at all. For a content file that means there's no
@@ -943,9 +1144,76 @@ fn check_frontmatter(
     }
 
     // ── schema enforcement: DB.md ## Schemas (the only schema source) ─────────
-    if let Some(t) = &type_ {
-        if let Some(schema) = effective_schema(store, t) {
-            check_schema(store, rel, fm, fm_yaml, &schema, issues);
+    let schema = type_.as_deref().and_then(|t| effective_schema(store, t));
+    if let Some(schema) = &schema {
+        check_schema(store, rel, fm, fm_yaml, schema, issues);
+    }
+
+    // ── near-miss keys: `source-kind` written for a declared `source_kind` ────
+    check_key_near_misses(rel, fm, fm_yaml, schema.as_ref(), issues);
+}
+
+/// Keys the SPEC defines for content files, whatever their type.
+const CORE_KEYS: &[&str] = &[
+    "type",
+    "meta-type",
+    "id",
+    "created",
+    "updated",
+    "summary",
+    "tags",
+    "derived_from",
+    "asset",
+    "assets",
+    "supersedes-asset",
+];
+
+/// A key with letter case and the `-`/`_` separator distinction removed.
+fn normalized_key(key: &str) -> String {
+    key.to_ascii_lowercase().replace('-', "_")
+}
+
+/// The declared key that `key` near-misses: equal to a declared key once case
+/// and `-`/`_` are ignored, but not equal to it. `None` for an exact or an
+/// unrelated key.
+fn near_miss_of<'a>(key: &str, declared: &[&'a str]) -> Option<&'a str> {
+    if declared.contains(&key) {
+        return None;
+    }
+    let norm = normalized_key(key);
+    declared.iter().copied().find(|d| normalized_key(d) == norm)
+}
+
+/// Flag every frontmatter key that near-misses a core key or a field of the
+/// file's schema. The typo hides the value from the schema (a required field
+/// then reads as absent) and from every index and query.
+fn check_key_near_misses(
+    rel: &Path,
+    fm: &BTreeMap<String, Value>,
+    fm_yaml: &str,
+    schema: Option<&Schema>,
+    issues: &mut Vec<Issue>,
+) {
+    let mut declared: Vec<&str> = CORE_KEYS.to_vec();
+    if let Some(schema) = schema {
+        declared.extend(schema.fields.iter().map(|field| field.name.as_str()));
+    }
+    for key in fm.keys() {
+        if let Some(intended) = near_miss_of(key, &declared) {
+            push(
+                issues,
+                Severity::Warning,
+                codes::FM_KEY_NEAR_MISS,
+                rel,
+                fm_key_line(fm_yaml, key),
+                Some(key.clone()),
+                format!(
+                    "frontmatter key `{key}` differs from the declared key `{intended}` only by \
+                     case or `-`/`_`; schemas, indexes and queries never read it"
+                ),
+                Some(format!("rename `{key}` to `{intended}`")),
+                vec![],
+            );
         }
     }
 }
@@ -1225,7 +1493,15 @@ fn check_schema(
                 fm_key_line_or_top(fm_yaml, &spec.name),
                 Some(spec.name.clone()),
                 format!("required field `{}` is absent or empty", spec.name),
-                Some(format!("set `{}` to a non-empty value", spec.name)),
+                Some(
+                    match fm
+                        .keys()
+                        .find(|key| near_miss_of(key, &[spec.name.as_str()]).is_some())
+                    {
+                        Some(typo) => format!("rename `{typo}` to `{}`", spec.name),
+                        None => format!("set `{}` to a non-empty value", spec.name),
+                    },
+                ),
                 vec![],
             );
             continue;
@@ -2751,7 +3027,7 @@ fn is_content_file(rel: &Path) -> bool {
     // store-relative path. Reject any `..`/absolute/prefix component so a
     // malformed object slot judged only by its FIRST component (`records/../..`)
     // can never turn a per-file read into a store escape, even if a future caller
-    // forgets the path-safety gate `changed_objects_since` now applies.
+    // forgets the path-safety gate `logged_objects_since` applies.
     if !is_safe_store_relative_path(rel) {
         return false;
     }
@@ -3602,48 +3878,12 @@ fn is_year_month_archive(s: &str) -> bool {
         && b[5..7].iter().all(u8::is_ascii_digit)
 }
 
-/// The timestamp of the most recent `validate` entry across the active `log.md`
-/// **and** the `log/<YYYY-MM>.md` archives — the default working-set cutoff.
-/// Reads only headers; never the whole store. Archive-aware so a `validate`
-/// entry that rotated into an archive after a month rollover still anchors the
-/// cutoff (without this, the cutoff silently resets to `None`).
-fn last_validate_at(store: &Store) -> Option<DateTime<FixedOffset>> {
-    let mut latest: Option<DateTime<FixedOffset>> = None;
-    for file in log_files_for_working_set(store) {
-        let Ok(text) = store.read_text_bounded(&file, crate::parser::MAX_DBMD_FILE_BYTES) else {
-            continue;
-        };
-        for line in text.lines() {
-            if !line.starts_with("## [") {
-                continue;
-            }
-            if let Some((ts, kind, _)) = parse_log_header(line) {
-                if kind == "validate" {
-                    latest = Some(match latest {
-                        Some(p) if p >= ts => p,
-                        _ => ts,
-                    });
-                }
-            }
-        }
-    }
-    latest
-}
-
-/// The set of content objects changed since `cutoff`, read from log entries
-/// whose kind mutates a file. When `cutoff` is `None`, every mutating entry
-/// counts (no prior validate window). Returns store-relative `.md` paths.
-///
-/// Scans the active `log.md` **and** every `log/<YYYY-MM>.md` archive: after a
-/// month rollover [`Log::append`] rotates prior-month entries out of the active
-/// file, so an object changed-but-never-validated in a prior month lives only in
-/// an archive. Reading the archives here is what keeps `dbmd validate` from
-/// silently skipping those files. Reads only log headers, never the content
-/// store.
-fn changed_objects_since(
-    store: &Store,
-    cutoff: Option<DateTime<FixedOffset>>,
-) -> BTreeSet<PathBuf> {
+/// Every content object any `log.md` entry (active file and `log/<YYYY-MM>.md`
+/// archives) names at or after `cutoff`, whatever its kind, as store-relative
+/// `.md` paths. Only the explicit `--since` working set reads this, so a logged
+/// deletion or rename still pulls in the files that link to the old path; the
+/// default working set never trusts the log for scope. Reads only headers.
+fn logged_objects_since(store: &Store, cutoff: DateTime<FixedOffset>) -> BTreeSet<PathBuf> {
     let mut out = BTreeSet::new();
     for file in log_files_for_working_set(store) {
         let Ok(text) = store.read_text_bounded(&file, crate::parser::MAX_DBMD_FILE_BYTES) else {
@@ -3656,15 +3896,7 @@ fn changed_objects_since(
             let Some((ts, kind, object)) = parse_log_header(line) else {
                 continue;
             };
-            if let Some(c) = cutoff {
-                if ts < c {
-                    continue;
-                }
-            }
-            if !matches!(
-                kind.as_str(),
-                "create" | "update" | "ingest" | "rename" | "delete" | "link"
-            ) {
+            if ts < cutoff || kind == "validate" {
                 continue;
             }
             if let Some(obj) = object {
@@ -3685,12 +3917,9 @@ fn changed_objects_since(
                 // Containment: the object slot is a log-header field that can
                 // carry a `..`/absolute/prefix path (a hand-edited or
                 // merge-malformed log line). Route it through the same safety gate
-                // every other disk-touching validator path uses
-                // (`safe_md_target_rel`, which `link_target_type` already applies)
-                // so a `records/../../leaky` object cannot make
-                // `validate_working_set` read + frontmatter-report on a file
-                // OUTSIDE the store root. An unsafe object is dropped from the
-                // changed set rather than probed.
+                // every other disk-touching validator path uses, so a
+                // `records/../../leaky` object can never make validation read or
+                // report on a file outside the store root.
                 if let Some(rel) = safe_md_target_rel(&bare) {
                     out.insert(rel);
                 }
@@ -6165,10 +6394,12 @@ mod tests {
     // ── working-set scoping ───────────────────────────────────────────────────
 
     #[test]
-    fn working_set_validates_only_changed_files() {
+    fn working_set_checks_files_the_log_never_named() {
+        // The September 2026 blind spot: a broken file written directly and
+        // never logged (or logged under a custom kind) passed the default
+        // check whenever any standard entry named some other file. The working
+        // set comes from the filesystem, so both files are checked.
         let fx = Fixture::new();
-        // `dirty` has a bad timestamp; `clean_but_unlogged` also does but is NOT
-        // in the log → working set must skip it.
         fx.write(
             "records/contacts/dirty.md",
             "---\ntype: contact\ncreated: BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\n# A\n",
@@ -6179,19 +6410,63 @@ mod tests {
         );
         fx.write(
             "log.md",
-            "---\ntype: log\n---\n\n## [2026-05-22 10:00] update | records/contacts/dirty\nedited\n",
+            "---\ntype: log\n---\n\n## [2026-05-22 10:00] update | records/contacts/dirty\nedited\n\n## [2026-05-22 10:05] audit | records/contacts/unlogged\nwrote\n",
+        );
+        for run in 0..2 {
+            let issues = validate_working_set(&fx.store(), None).unwrap();
+            for file in ["records/contacts/dirty.md", "records/contacts/unlogged.md"] {
+                assert!(
+                    issues
+                        .iter()
+                        .any(|i| i.code == codes::FM_BAD_TIMESTAMP && i.file == Path::new(file)),
+                    "run {run}: {file} must be checked and stay reported until fixed: {issues:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn working_set_records_clean_files_and_rechecks_them_when_they_change() {
+        use crate::validate_state::{Bindings, ValidationState};
+        let fx = Fixture::new();
+        fx.write(
+            "records/contacts/clean.md",
+            "---\ntype: contact\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\n# A\n",
+        );
+        fx.write(
+            "records/contacts/dirty.md",
+            "---\ntype: contact\ncreated: BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: B\n---\n\n# B\n",
+        );
+        let store = fx.store();
+        let issues = validate_working_set(&store, None).unwrap();
+        assert!(issues
+            .iter()
+            .all(|i| i.file != Path::new("records/contacts/clean.md")));
+        let state = ValidationState::load(&store, &Bindings::read(&store).unwrap())
+            .expect("a default run leaves a trusted record");
+        assert!(
+            state
+                .entry(Path::new("records/contacts/clean.md"))
+                .is_some(),
+            "a clean file is recorded"
+        );
+        assert!(
+            state
+                .entry(Path::new("records/contacts/dirty.md"))
+                .is_none(),
+            "a file with findings is never recorded, so it is checked every run"
+        );
+
+        // The recorded file changes on disk without any log entry: re-checked.
+        fx.write(
+            "records/contacts/clean.md",
+            "---\ntype: contact\ncreated: NOW-BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\n# A\n",
         );
         let issues = validate_working_set(&fx.store(), None).unwrap();
         assert!(
             issues.iter().any(|i| i.code == codes::FM_BAD_TIMESTAMP
-                && i.file == Path::new("records/contacts/dirty.md")),
+                && i.file == Path::new("records/contacts/clean.md")),
             "{issues:#?}"
-        );
-        assert!(
-            !issues
-                .iter()
-                .any(|i| i.file == Path::new("records/contacts/unlogged.md")),
-            "unlogged file must not be in the working set: {issues:#?}"
         );
     }
 
@@ -6219,6 +6494,10 @@ mod tests {
 
     #[test]
     fn working_set_respects_explicit_since_cutoff() {
+        // `--since` scopes by filesystem time plus the objects the log names
+        // since the cutoff. Every file here was just written, so a cutoff in
+        // the future isolates the log-named objects: `new` is logged after the
+        // cutoff, `old` before it.
         let fx = Fixture::new();
         fx.write(
             "records/contacts/old.md",
@@ -6232,12 +6511,11 @@ mod tests {
             "log.md",
             concat!(
                 "---\ntype: log\n---\n\n",
-                "## [2026-05-20 10:00] update | records/contacts/old\nx\n\n",
-                "## [2026-05-25 10:00] update | records/contacts/new\nx\n",
+                "## [2099-05-20 10:00] update | records/contacts/old\nx\n\n",
+                "## [2099-05-25 10:00] update | records/contacts/new\nx\n",
             ),
         );
-        // Cutoff after `old` but before `new`.
-        let since = DateTime::parse_from_rfc3339("2026-05-22T00:00:00+00:00").unwrap();
+        let since = DateTime::parse_from_rfc3339("2099-05-22T00:00:00+00:00").unwrap();
         let issues = validate_working_set(&fx.store(), Some(since)).unwrap();
         assert!(
             issues
@@ -6254,9 +6532,10 @@ mod tests {
     }
 
     #[test]
-    fn working_set_default_since_is_last_validate_entry() {
+    fn a_logged_validate_entry_never_hides_an_unchecked_file() {
+        // A `validate` log entry is a claim, not evidence. `before` changed
+        // before it and was never checked, so the default still reports it.
         let fx = Fixture::new();
-        // `before` changed before the last validate; `after` changed after.
         fx.write(
             "records/contacts/before.md",
             "---\ntype: contact\ncreated: BAD\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\nname: A\n---\n\n# A\n",
@@ -6275,18 +6554,12 @@ mod tests {
             ),
         );
         let issues = validate_working_set(&fx.store(), None).unwrap();
-        assert!(
-            issues
-                .iter()
-                .any(|i| i.file == Path::new("records/contacts/after.md")),
-            "{issues:#?}"
-        );
-        assert!(
-            !issues
-                .iter()
-                .any(|i| i.file == Path::new("records/contacts/before.md")),
-            "change before the last validate entry is outside the default window: {issues:#?}"
-        );
+        for file in ["records/contacts/before.md", "records/contacts/after.md"] {
+            assert!(
+                issues.iter().any(|i| i.file == Path::new(file)),
+                "{file} must be reported: {issues:#?}"
+            );
+        }
     }
 
     // ── ordering / determinism ────────────────────────────────────────────────
@@ -6370,19 +6643,21 @@ mod tests {
 
     #[test]
     fn incoming_linker_scan_does_not_prefix_match() {
-        // A changed `records/contacts/sarah` must NOT pull in a file that only
-        // links to `records/contacts/sarah-chen` (a longer path sharing a prefix).
+        // A removed `records/contacts/sarah` must NOT pull in a file that only
+        // links to `records/contacts/sarah-chen` (a longer path sharing a
+        // prefix). The explicit `--since` form isolates the log-named removal:
+        // the files on disk are older than the (future) cutoff.
         let fx = Fixture::new();
         fx.write(
             "records/profiles/only-sarah-chen.md",
             "---\ntype: profile\nmeta-type: conclusion\ncreated: 2026-05-22T10:00:00-07:00\nupdated: 2026-05-22T10:00:00-07:00\nsummary: x\n---\n\nSee [[records/contacts/sarah-chen]].\n",
         );
-        // The log says `records/contacts/sarah` (the shorter path) changed.
         fx.write(
             "log.md",
-            "---\ntype: log\n---\n\n## [2026-05-22 10:00] delete | records/contacts/sarah\nremoved\n",
+            "---\ntype: log\n---\n\n## [2099-05-22 10:00] delete | records/contacts/sarah\nremoved\n",
         );
-        let issues = validate_working_set(&fx.store(), None).unwrap();
+        let since = DateTime::parse_from_rfc3339("2099-05-22T00:00:00+00:00").unwrap();
+        let issues = validate_working_set(&fx.store(), Some(since)).unwrap();
         assert!(
             !issues
                 .iter()
@@ -7197,7 +7472,7 @@ mod tests {
         .unwrap();
         symlink(&replacement, &root).unwrap();
 
-        let issues = validate_content_sweep(&store).unwrap();
+        let issues = validate_working_set(&store, None).unwrap();
         assert!(
             issues
                 .iter()

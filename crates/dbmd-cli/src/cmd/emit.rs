@@ -28,7 +28,7 @@ use crate::error::{CliError, CliResult, ExitCode};
 
 /// Run `dbmd emit`.
 pub fn run(ctx: &Context, args: &EmitArgs) -> CliResult {
-    let store = Store::open_strict(Path::new(&args.dir))?;
+    let store = Store::open_strict(Path::new(args.store_dir()))?;
 
     // NDJSON: the streaming form. Project one file at a time and print it as
     // one compact line — the exact `files[]` element shape in the exact
@@ -43,7 +43,7 @@ pub fn run(ctx: &Context, args: &EmitArgs) -> CliResult {
     let dump = emit::compute(&store).map_err(CliError::from)?;
 
     if ctx.json {
-        println!("{}", json_dump(&args.dir, &dump));
+        println!("{}", json_dump(args.store_dir(), &dump));
     } else {
         print!("{}", text_dump(&dump));
     }

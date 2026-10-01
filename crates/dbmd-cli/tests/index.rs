@@ -213,6 +213,12 @@ fn writethrough_sequence_equals_rebuild_byte_for_byte() {
             "updated=2026-05-25T10:00:00-07:00",
             "--fm",
             "name=Jordan Li",
+            // The contact schema's required fields: `dbmd write` refuses a
+            // record that would fail its own schema.
+            "--fm",
+            "email=jordan.li@globex.example",
+            "--fm",
+            "company=[[records/companies/northstar]]",
         ])
         .assert()
         .success();

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Explicit store-owned validation policy. No generic error suppression:
-//! only custom log vocabulary, intentional optional uniqueness, and exact-byte
-//! acknowledgements of overlong summaries in preserved sources are supported.
+//! only custom log vocabulary, intentional optional uniqueness, exact-byte
+//! acknowledgements of overlong summaries in preserved sources, and the
+//! opposite direction, a store's choice to make every warning fail validation.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -20,6 +21,7 @@ pub struct ValidationPolicy {
     log_kinds: BTreeSet<String>,
     optional_unique: Vec<OptionalUnique>,
     preserved_summaries: Vec<PreservedSummary>,
+    blocking_warnings: bool,
     problems: Vec<String>,
 }
 
@@ -121,6 +123,26 @@ impl ValidationPolicy {
         }
     }
 
+    /// `### Blocking warnings`: the single bullet `all` makes every warning
+    /// that survives the other policies fail validation. Anything else is a
+    /// malformed policy, never a silently narrower one.
+    pub(crate) fn add_blocking_warning(&mut self, raw: &str) {
+        if raw != "all" {
+            self.problems
+                .push("Blocking warnings: the only supported bullet is `all`".into());
+        } else if self.blocking_warnings {
+            self.problems
+                .push("Blocking warnings: duplicate `all`".into());
+        } else {
+            self.blocking_warnings = true;
+        }
+    }
+
+    /// Whether the store declared that every warning fails validation.
+    pub fn blocks_warnings(&self) -> bool {
+        self.blocking_warnings
+    }
+
     /// Additional exact, case-sensitive log vocabulary; no timestamps or log
     /// ordering checks are affected.
     pub fn recognizes_log_kind(&self, kind: &str) -> bool {
@@ -213,6 +235,17 @@ impl ValidationPolicy {
                         entry.reason
                     ));
                     issue.suggestion = Some("Keep preserved source bytes unchanged; new summaries must be at most 200 characters".into());
+                }
+            }
+        }
+        // Last, so an acknowledged (info) finding is never escalated.
+        if self.blocking_warnings {
+            for issue in issues.iter_mut() {
+                if issue.severity == Severity::Warning {
+                    issue.severity = Severity::Error;
+                    issue
+                        .message
+                        .push_str(" (blocking: DB.md `### Blocking warnings`)");
                 }
             }
         }

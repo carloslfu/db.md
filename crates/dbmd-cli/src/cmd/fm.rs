@@ -18,7 +18,10 @@ use serde_norway::Value as YamlValue;
 
 use crate::cli::{FmArgs, FmCommand, FmGetArgs, FmInitArgs, FmSetArgs};
 use crate::cmd::log::into_cli;
-use crate::cmd::write::{apply_schema_defaults, require_store_relative};
+use crate::cmd::write::{
+    apply_schema_defaults, catalog_declared_assets, refuse_invalid_content, refuse_missing_assets,
+    require_store_relative,
+};
 use crate::context::Context;
 use crate::error::{CliError, CliResult, ExitCode};
 
@@ -67,7 +70,7 @@ pub fn run_get(ctx: &Context, args: &FmGetArgs) -> CliResult {
 pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     let (key, value) = split_assignment(&args.assignment)?;
 
-    let store = locate_store_from_cwd()?;
+    let store = locate_store_for(&args.file)?;
     let _transaction = store.transaction().map_err(CliError::from)?;
     let rel = require_store_relative(&store, &args.file)?;
 
@@ -75,6 +78,7 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     enforce_not_frozen(&store, &rel)?;
 
     let (mut fm, body) = into_cli(store.read_file(&rel))?;
+    let before = parser::render_file(&fm, &body);
     into_cli(fm.set(key, value))?;
     // Auto-maintain `updated`: any edit to an existing content file re-stamps
     // `updated` to now (SPEC: `updated` is auto-maintained), so the type-folder
@@ -82,7 +86,21 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
     // An explicit `fm set updated=…` already set the field via `fm.set` above;
     // don't clobber that operator-chosen value with `now`.
     bump_updated_unless_explicit(&mut fm, key);
+
+    // Content rules: refuse an edit that introduces a finding `dbmd validate`
+    // would report (a near-miss key, an overlong summary, an enum violation).
+    // Pre-existing findings never block, so a repair can proceed one field at a
+    // time. A newly declared asset must exist so it can be cataloged below.
+    let after = parser::render_file(&fm, &body);
+    refuse_invalid_content(&store, &rel, &after, Some(&before))?;
+    let declares_assets = matches!(key, "asset" | "assets");
+    if declares_assets {
+        refuse_missing_assets(&store, &fm)?;
+    }
     into_cli(store.write_file(&rel, &fm, &body))?;
+    if declares_assets {
+        catalog_declared_assets(&store, &rel, &fm)?;
+    }
 
     // Write-through: re-derive the record from the now-updated file and re-sort
     // the type-folder index. Non-fatal if it can't run (the file is the source
@@ -114,7 +132,7 @@ pub fn run_set(ctx: &Context, args: &FmSetArgs) -> CliResult {
 /// `summary` (overridable with `--summary`), then fold the file into its index
 /// write-through. Refuses on a `DB.md` frozen page before mutating.
 pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
-    let store = locate_store_from_cwd()?;
+    let store = locate_store_for(&args.file)?;
     let _transaction = store.transaction().map_err(CliError::from)?;
     let rel = require_store_relative(&store, &args.file)?;
 
@@ -173,6 +191,34 @@ pub fn run_init(ctx: &Context, args: &FmInitArgs) -> CliResult {
         fm.summary = Some(composed);
     }
 
+    // An explicit summary is the one value `fm init` takes from the caller;
+    // refuse it when `dbmd validate` would (over 200 characters), never
+    // truncate it. Schema fields the type requires are added afterwards with
+    // `fm set`, so they are not demanded here.
+    if args.summary.is_some() {
+        let text = parser::render_file(&fm, &body);
+        let invalid_summary: Vec<_> =
+            dbmd_core::validate::write_blocking_issues(&store, &rel, &text)
+                .into_iter()
+                .filter(|issue| issue.key.as_deref() == Some("summary"))
+                .collect();
+        if !invalid_summary.is_empty() {
+            let reasons: Vec<String> = invalid_summary
+                .iter()
+                .map(|issue| format!("{}: {}", issue.code, issue.message))
+                .collect();
+            return Err(CliError::new(
+                ExitCode::ValidationFailed,
+                "WRITE_INVALID",
+                format!(
+                    "refused to initialize `{}`: {}",
+                    rel.to_string_lossy(),
+                    reasons.join("; ")
+                ),
+            )
+            .with_hint("pass a summary of at most 200 characters; nothing was written"));
+        }
+    }
     into_cli(store.write_file(&rel, &fm, &body))?;
     let index_ok = Index::on_write(&store, &rel).is_ok();
 
@@ -323,6 +369,27 @@ fn bump_updated_unless_explicit(fm: &mut parser::Frontmatter, mutated_key: &str)
 /// boundary; its files must never be mutated using an outer store's policy or
 /// indexes. When no ancestor is a store, the error carries an actionable hint
 /// because `fm set` / `fm init` take no `--dir`.
+fn locate_store_for(file: &str) -> Result<Store, CliError> {
+    let start = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    if nearest_store_root(&start).is_some() {
+        return locate_store_from_cwd();
+    }
+    // Outside every store, there is no operating context the file could escape
+    // from, so the file's own nearest store decides: `dbmd fm set
+    // /abs/store/records/x.md k=v` works from anywhere, as `dbmd body` does.
+    let path = Path::new(file);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    match std::fs::canonicalize(parent)
+        .ok()
+        .and_then(|parent| nearest_store_root(&parent))
+    {
+        Some(root) => Store::open_strict(&root).map_err(CliError::from),
+        None => locate_store_from_cwd(),
+    }
+}
+
+/// The store `fm set` / `fm init` operate on when the working directory is
+/// inside one (see [`locate_store_for`] for the outside-any-store case).
 fn locate_store_from_cwd() -> Result<Store, CliError> {
     let start = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
 
@@ -343,7 +410,7 @@ fn locate_store_from_cwd() -> Result<Store, CliError> {
 }
 
 /// Walk `start` and its ancestors, returning the nearest db.md store root.
-fn nearest_store_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn nearest_store_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|path| Store::is_db_md_store(path))

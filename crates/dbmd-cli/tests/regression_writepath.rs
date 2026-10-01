@@ -4,8 +4,11 @@
 //! silently return.
 //!
 //!   - #17 — `dbmd write --summary` / `dbmd fm init --summary` must NOT silently
-//!     hard-truncate an explicit >200-char agent summary (parity with
-//!     `dbmd fm set`, which preserves it verbatim).
+//!     hard-truncate an explicit >200-char agent summary. Since the September
+//!     2026 write-time checks they refuse it loudly instead (exit 6,
+//!     `WRITE_INVALID`, nothing written), in parity with `dbmd fm set`: the
+//!     agent's text is never dropped, and a summary the SPEC caps at 200
+//!     characters never reaches disk.
 //!   - #18 — `dbmd write`'s collision guard must be atomic, not TOCTOU: two
 //!     concurrent writers to the same resolved path can never both succeed and
 //!     silently clobber one another's primary content.
@@ -34,7 +37,7 @@ fn long_summary() -> String {
 }
 
 #[test]
-fn regression_write_preserves_long_explicit_summary() {
+fn regression_write_refuses_long_explicit_summary_without_truncating() {
     let tmp = tempfile::TempDir::new().unwrap();
     let store = tmp.path();
     write_db_md(store);
@@ -42,9 +45,10 @@ fn regression_write_preserves_long_explicit_summary() {
     let summary = long_summary();
     assert!(summary.chars().count() > 200, "fixture must exceed the cap");
 
-    dbmd()
+    let output = dbmd()
         .current_dir(store)
         .args([
+            "--json",
             "write",
             "records/contacts/sarah.md",
             "--type",
@@ -52,33 +56,37 @@ fn regression_write_preserves_long_explicit_summary() {
             "--summary",
             &summary,
         ])
-        .assert()
-        .success();
-
-    let written = std::fs::read_to_string(store.join("records/contacts/sarah.md")).unwrap();
-    // The full agent summary survives — the trailing qualifier (the part a
-    // 200-char cut would discard) is on disk.
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "an overlong summary is refused"
+    );
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "WRITE_INVALID");
     assert!(
-        written.contains("END_QUALIFIER"),
-        "explicit --summary must not be truncated; the tail is missing:\n{written}"
+        error["error"]["details"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "SUMMARY_TOO_LONG"),
+        "{error}"
     );
     assert!(
-        written.contains(&summary),
-        "the full explicit summary must round-trip verbatim:\n{written}"
+        !store.join("records/contacts/sarah.md").exists(),
+        "a refused write leaves nothing behind (and so never a truncated summary)"
     );
 }
 
 #[test]
-fn regression_fm_init_preserves_long_explicit_summary() {
+fn regression_fm_init_refuses_long_explicit_summary_without_truncating() {
     let (_tmp, store) = copy_store_to_temp(&corpus_a());
-    write_file(
-        &store,
-        "records/contacts/nina-ray.md",
-        "---\nname: Nina Ray\nrole: Analyst\n---\n\n# Nina Ray\n",
-    );
+    let original = "---\nname: Nina Ray\nrole: Analyst\n---\n\n# Nina Ray\n";
+    write_file(&store, "records/contacts/nina-ray.md", original);
 
     let summary = long_summary();
-    dbmd()
+    let output = dbmd()
         .current_dir(&store)
         .args([
             "fm",
@@ -87,13 +95,17 @@ fn regression_fm_init_preserves_long_explicit_summary() {
             "--summary",
             &summary,
         ])
-        .assert()
-        .success();
-
-    let written = std::fs::read_to_string(store.join("records/contacts/nina-ray.md")).unwrap();
-    assert!(
-        written.contains("END_QUALIFIER") && written.contains(&summary),
-        "fm init --summary must not truncate the agent's value:\n{written}"
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "an overlong summary is refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.join("records/contacts/nina-ray.md")).unwrap(),
+        original,
+        "a refused fm init leaves the file byte-for-byte unchanged"
     );
 }
 

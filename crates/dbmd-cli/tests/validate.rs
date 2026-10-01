@@ -436,9 +436,12 @@ fn projection_excludes_requires_all_and_rejects_unsafe_paths() {
 fn since_flag_parses_date_only_and_rfc3339() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_db_md(tmp.path());
-    // Two dirty logged files: `old` changed before the cutoff, `new` after.
+    // Two dirty logged files: `old` logged before the cutoff, `new` after.
     // Both `--since` forms must parse AND scope to the same cutoff — exactly
     // `new.md` is inspected (its FM_BAD_TIMESTAMP fires), `old.md` is excluded.
+    // `--since` scopes by filesystem time plus the objects `log.md` names
+    // since the cutoff; the cutoff is in the future relative to these just
+    // written files, so only the log-named objects decide the scope.
     // Asserting the scoped issue set, not bare exit 0 on an empty store, makes
     // the date load-bearing: a `--since` that's ignored or misparsed would
     // either inspect `old` too or inspect nothing, and this fails either way.
@@ -457,14 +460,14 @@ fn since_flag_parses_date_only_and_rfc3339() {
         "log.md",
         concat!(
             "---\ntype: log\n---\n\n",
-            "## [2026-04-20 10:00] update | records/contacts/old\nx\n\n",
-            "## [2026-05-10 10:00] update | records/contacts/new\nx\n",
+            "## [2099-04-20 10:00] update | records/contacts/old\nx\n\n",
+            "## [2099-05-10 10:00] update | records/contacts/new\nx\n",
         ),
     );
 
     // The cutoff sits after `old`'s change and before `new`'s. Both spellings
     // resolve to it.
-    for since in ["2026-05-01", "2026-05-01T00:00:00-07:00"] {
+    for since in ["2099-05-01", "2099-05-01T00:00:00-07:00"] {
         let mut cmd = dbmd();
         cmd.arg("--json")
             .arg("validate")

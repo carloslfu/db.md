@@ -181,43 +181,38 @@ fn regression_working_set_validates_archived_changed_file() {
     );
 }
 
-/// The working-set cutoff (`last_validate_at`) must read the `validate` entry
-/// from a `log/<YYYY-MM>.md` archive, not silently reset to `None`.
+/// A `validate` log entry, wherever it sits (active log or a rotated archive),
+/// never narrows the default working set.
 ///
-/// Trigger: the last `validate` entry and an earlier (pre-validate) `update`
-/// both rotated into the May archive; a post-validate change sits in the active
-/// June log. Pre-fix, `last_validate_at` read only the active log → returned
-/// `None` → the cutoff vanished and a `changed_objects_since(None)` that also
-/// ignored archives mis-anchored the window. With the fix, the cutoff is the
-/// archived May-30 validate, so the pre-validate `before.md` change is correctly
-/// EXCLUDED while the post-validate `after.md` change is INCLUDED.
+/// History: the working set used to be read from `log.md`, anchored on the
+/// last `validate` entry, and this test asserted that a change logged before an
+/// archived `validate` entry was *excluded*. That design let a file that was
+/// never actually checked, or never logged, pass the default check whenever a
+/// later standard entry existed. It is how a September 2026 store accumulated
+/// schema errors that every session's `dbmd validate` reported as clean. The
+/// scope now comes from the filesystem, so an unchecked defect is reported no
+/// matter what the log claims.
 #[test]
-fn regression_working_set_cutoff_reads_archived_validate_entry() {
+fn regression_working_set_never_trusts_a_logged_validate_entry() {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
     fresh_store(root);
 
-    // `before` changed before the (archived) validate; it must be excluded.
-    // It carries a defect (short-form link) that must NOT be reported.
     write(
         root,
         "records/contacts/before.md",
         "---\ntype: contact\ncreated: 2026-05-20T10:00:00-07:00\nupdated: 2026-05-20T10:00:00-07:00\nsummary: \"changed before validate\"\nname: B\n---\n\nSee [[ghost]].\n",
     );
-    // `after` changed after the validate; its defect must be reported.
     write(
         root,
         "records/contacts/after.md",
         "---\ntype: contact\ncreated: 2026-06-02T10:00:00-07:00\nupdated: 2026-06-02T10:00:00-07:00\nsummary: \"changed after validate\"\nname: A\n---\n\nSee [[phantom]].\n",
     );
-
-    // Active log: only the post-validate June change survives.
     write(
         root,
         "log.md",
         "---\ntype: log\n---\n\n## [2026-06-02 10:00] update | records/contacts/after\n",
     );
-    // May archive: the pre-validate update AND the validate entry (the cutoff).
     write(
         root,
         "log/2026-05.md",
@@ -226,18 +221,12 @@ fn regression_working_set_cutoff_reads_archived_validate_entry() {
 
     let store = open(root);
     let issues = validate_working_set(&store, None).unwrap();
-    assert!(
-        issues
-            .iter()
-            .any(|i| i.file == Path::new("records/contacts/after.md")),
-        "post-validate change must be in the working set: {issues:#?}"
-    );
-    assert!(
-        !issues
-            .iter()
-            .any(|i| i.file == Path::new("records/contacts/before.md")),
-        "pre-validate change (before the archived cutoff) must be excluded: {issues:#?}"
-    );
+    for file in ["records/contacts/before.md", "records/contacts/after.md"] {
+        assert!(
+            issues.iter().any(|i| i.file == Path::new(file)),
+            "{file} carries an unchecked defect and must be reported: {issues:#?}"
+        );
+    }
 }
 
 // ── Adversarial review (second pass) ─────────────────────────────────────────

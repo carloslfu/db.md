@@ -690,6 +690,13 @@ Don't synthesize conclusion records from sources tagged `transient`.
     never inherit an exception. This preserves immutable historical evidence
     without claiming its metadata was repaired or suppressing future defects.
 
+  - **`### Blocking warnings`** — the single bullet `- all`. Every warning
+    that survives the other policies becomes an **error**, so `dbmd validate`
+    (both scopes) exits non-zero on it and anything gated on validation (a
+    sync, a checkpoint, CI) refuses it. Acknowledged preserved-source summaries
+    stay info. Use it when a store's owner requires zero warnings; any other
+    bullet is `VALIDATION_POLICY_INVALID`, never a silently narrower policy.
+
     These three policy lists are bounded to 256 entries each. Reasons are
     required, nonempty single-line strings of at most 1,000 bytes. Malformed,
     duplicate, stale or mismatched declarations emit `VALIDATION_POLICY_INVALID`
@@ -1144,6 +1151,20 @@ source-first discipline above:
 
 ### Pre-write checks
 
+The toolkit refuses a write whose own content breaks a rule `dbmd
+validate` enforces, so the agent does not have to remember them:
+`dbmd write` refuses a new content file, and `dbmd fm set` refuses an
+edit that introduces, any of the file-local findings (a missing required
+schema field, an enum or shape violation, a key such as `source-kind`
+that only near-misses the declared `source_kind`, a summary over 200
+characters, a malformed timestamp or id, a short-form wiki-link). Nothing
+is written; the error (`WRITE_INVALID`, exit 6) lists each finding with
+its fix. Findings that depend on other files (a link to a page not
+written yet, a duplicate, the asset catalog) stay `dbmd validate`
+findings. A wrapper that declares an `asset:` must name a file already
+in the store (`ASSET_NOT_FOUND` otherwise), and `dbmd write` / `dbmd fm
+set` catalog it in `assets.jsonl` in the same step.
+
 Before `dbmd write`, `dbmd link`, or `dbmd fm set`, the agent
 should:
 
@@ -1176,11 +1197,13 @@ should:
 After a meaningful batch of writes (a session, a sweep, a recovery
 pass):
 
-1. **`dbmd validate`** — validates the working set (the files
-   touched this session plus anything linking to them); surfaces
-   missed pre-write checks (broken links, missing summaries, schema
-   violations from `DB.md`'s `## Schemas`). `dbmd validate --all`
-   is the full-store sweep — CI or recovery, not the loop.
+1. **`dbmd validate`** — validates the working set (every content
+   file changed on disk since the last run, every file that still had
+   findings, and anything linking to a changed or removed path);
+   surfaces what the pre-write refusals cannot see (broken links,
+   uncataloged assets, files written without `dbmd`). `dbmd validate
+   --all` adds the cross-file sweep (indexes, log, duplicates, the
+   asset manifest) — run it before a sync or checkpoint and in CI.
 2. **`dbmd log <kind> <object>`** — append a chronological entry
    for the action (every meaningful write).
 
@@ -1210,8 +1233,9 @@ toolkit doesn't enforce it; the contract lives here.
    **Append `dbmd log <kind> <object> -m <note>` for every
    meaningful action.**
 4. **Validate** — `dbmd validate` after any non-trivial change
-   validates the working set (fast, O(changed)); `dbmd validate
-   --all` is the periodic full sweep. Hard issues block; soft
+   validates the working set (fast: one metadata pass plus the changed
+   files); `dbmd validate --all` is the full sweep, run before a sync
+   or checkpoint. Hard issues block; soft
    warnings are decision points the agent resolves with `dbmd
    rename` / `dbmd link` / `dbmd write`.
 5. **Catalog stays current automatically** — the write commands
@@ -1251,14 +1275,22 @@ is a deterministic remediation hint — the agent applies it without
 guessing. `related` lists other files involved (e.g. the duplicate
 partner in a collision).
 
-**Scope.** `dbmd validate` validates the **working set** by default —
-content files changed since the last `validate` entry in `log.md` (or
-since `--since <ts>`), plus any file linking to a changed, renamed, or
-removed path. This keeps the post-write check O(changed), flat in
-store size. If the default call has no logged changed objects to
-inspect (fresh store, missing log, or external edits not recorded in
-`log.md`), it falls back to a per-file content sweep so validation
-never passes vacuously. `dbmd validate --all` walks the entire store —
+**Scope.** `dbmd validate` validates the **working set** by default:
+every content file whose size, modification time or change time
+differs from what the last default run recorded (or that is new), every
+file that still had an error or warning then, and every file linking to
+a changed, renamed, or removed path. The scope comes from the
+filesystem, never from `log.md`: the log is written by the agent whose
+work is being checked, so a file it forgot to log, or logged under a
+custom kind, is exactly the one most likely to be wrong. The record of
+what was checked lives in the store-local `.dbmd/validate-state.json`
+(beside a `.dbmd/.gitignore` that keeps it out of version control); it
+is bound to the toolkit version, the exact `DB.md` bytes, and the store
+directory's identity, so a new toolkit, a schema or policy change, or a
+copied store falls back to a full per-file sweep. A logged `validate`
+entry never narrows the scope. `--since <ts>` instead checks the content
+files modified or changed at or after `<ts>` plus the objects `log.md`
+names since then, and records nothing. `dbmd validate --all` walks the entire store —
 every link, every index, and the entity-dedup collisions (`DUP_*`),
 which the working-set pass leaves to the pre-write checks and to
 `--all`. Both
@@ -1305,6 +1337,7 @@ see; grouped by category):
 | `FM_BAD_TIMESTAMP` | error | `created` or `updated` isn't ISO-8601 |
 | `FM_BAD_META_TYPE` | error | a record's `meta-type` is not one of `fact` / `operational` / `conclusion` |
 | `FM_BAD_ID` | warning | `id` is present but unusable as an identifier (non-scalar, empty, or contains whitespace); the recommended form is a lowercase ULID |
+| `FM_KEY_NEAR_MISS` | warning | a frontmatter key differs from a declared key (a `## Schemas` field or a core field) only by letter case or `-`/`_`, e.g. `source-kind` for `source_kind`; schemas, indexes and queries never read it |
 | `FM_IN_BODY` | warning | a content file's body opens with a second `---` frontmatter block (typically an imported file's own frontmatter embedded verbatim as body text); the record's real frontmatter is the block at the top of the file, so strip the leftover one |
 | `SUMMARY_MISSING` | error | content file has no `summary` — run `dbmd fm init` |
 | `SUMMARY_EMPTY` | error | `summary` present but empty |
@@ -1923,7 +1956,7 @@ prompt interactively.
 | Warm up   | `dbmd log tail [N]`, `dbmd log since <ts>` |
 | Read      | `dbmd search <q> [--type --in --where --linked-from --linked-to --updated-after --updated-before]`, `dbmd query [--type --in --where --updated-after --updated-before --created-after --created-before --limit]` (frontmatter filter over the sidecar; paths by default, `--json` = full records — the dedup/`--where` lookup folds in the former `fm query`, `--json` the former `index query`), `dbmd show <file>` (one file as its full structured record — the single-file `emit`), `dbmd fm get <file> <key>`, `dbmd section get <file> <heading>`, `dbmd schema [<type>]` (the parsed `DB.md ## Schemas` contracts), `dbmd graph <backlinks\|forwardlinks\|neighborhood\|orphans>`, `dbmd tree`, `dbmd outline <file>`, `dbmd stats`, `dbmd extract <file>`, `dbmd index show [<path>]`, `dbmd emit` (the whole store as one structured JSON document — the host-integration surface `show` is the single-file form of), `dbmd watch [--path]` (the local change feed) |
 | Write     | `dbmd write <path> --type <t> [--summary --fm --body-file]`, `dbmd fm set <file> <k>=<v>`, `dbmd fm init <file>`, `dbmd body <set\|append> <file>`, `dbmd section <set\|append> <file> <heading> [--create]`, `dbmd link <from> <to>`, `dbmd rename <old> <new>`, `dbmd rm <path> [--force]` (link-aware delete), `dbmd format <file>` |
-| Validate  | `dbmd validate [--json]` (working set), `dbmd validate --all` (full sweep), `dbmd validate --all --projection-excludes <file>` (local declared projection), `dbmd validate --all --projection-manifest <file\|->` (path-commitment projection) |
+| Validate  | `dbmd validate [DIR \| --dir DIR] [--json]` (working set), `dbmd validate --all` (full sweep), `dbmd validate --all --projection-excludes <file>` (local declared projection), `dbmd validate --all --projection-manifest <file\|->` (path-commitment projection) |
 | Maintain  | indexes are write-through; `dbmd index rebuild [--layer --folder --dry-run]` repairs / folds in bulk drops |
 | Close     | `dbmd log <kind> <object> [-m <note>]` |
 | Serve     | `dbmd api [--addr]` — the local app API: the full local verb surface over loopback HTTP (every route executes the same-named verb; `GET /v1` lists routes; `GET /v1/events` streams `watch` as SSE), so an application uses the store as its backend without shelling out |
