@@ -6925,6 +6925,26 @@ fn stage_v2_bulk_windows<'a>(
     }
 }
 
+/// Every path has already passed its own signed inclusion proof. Equal content
+/// hashes with equal lengths can share one verified immutable download; never
+/// upload thousands of repeated proof claims just to fetch identical bytes.
+fn unique_v2_blob_downloads<'a>(
+    pending: &[(&'a String, &'a V2BaselineFile)],
+) -> LinkResult<Vec<(&'a String, &'a V2BaselineFile)>> {
+    let mut hashes = std::collections::BTreeMap::<&str, u64>::new();
+    let mut unique = Vec::new();
+    for &(path, file) in pending {
+        match hashes.insert(file.sha256.as_str(), file.bytes) {
+            Some(bytes) if bytes != file.bytes => {
+                return Err(invalid_feed("equal v2 blob hashes claim different lengths"));
+            }
+            Some(_) => {}
+            None => unique.push((path, file)),
+        }
+    }
+    Ok(unique)
+}
+
 #[cfg(any(unix, windows))]
 fn stage_v2_blobs(
     cfg: &HubConfig,
@@ -6938,7 +6958,7 @@ fn stage_v2_blobs(
     let mut window = Vec::new();
     let mut missing_windows = Vec::new();
     let mut window_bytes = 0_u64;
-    for &(path, file) in &pending {
+    for (path, file) in unique_v2_blob_downloads(&pending)? {
         if file.bytes > V2_BULK_STREAM_CONTENT_BYTES {
             queue_v2_bulk_window(
                 &cache_dir,
@@ -6992,12 +7012,25 @@ fn stage_v2_blobs(
             },
         );
     }
+    let by_hash = staged
+        .into_values()
+        .map(|file| (file.sha256.clone(), file))
+        .collect::<std::collections::BTreeMap<_, _>>();
     pending
         .into_iter()
-        .map(|(path, _)| {
-            staged
-                .remove(path)
-                .ok_or_else(|| invalid_feed("v2 download cache omitted a proven path"))
+        .map(|(path, expected)| {
+            let file = by_hash
+                .get(&expected.sha256)
+                .ok_or_else(|| invalid_feed("v2 download cache omitted a proven hash"))?;
+            if file.bytes != expected.bytes {
+                return Err(invalid_feed("v2 download cache has a conflicting length"));
+            }
+            Ok(V2StagedFile {
+                path: path.clone(),
+                source: file.source.clone(),
+                sha256: file.sha256.clone(),
+                bytes: file.bytes,
+            })
         })
         .collect()
 }
@@ -16021,6 +16054,36 @@ pub fn head(cfg: &HubConfig, brain: &str) -> LinkResult<Head> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn immutable_blob_downloads_share_bytes_without_sharing_path_authority() {
+        let first = "records/a.md".to_string();
+        let second = "records/b.md".to_string();
+        let third = "records/c.md".to_string();
+        let file: V2BaselineFile = serde_json::from_value(json!({
+            "sha256": "a".repeat(64), "bytes": 8
+        }))
+        .unwrap();
+        let other: V2BaselineFile = serde_json::from_value(json!({
+            "sha256": "b".repeat(64), "bytes": 8
+        }))
+        .unwrap();
+        let unique =
+            unique_v2_blob_downloads(&[(&first, &file), (&second, &file), (&third, &other)])
+                .unwrap();
+        assert_eq!(
+            unique
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["records/a.md", "records/c.md"]
+        );
+        let conflicting: V2BaselineFile = serde_json::from_value(json!({
+            "sha256": "a".repeat(64), "bytes": 9
+        }))
+        .unwrap();
+        assert!(unique_v2_blob_downloads(&[(&first, &file), (&second, &conflicting)]).is_err());
+    }
+
     #[test]
     fn manifest_sizing_recovers_throughput_without_exceeding_wire_or_byte_budgets() {
         let mut sizing = super::V2ManifestPageSizing::new();

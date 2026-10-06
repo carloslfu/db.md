@@ -14,6 +14,9 @@ Two things version independently:
 
 ## [0.14.5] - 2026-10-06
 
+- Cold v2 checkouts fetch each proven content hash once, then materialize every
+  separately authorized path. Conflicting lengths for one hash fail closed.
+
 ### Fixed
 
 - Regain inventory throughput after verified, promptly delivered full pages.
