@@ -9078,7 +9078,9 @@ fn v2_sync_push(
     let includes_contract = operations
         .iter()
         .any(|operation| operation.get("path").and_then(Value::as_str) == Some("DB.md"));
-    let rebase = if head.pointer.is_none() || includes_contract {
+    // A client signs one exact parent and candidate. The hub cannot rebase
+    // that signature, including the content phase after a DB.md-only commit.
+    let rebase = if head.identity.custody == "self" || head.pointer.is_none() || includes_contract {
         "strict"
     } else {
         "disjoint"

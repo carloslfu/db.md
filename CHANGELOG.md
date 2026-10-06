@@ -8,9 +8,18 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.14.3**.
+  `Cargo.toml`, currently **v0.14.4**.
 
 ## Unreleased
+
+## [0.14.4] - 2026-10-06
+
+### Fixed
+
+- Keep every self-custodied write pinned to its exact signed parent. Content
+  commits after the initial contract phase incorrectly requested disjoint
+  rebasing, which the hub correctly refused before signing. Hub-custodied
+  writers keep their existing disjoint convergence behavior.
 
 ## [0.14.3] — 2026-10-06
 
