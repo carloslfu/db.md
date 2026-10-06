@@ -4028,6 +4028,46 @@ fn clear_v2_manifest_journal(cfg: &HubConfig, brain: &str) -> LinkResult<()> {
     Ok(())
 }
 
+// Grow only from complete, promptly delivered pages. A transient transport
+// failure must not trap a large recovery at ten files per request forever.
+struct V2ManifestPageSizing {
+    limit: usize,
+    recovery_pages: usize,
+}
+
+impl V2ManifestPageSizing {
+    fn new() -> Self {
+        Self {
+            limit: 50,
+            recovery_pages: 0,
+        }
+    }
+
+    fn transport_failed(&mut self) {
+        self.limit = (self.limit / 2).max(10);
+        self.recovery_pages = 2;
+    }
+
+    fn verified(&mut self, files: usize, bytes: usize, elapsed: std::time::Duration) {
+        if files < self.limit || bytes == 0 {
+            return;
+        }
+        if self.recovery_pages > 0 {
+            self.recovery_pages -= 1;
+            return;
+        }
+        if elapsed > std::time::Duration::from_secs(5) {
+            return;
+        }
+        // Keep the estimated decoded payload near 2 MiB and obey the wire's
+        // 500-file maximum. The hard response-byte bound remains independent.
+        let byte_budget_limit = self.limit.saturating_mul(2 * 1024 * 1024) / bytes;
+        self.limit = self
+            .limit
+            .max((self.limit * 2).min(500).min(byte_budget_limit));
+    }
+}
+
 fn v2_manifest(
     cfg: &HubConfig,
     head: &V2VerifiedHead,
@@ -4050,7 +4090,7 @@ fn v2_manifest(
     let mut files = std::collections::BTreeMap::new();
     let mut after = String::new();
     let mut page_number = 0;
-    let mut page_limit = 50;
+    let mut sizing = V2ManifestPageSizing::new();
     let http = hub_agent_with_timeout(cfg, std::time::Duration::from_secs(30))?;
     loop {
         let cache_name = format!("manifest-{cache_key}-{page_number:05}.json");
@@ -4070,6 +4110,8 @@ fn v2_manifest(
         let page = if let Some(cached) = cached {
             cached.page
         } else {
+            let page_limit = sizing.limit;
+            let page_started = std::time::Instant::now();
             let encoded_after: String =
                 url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
             let path = format!("/api/hub/brains/{brain}/v2/files?commit={}&limit={page_limit}&after={encoded_after}", pointer.commit_hash);
@@ -4079,7 +4121,7 @@ fn v2_manifest(
             }) {
                 Ok(response) => response,
                 Err(LinkError::Transport { .. }) if page_limit > 10 => {
-                    page_limit = (page_limit / 2).max(10);
+                    sizing.transport_failed();
                     continue;
                 }
                 Err(LinkError::Transport { hub, message }) => return Err(LinkError::Transport {
@@ -4087,6 +4129,7 @@ fn v2_manifest(
                 }),
                 Err(error) => return Err(error),
             };
+            let response_bytes = response.body.len();
             let value = ensure_ok(
                 HubResponse {
                     status: response.status,
@@ -4097,6 +4140,7 @@ fn v2_manifest(
             let page: V2ManifestPage = serde_json::from_value(value)
                 .map_err(|_| invalid_feed("v2 file manifest has an invalid shape"))?;
             validate_v2_manifest_page(&page, pointer)?;
+            sizing.verified(page.files.len(), response_bytes, page_started.elapsed());
             if page
                 .next_cursor
                 .as_ref()
@@ -15977,6 +16021,44 @@ pub fn head(cfg: &HubConfig, brain: &str) -> LinkResult<Head> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_sizing_recovers_throughput_without_exceeding_wire_or_byte_budgets() {
+        let mut sizing = super::V2ManifestPageSizing::new();
+        let fast = std::time::Duration::from_secs(1);
+        sizing.verified(50, 300_000, fast);
+        assert_eq!(sizing.limit, 100);
+        sizing.verified(100, 600_000, fast);
+        assert_eq!(sizing.limit, 200);
+        sizing.verified(200, 1_200_000, fast);
+        assert_eq!(sizing.limit, 349);
+        sizing.transport_failed();
+        assert_eq!(sizing.limit, 174);
+        sizing.verified(174, 300_000, fast);
+        sizing.verified(174, 300_000, fast);
+        assert_eq!(
+            sizing.limit, 174,
+            "require two recovery pages before growth"
+        );
+        sizing.verified(174, 300_000, fast);
+        assert_eq!(sizing.limit, 348);
+        sizing.verified(348, 300_000, fast);
+        assert_eq!(sizing.limit, 500);
+        sizing.verified(500, 300_000, fast);
+        assert_eq!(sizing.limit, 500);
+        for _ in 0..10 {
+            sizing.transport_failed();
+        }
+        assert_eq!(sizing.limit, 10);
+        let mut sizing = super::V2ManifestPageSizing::new();
+        sizing.verified(49, 100_000, fast);
+        sizing.verified(50, 100_000, std::time::Duration::from_secs(6));
+        sizing.verified(50, 3_000_000, fast);
+        assert_eq!(
+            sizing.limit, 50,
+            "short, slow or already oversized pages cannot grow"
+        );
+    }
+
     use super::*;
 
     const TEST_BRAIN_ID: &str = "01j5qc3v9k4ym8rwbn2tqe6f7d";

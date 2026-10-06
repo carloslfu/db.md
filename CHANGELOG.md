@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.14.4**.
+  `Cargo.toml`, currently **v0.14.5**.
 
 ## Unreleased
+
+## [0.14.5] - 2026-10-06
+
+### Fixed
+
+- Regain inventory throughput after verified, promptly delivered full pages.
+  Recovery still starts at 50 files, halves pages after transport failures,
+  waits for two successful recovery pages, and retains every proof check and
+  durable journal. Growth obeys the 500-file wire cap and an estimated 2 MiB
+  decoded-page budget, so one transient failure no longer permanently limits
+  a large inventory to tiny pages.
 
 ## [0.14.4] - 2026-10-06
 

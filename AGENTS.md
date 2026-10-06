@@ -71,11 +71,13 @@ CI (`.github/workflows/`): `test.yml` (fmt/build/clippy/test), `publish-check.ym
 
 ## Releasing
 
-Bump the version, push `main`, push a `vX.Y.Z` tag. The tag publishes via CI
-(Trusted Publishing / OIDC, no token; approval only if required reviewers are
-configured on the GitHub environment). **Full procedure and
-the files to bump: [RELEASING.md](RELEASING.md).** Do not try to `cargo publish`
-by hand — the release flow is the tag.
+Bump the version, push `main`, then run `scripts/release.sh X.Y.Z`.
+The controller creates or resumes the tag, independently reproduces all five
+binaries, approves the protected publication only after byte comparison, and
+converges crates.io, immutable assets, attestations, Homebrew and latest.
+Then update the installers' independent trust manifest. **Full procedure and
+the files to bump: [RELEASING.md](RELEASING.md).** Do not push release tags or
+run `cargo publish` by hand.
 
 ## Conventions
 
