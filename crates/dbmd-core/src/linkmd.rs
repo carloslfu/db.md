@@ -1643,6 +1643,19 @@ fn request_raw_with_agent(
     body: Option<&Value>,
     options: RawRequestOptions<'_>,
 ) -> LinkResult<RawHubResponse> {
+    request_raw_with_read_attempts(cfg, http, method, path, body, options, SAFE_READ_ATTEMPTS)
+}
+
+fn request_raw_with_read_attempts(
+    cfg: &HubConfig,
+    http: &ureq::Agent,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    options: RawRequestOptions<'_>,
+    read_attempts: usize,
+) -> LinkResult<RawHubResponse> {
+    let read_attempts = read_attempts.clamp(1, SAFE_READ_ATTEMPTS);
     let url = format!("{}{}", cfg.hub, path);
     let encoded_body = body.map(Value::to_string);
     let origin = normalized_origin(&cfg.hub)?;
@@ -1695,7 +1708,7 @@ fn request_raw_with_agent(
             Err(error) => match *error {
                 ureq::Error::Status(_, resp) => resp,
                 ureq::Error::Transport(error) => {
-                    if safe_read && read_attempt + 1 < SAFE_READ_ATTEMPTS {
+                    if safe_read && read_attempt + 1 < read_attempts {
                         std::thread::sleep(std::time::Duration::from_millis(
                             SAFE_READ_RETRY_BACKOFF_MS[read_attempt],
                         ));
@@ -1713,9 +1726,7 @@ fn request_raw_with_agent(
         let status = resp.status();
         let buf = match read_response_body(resp, options.max_response_bytes + 1, &cfg.hub) {
             Ok(buf) => buf,
-            Err(LinkError::Transport { .. })
-                if safe_read && read_attempt + 1 < SAFE_READ_ATTEMPTS =>
-            {
+            Err(LinkError::Transport { .. }) if safe_read && read_attempt + 1 < read_attempts => {
                 std::thread::sleep(std::time::Duration::from_millis(
                     SAFE_READ_RETRY_BACKOFF_MS[read_attempt],
                 ));
@@ -4115,10 +4126,13 @@ fn v2_manifest(
             let encoded_after: String =
                 url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
             let path = format!("/api/hub/brains/{brain}/v2/files?commit={}&limit={page_limit}&after={encoded_after}", pointer.commit_hash);
-            let response = match request_raw_with_agent(cfg, &http, "GET", &path, None, RawRequestOptions {
+            // The page loop owns transport recovery. An inner four-attempt
+            // read loop would hide stalls and retry the same oversized page
+            // before this adaptive budget can shrink it.
+            let response = match request_raw_with_read_attempts(cfg, &http, "GET", &path, None, RawRequestOptions {
                 auth: Auth::Required, max_response_bytes: MAX_FEED_RESPONSE_BYTES,
                 request_id: None, retry_transport: false,
-            }) {
+            }, 1) {
                 Ok(response) => response,
                 Err(LinkError::Transport { .. }) if page_limit > 10 => {
                     sizing.transport_failed();
@@ -4406,10 +4420,10 @@ fn v2_asset_manifest(
             "/api/hub/brains/{brain}/v2/assets?commit={}&limit={limit}&after={encoded_after}",
             pointer.commit_hash
         );
-        let response = match request_raw_with_agent(cfg, &http, "GET", &path, None, RawRequestOptions {
+        let response = match request_raw_with_read_attempts(cfg, &http, "GET", &path, None, RawRequestOptions {
             auth: Auth::Required, max_response_bytes: MAX_FEED_RESPONSE_BYTES,
             request_id: None, retry_transport: false,
-        }) {
+        }, 1) {
             Ok(response) => response,
             Err(LinkError::Transport { .. }) if limit > 10 => {
                 limit = (limit / 2).max(10);
@@ -19376,6 +19390,95 @@ mod tests {
             other => panic!("expected a transport failure, got {other:?}"),
         }
         server.join().unwrap();
+    }
+
+    #[test]
+    fn adaptive_inventories_shrink_after_the_first_interrupted_body() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        for inventory in ["files", "assets"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let commit = "c".repeat(64);
+            let root = "f".repeat(64);
+            let response = json!({
+                "v": 2, "commit": commit, "content_root": root,
+                "asset_root": root, "files": [], "assets": [], "next_cursor": null
+            })
+            .to_string();
+            let server = std::thread::spawn(move || {
+                let mut limits = Vec::new();
+                for attempt in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut bytes = [0_u8; 4096];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let read = stream.read(&mut bytes).unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&bytes[..read]);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    assert!(request.contains(&format!("/v2/{inventory}?")));
+                    let limit = request
+                        .split("&limit=")
+                        .nth(1)
+                        .unwrap()
+                        .split('&')
+                        .next()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    limits.push(limit);
+                    if attempt == 0 {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").unwrap();
+                    } else {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .unwrap();
+                    }
+                }
+                limits
+            });
+            let state = tempfile::tempdir().unwrap();
+            let cfg = test_hub_config(format!("http://{address}"), state.path().to_path_buf());
+            let pointer = V2PointerBody {
+                v: 2,
+                brain: TEST_BRAIN_ID.to_string(),
+                seq: 1,
+                commit_hash: commit,
+                feed_hash: "a".repeat(64),
+                content_root: Some(root.clone()),
+                asset_root: Some(root),
+                materializer: "dbmd-projection-v1".to_string(),
+                signer_epoch: 1,
+                control_revision: "d".repeat(64),
+                backup_preparation: "e".repeat(64),
+                prior_pointer_hash: None,
+                signed_at: "2026-10-06T21:00:00.000Z".to_string(),
+            };
+            if inventory == "files" {
+                let mut head = scoped_test_head(&"d".repeat(64));
+                head.pointer = Some(pointer);
+                assert!(v2_manifest(&cfg, &head).unwrap().is_empty());
+            } else {
+                assert!(v2_asset_manifest(&cfg, TEST_BRAIN_ID, Some(&pointer))
+                    .unwrap()
+                    .is_empty());
+            }
+            assert_eq!(
+                server.join().unwrap(),
+                vec![50, 25],
+                "a failed page must reach adaptive recovery before another request"
+            );
+        }
     }
 
     #[test]

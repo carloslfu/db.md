@@ -12,6 +12,14 @@ Two things version independently:
 
 ## Unreleased
 
+### Fixed
+
+- Adaptive file and asset inventories receive the first interrupted read so
+  they can reduce the next page immediately. The generic four-attempt GET
+  retry loop no longer hides repeated stalls from their page-size recovery.
+  Other safe reads retain their retries, and all proof and journal checks
+  remain unchanged.
+
 ## [0.14.5] - 2026-10-06
 
 - Cold v2 checkouts fetch each proven content hash once, then materialize every
