@@ -6,7 +6,7 @@ Written so an agent or a human can run it cold.
 ## TL;DR
 
 Bump the version and push `main`, then run the release controller. It creates
-or resumes the exact tag/run, independently rebuilds all four release targets
+or resumes the exact tag/run, independently rebuilds all five release targets
 and byte-compares their binaries before approving publication, then converges
 crates.io, the immutable GitHub release, Homebrew, and finally `latest`.
 The installers only see the release once it is trusted in their independent
@@ -31,8 +31,8 @@ controller has reviewed the independent rebuild.
 | Step | Who |
 |---|---|
 | Version bump + changelog | **you / agent** (before tagging) |
-| Build 4 platforms, draft assets, SHA256SUMS, provenance attestation | CI (`release.yml`, on tag) |
-| Independently rebuild and byte-compare all 4 binaries | local controller, before environment approval |
+| Build 5 targets, draft assets, SHA256SUMS, provenance attestation | CI (`release.yml`, on tag) |
+| Independently rebuild and byte-compare all 5 binaries | local controller, before environment approval |
 | Publish `dbmd-core` then `dbmd-cli` to crates.io via OIDC | CI (`publish-crates` job, on tag) |
 | Publish immutable GitHub release (not latest yet) | CI, only after both crates converge |
 | Bump the Homebrew tap formula (`carloslfu/homebrew-tap`) | local controller via optimistic GitHub Contents API |
@@ -51,12 +51,13 @@ the reviewed tap head, tap `main` must equal that commit, and its bytes are read
 back exactly. A killed controller leaves no deploy key or environment secret.
 
 The controller also asserts GitHub release immutability before it creates the
-tag. Before approval it downloads the four CI artifacts, rebuilds both Darwin
+tag. Before approval it downloads the five CI artifacts, rebuilds both Darwin
 targets with normalized Mach-O build metadata and both musl targets in
 digest-pinned Linux builder images. Linux inputs use the same canonical
 `/project`, `/cargo`, and `/rust` paths as CI before each binary and its legal
-files are compared byte-for-byte.
-After CI completes it verifies the tag-to-SHA binding, exact five-asset set,
+files are compared byte-for-byte. The Windows MSVC target is independently
+rebuilt with the pinned cross-compilation inputs used by CI.
+After CI completes it verifies the tag-to-SHA binding, exact six-asset set,
 SHA256 manifest, every provenance attestation, exact local-vs-crates.io package
 checksums, and the resulting tap formula.
 
@@ -94,7 +95,7 @@ you tag. CI runs the same check (`publish-check.yml`) on every push.
 ## Verify after the tag
 
 ```sh
-gh release view vX.Y.Z                            # 4 tarballs + SHA256SUMS attached
+gh release view vX.Y.Z                            # 4 tarballs + Windows executable + SHA256SUMS attached
 ```
 
 `scripts/release.sh` does not return success until the workflow and the
@@ -156,7 +157,7 @@ the version and contents right before tagging. There is no un-publish.
 
 Run `scripts/release.sh X.Y.Z` again. The controller accepts an existing tag
 only when it names the exact reviewed `main` commit. It finds the bound
-workflow, reruns failed jobs when necessary, re-verifies the four rebuilds
+workflow, reruns failed jobs when necessary, re-verifies the five rebuilds
 before a new approval, treats already-published crates as idempotent only after
 exact checksum comparison, treats an already matching tap formula as a no-op,
 and promotes `latest` only after every channel has converged. Never cut a patch
