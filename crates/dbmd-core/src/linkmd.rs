@@ -4000,6 +4000,34 @@ fn validate_v2_manifest_page(page: &V2ManifestPage, pointer: &V2PointerBody) -> 
     Ok(())
 }
 
+fn v2_manifest_cache_key(cfg: &HubConfig, brain: &str) -> LinkResult<String> {
+    let principal = cfg
+        .agent_key
+        .as_ref()
+        .map(|key| key.multikey.as_str())
+        .or(cfg.key.as_deref())
+        .unwrap_or("");
+    Ok(content_sha256(
+        format!("{}\0{brain}\0{principal}", normalized_origin(&cfg.hub)?).as_bytes(),
+    ))
+}
+
+// The file inventory can finish before the asset inventory or commit fails.
+// Retain its verified pages until a complete baseline has been saved atomically.
+fn clear_v2_manifest_journal(cfg: &HubConfig, brain: &str) -> LinkResult<()> {
+    let directory = open_trust_dir(cfg)?;
+    let key = v2_manifest_cache_key(cfg, brain)?;
+    for page in 0..=MAX_PUSH_FILES {
+        let name = format!("manifest-{key}-{page:05}.json");
+        match crate::fsx::remove_file_beneath(&directory, Path::new(&name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn v2_manifest(
     cfg: &HubConfig,
     head: &V2VerifiedHead,
@@ -4009,15 +4037,7 @@ fn v2_manifest(
     };
     let brain = &head.brain_id;
     let directory = open_trust_dir(cfg)?;
-    let principal = cfg
-        .agent_key
-        .as_ref()
-        .map(|key| key.multikey.as_str())
-        .or(cfg.key.as_deref())
-        .unwrap_or("");
-    let cache_key = content_sha256(
-        format!("{}\0{brain}\0{principal}", normalized_origin(&cfg.hub)?).as_bytes(),
-    );
+    let cache_key = v2_manifest_cache_key(cfg, brain)?;
     let coordinate = content_sha256(
         serde_json::to_vec(&json!({
             "commit": pointer.commit_hash, "root": pointer.content_root,
@@ -4031,7 +4051,6 @@ fn v2_manifest(
     let mut after = String::new();
     let mut page_number = 0;
     let mut page_limit = 50;
-    let mut cache_names = Vec::new();
     let http = hub_agent_with_timeout(cfg, std::time::Duration::from_secs(30))?;
     loop {
         let cache_name = format!("manifest-{cache_key}-{page_number:05}.json");
@@ -4104,7 +4123,6 @@ fn v2_manifest(
             )?;
             page
         };
-        cache_names.push(cache_name);
         for file in page.files {
             if files
                 .insert(
@@ -4135,15 +4153,6 @@ fn v2_manifest(
             return Err(invalid_feed(
                 "v2 file manifest exceeds the page-count bound",
             ));
-        }
-    }
-    // A completed read needs no transport journal. Interrupted runs leave only
-    // their verified prefix, in fixed per-principal page slots for the retry.
-    for name in cache_names {
-        match crate::fsx::remove_file_beneath(&directory, Path::new(&name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
     }
     Ok(files)
@@ -4343,22 +4352,35 @@ fn v2_asset_manifest(
     };
     let mut assets = std::collections::BTreeMap::new();
     let mut after = String::new();
+    let mut limit = 50;
+    let mut pages = 0;
+    let http = hub_agent_with_timeout(cfg, std::time::Duration::from_secs(30))?;
     loop {
         let encoded_after: String =
             url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
         let path = format!(
-            "/api/hub/brains/{brain}/v2/assets?commit={}&limit=500&after={encoded_after}",
+            "/api/hub/brains/{brain}/v2/assets?commit={}&limit={limit}&after={encoded_after}",
             pointer.commit_hash
         );
+        let response = match request_raw_with_agent(cfg, &http, "GET", &path, None, RawRequestOptions {
+            auth: Auth::Required, max_response_bytes: MAX_FEED_RESPONSE_BYTES,
+            request_id: None, retry_transport: false,
+        }) {
+            Ok(response) => response,
+            Err(LinkError::Transport { .. }) if limit > 10 => {
+                limit = (limit / 2).max(10);
+                continue;
+            }
+            Err(LinkError::Transport { hub, message }) => return Err(LinkError::Transport {
+                hub, message: format!("v2 asset manifest after {} verified assets (limit {limit}); file inventory remains cached: {message}", assets.len()),
+            }),
+            Err(error) => return Err(error),
+        };
         let value = ensure_ok(
-            request_capped(
-                cfg,
-                "GET",
-                &path,
-                None,
-                Auth::Required,
-                MAX_FEED_RESPONSE_BYTES,
-            )?,
+            HubResponse {
+                status: response.status,
+                body: serde_json::from_slice(&response.body).ok(),
+            },
             "v2 asset manifest",
         )?;
         let page: V2AssetManifestPage = serde_json::from_value(value)
@@ -4370,6 +4392,19 @@ fn v2_asset_manifest(
         {
             return Err(invalid_feed(
                 "v2 asset manifest is not bound to the verified head",
+            ));
+        }
+        if page
+            .next_cursor
+            .as_ref()
+            .is_some_and(|next| next <= &after || page.assets.is_empty())
+        {
+            return Err(invalid_feed("v2 asset manifest cursor did not advance"));
+        }
+        pages += 1;
+        if pages > MAX_PUSH_FILES {
+            return Err(invalid_feed(
+                "v2 asset manifest exceeds the page-count bound",
             ));
         }
         for item in page.assets {
@@ -5515,6 +5550,7 @@ fn save_v2_baseline(
         return Err(error.into());
     }
     directory.sync_all()?;
+    clear_v2_manifest_journal(cfg, brain)?;
     Ok(())
 }
 
@@ -5535,6 +5571,7 @@ fn save_v2_baseline(
         return Err(invalid_feed("v2 sync baseline is oversized"));
     }
     crate::fsx::write_atomic_beneath(&directory, Path::new(&name), &bytes, false, true)?;
+    clear_v2_manifest_journal(cfg, brain)?;
     Ok(())
 }
 
@@ -17630,9 +17667,16 @@ mod tests {
         .to_string();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
-        let (hub, server) = routed_json_hub(3, move |request| {
+        let (hub, server) = routed_json_hub(4, move |request| {
             let n = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert!(request.contains("limit=50"));
+            if n == 3 {
+                assert!(request.contains("/v2/assets?"));
+                return (
+                    503,
+                    r#"{"error":"asset inventory interrupted"}"#.to_string(),
+                );
+            }
             if n == 0 {
                 assert!(request.ends_with("after="));
                 (200, first_page.clone())
@@ -17654,6 +17698,20 @@ mod tests {
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[path].sha256, sha256);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let mut asset_pointer = pointer.clone();
+        asset_pointer.asset_root = Some("f".repeat(64));
+        assert!(v2_asset_manifest(&cfg, TEST_BRAIN_ID, Some(&asset_pointer)).is_err());
+        server.join().unwrap();
+        // A later asset/commit failure must not discard this completed file
+        // inventory. Its next use must succeed with the HTTP server gone.
+        assert_eq!(v2_manifest(&cfg, &head).unwrap().len(), 1);
+        let baseline =
+            v2_baseline_from_head(&cfg, &head, resumed, Default::default(), None, None).unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        save_v2_baseline(&cfg, &head.brain_id, checkout.path(), &baseline).unwrap();
+        assert!(load_v2_baseline(&cfg, &head.brain_id, checkout.path())
+            .unwrap()
+            .is_some());
         assert!(!std::fs::read_dir(state.path().join("trust"))
             .unwrap()
             .any(|item| item
@@ -17661,7 +17719,6 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with("manifest-")));
-        server.join().unwrap();
 
         for invalidation in ["proof", "view", "control"] {
             let mut first_page: Value = serde_json::from_str(&manifest).unwrap();

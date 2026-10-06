@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.14.2**.
+  `Cargo.toml`, currently **v0.14.3**.
 
 ## Unreleased
+
+## [0.14.3] — 2026-10-06
+
+### Fixed
+
+- Keep the verified file-inventory journal until an atomic sync baseline is
+  saved, so a subsequent asset read or commit failure cannot discard completed
+  recovery work. Cached pages remain bound to the signed head and current
+  authority and every inclusion proof is checked again before reuse.
+- Use smaller adaptive asset-inventory pages and bounded request attempts, with
+  verified-progress context on transport failure.
 
 ## [0.14.2] — 2026-10-06
 
