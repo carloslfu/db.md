@@ -3848,7 +3848,7 @@ struct V2ProofStep {
     proof: crate::linkmd_v2::HamtProof,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct V2ManifestFile {
     path: String,
     sha256: String,
@@ -3856,7 +3856,7 @@ struct V2ManifestFile {
     proof: Vec<V2ProofStep>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct V2ManifestPage {
     v: u8,
     commit: String,
@@ -3970,50 +3970,142 @@ fn verify_v2_file_proof(root: &str, file: &V2ManifestFile) -> LinkResult<()> {
     Ok(())
 }
 
+// A cache page is only a resumable transport artifact, never a sync baseline.
+// Recheck every proof on reuse, bind it to the current authority view and keep
+// it outside the checkout through the same no-follow private-state boundary.
+#[derive(Deserialize, Serialize)]
+struct V2ManifestCachePage {
+    coordinate: String,
+    after: String,
+    page: V2ManifestPage,
+}
+
+fn validate_v2_manifest_page(page: &V2ManifestPage, pointer: &V2PointerBody) -> LinkResult<()> {
+    if page.v != 2
+        || page.commit != pointer.commit_hash
+        || page.content_root != pointer.content_root
+        || page.files.len() > 500
+    {
+        return Err(invalid_feed(
+            "v2 file manifest is not bound to the verified head",
+        ));
+    }
+    let root = pointer
+        .content_root
+        .as_deref()
+        .ok_or_else(|| invalid_feed("manifest has no content root"))?;
+    for file in &page.files {
+        verify_v2_file_proof(root, file)?;
+    }
+    Ok(())
+}
+
 fn v2_manifest(
     cfg: &HubConfig,
-    brain: &str,
-    pointer: Option<&V2PointerBody>,
+    head: &V2VerifiedHead,
 ) -> LinkResult<std::collections::BTreeMap<String, V2BaselineFile>> {
-    let Some(pointer) = pointer else {
+    let Some(pointer) = head.pointer.as_ref().filter(|p| p.content_root.is_some()) else {
         return Ok(std::collections::BTreeMap::new());
     };
-    let Some(root) = pointer.content_root.as_deref() else {
-        return Ok(std::collections::BTreeMap::new());
-    };
+    let brain = &head.brain_id;
+    let directory = open_trust_dir(cfg)?;
+    let principal = cfg
+        .agent_key
+        .as_ref()
+        .map(|key| key.multikey.as_str())
+        .or(cfg.key.as_deref())
+        .unwrap_or("");
+    let cache_key = content_sha256(
+        format!("{}\0{brain}\0{principal}", normalized_origin(&cfg.hub)?).as_bytes(),
+    );
+    let coordinate = content_sha256(
+        serde_json::to_vec(&json!({
+            "commit": pointer.commit_hash, "root": pointer.content_root,
+            "view": head.view_kind, "view_revision": head.view_revision,
+            "control": head.control_revision,
+        }))
+        .map_err(|_| invalid_feed("could not encode manifest cache coordinate"))?
+        .as_slice(),
+    );
     let mut files = std::collections::BTreeMap::new();
     let mut after = String::new();
+    let mut page_number = 0;
+    let mut page_limit = 50;
+    let mut cache_names = Vec::new();
+    let http = hub_agent_with_timeout(cfg, std::time::Duration::from_secs(30))?;
     loop {
-        let encoded_after: String =
-            url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
-        let path = format!(
-            "/api/hub/brains/{brain}/v2/files?commit={}&limit=500&after={encoded_after}",
-            pointer.commit_hash
-        );
-        let value = ensure_ok(
-            request_capped(
-                cfg,
-                "GET",
-                &path,
-                None,
-                Auth::Required,
-                MAX_FEED_RESPONSE_BYTES,
-            )?,
-            "v2 file manifest",
-        )?;
-        let page: V2ManifestPage = serde_json::from_value(value)
-            .map_err(|_| invalid_feed("v2 file manifest has an invalid shape"))?;
-        if page.v != 2
-            || page.commit != pointer.commit_hash
-            || page.content_root.as_deref() != Some(root)
-            || page.files.len() > 500
+        let cache_name = format!("manifest-{cache_key}-{page_number:05}.json");
+        let cached = match crate::fsx::BoundedDirReader::from_root(&directory)?
+            .read(Path::new(&cache_name), MAX_FEED_RESPONSE_BYTES)
         {
-            return Err(invalid_feed(
-                "v2 file manifest is not bound to the verified head",
-            ));
-        }
+            Ok(bytes) => serde_json::from_slice::<V2ManifestCachePage>(&bytes)
+                .ok()
+                .filter(|cached| {
+                    cached.coordinate == coordinate
+                        && cached.after == after
+                        && validate_v2_manifest_page(&cached.page, pointer).is_ok()
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let page = if let Some(cached) = cached {
+            cached.page
+        } else {
+            let encoded_after: String =
+                url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
+            let path = format!("/api/hub/brains/{brain}/v2/files?commit={}&limit={page_limit}&after={encoded_after}", pointer.commit_hash);
+            let response = match request_raw_with_agent(cfg, &http, "GET", &path, None, RawRequestOptions {
+                auth: Auth::Required, max_response_bytes: MAX_FEED_RESPONSE_BYTES,
+                request_id: None, retry_transport: false,
+            }) {
+                Ok(response) => response,
+                Err(LinkError::Transport { .. }) if page_limit > 10 => {
+                    page_limit = (page_limit / 2).max(10);
+                    continue;
+                }
+                Err(LinkError::Transport { hub, message }) => return Err(LinkError::Transport {
+                    hub, message: format!("v2 file manifest page {} after {} verified files (limit {page_limit}); retry resumes verified pages: {message}", page_number + 1, files.len()),
+                }),
+                Err(error) => return Err(error),
+            };
+            let value = ensure_ok(
+                HubResponse {
+                    status: response.status,
+                    body: serde_json::from_slice(&response.body).ok(),
+                },
+                "v2 file manifest",
+            )?;
+            let page: V2ManifestPage = serde_json::from_value(value)
+                .map_err(|_| invalid_feed("v2 file manifest has an invalid shape"))?;
+            validate_v2_manifest_page(&page, pointer)?;
+            if page
+                .next_cursor
+                .as_ref()
+                .is_some_and(|next| next <= &after || page.files.is_empty())
+            {
+                return Err(invalid_feed("v2 file manifest cursor did not advance"));
+            }
+            let cached = V2ManifestCachePage {
+                coordinate: coordinate.clone(),
+                after: after.clone(),
+                page: page.clone(),
+            };
+            let bytes = serde_json::to_vec(&cached)
+                .map_err(|_| invalid_feed("could not encode manifest cache page"))?;
+            if bytes.len() as u64 > MAX_FEED_RESPONSE_BYTES {
+                return Err(invalid_feed("v2 manifest cache page is oversized"));
+            }
+            crate::fsx::write_atomic_beneath(
+                &directory,
+                Path::new(&cache_name),
+                &bytes,
+                false,
+                true,
+            )?;
+            page
+        };
+        cache_names.push(cache_name);
         for file in page.files {
-            verify_v2_file_proof(root, &file)?;
             if files
                 .insert(
                     file.path.clone(),
@@ -4037,6 +4129,21 @@ fn v2_manifest(
             None => break,
             Some(next) if next > after => after = next,
             Some(_) => return Err(invalid_feed("v2 file manifest cursor did not advance")),
+        }
+        page_number += 1;
+        if page_number > MAX_PUSH_FILES {
+            return Err(invalid_feed(
+                "v2 file manifest exceeds the page-count bound",
+            ));
+        }
+    }
+    // A completed read needs no transport journal. Interrupted runs leave only
+    // their verified prefix, in fixed per-principal page slots for the retry.
+    for name in cache_names {
+        match crate::fsx::remove_file_beneath(&directory, Path::new(&name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(files)
@@ -7144,10 +7251,7 @@ fn v2_sync_pull_with_resolution(
     {
         Some(state) => (state.files.clone(), state.assets.clone()),
         None => (
-            files_for_v2_view(
-                &head,
-                v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
-            ),
+            files_for_v2_view(&head, v2_manifest(cfg, &head)?),
             v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
         ),
     };
@@ -8429,10 +8533,7 @@ fn v2_sync_push(
             {
                 Some(state) => (state.files.clone(), state.assets.clone(), None, None),
                 None => (
-                    files_for_v2_view(
-                        &head,
-                        v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
-                    ),
+                    files_for_v2_view(&head, v2_manifest(cfg, &head)?),
                     v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
                     None,
                     None,
@@ -9300,10 +9401,7 @@ fn v2_sync_push(
         .ok_or_else(|| invalid_feed("v2 commit receipt has no rebase result"))?;
     let (refreshed_files, refreshed_assets) = if rebased {
         (
-            files_for_v2_view(
-                &refreshed,
-                v2_manifest(cfg, &refreshed.brain_id, refreshed.pointer.as_ref())?,
-            ),
+            files_for_v2_view(&refreshed, v2_manifest(cfg, &refreshed)?),
             v2_asset_manifest(cfg, &refreshed.brain_id, refreshed.pointer.as_ref())?,
         )
     } else {
@@ -9847,8 +9945,7 @@ pub fn sync_resolve_conflict(
             // Re-read the exact current manifest so every selected remote byte
             // retains its signed inclusion proof. The private bundle is useful
             // for inspection, but is never promoted into live state as trust.
-            let current_remote =
-                files_for_v2_view(&head, v2_manifest(cfg, &plan.brain, head.pointer.as_ref())?);
+            let current_remote = files_for_v2_view(&head, v2_manifest(cfg, &head)?);
             let _ = v2_take_remote_selection(&plan.files, &current_remote)?;
             let selected = plan
                 .files
@@ -12951,10 +13048,7 @@ pub fn proposal_accept_exact(
         }
         downloaded.insert(hash.clone(), body);
     }
-    let remote = files_for_v2_view(
-        &head,
-        v2_manifest(cfg, &head.brain_id, head.pointer.as_ref())?,
-    );
+    let remote = files_for_v2_view(&head, v2_manifest(cfg, &head)?);
     let remote_assets = v2_asset_manifest(cfg, &head.brain_id, head.pointer.as_ref())?;
     let mut expected_candidate = remote.clone();
     let mut expected_candidate_assets = remote_assets;
@@ -17525,6 +17619,100 @@ mod tests {
                 .is_none()
         );
         server.join().unwrap();
+
+        // Stop after a verified first page. A retry must skip its HTTP request
+        // but revalidate the stored proof, then finish from the exact cursor.
+        let mut first_page: Value = serde_json::from_str(&manifest).unwrap();
+        first_page["next_cursor"] = json!("cursor-1");
+        let first_page = first_page.to_string();
+        let second_page = json!({ "v": 2, "commit": commit_hash, "content_root": root,
+            "files": [], "next_cursor": Value::Null })
+        .to_string();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (hub, server) = routed_json_hub(3, move |request| {
+            let n = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(request.contains("limit=50"));
+            if n == 0 {
+                assert!(request.ends_with("after="));
+                (200, first_page.clone())
+            } else {
+                assert!(request.ends_with("after=cursor-1"));
+                if n == 1 {
+                    (503, r#"{"error":"interrupted"}"#.to_string())
+                } else {
+                    (200, second_page.clone())
+                }
+            }
+        });
+        let state = tempfile::tempdir().unwrap();
+        let cfg = test_hub_config(hub, state.path().to_path_buf());
+        let mut head = scoped_test_head(&"a".repeat(64));
+        head.pointer = Some(pointer.clone());
+        assert!(v2_manifest(&cfg, &head).is_err());
+        let resumed = v2_manifest(&cfg, &head).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[path].sha256, sha256);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!std::fs::read_dir(state.path().join("trust"))
+            .unwrap()
+            .any(|item| item
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("manifest-")));
+        server.join().unwrap();
+
+        for invalidation in ["proof", "view", "control"] {
+            let mut first_page: Value = serde_json::from_str(&manifest).unwrap();
+            first_page["next_cursor"] = json!("cursor-1");
+            let first_page = first_page.to_string();
+            let last_page = json!({ "v": 2, "commit": commit_hash, "content_root": root,
+                "files": [], "next_cursor": Value::Null })
+            .to_string();
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = count.clone();
+            let (hub, server) = routed_json_hub(4, move |request| {
+                let n = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 || n == 2 {
+                    assert!(request.ends_with("after="));
+                    (200, first_page.clone())
+                } else if n == 1 {
+                    (503, r#"{"error":"interrupted"}"#.to_string())
+                } else {
+                    (200, last_page.clone())
+                }
+            });
+            let state = tempfile::tempdir().unwrap();
+            let cfg = test_hub_config(hub, state.path().to_path_buf());
+            let mut head = scoped_test_head(&"a".repeat(64));
+            head.pointer = Some(pointer.clone());
+            assert!(v2_manifest(&cfg, &head).is_err());
+            match invalidation {
+                "proof" => {
+                    let cached = std::fs::read_dir(state.path().join("trust"))
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with("manifest-")
+                        })
+                        .unwrap();
+                    let mut value: Value =
+                        serde_json::from_slice(&std::fs::read(&cached).unwrap()).unwrap();
+                    value["page"]["files"][0]["sha256"] = json!("0".repeat(64));
+                    std::fs::write(cached, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "view" => head.view_revision = "b".repeat(64),
+                _ => head.control_revision = "b".repeat(64),
+            }
+            let files = v2_manifest(&cfg, &head).unwrap();
+            assert_eq!(files[path].sha256, sha256);
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
+            server.join().unwrap();
+        }
 
         let id_manifest = manifest;
         let (hub, server) = routed_json_hub(1, move |request| {

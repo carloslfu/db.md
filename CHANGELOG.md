@@ -8,9 +8,20 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.14.1**.
+  `Cargo.toml`, currently **v0.14.2**.
 
 ## Unreleased
+
+## [0.14.2] — 2026-10-06
+
+### Fixed
+
+- V2 manifest recovery uses 50-file pages with bounded read attempts and reduces
+  the page size after transport failures. Interrupted reads keep a private page
+  journal and resume their verified prefix. Every reused page is checked again
+  against the signed content root, current permission view and control revision;
+  the journal never changes the sync baseline. Completed reads remove the journal.
+  Final transport errors identify the failed page and verified progress.
 
 ## [0.14.1] — 2026-10-01
 
