@@ -95,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/instal
 On Windows, from PowerShell:
 
 ```powershell
-irm https://www.sevrahq.com/install/dbmd.ps1 | iex
+irm https://raw.githubusercontent.com/carloslfu/db.md/main/scripts/install.ps1 | iex
 ```
 
 Then, from inside a store:
@@ -436,11 +436,6 @@ app, a family tool, an Obsidian vault, a research wiki, an agent-built
 internal tool, a customer database, any runtime with a folder of markdown.
 The [spec](SPEC.md) is the contract. The runtime is replaceable. **The
 files outlast both.**
-
-db.md needs no host. If you want one anyway, [Sevra](https://sevrahq.com)
-is the hosted home: your store kept always on, indexed, and curated. The
-standard stays neutral, Apache-2.0, and self-hostable no matter where a
-store lives.
 
 ## Sync, if you want it
 

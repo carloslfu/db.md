@@ -12,6 +12,11 @@ Two things version independently:
 
 ## Unreleased
 
+### Documentation
+
+- Remove the retired Sevra hosting offer and point the Windows quick start
+  directly to the GitHub installer. Release verification is unchanged.
+
 ## [0.14.6] - 2026-10-06
 
 ### Fixed
