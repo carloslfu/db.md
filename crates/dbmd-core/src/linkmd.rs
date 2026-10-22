@@ -12107,7 +12107,12 @@ fn parse_store_pack(bytes: Vec<u8>) -> LinkResult<Vec<(String, Vec<u8>)>> {
         if file.is_dir() {
             continue;
         }
-        let path = file.name().to_string();
+        let path = file
+            .name()
+            .map_err(|err| LinkError::InvalidPack {
+                message: format!("invalid ZIP entry name: {err}"),
+            })?
+            .into_owned();
         if file.enclosed_name().is_none() || !safe_store_rel_path(&path) {
             return Err(LinkError::UnsafePath { path });
         }
@@ -18001,6 +18006,29 @@ mod tests {
             build_store_pack(&[("../escape.md".to_string(), "no".to_string())]),
             Err(LinkError::UnsafePath { .. })
         ));
+    }
+
+    #[test]
+    fn store_pack_rejects_invalid_utf8_names_and_symlink_entries() {
+        let pack = build_store_pack(&[("DB.md".to_string(), "# db\n".to_string())]).unwrap();
+        let central = pack
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+
+        let mut invalid_name = pack.clone();
+        // The canonical pack marks both names as UTF-8. Corrupt both copies,
+        // preserving lengths and the directory structure so name decoding
+        // itself must refuse the archive instead of replacing invalid bytes.
+        invalid_name[30] = 0xff;
+        invalid_name[central + 46] = 0xff;
+        let result = parse_store_pack(invalid_name);
+        assert!(result.is_err(), "invalid UTF-8 was accepted: {result:?}");
+
+        let mut symlink = pack;
+        symlink[central + 38..central + 42].copy_from_slice(&(0o120777_u32 << 16).to_le_bytes());
+        let error = parse_store_pack(symlink).unwrap_err().to_string();
+        assert!(error.contains("non-file entry"), "{error}");
     }
 
     #[test]

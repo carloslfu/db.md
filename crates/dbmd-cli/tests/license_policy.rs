@@ -23,10 +23,9 @@
 //!   from the two workspace crates. `build`/`dev` edges (build scripts, the test
 //!   harness like `assert_cmd`) are excluded — they are not in the released
 //!   binary.
-//! - **Real targets only.** We resolve with `--filter-platform` for the two
-//!   targets db.md ships (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`)
-//!   and take the union, so Windows/wasm/haiku-only crates (which never compile
-//!   into the released binary) do not count, and the result is host-independent.
+//! - **Real targets only.** We resolve with `--filter-platform` for all
+//!   five targets db.md ships and take the union, so dependencies used only
+//!   by unshipped targets do not count, and the result is host-independent.
 //!
 //! ## SPDX semantics
 //!
@@ -61,9 +60,15 @@ const ALLOWED: &[&str] = &[
     "CDLA-Permissive-2.0",
 ];
 
-/// The two targets the released `dbmd` binary is built for. We union the
-/// shipped closure across both so the test does not depend on the host OS.
-const SHIP_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"];
+/// All five released targets, including musl and native Windows dependencies.
+/// Union their shipped closures so the test does not depend on the host OS.
+const SHIP_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+];
 
 /// Shipped crates that carry an obligation beyond plain MIT/Apache and are
 /// therefore called out by name in THIRD_PARTY_NOTICES. Pinned here so the test

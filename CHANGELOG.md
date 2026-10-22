@@ -8,14 +8,29 @@ Two things version independently:
 
 - **The format** (`SPEC.md`) — **v0.4** (v0.1 was the first tagged release).
 - **The toolkit** (the `dbmd` binary, `crates/`) — versioned in
-  `Cargo.toml`, currently **v0.14.6**.
+  `Cargo.toml`, currently **v0.14.7**.
 
 ## Unreleased
+
+## [0.14.7] - 2026-10-21
+
+### Security
+
+- Update the TLS dependency stack to rustls 0.23.46, rustls-webpki 0.103.16,
+  and webpki-roots 1.0.10, addressing RUSTSEC-2026-0346 through 0349 and
+  RUSTSEC-2026-0381/0382, including rejection of distrusted emSign intermediates.
+- Update ZIP handling to zip 9.0.5 and the spreadsheet reader to calamine 0.37,
+  removing both vulnerable ZIP versions from the dependency graph and addressing
+  RUSTSEC-2026-0367/0368/0369. Keep DEFLATE-only support and Rust 1.88 compatibility.
+- Check the shipped dependency license closure on all five release targets,
+  including native Windows and both musl targets.
 
 ### Documentation
 
 - Remove the retired Sevra hosting offer and point the Windows quick start
   directly to the GitHub installer. Release verification is unchanged.
+- Correct the security policy's outdated native Windows and independent-rebuild
+  descriptions, and refresh dependency attribution versions.
 
 ## [0.14.6] - 2026-10-06
 

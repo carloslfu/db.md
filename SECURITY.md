@@ -18,9 +18,10 @@ impact. Do not open a public issue for an unpatched vulnerability.
   encryption for confidentiality.
 - An opened store retains its root directory descriptor. Security-sensitive
   reads and writes traverse from that capability with `openat`, `O_NOFOLLOW`,
-  bounded regular-file reads, and handle-relative atomic replacement; a later
-  pathname or symlink swap cannot redirect them. Walks prune symlinks and
-  nested-store markers.
+  bounded regular-file reads, and handle-relative atomic replacement on Unix.
+  Native Windows uses held directory handles without delete sharing, rejects
+  reparse points, locks with `LockFileEx`, and publishes with write-through
+  replacement. Walks prune symlinks and nested-store markers.
 - Parser and extractor input, aggregate inflation, XML-event, spine, table,
   cell, response, pack, and file-count budgets reject known amplification
   shapes before allocation. Document parser libraries run in a child process
@@ -120,9 +121,10 @@ The same-origin checksum mode is restricted to explicitly configured,
 non-GitHub mirrors for controlled tests. GitHub releases are assembled as
 drafts and receive every asset and provenance attestation. Before the protected
 publishing environment is approved, the trusted local controller independently
-rebuilds both Darwin binaries and both musl binaries and requires byte-for-byte
-equality with CI. Linux builds use digest-pinned `cross` images; Darwin build
-metadata is normalized before comparison. CI publishes the two permanent
+rebuilds all five binaries and requires byte-for-byte equality with CI. Linux
+builds use digest-pinned `cross` images; Darwin build metadata is normalized
+before comparison; Windows uses pinned cargo-xwin, SDK, and LLVM inputs.
+CI publishes the two permanent
 crates first, then the immutable GitHub release without promoting it to latest.
 The controller verifies exact crates.io package checksums, updates Homebrew
 through an optimistic GitHub Contents API write using its existing `gh`
@@ -147,8 +149,6 @@ the shipped-closure license test, formatting, tests, and clippy. See
 - Trustworthiness of an agent or human authorized to change store content.
 - Availability of a remote hub, independent release-manifest service, DNS,
   certificate authorities, or the operating system.
-- Native Windows filesystem hardening. Official prebuilt installation supports
-  Windows through WSL; native Windows builds are not a release target.
-  Security-sensitive operations that persist identity checkpoints, create or
-  rotate keys, pull snapshots, or mirror brains fail closed on native Windows
-  instead of falling back to weaker path-based writes.
+- Document extraction on native platforms without the required process limits,
+  including Windows. Those extraction operations fail closed; native Windows
+  remains a supported release target for the toolkit's other operations.

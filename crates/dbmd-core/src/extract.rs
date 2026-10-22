@@ -2837,7 +2837,7 @@ media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
 
         for i in 0..archive.len() {
             let entry = archive.by_index(i).unwrap();
-            let name = entry.name().to_string();
+            let name = entry.name().unwrap().into_owned();
             if name == "xl/worksheets/sheet1.xml" {
                 writer.start_file(name, opts).unwrap();
                 writer.write_all(bomb_sheet).unwrap();
