@@ -34,6 +34,13 @@ Two things version independently:
   `Timestamp` parses with `parse_rfc3339`, renders with `to_rfc3339` /
   `to_rfc3339_z`, and compares by instant. The `dbmd` command line is unchanged.
 
+### Fixed
+
+- The Windows release build uses cargo-xwin 0.23.1 (xwin 0.10.0). Microsoft's
+  current Visual Studio 17 manifest names the Windows SDK 10.0.26100 header
+  installers with forward slashes, which cargo-xwin 0.23.0 could not find. The
+  SDK, CRT and LLVM pins are unchanged.
+
 ## [0.14.7] - 2026-10-21
 
 ### Security

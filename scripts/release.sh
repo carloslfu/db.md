@@ -178,15 +178,15 @@ preflight_release_builder() {
 
     xwin_archive="$release_tmp/cargo-xwin.tar.gz"
     curl -fsSL \
-        https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.0/cargo-xwin-v0.23.0.universal2-apple-darwin.tar.gz \
+        https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.1/cargo-xwin-v0.23.1.universal2-apple-darwin.tar.gz \
         -o "$xwin_archive"
     printf '%s  %s\n' \
-        d78a88f43247a6298d8888dc4c44a8af92801fdf4e5374cc5a359a1e53770993 \
+        1d74345d23ec744728124a0244696e9f21340fbb4b8a59cc1e39ba4ab18d8113 \
         "$xwin_archive" |
         shasum -a 256 -c - >/dev/null
     mkdir -m 0700 "$xwin_dir"
     tar -xzf "$xwin_archive" -C "$xwin_dir"
-    test "$("$xwin_dir/cargo-xwin" --version)" = "cargo-xwin 0.23.0" ||
+    test "$("$xwin_dir/cargo-xwin" --version)" = "cargo-xwin 0.23.1" ||
         die "digest-verified cargo-xwin reported an unexpected version"
     "$release_source/scripts/install-pinned-llvm.sh" "$llvm_dir" >/dev/null
 }
