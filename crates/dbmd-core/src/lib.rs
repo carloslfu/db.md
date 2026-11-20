@@ -99,7 +99,7 @@ pub use parser::{
 pub use query::Query;
 pub use render::{Outline, Tree};
 pub use store::{infer_type_from_path, layer_for_type, Layer, NotAStore, Store, StoreError};
-pub use time::now;
+pub use time::{now, Timestamp, TimestampError};
 pub use validate::{Issue, Severity};
 
 /// Crate-wide result alias over [`Error`].

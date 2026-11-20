@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset};
+use crate::time::Timestamp;
 use serde_norway::{Mapping, Value};
 
 /// One db.md text file is bounded before allocation/YAML parsing. Interactive
@@ -90,9 +90,9 @@ pub struct Frontmatter {
     /// `id` — optional; derived from the file path when absent.
     pub id: Option<String>,
     /// `created` — RFC3339; required and auto-set on content-file create.
-    pub created: Option<DateTime<FixedOffset>>,
+    pub created: Option<Timestamp>,
     /// `updated` — RFC3339; required and auto-maintained on content files.
-    pub updated: Option<DateTime<FixedOffset>>,
+    pub updated: Option<Timestamp>,
     /// `summary` — the one-line catalog line; required on every content file.
     pub summary: Option<String>,
     /// `status` — optional lifecycle state.
@@ -518,7 +518,7 @@ impl Frontmatter {
                 },
                 // Same preserve-don't-destroy rule as the scalar keys above,
                 // applied to the two typed ones. A value that is not RFC3339
-                // has nowhere to live in the typed `Option<DateTime>`, so it
+                // has nowhere to live in the typed `Option<Timestamp>`, so it
                 // rides in `extra` verbatim and `to_yaml` re-emits it byte-for-
                 // byte; the typed accessor stays None because there is no
                 // timestamp to offer.
@@ -1915,13 +1915,9 @@ pub fn parse_field_spec(bullet_line: &str) -> FieldSpec {
 
 // ── Private helpers ─────────────────────────────────────────────────────────
 
-/// Parse a frontmatter timestamp value into a `DateTime<FixedOffset>`. A `null`
+/// Parse a frontmatter timestamp value into a `Timestamp`. A `null`
 /// is treated as absent; anything else must be an RFC3339 string.
-fn parse_timestamp(
-    value: &Value,
-    key: &str,
-    file: &Path,
-) -> Result<Option<DateTime<FixedOffset>>, ParseError> {
+fn parse_timestamp(value: &Value, key: &str, file: &Path) -> Result<Option<Timestamp>, ParseError> {
     match value {
         Value::Null => Ok(None),
         Value::String(s) => parse_rfc3339(s, key, file).map(Some),
@@ -1934,8 +1930,8 @@ fn parse_timestamp(
 }
 
 /// Parse an RFC3339 timestamp string, mapping failure to [`ParseError::BadTimestamp`].
-fn parse_rfc3339(s: &str, key: &str, file: &Path) -> Result<DateTime<FixedOffset>, ParseError> {
-    DateTime::parse_from_rfc3339(s.trim()).map_err(|_| ParseError::BadTimestamp {
+fn parse_rfc3339(s: &str, key: &str, file: &Path) -> Result<Timestamp, ParseError> {
+    Timestamp::parse_rfc3339(s.trim()).map_err(|_| ParseError::BadTimestamp {
         file: file.to_path_buf(),
         key: key.to_string(),
         value: s.to_string(),
@@ -2822,7 +2818,7 @@ mod tests {
         let fm = Frontmatter::parse(yaml, Path::new("f.md")).unwrap();
         let created = fm.created.expect("created parsed");
         // -07:00 offset is 7 * 3600 seconds west.
-        assert_eq!(created.offset().utc_minus_local(), 7 * 3600);
+        assert_eq!(created.offset_seconds(), -7 * 3600);
         assert_eq!(created.to_rfc3339(), "2026-05-27T08:00:00-07:00");
         assert!(fm.updated.is_some());
     }
@@ -2914,8 +2910,8 @@ mod tests {
             summary: Some("Director of Ops".into()),
             status: Some("active".into()),
             tags: vec!["vip".into()],
-            created: Some(DateTime::parse_from_rfc3339("2026-05-27T08:00:00-07:00").unwrap()),
-            updated: Some(DateTime::parse_from_rfc3339("2026-05-28T09:30:00-07:00").unwrap()),
+            created: Some(Timestamp::parse_rfc3339("2026-05-27T08:00:00-07:00").unwrap()),
+            updated: Some(Timestamp::parse_rfc3339("2026-05-28T09:30:00-07:00").unwrap()),
             ..Default::default()
         };
         // Two type-specific fields, inserted in NON-alphabetical order to prove
@@ -3435,7 +3431,7 @@ mod tests {
         let mut fm = Frontmatter {
             type_: Some("email".into()),
             summary: Some("renewal note".into()),
-            created: Some(DateTime::parse_from_rfc3339("2026-05-27T08:00:00-07:00").unwrap()),
+            created: Some(Timestamp::parse_rfc3339("2026-05-27T08:00:00-07:00").unwrap()),
             ..Default::default()
         };
         fm.extra

@@ -838,7 +838,7 @@ mod tests {
 
         // Re-parsing the rendered value reproduces the seeded instant exactly.
         let rendered = now.to_rfc3339();
-        let reparsed = chrono::DateTime::parse_from_rfc3339(&rendered)
+        let reparsed = dbmd_core::Timestamp::parse_rfc3339(&rendered)
             .expect("the seeded timestamp must render as valid RFC3339");
         assert_eq!(
             reparsed, now,
@@ -1028,9 +1028,8 @@ mod tests {
         std::fs::write(root.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
         let detached = sandbox.path().join("detached");
         let replacement = sandbox.path().join("replacement");
-        let dated_note = chrono::Utc::now()
-            .format("sources/notes/%Y/%m/new.md")
-            .to_string();
+        let now = dbmd_core::Timestamp::now_utc();
+        let dated_note = format!("sources/notes/{:04}/{:02}/new.md", now.year(), now.month());
         std::fs::create_dir_all(replacement.join(&dated_note).parent().unwrap()).unwrap();
         std::fs::write(replacement.join("DB.md"), "---\ntype: db-md\n---\n").unwrap();
         std::fs::write(

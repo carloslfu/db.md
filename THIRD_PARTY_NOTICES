@@ -116,7 +116,6 @@ after any dependency change.
                                                   term is an alternative, NOT a
                                                   conjunctive obligation like
                                                   zlib-rs's bare `Zlib`)
-- chrono           0.4.x    MIT OR Apache-2.0   — RFC3339 / ISO-8601 timestamps
 - thiserror        2.x      MIT OR Apache-2.0   — error enum derive
 - windows-sys      0.61.x   MIT OR Apache-2.0   — native Windows filesystem
                                                   capabilities and locking;
@@ -126,7 +125,7 @@ Document text extraction (the `extract` module — `dbmd extract`). These are
 deterministic format decoders only: no AI/LLM, no OCR, no embeddings.
 
 - pdf-extract      0.12.x   MIT                 — PDF text-layer extraction
-- calamine         0.37.x   MIT                 — XLSX/XLSM/XLSB/ODS spreadsheet reader
+- calamine         0.38.x   MIT                 — XLSX/XLSM/XLSB/ODS spreadsheet reader
 - html2text        0.17.x   MIT                 — HTML → plain text (also used for
                                                   EPUB chapter XHTML)
 - quick-xml        0.41/0.42.x MIT              — docx (WordprocessingML) + EPUB
@@ -160,6 +159,13 @@ PDF fallback (noted, not taken): if `pdf-extract` quality regresses, the
 plan permits swapping to `pdfium-render` + `bblanchon/pdfium-binaries`
 (BSD-3-Clause). That remains permissive-compliant; it is not in the tree
 today.
+
+Timestamp handling: no date/time crate. `chrono` was removed after it was
+declared unmaintained (RUSTSEC-2026-0543), together with its clock stack
+(iana-time-zone and the Windows/Android/Haiku time-zone crates). db.md
+timestamps are RFC 3339 instants with fixed offsets and need no time-zone
+database, so `dbmd-core`'s own `time` module parses and renders them, with
+the same rules dbmd had through chrono 0.4.
 
 YAML crate choice: `serde_norway` (a maintained `serde_yaml` fork).
 `serde_yaml` is archived/deprecated upstream, and the previously-used
@@ -232,9 +238,6 @@ are now also direct dependencies of the binary crate):
                                                   (no-filter candidate set)
 - regex            1.x      MIT OR Apache-2.0   — query-regex validation +
                                                   link-target normalization
-- chrono           0.4.x    MIT OR Apache-2.0   — RFC3339/date parsing for
-                                                  `dbmd log` (entry timestamp,
-                                                  `since`) + `index query` windows
 - serde_norway     0.9.x    MIT OR Apache-2.0   — render a frontmatter YAML
                                                   scalar for `dbmd fm get`
 

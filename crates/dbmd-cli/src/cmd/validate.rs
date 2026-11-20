@@ -15,8 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset};
 use dbmd_core::validate::{apply_projection_policy, validate_all, validate_working_set};
+use dbmd_core::Timestamp;
 use dbmd_core::{Config, Issue, Severity, Store};
 
 use crate::cli::ValidateArgs;
@@ -117,15 +117,15 @@ fn make_scoped_link_findings_non_disclosing(issues: &mut [Issue]) {
 /// Parse the optional `--since` cutoff. Accepts a full RFC3339 timestamp or a
 /// date-only `YYYY-MM-DD` (treated as `T00:00:00Z`, per the flag's contract).
 /// `None` lets the engine fall back to the last `validate` log entry.
-fn parse_since(raw: Option<&str>) -> Result<Option<DateTime<FixedOffset>>, CliError> {
+fn parse_since(raw: Option<&str>) -> Result<Option<Timestamp>, CliError> {
     let Some(raw) = raw else { return Ok(None) };
     let raw = raw.trim();
     // Full RFC3339 first.
-    if let Ok(ts) = DateTime::parse_from_rfc3339(raw) {
+    if let Ok(ts) = Timestamp::parse_rfc3339(raw) {
         return Ok(Some(ts));
     }
     // Date-only → midnight UTC.
-    if let Ok(ts) = DateTime::parse_from_rfc3339(&format!("{raw}T00:00:00Z")) {
+    if let Ok(ts) = Timestamp::parse_rfc3339(&format!("{raw}T00:00:00Z")) {
         return Ok(Some(ts));
     }
     Err(CliError::new(

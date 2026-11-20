@@ -21,7 +21,7 @@
 //! wall-clock "now", so the seeded "older" months use a fixed FAR-PAST year
 //! (2023). That year is strictly before any plausible run date, so rotation
 //! ALWAYS fires and never false-passes on the clock. To assert "the current
-//! month stays active" without pulling chrono into this test crate, we read the
+//! month stays active" without pulling a date library into this test crate, we read the
 //! month back from the append's own `--json` `timestamp` — the binary's own
 //! report of the instant it stamped. The read-path assertions (2) and (3) run
 //! against a HAND-AUTHORED already-rotated store, so they are independent of the
@@ -167,7 +167,7 @@ fn log_append_rotates_multiple_prior_months_into_archives_and_keeps_current_acti
     assert_eq!(appended["appended"], serde_json::json!(true));
 
     // The binary reports the exact instant it stamped; its YYYY-MM is the month
-    // that must remain active. (Avoids pulling chrono into this test crate.)
+    // that must remain active. (Avoids pulling a date library into this test crate.)
     let stamped_ts = appended["timestamp"]
         .as_str()
         .expect("append --json carries a timestamp string");

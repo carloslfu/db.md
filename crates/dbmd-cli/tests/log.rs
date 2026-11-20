@@ -235,7 +235,7 @@ fn append_rotates_prior_months_into_archive() {
     }
 }
 
-/// Cheap "is the current month after 2026-05?" check without pulling chrono into
+/// Cheap "is the current month after 2026-05?" check without pulling a date library into
 /// the test crate: parse the year/month out of an RFC3339 `now` we get from the
 /// filesystem mtime of a just-created temp file. Kept conservative — returns
 /// false on any uncertainty so the rotation assertion never false-fails.

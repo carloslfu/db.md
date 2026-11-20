@@ -32,7 +32,6 @@ globset = { workspace = true }
 # matching). Deterministic Unicode algorithm — zero AI/LLM, zero embeddings.
 # MIT OR Apache-2.0; recorded in THIRD_PARTY_NOTICES.
 unicode-normalization = { workspace = true }
-chrono = { workspace = true }
 thiserror = { workspace = true }
 # SHA-256 content hashing for the asset manifest (`assets` module). Deterministic,
 # zero AI/LLM; recorded in THIRD_PARTY_NOTICES.

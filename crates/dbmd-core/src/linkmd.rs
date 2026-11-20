@@ -12376,10 +12376,7 @@ pub fn sync_push(cfg: &HubConfig, brain: &str, files: &[(String, String)]) -> Li
             })
             .collect();
         manifest.sort_by(|a, b| a.path.cmp(&b.path));
-        let ts = crate::now()
-            .with_timezone(&chrono::Utc)
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let ts = crate::now().to_rfc3339_utc_millis();
         let entry = self_custody_entry(
             key,
             next_seq,
@@ -12984,7 +12981,7 @@ fn verify_v2_proposal_value(
             .and_then(Value::as_str)
             .is_some_and(is_sha256)
         || submitted_at.is_none_or(|value| {
-            chrono::DateTime::parse_from_rfc3339(value).is_err()
+            crate::Timestamp::parse_rfc3339(value).is_err()
                 || proposal.get("submitted_at").and_then(Value::as_str) != Some(value)
         })
         || !proposal
@@ -12994,7 +12991,7 @@ fn verify_v2_proposal_value(
         || proposal
             .get("expires_at")
             .and_then(Value::as_str)
-            .is_none_or(|value| chrono::DateTime::parse_from_rfc3339(value).is_err())
+            .is_none_or(|value| crate::Timestamp::parse_rfc3339(value).is_err())
         || proposal
             .get("proposer")
             .and_then(Value::as_object)
@@ -15250,10 +15247,7 @@ pub fn rotate_brain_key(
     let journal = if journal_path.exists() {
         read_rotation_journal(&journal_path)?
     } else {
-        let ts = crate::now()
-            .with_timezone(&chrono::Utc)
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let ts = crate::now().to_rfc3339_utc_millis();
         let unsigned = serde_json::to_string(&UnsignedRotation {
             v: 1,
             op: "rotate",

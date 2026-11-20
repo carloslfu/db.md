@@ -36,7 +36,7 @@ use grep::regex::RegexMatcher;
 use grep::searcher::sinks::Lossy;
 use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
 
-use dbmd_core::{Layer, Query, Store};
+use dbmd_core::{Layer, Query, Store, Timestamp};
 
 use crate::cli::SearchArgs;
 use crate::context::Context;
@@ -348,10 +348,10 @@ fn content_files(store: &Store) -> Result<Vec<PathBuf>, CliError> {
 /// ("at or after" / "at or before", per the CLI help). A date-only value is
 /// treated as `T00:00:00Z`, matching `dbmd log since`.
 struct TimeWindows {
-    updated_after: Option<chrono::DateTime<chrono::FixedOffset>>,
-    updated_before: Option<chrono::DateTime<chrono::FixedOffset>>,
-    created_after: Option<chrono::DateTime<chrono::FixedOffset>>,
-    created_before: Option<chrono::DateTime<chrono::FixedOffset>>,
+    updated_after: Option<Timestamp>,
+    updated_before: Option<Timestamp>,
+    created_after: Option<Timestamp>,
+    created_before: Option<Timestamp>,
 }
 
 impl TimeWindows {
@@ -374,13 +374,7 @@ impl TimeWindows {
     /// True if a record's `(created, updated)` instants satisfy every set bound.
     /// A bound against an absent timestamp fails (you cannot prove a missing
     /// `updated` is "after" a cutoff), so a window filter excludes undated files.
-    fn matches(
-        &self,
-        ts: (
-            Option<chrono::DateTime<chrono::FixedOffset>>,
-            Option<chrono::DateTime<chrono::FixedOffset>>,
-        ),
-    ) -> bool {
+    fn matches(&self, ts: (Option<Timestamp>, Option<Timestamp>)) -> bool {
         let (created, updated) = ts;
         if let Some(bound) = self.updated_after {
             match updated {
@@ -483,10 +477,7 @@ fn split_kv(clause: &str) -> Result<(&str, &str), CliError> {
 
 /// Parse an optional RFC3339 timestamp, accepting a bare date (`2026-05-15`) as
 /// midnight UTC. An unparseable value is a usage-class error naming the flag.
-fn parse_ts_opt(
-    value: Option<&str>,
-    flag: &str,
-) -> Result<Option<chrono::DateTime<chrono::FixedOffset>>, CliError> {
+fn parse_ts_opt(value: Option<&str>, flag: &str) -> Result<Option<Timestamp>, CliError> {
     match value {
         None => Ok(None),
         Some(raw) => parse_ts(raw)
@@ -496,14 +487,14 @@ fn parse_ts_opt(
 }
 
 /// Parse a timestamp as RFC3339, or a bare `YYYY-MM-DD` date as `T00:00:00Z`.
-fn parse_ts(raw: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+fn parse_ts(raw: &str) -> Option<Timestamp> {
     let raw = raw.trim();
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+    if let Ok(dt) = Timestamp::parse_rfc3339(raw) {
         return Some(dt);
     }
     // Date-only → midnight UTC, the same lenience `dbmd log since` documents.
     let midnight = format!("{raw}T00:00:00Z");
-    chrono::DateTime::parse_from_rfc3339(&midnight).ok()
+    Timestamp::parse_rfc3339(&midnight).ok()
 }
 
 fn bad_timestamp(flag: &str, raw: &str) -> CliError {
@@ -521,13 +512,7 @@ fn bad_timestamp(flag: &str, raw: &str) -> CliError {
 /// active — and only over the already-narrowed candidate set, so it never
 /// becomes a whole-store parse. A missing file / frontmatter / field yields
 /// `None`, which a window filter then excludes.
-fn read_file_timestamps(
-    store: &Store,
-    rel: &Path,
-) -> (
-    Option<chrono::DateTime<chrono::FixedOffset>>,
-    Option<chrono::DateTime<chrono::FixedOffset>>,
-) {
+fn read_file_timestamps(store: &Store, rel: &Path) -> (Option<Timestamp>, Option<Timestamp>) {
     let text = match store.read_bounded(rel, dbmd_core::parser::MAX_DBMD_FILE_BYTES) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => text,
@@ -547,7 +532,7 @@ fn read_file_timestamps(
         value
             .get(key)
             .and_then(yaml_scalar_string)
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+            .and_then(|s| Timestamp::parse_rfc3339(s.trim()).ok())
     };
     (read("created"), read("updated"))
 }
@@ -1070,9 +1055,9 @@ mod tests {
             created_after: None,
             created_before: None,
         };
-        let on_cutoff = chrono::DateTime::parse_from_rfc3339("2026-05-15T00:00:00Z").unwrap();
-        let after = chrono::DateTime::parse_from_rfc3339("2026-05-22T00:00:00Z").unwrap();
-        let before = chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z").unwrap();
+        let on_cutoff = Timestamp::parse_rfc3339("2026-05-15T00:00:00Z").unwrap();
+        let after = Timestamp::parse_rfc3339("2026-05-22T00:00:00Z").unwrap();
+        let before = Timestamp::parse_rfc3339("2026-05-01T00:00:00Z").unwrap();
         // Inclusive "at or after": the cutoff instant itself passes.
         assert!(w.matches((None, Some(on_cutoff))));
         assert!(w.matches((None, Some(after))));

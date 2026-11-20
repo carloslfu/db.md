@@ -9,9 +9,9 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, FixedOffset};
 use dbmd_core::query::Query;
 use dbmd_core::store::Layer;
+use dbmd_core::Timestamp;
 use dbmd_core::{IndexRecord, Store};
 
 use crate::cli::QueryArgs;
@@ -126,10 +126,10 @@ fn records_json(records: &[IndexRecord]) -> String {
 /// The parsed `--created/updated-after/-before` window. Absent bounds impose no
 /// constraint on that side.
 struct TimeWindow {
-    updated_after: Option<DateTime<FixedOffset>>,
-    updated_before: Option<DateTime<FixedOffset>>,
-    created_after: Option<DateTime<FixedOffset>>,
-    created_before: Option<DateTime<FixedOffset>>,
+    updated_after: Option<Timestamp>,
+    updated_before: Option<Timestamp>,
+    created_after: Option<Timestamp>,
+    created_before: Option<Timestamp>,
 }
 
 impl TimeWindow {
@@ -178,7 +178,7 @@ impl TimeWindow {
 
 /// Parse an optional timestamp bound through the shared flexible parser
 /// (RFC3339 or bare `YYYY-MM-DD`).
-fn opt_ts(raw: &Option<String>) -> Result<Option<DateTime<FixedOffset>>, CliError> {
+fn opt_ts(raw: &Option<String>) -> Result<Option<Timestamp>, CliError> {
     match raw {
         Some(s) => Ok(Some(parse_flexible_timestamp(s)?)),
         None => Ok(None),

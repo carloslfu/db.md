@@ -230,7 +230,7 @@ fn working_set_applies_preserved_summary_policy() {
         "---\ntype: log\n---\n## [2026-09-04 01:00] update | sources/raw/a.md\n",
     )
     .unwrap();
-    let since = chrono::DateTime::parse_from_rfc3339("2026-09-04T00:00:00Z").unwrap();
+    let since = dbmd_core::Timestamp::parse_rfc3339("2026-09-04T00:00:00Z").unwrap();
     let issues = validate_working_set(&store, Some(since)).unwrap();
     assert_eq!(count(&issues, codes::SUMMARY_TOO_LONG, Severity::Info), 1);
     assert_eq!(
@@ -243,7 +243,7 @@ fn working_set_applies_preserved_summary_policy() {
 fn missing_source_is_a_policy_error_even_in_an_empty_explicit_working_set() {
     let policy = preserved("sources/raw/missing.md", &file(&"x".repeat(201), "", ""));
     let (_dir, store) = fixture(&policy, "", &[]);
-    let since = chrono::DateTime::parse_from_rfc3339("2026-09-04T00:00:00Z").unwrap();
+    let since = dbmd_core::Timestamp::parse_rfc3339("2026-09-04T00:00:00Z").unwrap();
     assert_eq!(
         count(
             &validate_working_set(&store, Some(since)).unwrap(),

@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone};
+use dbmd_core::Timestamp;
 
 use crate::cli::{LogArgs, LogCommand, LogSinceArgs, LogTailArgs};
 use crate::context::{ColorChoice, Context};
@@ -420,14 +420,14 @@ fn entry_to_json(e: &LogEntry) -> serde_json::Value {
 
 /// Render a timestamp in the on-disk header style (`YYYY-MM-DD HH:MM`, minute
 /// precision, no timezone) so the text output matches the `log.md` headers.
-fn fmt_ts(ts: &DateTime<FixedOffset>) -> String {
-    ts.format("%Y-%m-%d %H:%M").to_string()
+fn fmt_ts(ts: &Timestamp) -> String {
+    ts.format_minute()
 }
 
 /// Wall-clock now as a fixed-offset (UTC) timestamp for a fresh log entry.
 /// Delegates to `dbmd_core::now()` — the one canonical wall-clock every write
 /// surface (write, fm init, fm set, log append) seeds timestamps from.
-fn now_fixed() -> DateTime<FixedOffset> {
+fn now_fixed() -> Timestamp {
     dbmd_core::now()
 }
 
@@ -453,20 +453,16 @@ pub(crate) fn into_cli<T, E: Into<dbmd_core::Error>>(r: Result<T, E>) -> Result<
 /// a full RFC3339 string (`2026-05-27T10:00:00Z`, `…-07:00`) and a bare
 /// date (`2026-05-27`, treated as `T00:00:00Z`). Shared by `log since` and
 /// `query`'s `--*-after/-before` windows so both honor the same contract.
-pub(crate) fn parse_flexible_timestamp(raw: &str) -> Result<DateTime<FixedOffset>, CliError> {
+pub(crate) fn parse_flexible_timestamp(raw: &str) -> Result<Timestamp, CliError> {
     let s = raw.trim();
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+    if let Ok(dt) = Timestamp::parse_rfc3339(s) {
         return Ok(dt);
     }
     // Date-only fallback: midnight UTC on that calendar day.
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        if let Some(naive) = date.and_hms_opt(0, 0, 0) {
-            if let Some(dt) =
-                FixedOffset::east_opt(0).and_then(|tz| tz.from_local_datetime(&naive).single())
-            {
-                return Ok(dt);
-            }
-        }
+    if let Some(dt) = dbmd_core::time::parse_ymd(s)
+        .and_then(|(y, m, d)| Timestamp::from_civil(y, m, d, 0, 0, 0, 0, 0))
+    {
+        return Ok(dt);
     }
     Err(CliError::new(
         ExitCode::Runtime,

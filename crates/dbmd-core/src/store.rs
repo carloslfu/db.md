@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::index::IndexRecord;
 use crate::parser::{parse_db_md, Config, Frontmatter};
-use chrono::{DateTime, Datelike, FixedOffset};
+use crate::time::Timestamp;
 
 /// Basenames that are never content files: the config marker and the two
 /// curator-maintained catalogs. The store walks skip these so a SWEEP over the
@@ -714,7 +714,7 @@ impl Store {
         // are deterministically the lowest-priority candidates for the cap, not
         // dropped silently. The total order (updated desc, path asc) is what
         // keeps write-through and rebuild agreeing on #500 vs #501.
-        let mut keyed: Vec<(Option<DateTime<FixedOffset>>, PathBuf)> = files
+        let mut keyed: Vec<(Option<Timestamp>, PathBuf)> = files
             .into_iter()
             .map(|rel| {
                 let updated = self.read_updated(&rel);
@@ -1163,7 +1163,7 @@ impl Store {
     /// returning `None` when absent/unparseable. A self-contained reader (does
     /// not depend on the not-yet-implemented `parser::read_file`); parses the
     /// leading `---`-fenced YAML block with the same engine the parser uses.
-    fn read_updated(&self, path: &Path) -> Option<DateTime<FixedOffset>> {
+    fn read_updated(&self, path: &Path) -> Option<Timestamp> {
         let bytes = self
             .read_bounded(path, crate::parser::MAX_DBMD_FILE_BYTES)
             .ok()?;
@@ -2002,11 +2002,11 @@ fn primary_date_field(type_: &str) -> Option<&'static str> {
     }
 }
 
-/// Parse a YAML value into an RFC3339 [`DateTime`], accepting both an explicit
+/// Parse a YAML value into an RFC3339 [`Timestamp`], accepting both an explicit
 /// string and a YAML-native scalar rendered to string.
-fn value_to_datetime(value: &serde_norway::Value) -> Option<DateTime<FixedOffset>> {
+fn value_to_datetime(value: &serde_norway::Value) -> Option<Timestamp> {
     let s = yaml_scalar_string(value)?;
-    DateTime::parse_from_rfc3339(s.trim()).ok()
+    Timestamp::parse_rfc3339(s.trim()).ok()
 }
 
 /// Extract `(YYYY, MM)` from a YAML date/timestamp value. Lenient: matches a
@@ -2023,7 +2023,7 @@ fn value_to_year_month(value: &serde_norway::Value) -> Option<(String, String)> 
 /// The month may be single- OR double-digit so that `2026-1-15` and its
 /// zero-padded twin `2026-01-15` shard to the *same* `2026/01` folder. This
 /// matches the lenient `date`-shape validator (`is_iso8601_date_or_datetime`,
-/// chrono `%Y-%m-%d`), which accepts an unpadded month — without this, a value
+/// `time::parse_ymd`), which accepts an unpadded month — without this, a value
 /// the validator treats as a valid date is silently mis-filed under the
 /// `created`-fallback month. Genuinely non-date input still returns `None`.
 fn year_month_from_str(s: &str) -> Option<(String, String)> {
@@ -2174,13 +2174,13 @@ fn record_matches_field(record: &IndexRecord, key: &str, value: &str) -> bool {
 /// db.md files write timestamps in several equivalent RFC3339 spellings — most
 /// commonly the `Z` UTC designator (`2026-05-01T00:00:00Z`) but also an explicit
 /// offset (`...+00:00`, `...-07:00`). A naive `record.created.to_rfc3339() ==
-/// value` reformats only one side: chrono renders a UTC instant as `+00:00`, so
+/// value` reformats only one side: `to_rfc3339` renders a UTC instant as `+00:00`, so
 /// the `Z` form an agent reads straight out of the file would never match. We
 /// instead parse `value` as RFC3339 and compare instants, where `Z` and `+00:00`
 /// (and any same-instant offset) are equal. A `value` that is not valid RFC3339
 /// can never equal a real timestamp, so it falls through to `false`.
-fn timestamp_matches(stored: Option<DateTime<FixedOffset>>, value: &str) -> bool {
-    match (stored, DateTime::parse_from_rfc3339(value)) {
+fn timestamp_matches(stored: Option<Timestamp>, value: &str) -> bool {
+    match (stored, Timestamp::parse_rfc3339(value)) {
         (Some(stored), Ok(queried)) => stored == queried,
         _ => false,
     }
@@ -2899,7 +2899,7 @@ mod tests {
     #[test]
     fn year_month_from_str_accepts_unpadded_month() {
         // A single-digit month shards to the same zero-padded folder as its twin,
-        // matching the lenient `date`-shape validator (chrono `%Y-%m-%d`).
+        // matching the lenient `date`-shape validator (`time::parse_ymd`).
         let ym = year_month_from_str;
         assert_eq!(
             ym("2026-1-15"),
@@ -2966,7 +2966,7 @@ mod tests {
 
     fn fm_with_created(rfc3339: &str) -> Frontmatter {
         Frontmatter {
-            created: Some(DateTime::parse_from_rfc3339(rfc3339).unwrap()),
+            created: Some(Timestamp::parse_rfc3339(rfc3339).unwrap()),
             ..Default::default()
         }
     }

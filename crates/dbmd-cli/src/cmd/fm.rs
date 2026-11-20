@@ -474,7 +474,7 @@ mod tests {
     /// the edit.
     #[test]
     fn bump_updated_restamps_non_updated_edits() {
-        let old = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap();
+        let old = dbmd_core::Timestamp::parse_rfc3339("2020-01-01T00:00:00Z").unwrap();
         let mut fm = parser::Frontmatter {
             updated: Some(old),
             ..Default::default()
@@ -495,7 +495,7 @@ mod tests {
     fn bump_updated_preserves_explicit_updated_assignment() {
         // `fm.set("updated", …)` already wrote the operator value before the
         // bump runs; model that here, then assert the bump leaves it untouched.
-        let chosen = chrono::DateTime::parse_from_rfc3339("2030-06-01T12:00:00Z").unwrap();
+        let chosen = dbmd_core::Timestamp::parse_rfc3339("2030-06-01T12:00:00Z").unwrap();
         let mut fm = parser::Frontmatter {
             updated: Some(chosen),
             ..Default::default()

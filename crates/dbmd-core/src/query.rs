@@ -10,7 +10,7 @@
 //! Backs `dbmd search --type/--where`, `dbmd query`, and
 //! `dbmd graph backlinks --type/--in`.
 
-use chrono::{DateTime, FixedOffset};
+use crate::time::Timestamp;
 use serde_json::Value;
 
 use crate::index::IndexRecord;
@@ -270,8 +270,8 @@ fn number_matches(n: &serde_json::Number, target: &str) -> bool {
 /// (which always emits the numeric `+00:00` offset, never `Z`) would reject a
 /// `…Z` query against the identical moment, and disagree with the sidecar
 /// pre-filter [`Store::find_by_where_in`], silently dropping real matches.
-fn timestamp_value_matches(stored: Option<DateTime<FixedOffset>>, value: &str) -> bool {
-    match (stored, DateTime::parse_from_rfc3339(value)) {
+fn timestamp_value_matches(stored: Option<Timestamp>, value: &str) -> bool {
+    match (stored, Timestamp::parse_rfc3339(value)) {
         (Some(stored), Ok(queried)) => stored == queried,
         _ => false,
     }
@@ -928,7 +928,7 @@ mod tests {
     #[test]
     fn record_matches_where_on_timestamps_uses_rfc3339() {
         let mut r = rec("records/meetings/m.md", "meeting", &[]);
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-29T12:00:00+00:00").unwrap();
+        let ts = Timestamp::parse_rfc3339("2026-05-29T12:00:00+00:00").unwrap();
         r.created = Some(ts);
 
         assert!(record_matches_where(
@@ -957,8 +957,7 @@ mod tests {
         // `Store::find_by_where_in` sidecar pre-filter (instant-based),
         // dropping real matches. Both spellings must compare equal now.
         let mut stored_z = rec("records/meetings/m.md", "meeting", &[]);
-        stored_z.created =
-            Some(chrono::DateTime::parse_from_rfc3339("2026-05-29T12:00:00Z").unwrap());
+        stored_z.created = Some(Timestamp::parse_rfc3339("2026-05-29T12:00:00Z").unwrap());
         assert!(record_matches_where(
             &stored_z,
             "created",
@@ -974,7 +973,7 @@ mod tests {
         // failed before the fix.
         let mut stored_offset = rec("records/meetings/n.md", "meeting", &[]);
         stored_offset.created =
-            Some(chrono::DateTime::parse_from_rfc3339("2026-05-29T12:00:00+00:00").unwrap());
+            Some(Timestamp::parse_rfc3339("2026-05-29T12:00:00+00:00").unwrap());
         assert!(record_matches_where(
             &stored_offset,
             "created",

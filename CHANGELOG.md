@@ -12,6 +12,26 @@ Two things version independently:
 
 ## Unreleased
 
+### Security
+
+- Update the spreadsheet reader to calamine 0.38, addressing RUSTSEC-2026-0436:
+  a crafted spreadsheet could make `dbmd extract` panic or allocate without
+  bound in calamine's OLE2 (compound file) parser.
+- Remove `chrono`, which is unmaintained (RUSTSEC-2026-0543), together with its
+  clock and time-zone crates. Fifteen crates leave the dependency tree and none
+  are added. `dbmd-core` now parses and renders timestamps itself, with the
+  same rules as before, so stores, `index.md` / `index.jsonl` sidecars and
+  log headers read and write byte-for-byte as they did.
+
+### Changed
+
+- **`dbmd-core` library API (breaking):** timestamps are now
+  `dbmd_core::Timestamp` instead of `chrono::DateTime<FixedOffset>`. This
+  covers `Frontmatter::created` / `updated`, `IndexRecord`, `LogEntry::timestamp`,
+  `dbmd_core::now()` and the functions that take or return a timestamp.
+  `Timestamp` parses with `parse_rfc3339`, renders with `to_rfc3339` /
+  `to_rfc3339_z`, and compares by instant. The `dbmd` command line is unchanged.
+
 ## [0.14.7] - 2026-10-21
 
 ### Security

@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset, NaiveDateTime};
+use crate::time::Timestamp;
 use serde_norway::Value;
 
 use crate::parser::{Schema, Shape};
@@ -260,10 +260,7 @@ const RECOGNIZED_LOG_KINDS: &[&str] = &[
 /// incoming linkers for the whole changed set ([`Store::find_links_to_any`]).
 /// With no trustworthy record (first run, another toolkit version, a changed
 /// `DB.md`, a copied store) it is a full per-file sweep.
-pub fn validate_working_set(
-    store: &Store,
-    since: Option<DateTime<FixedOffset>>,
-) -> crate::Result<Vec<Issue>> {
+pub fn validate_working_set(store: &Store, since: Option<Timestamp>) -> crate::Result<Vec<Issue>> {
     // Both validate entry points are read-only sweeps over a point-in-time
     // store, so the exact-casing checks below may reuse directory listings for
     // the length of the run instead of re-reading a folder once per wiki-link.
@@ -368,9 +365,9 @@ fn validate_incremental(store: &Store, files: &[PathBuf]) -> crate::Result<Vec<I
 fn validate_changed_since(
     store: &Store,
     files: &[PathBuf],
-    cutoff: DateTime<FixedOffset>,
+    cutoff: Timestamp,
 ) -> crate::Result<Vec<Issue>> {
-    let cutoff_ns = u64::try_from(cutoff.timestamp_nanos_opt().unwrap_or(0)).unwrap_or(0);
+    let cutoff_ns = u64::try_from(cutoff.unix_nanos().unwrap_or(0)).unwrap_or(0);
     let mut changed: BTreeSet<PathBuf> = files
         .iter()
         .filter(|rel| match crate::validate_state::stamp(store, rel) {
@@ -2526,7 +2523,7 @@ fn check_index_scope(
 /// chronological timeline — so the out-of-order check threads `prev` across the
 /// rotation boundary the same way it does within a single file.
 fn check_log(store: &Store, issues: &mut Vec<Issue>) {
-    let mut prev: Option<DateTime<FixedOffset>> = None;
+    let mut prev: Option<Timestamp> = None;
     for rel in log_files_chronological(store) {
         check_log_file(store, &rel, &mut prev, issues);
     }
@@ -2568,7 +2565,7 @@ fn log_files_chronological(store: &Store) -> Vec<PathBuf> {
 fn check_log_file(
     store: &Store,
     log_rel: &Path,
-    prev: &mut Option<DateTime<FixedOffset>>,
+    prev: &mut Option<Timestamp>,
     issues: &mut Vec<Issue>,
 ) {
     let Ok(text) = store.read_text_bounded(log_rel, crate::parser::MAX_DBMD_FILE_BYTES) else {
@@ -3803,17 +3800,15 @@ fn is_tag_suffix(s: &str) -> bool {
 /// Parse a `log.md` entry header `## [YYYY-MM-DD HH:MM] <kind> | <object>`.
 /// Returns `(timestamp, kind, object)`; `None` if the timestamp is unparseable
 /// or the header isn't well-formed.
-fn parse_log_header(line: &str) -> Option<(DateTime<FixedOffset>, String, Option<String>)> {
+fn parse_log_header(line: &str) -> Option<(Timestamp, String, Option<String>)> {
     let rest = line.strip_prefix("## [")?;
     let close = rest.find(']')?;
     let ts_str = &rest[..close];
     let tail = rest[close + 1..].trim();
 
-    // Parse `YYYY-MM-DD HH:MM` (the SPEC header form) as a naive local time and
-    // attach a zero offset — the log header carries minute precision, no zone.
-    let naive = NaiveDateTime::parse_from_str(ts_str.trim(), "%Y-%m-%d %H:%M").ok()?;
-    let offset = FixedOffset::east_opt(0)?;
-    let ts = naive.and_local_timezone(offset).single()?;
+    // Parse `YYYY-MM-DD HH:MM` (the SPEC header form) as UTC — the log header
+    // carries minute precision, no zone.
+    let ts = Timestamp::parse_minute_utc(ts_str.trim())?;
 
     // kind | object
     let (kind, object) = match tail.split_once('|') {
@@ -3883,7 +3878,7 @@ fn is_year_month_archive(s: &str) -> bool {
 /// `.md` paths. Only the explicit `--since` working set reads this, so a logged
 /// deletion or rename still pulls in the files that link to the old path; the
 /// default working set never trusts the log for scope. Reads only headers.
-fn logged_objects_since(store: &Store, cutoff: DateTime<FixedOffset>) -> BTreeSet<PathBuf> {
+fn logged_objects_since(store: &Store, cutoff: Timestamp) -> BTreeSet<PathBuf> {
     let mut out = BTreeSet::new();
     for file in log_files_for_working_set(store) {
         let Ok(text) = store.read_text_bounded(&file, crate::parser::MAX_DBMD_FILE_BYTES) else {
@@ -4003,7 +3998,7 @@ fn link_target_type(store: &Store, target: &str) -> Option<String> {
 /// True if a string is RFC3339 / ISO-8601 with a time + zone (the
 /// `created`/`updated` contract: `2026-05-27T08:00:00-07:00`).
 fn is_iso8601(s: &str) -> bool {
-    DateTime::parse_from_rfc3339(s.trim()).is_ok()
+    Timestamp::parse_rfc3339(s.trim()).is_ok()
 }
 
 /// True if a string is an ISO-8601 *date* (`2026-05-27`) or a full RFC3339
@@ -4011,10 +4006,10 @@ fn is_iso8601(s: &str) -> bool {
 /// accept the date-only form per the SPEC's worked example.
 fn is_iso8601_date_or_datetime(s: &str) -> bool {
     let s = s.trim();
-    if DateTime::parse_from_rfc3339(s).is_ok() {
+    if Timestamp::parse_rfc3339(s).is_ok() {
         return true;
     }
-    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+    crate::time::parse_ymd(s).is_some()
 }
 
 /// True for `<local>@<domain>` with a non-empty local part and a dotted domain.
@@ -6515,7 +6510,7 @@ mod tests {
                 "## [2099-05-25 10:00] update | records/contacts/new\nx\n",
             ),
         );
-        let since = DateTime::parse_from_rfc3339("2099-05-22T00:00:00+00:00").unwrap();
+        let since = Timestamp::parse_rfc3339("2099-05-22T00:00:00+00:00").unwrap();
         let issues = validate_working_set(&fx.store(), Some(since)).unwrap();
         assert!(
             issues
@@ -6656,7 +6651,7 @@ mod tests {
             "log.md",
             "---\ntype: log\n---\n\n## [2099-05-22 10:00] delete | records/contacts/sarah\nremoved\n",
         );
-        let since = DateTime::parse_from_rfc3339("2099-05-22T00:00:00+00:00").unwrap();
+        let since = Timestamp::parse_rfc3339("2099-05-22T00:00:00+00:00").unwrap();
         let issues = validate_working_set(&fx.store(), Some(since)).unwrap();
         assert!(
             !issues

@@ -457,12 +457,12 @@ mod tests {
                 "created" => {
                     f.created = v
                         .as_str()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .and_then(|s| crate::Timestamp::parse_rfc3339(s).ok())
                 }
                 "updated" => {
                     f.updated = v
                         .as_str()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .and_then(|s| crate::Timestamp::parse_rfc3339(s).ok())
                 }
                 _ => {
                     f.extra.insert(key, v);

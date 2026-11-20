@@ -20,14 +20,14 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use crate::time::Timestamp;
 
 use crate::store::Store;
 
-/// The on-disk header timestamp format: `YYYY-MM-DD HH:MM` (minute precision,
-/// no timezone). Parsing reattaches UTC; emitting renders the entry's own
-/// wall-clock, so a read→write→read round-trip is stable at minute precision.
-const TS_FORMAT: &str = "%Y-%m-%d %H:%M";
+// The on-disk header timestamp format is `YYYY-MM-DD HH:MM` (minute precision,
+// no timezone). Parsing reattaches UTC (`Timestamp::parse_minute_utc`); emitting
+// renders the entry's own wall-clock (`Timestamp::format_minute`), so a
+// read→write→read round-trip is stable at minute precision.
 
 /// The frontmatter block written when the active `log.md` is created.
 const LOG_FRONTMATTER: &str = "---\ntype: log\n---\n\n# Curator log\n";
@@ -121,7 +121,7 @@ impl LogKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
     /// The entry timestamp from the header.
-    pub timestamp: DateTime<FixedOffset>,
+    pub timestamp: Timestamp,
     /// The entry kind.
     pub kind: LogKind,
     /// The object slot — a store-relative path/wiki-link target, or `None` for
@@ -140,7 +140,7 @@ impl LogEntry {
     /// never be mistaken for a real entry header on readback or on the next
     /// rotation. The escape round-trips exactly through [`unescape_note_line`].
     fn render(&self) -> String {
-        let ts = self.timestamp.format(TS_FORMAT);
+        let ts = self.timestamp.format_minute();
         let mut out = String::new();
         match &self.object {
             Some(obj) => {
@@ -440,7 +440,7 @@ impl Log {
     /// strictly before `time`'s month cannot contain any entry newer than
     /// `time`. We cross archives newest-month-first and stop at the first whose
     /// month is entirely at or before `time`'s.
-    pub fn since(store: &Store, time: DateTime<FixedOffset>) -> crate::Result<Vec<LogEntry>> {
+    pub fn since(store: &Store, time: Timestamp) -> crate::Result<Vec<LogEntry>> {
         let mut collected: Vec<LogEntry> = Vec::new();
         // Active↔archive overlap dedup, narrowly scoped AND gated on the
         // crash-recovery marker (mirrors `tail` and the write side). An overlap
@@ -485,7 +485,7 @@ impl Log {
         // UTC month would otherwise prune away an archive holding entries that
         // are strictly newer than `time` — `time.year()/.month()` read the
         // offset-LOCAL calendar, not UTC.
-        let cutoff_utc = time.with_timezone(&Utc);
+        let cutoff_utc = time.to_utc();
         let cutoff_ym = (cutoff_utc.year(), cutoff_utc.month());
 
         for archive in list_archives_desc(store)? {
@@ -517,8 +517,8 @@ impl Log {
 
     /// The timestamp of the most recent `validate` entry — the default `since`
     /// window for working-set validation ([`crate::validate::validate_working_set`]).
-    pub fn last_validate_at(store: &Store) -> crate::Result<Option<DateTime<FixedOffset>>> {
-        let mut found: Option<DateTime<FixedOffset>> = None;
+    pub fn last_validate_at(store: &Store) -> crate::Result<Option<Timestamp>> {
+        let mut found: Option<Timestamp> = None;
 
         let active = active_log_path(store);
         if store.regular_file_exists(&active)? {
@@ -554,7 +554,7 @@ impl Log {
     /// Parse a single entry header (`## [YYYY-MM-DD HH:MM] <kind> | <object>`)
     /// into its timestamp, kind, and object. Returns `None` if the line isn't a
     /// well-formed entry header.
-    pub fn parse_header(line: &str) -> Option<(DateTime<FixedOffset>, LogKind, Option<String>)> {
+    pub fn parse_header(line: &str) -> Option<(Timestamp, LogKind, Option<String>)> {
         let line = line.trim_end_matches(['\n', '\r']);
         let rest = line.strip_prefix("## [")?;
         let close = rest.find(']')?;
@@ -803,10 +803,8 @@ fn rotation_marker_path(store: &Store) -> PathBuf {
 
 /// Parse a `YYYY-MM-DD HH:MM` header timestamp, reattaching UTC. `None` on any
 /// malformed shape.
-fn parse_timestamp(s: &str) -> Option<DateTime<FixedOffset>> {
-    let naive = NaiveDateTime::parse_from_str(s.trim(), TS_FORMAT).ok()?;
-    let utc = FixedOffset::east_opt(0)?;
-    utc.from_local_datetime(&naive).single()
+fn parse_timestamp(s: &str) -> Option<Timestamp> {
+    Timestamp::parse_minute_utc(s.trim())
 }
 
 /// Split a `log.md` / archive file into its leading frontmatter+heading block
@@ -894,11 +892,11 @@ fn unescape_note_line(line: &str) -> std::borrow::Cow<'_, str> {
 /// they simply start no new entry).
 fn parse_entries(text: &str) -> Vec<LogEntry> {
     let mut entries: Vec<LogEntry> = Vec::new();
-    let mut cur_header: Option<(DateTime<FixedOffset>, LogKind, Option<String>)> = None;
+    let mut cur_header: Option<(Timestamp, LogKind, Option<String>)> = None;
     let mut cur_note: Vec<&str> = Vec::new();
 
     let flush = |entries: &mut Vec<LogEntry>,
-                 header: &mut Option<(DateTime<FixedOffset>, LogKind, Option<String>)>,
+                 header: &mut Option<(Timestamp, LogKind, Option<String>)>,
                  note: &mut Vec<&str>| {
         if let Some((timestamp, kind, object)) = header.take() {
             // Reverse the per-line header escape `render` applies so an escaped
@@ -1090,7 +1088,7 @@ fn batch_is_archived(
 /// the one already archived. Owned (rather than borrowed) so keys from the
 /// existing archive and from the incoming entries share one type regardless of
 /// where they came from; the cost is paid only on the cold rotation path.
-type EntryKey = (DateTime<FixedOffset>, String, Option<String>, String);
+type EntryKey = (Timestamp, String, Option<String>, String);
 
 /// Derive the dedup key for `e` (see [`EntryKey`]). Keying on `kind.as_str()`
 /// (rather than `LogKind`, which is not `Hash`) is exact: `as_str`/`parse`
@@ -1482,16 +1480,8 @@ mod tests {
     }
 
     /// A timestamp at UTC from `YYYY-MM-DD HH:MM` components.
-    fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<FixedOffset> {
-        let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
-            .unwrap()
-            .and_hms_opt(h, mi, 0)
-            .unwrap();
-        FixedOffset::east_opt(0)
-            .unwrap()
-            .from_local_datetime(&naive)
-            .single()
-            .unwrap()
+    fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> Timestamp {
+        Timestamp::from_civil(y, mo, d, h, mi, 0, 0, 0).unwrap()
     }
 
     #[allow(clippy::too_many_arguments)] // test fixture builder; struct-ifying churns every call site
@@ -2970,24 +2960,9 @@ Second.
 
     // ── regression: `since` archive pruning uses the UTC month, not local (#11) ─
 
-    /// A `DateTime<FixedOffset>` at the given fixed offset (hours east of UTC).
-    fn ts_offset(
-        y: i32,
-        mo: u32,
-        d: u32,
-        h: u32,
-        mi: u32,
-        offset_hours: i32,
-    ) -> DateTime<FixedOffset> {
-        let naive = chrono::NaiveDate::from_ymd_opt(y, mo, d)
-            .unwrap()
-            .and_hms_opt(h, mi, 0)
-            .unwrap();
-        FixedOffset::east_opt(offset_hours * 3600)
-            .unwrap()
-            .from_local_datetime(&naive)
-            .single()
-            .unwrap()
+    /// A `Timestamp` at the given fixed offset (hours east of UTC).
+    fn ts_offset(y: i32, mo: u32, d: u32, h: u32, mi: u32, offset_hours: i32) -> Timestamp {
+        Timestamp::from_civil(y, mo, d, h, mi, 0, 0, offset_hours * 3600).unwrap()
     }
 
     #[test]
@@ -3025,13 +3000,7 @@ Second.
         let cutoff = ts_offset(2026, 5, 1, 0, 30, 7);
         // Sanity: the cutoff's UTC month is April, its local month is May.
         assert_eq!((cutoff.year(), cutoff.month()), (2026, 5));
-        assert_eq!(
-            (
-                cutoff.with_timezone(&Utc).year(),
-                cutoff.with_timezone(&Utc).month()
-            ),
-            (2026, 4)
-        );
+        assert_eq!((cutoff.to_utc().year(), cutoff.to_utc().month()), (2026, 4));
 
         // Pre-fix: cutoff_ym = (2026, 5) from local fields, so the (2026, 4)
         // archive was pruned and the genuinely-newer 18:00 UTC entry was dropped

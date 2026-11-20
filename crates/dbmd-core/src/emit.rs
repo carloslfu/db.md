@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset};
+use crate::time::Timestamp;
 use sha2::{Digest, Sha256};
 
 use crate::index::{parse_ts, scalar_string, yaml_to_json_value};
@@ -88,9 +88,9 @@ pub struct EmittedFile {
     /// links.
     pub link_spans: Vec<EdgeSpan>,
     /// Frontmatter `created`, when present and RFC3339-parseable.
-    pub created: Option<DateTime<FixedOffset>>,
+    pub created: Option<Timestamp>,
     /// Frontmatter `updated`, when present and RFC3339-parseable.
-    pub updated: Option<DateTime<FixedOffset>>,
+    pub updated: Option<Timestamp>,
     /// Lowercase-hex SHA-256 of the raw file bytes — the exact bytes this
     /// projection was parsed from, so a consumer can detect drift.
     pub sha256: String,

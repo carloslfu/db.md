@@ -202,11 +202,11 @@ fn write_seeds_created_and_updated_as_valid_rfc3339() {
     let updated = fm_value(&written, "updated");
 
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&created).is_ok(),
+        dbmd_core::Timestamp::parse_rfc3339(&created).is_ok(),
         "seeded `created` must be valid RFC3339, got {created:?}"
     );
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&updated).is_ok(),
+        dbmd_core::Timestamp::parse_rfc3339(&updated).is_ok(),
         "seeded `updated` must be valid RFC3339, got {updated:?}"
     );
     // Both fields seed from a single `now()` call, so they are identical.

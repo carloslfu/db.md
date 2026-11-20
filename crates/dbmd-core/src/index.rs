@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset, SecondsFormat};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -101,9 +101,9 @@ pub struct IndexRecord {
     #[serde(default)]
     pub links: Vec<String>,
     /// `created` timestamp.
-    pub created: Option<DateTime<FixedOffset>>,
+    pub created: Option<Timestamp>,
     /// `updated` timestamp (the recency key for the `index.md` cap order).
-    pub updated: Option<DateTime<FixedOffset>>,
+    pub updated: Option<Timestamp>,
     /// Remaining type-specific frontmatter fields, verbatim — including the
     /// record's `id` (SPEC v0.4), which rides here like any other frontmatter
     /// field rather than as a dedicated column, so `--where id=…` resolves
@@ -758,7 +758,7 @@ fn render_layer_md_from_stats(
 ) -> String {
     let layer_dir = layer_dir_name(layer);
     let prefix = format!("{layer_dir}/");
-    let mut max_upd: Option<DateTime<FixedOffset>> = None;
+    let mut max_upd: Option<Timestamp> = None;
     let mut entries = String::new();
     for (tf, stat) in stats {
         if stat.count == 0 || !path_to_unix(tf).starts_with(&prefix) {
@@ -793,7 +793,7 @@ fn render_root_md_from_stats(
     stats: &BTreeMap<PathBuf, FolderStat>,
     folders: &BTreeMap<String, FolderMeta>,
 ) -> String {
-    let mut max_upd: Option<DateTime<FixedOffset>> = None;
+    let mut max_upd: Option<Timestamp> = None;
     for stat in stats.values() {
         if stat.count == 0 {
             continue;
@@ -849,7 +849,7 @@ fn render_layer_md_with_store(store: &Store, idx: &Index) -> String {
         _ => unreachable!("render_layer_md_with_store called on non-layer"),
     };
     let layer_dir = layer_dir_name(layer);
-    let mut max_upd: Option<DateTime<FixedOffset>> = None;
+    let mut max_upd: Option<Timestamp> = None;
     let mut entries = String::new();
     for (tf, n) in &idx.child_counts {
         let recs = read_jsonl_records(store, &tf.join("index.jsonl")).unwrap_or_default();
@@ -883,7 +883,7 @@ fn render_layer_md_with_store(store: &Store, idx: &Index) -> String {
 /// `index.jsonl`. The **sweep-path** renderer (the loop path uses
 /// [`render_root_md_from_stats`]).
 fn render_root_md_with_store(store: &Store, idx: &Index) -> String {
-    let mut max_upd: Option<DateTime<FixedOffset>> = None;
+    let mut max_upd: Option<Timestamp> = None;
     for tf in idx.child_counts.keys() {
         let recs = read_jsonl_records(store, &tf.join("index.jsonl")).unwrap_or_default();
         if let Some(u) = recs.first().and_then(|r| r.updated) {
@@ -1015,8 +1015,8 @@ struct FileMeta {
     summary: Option<String>,
     tags: Vec<String>,
     links: Vec<String>,
-    created: Option<DateTime<FixedOffset>>,
-    updated: Option<DateTime<FixedOffset>>,
+    created: Option<Timestamp>,
+    updated: Option<Timestamp>,
     fields: BTreeMap<String, Value>,
 }
 
@@ -1209,22 +1209,20 @@ fn unquoted_wiki_link_literal(v: &serde_norway::Value) -> Option<String> {
 /// Parse an RFC3339 timestamp scalar. `pub(crate)` because the `emit`
 /// projection reads `created`/`updated` through the same lenient rule
 /// (unparseable ⇒ `None`, never an abort).
-pub(crate) fn parse_ts(s: &str) -> Option<DateTime<FixedOffset>> {
-    DateTime::parse_from_rfc3339(s.trim()).ok()
+pub(crate) fn parse_ts(s: &str) -> Option<Timestamp> {
+    Timestamp::parse_rfc3339(s.trim()).ok()
 }
 
 /// Render a timestamp the same way `serde_json` renders an `IndexRecord`
 /// timestamp (RFC3339, `Z` for UTC, sub-seconds preserved) so the md
 /// frontmatter and the jsonl agree byte-for-byte.
-fn fmt_ts(ts: &DateTime<FixedOffset>) -> String {
-    ts.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+fn fmt_ts(ts: &Timestamp) -> String {
+    ts.to_rfc3339_z()
 }
 
 /// Max `updated` over an iterator of optional timestamps.
-fn max_updated<'a>(
-    it: impl Iterator<Item = Option<&'a DateTime<FixedOffset>>>,
-) -> Option<DateTime<FixedOffset>> {
-    let mut best: Option<DateTime<FixedOffset>> = None;
+fn max_updated<'a>(it: impl Iterator<Item = Option<&'a Timestamp>>) -> Option<Timestamp> {
+    let mut best: Option<Timestamp> = None;
     for ts in it.flatten() {
         best = Some(match best {
             Some(cur) if cur >= *ts => cur,
@@ -1977,7 +1975,7 @@ mod tests {
         );
         assert_eq!(
             r1.created,
-            Some(DateTime::parse_from_rfc3339("2026-05-10T09:00:00Z").unwrap())
+            Some(Timestamp::parse_rfc3339("2026-05-10T09:00:00Z").unwrap())
         );
         assert_eq!(r1.fields.get("status"), Some(&Value::from("paid")));
         assert_eq!(r1.fields.get("amount"), Some(&Value::from(42)));
@@ -2087,7 +2085,7 @@ mod tests {
             tags: vec![],
             links: vec![],
             created: None,
-            updated: updated.map(|u| DateTime::parse_from_rfc3339(u).unwrap()),
+            updated: updated.map(|u| Timestamp::parse_rfc3339(u).unwrap()),
             fields: BTreeMap::new(),
         }
     }

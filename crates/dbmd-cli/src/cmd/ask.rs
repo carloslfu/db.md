@@ -303,7 +303,7 @@ pub(crate) fn build_system_prompt(
     }
     prompt.push_str(&format!(
         "\nCurrent date: {}.\n",
-        dbmd_core::now().format("%Y-%m-%d")
+        dbmd_core::now().format_date()
     ));
     prompt
 }
