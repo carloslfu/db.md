@@ -12,6 +12,12 @@ Two things version independently:
 
 ## Unreleased
 
+### Fixed
+
+- The release smoke test's Apple Silicon leg runs on `macos-26`, like the
+  release and test workflows. GitHub no longer offers the `macos-14` runner, so
+  that leg was cancelled before it ran for 0.15.0.
+
 ## [0.15.0] - 2026-11-20
 
 ### Security
