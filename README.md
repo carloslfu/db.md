@@ -420,6 +420,8 @@ db.md/
 │   └── dbmd-cli/    # the dbmd binary (thin wrappers over the library)
 ├── examples/        # five complete stores: research wiki, ops, second brain, agency, CRM
 ├── tests/corpora/   # canonical, edge-case, format, scale, and agent-eval stores
+├── demos/           # TodoMVC on a db.md store, with dbmd api as its only backend
+├── bench/           # a draft agent-memory benchmark harness (not yet run at scale)
 └── skills/db-md/    # the canonical Agent Skill you place in your own agent
 ```
 

@@ -1,0 +1,23 @@
+{
+  "smoke": true,
+  "dataset": "longmemeval",
+  "adapter": "dbmd",
+  "limit": 8,
+  "model": "claude-haiku-4-5-20251001",
+  "judgeModel": "claude-haiku-4-5-20251001",
+  "maxRounds": 8,
+  "runId": "smoke-2026-07-13",
+  "maxSpendUsd": 0.8,
+  "datasetFile": "bench/data/longmemeval_oracle.json",
+  "itemIds": [
+    "01493427",
+    "00ca467f",
+    "0e5e2d1a",
+    "06878be2",
+    "001be529",
+    "08f4fc43",
+    "031748ae",
+    "0100672e"
+  ],
+  "protocol": "DRAFT-2026-07-13"
+}

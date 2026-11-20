@@ -1,0 +1,28 @@
+{
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true
+      },
+      "models": [
+        {
+          "id": "qwen3.8-27b-32k",
+          "name": "Qwen3.8 27B (local Ollama, 32k ctx)",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 32768,
+          "maxTokens": 16384,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "xhigh": "high"
+          }
+        }
+      ]
+    }
+  }
+}

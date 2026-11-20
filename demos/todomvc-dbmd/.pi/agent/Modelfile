@@ -1,0 +1,5 @@
+FROM hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
+PARAMETER num_ctx 32768
+PARAMETER temperature 0.6
+PARAMETER top_p 0.95
+PARAMETER top_k 20

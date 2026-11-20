@@ -24,6 +24,21 @@ log.md.lock
 # Stray compile artifact (an anonymous `rustc` / doctest binary lands here)
 /rust_out
 
+# Demo apps: their own Node toolchains, build output and local agent state.
+demos/*/node_modules/
+demos/*/dist/
+demos/todomvc-dbmd/db/**/*.lock
+demos/todomvc-dbmd/.pi/agent/sessions/
+demos/todomvc-dbmd/.pi/agent/auth.json
+demos/todomvc-dbmd/.pi/agent/models-store.json
+
+# Benchmark: downloaded datasets, large raw transcripts, the local API key
+# file and the Node toolchain. Fetch datasets with bench/harness/fetch-datasets.ts.
+/bench/data/
+/bench/runs/*/transcripts-full.jsonl
+/bench/node_modules/
+/bench/.env.local
+
 # OS noise
 .DS_Store
 

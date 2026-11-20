@@ -1,0 +1,4 @@
+# Store-local, non-secret harness defaults (see `dbmd ask --help`).
+# The key, if any provider needs one, is environment-only — never here.
+llm_model = qwen3.8-27b-32k
+workspace = ..

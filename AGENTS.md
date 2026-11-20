@@ -15,6 +15,10 @@ workspace:
 - `crates/dbmd-cli` — the thin `dbmd` binary that wraps `dbmd-core`.
 - `SPEC.md` — the canonical format + curator contract (single source of truth).
 - `tests/corpora/` — frozen test stores. `examples/` — small worked stores.
+- `demos/todomvc-dbmd/` — a TodoMVC web app whose only backend is `dbmd api`.
+  `bench/` — a draft agent-memory benchmark harness. Both are TypeScript with
+  their own Node toolchains, outside the toolkit and its build; the bench
+  calls a model API with the user's own key.
 
 ## Hard rules (do not violate)
 

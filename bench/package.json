@@ -1,0 +1,18 @@
+{
+  "name": "dbmd-bench",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Draft agent-memory benchmark harness for db.md stores",
+  "license": "Apache-2.0",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "fetch-datasets": "tsx harness/fetch-datasets.ts",
+    "smoke": "tsx harness/run.ts --smoke",
+    "eval": "tsx harness/run.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.2"
+  }
+}

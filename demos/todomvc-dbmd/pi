@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Local agent companion for the TodoMVC-on-db.md demo.
+#
+# Runs the pi coding agent (@mariozechner/pi-coding-agent) against the local
+# Ollama Qwen3.8-27B at high reasoning effort, with the demo's db.md store as
+# the working directory — a fully local replacement for
+# `codex exec -m <cloud-model> "<task>"`.
+#
+#   ./pi "change todo Taste db.md to 'taste db.md POWER 56'"   # one-shot
+#   ./pi                                                       # interactive
+#   PI_THINKING=low ./pi "quick task"                          # effort: low|medium|high
+#
+# All pi config is repo-local (.pi/agent/): models.json wires Ollama's
+# OpenAI-compatible endpoint, APPEND_SYSTEM.md teaches the dbmd playbook.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PI_CODING_AGENT_DIR="$HERE/.pi/agent"
+
+MODEL="qwen3.8-27b-32k"
+# Reasoning-effort experiments in progress: default is currently OFF
+# (zero reasoning — sent as reasoning_effort "none", which Ollama's /v1
+# maps to enable_thinking=false). Override per run with PI_THINKING=
+# off | minimal | low | medium | high.
+THINKING="${PI_THINKING:-off}"
+
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "error: ollama is not installed (https://ollama.com)" >&2
+  exit 1
+fi
+
+# The base GGUF ships with ollama's small default context; agent transcripts
+# need more, so we keep a derived alias with 32k ctx + Qwen sampling params.
+if ! ollama show "$MODEL" >/dev/null 2>&1; then
+  echo "creating ollama model alias '$MODEL' (32k context)..." >&2
+  ollama create "$MODEL" -f "$HERE/.pi/agent/Modelfile" >&2
+fi
+
+PI_BIN="$HERE/node_modules/.bin/pi"
+if [ ! -x "$PI_BIN" ]; then
+  echo "error: pi is not installed — run 'npm install' in $HERE first" >&2
+  exit 1
+fi
+
+cd "$HERE/db"
+
+if [ $# -eq 0 ]; then
+  exec "$PI_BIN" --provider ollama --model "$MODEL" --thinking "$THINKING" --no-context-files
+fi
+
+# One-shot mode streams the full process — thinking, every tool call and its
+# output, then the answer — by rendering pi's JSON event stream.
+# PI_RAW=1 emits the raw JSON lines instead.
+if [ -n "${PI_RAW:-}" ]; then
+  exec "$PI_BIN" --provider ollama --model "$MODEL" --thinking "$THINKING" --no-context-files --mode json "$*"
+fi
+"$PI_BIN" --provider ollama --model "$MODEL" --thinking "$THINKING" --no-context-files --mode json "$*" | node "$HERE/.pi/render.mjs"

@@ -1,0 +1,100 @@
+{
+  "runId": "smoke-2026-07-13",
+  "startedAt": "2026-07-13T14:17:38.225Z",
+  "finishedAt": "2026-07-13T14:18:56.873Z",
+  "protocol": "DRAFT-2026-07-13 (pre-freeze; not citable)",
+  "smoke": true,
+  "dataset": "longmemeval",
+  "datasetFile": "bench/data/longmemeval_oracle.json",
+  "adapter": "dbmd",
+  "model": "claude-haiku-4-5-20251001",
+  "judgeModel": "claude-haiku-4-5-20251001",
+  "maxRounds": 8,
+  "n": 8,
+  "correct": 7,
+  "accuracy": 0.875,
+  "byType": {
+    "knowledge-update": {
+      "n": 2,
+      "correct": 2
+    },
+    "multi-session": {
+      "n": 2,
+      "correct": 1
+    },
+    "single-session-assistant": {
+      "n": 1,
+      "correct": 1
+    },
+    "single-session-preference": {
+      "n": 1,
+      "correct": 1
+    },
+    "single-session-user": {
+      "n": 1,
+      "correct": 1
+    },
+    "temporal-reasoning": {
+      "n": 1,
+      "correct": 1
+    }
+  },
+  "totals": {
+    "inputTokens": 69369,
+    "outputTokens": 3064,
+    "apiCalls": 37,
+    "toolCalls": 36,
+    "costUsd": 0.0847
+  },
+  "wallClockMs": 78648,
+  "items": [
+    {
+      "id": "01493427",
+      "type": "knowledge-update",
+      "correct": true,
+      "costUsd": 0.01384
+    },
+    {
+      "id": "00ca467f",
+      "type": "multi-session",
+      "correct": true,
+      "costUsd": 0.0181
+    },
+    {
+      "id": "0e5e2d1a",
+      "type": "single-session-assistant",
+      "correct": true,
+      "costUsd": 0.00639
+    },
+    {
+      "id": "06878be2",
+      "type": "single-session-preference",
+      "correct": true,
+      "costUsd": 0.01277
+    },
+    {
+      "id": "001be529",
+      "type": "single-session-user",
+      "correct": true,
+      "costUsd": 0.00536
+    },
+    {
+      "id": "08f4fc43",
+      "type": "temporal-reasoning",
+      "correct": true,
+      "costUsd": 0.00666
+    },
+    {
+      "id": "031748ae",
+      "type": "knowledge-update",
+      "correct": true,
+      "costUsd": 0.01368
+    },
+    {
+      "id": "0100672e",
+      "type": "multi-session",
+      "correct": false,
+      "costUsd": 0.0079
+    }
+  ]
+}

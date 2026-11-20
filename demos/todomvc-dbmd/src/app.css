@@ -1,0 +1,907 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Additions on top of todomvc-app-css: the view switcher (one store,
+   several views), drag reordering, schema-driven field badges, the
+   record-body (description) WYSIWYG layer, and the search / checklist /
+   activity / store views. Everything stays inside TodoMVC's visual
+   language: hairlines #ededed, muted grays, the rose accent #b83f45. */
+
+/* ── View switcher: the filter pills' language, one level up, floating
+   between the big title and the card. The stock sheet only reserves a
+   130px band above the card; open it up so the stack breathes —
+   title · ~30px · nav · ~33px · card. */
+
+.todoapp {
+  margin-top: 200px;
+}
+
+.todoapp h1 {
+  top: -186px;
+}
+
+.view-nav {
+  position: absolute;
+  top: -64px;
+  width: 100%;
+  text-align: center;
+}
+
+.view-nav ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.view-nav li {
+  display: inline;
+}
+
+.view-nav a {
+  display: inline-block;
+  color: #777;
+  margin: 3px;
+  padding: 6px 14px;
+  font-size: 14px;
+  line-height: 1.2;
+  text-decoration: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  transition: border-color 0.15s ease-out;
+}
+
+.view-nav a:hover {
+  border-color: rgba(175, 47, 47, 0.1);
+}
+
+.view-nav a.selected {
+  border-color: rgba(175, 47, 47, 0.2);
+}
+
+.view-nav a:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 2px 2px #cf7d7d;
+}
+
+@media (max-width: 500px) {
+  .view-nav a {
+    margin: 2px;
+    padding: 5px 9px;
+    font-size: 13px;
+  }
+}
+
+/* ── Connection state: the SSE feed doubles as the liveness probe. */
+
+.offline-banner {
+  padding: 8px 15px;
+  font-size: 12px;
+  color: #b83f45;
+  background: rgba(175, 47, 47, 0.05);
+  border-bottom: 1px solid rgba(175, 47, 47, 0.15);
+}
+
+.offline-banner code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.todo-list li label {
+  padding-right: 125px;
+}
+
+/* ── Schema-driven enum badges (e.g. priority): a dot per field, colored
+   by the value's position in the store-declared enum; hollow when unset. */
+
+.todo-list li .fm-badge {
+  position: absolute;
+  top: 22px;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 2px solid #e6e6e6;
+  border-radius: 50%;
+  background: none;
+  cursor: pointer;
+  transition: border-color 0.2s ease-out;
+}
+
+.todo-list li .fm-badge:hover {
+  border-color: #c4c4c4;
+}
+
+.todo-list li .fm-badge.set {
+  border-color: currentColor;
+  background: currentColor;
+  box-shadow: inset 0 0 0 2px #fff;
+}
+
+.todo-list li.completed .fm-badge.set {
+  opacity: 0.45;
+}
+
+/* ── Reveal flash: another view pointed at this row. */
+
+.todo-list li.revealed {
+  animation: reveal-flash 1.5s ease-out;
+}
+
+@keyframes reveal-flash {
+  0% {
+    background: rgba(175, 47, 47, 0.11);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+/* The stock buttons center over the whole li; with an expanded details
+   panel the li grows tall, so pin them to the 58px title row instead. */
+.todo-list li .destroy {
+  top: 9px;
+  bottom: auto;
+  margin: 0;
+}
+
+.todo-list li .details-toggle {
+  position: absolute;
+  top: 9px;
+  right: 40px;
+  width: 30px;
+  height: 40px;
+  margin: 0;
+  padding: 0;
+  font-size: 16px;
+  color: #d9d9d9;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition:
+    color 0.2s ease-out,
+    transform 0.2s ease-out;
+}
+
+.todo-list li .details-toggle.has-details {
+  color: #949494;
+}
+
+.todo-list li .details-toggle:hover {
+  color: #b83f45;
+}
+
+.todo-list li .details-toggle.open {
+  transform: rotate(90deg);
+}
+
+/* Drag reordering. The handle only appears on hover, keeps clicks/dblclicks
+   on the row untouched, and needs touch-action none for pointer dragging. */
+.todo-list li .drag-handle {
+  position: absolute;
+  top: 9px;
+  right: 70px;
+  width: 22px;
+  height: 40px;
+  line-height: 40px;
+  font-size: 13px;
+  text-align: center;
+  color: #d9d9d9;
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.15s ease-out;
+  user-select: none;
+  touch-action: none;
+}
+
+.todo-list li:hover .drag-handle,
+.todo-list li .drag-handle:focus-visible {
+  opacity: 1;
+}
+
+.todo-list li .drag-handle:active {
+  cursor: grabbing;
+}
+
+.todo-list li.dragging {
+  position: relative;
+  z-index: 10;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+/* ── The record-body editor (Milkdown Crepe), skinned to the TodoMVC look ── */
+
+.todo-list li .details {
+  padding: 0 15px 14px 60px;
+}
+
+.details-crepe {
+  border: 1px solid #ededed;
+  background: rgba(0, 0, 0, 0.003);
+}
+
+.details-crepe:focus-within {
+  border-color: #cf7d7d;
+  box-shadow: 0 0 2px 2px #cf7d7d;
+}
+
+.details-crepe .milkdown {
+  --crepe-color-background: transparent;
+  --crepe-color-on-background: #4d4d4d;
+  --crepe-color-surface: #fff;
+  --crepe-color-primary: #b83f45;
+  --crepe-color-outline: #ededed;
+  --crepe-font-title: inherit;
+  --crepe-font-default: inherit;
+  --crepe-font-code: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px;
+  color: #4d4d4d;
+}
+
+.details-crepe .milkdown .ProseMirror {
+  padding: 10px 14px;
+  min-height: 44px;
+  line-height: 1.55;
+}
+
+.details-crepe .milkdown .ProseMirror > * + * {
+  margin-top: 4px;
+}
+
+.details-crepe .milkdown h1 {
+  font-size: 18px;
+}
+
+.details-crepe .milkdown h2 {
+  font-size: 17px;
+}
+
+.details-crepe .milkdown h3,
+.details-crepe .milkdown h4,
+.details-crepe .milkdown h5,
+.details-crepe .milkdown h6 {
+  font-size: 16px;
+}
+
+.details-crepe .milkdown h1,
+.details-crepe .milkdown h2,
+.details-crepe .milkdown h3,
+.details-crepe .milkdown h4,
+.details-crepe .milkdown h5,
+.details-crepe .milkdown h6 {
+  font-weight: 500;
+  margin: 8px 0 2px;
+}
+
+.todo-list li.completed .details-crepe .milkdown {
+  color: #949494;
+}
+
+.todo-list li .details-path {
+  margin-top: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #c4c4c4;
+  text-align: right;
+}
+
+/* ── Wiki-link chips inside the details panel: the record's edges, both
+   directions, clickable. */
+
+.todo-list li .details-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #949494;
+}
+
+.links-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.link-chip {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: #b83f45;
+  cursor: pointer;
+  border-bottom: 1px dotted rgba(175, 47, 47, 0.4);
+}
+
+.link-chip:hover {
+  border-bottom-style: solid;
+}
+
+/* ── Shared framing for the non-list views. */
+
+.view-panel {
+  position: relative;
+  min-height: 131px;
+}
+
+.view-caption {
+  padding: 10px 15px;
+  font-size: 12px;
+  color: #9c9c9c;
+  border-bottom: 1px solid #ededed;
+}
+
+.view-empty {
+  padding: 42px 30px;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1.7;
+  color: #949494;
+}
+
+.view-empty code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #a08585;
+}
+
+.view-empty .chevron-glyph {
+  color: #949494;
+}
+
+.view-hint {
+  padding: 10px 15px;
+  font-size: 11px;
+  color: #b5b5b5;
+  border-top: 1px solid #ededed;
+  line-height: 1.6;
+}
+
+.view-hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #a08585;
+}
+
+.linkish {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: #b83f45;
+  cursor: pointer;
+  border-bottom: 1px dotted rgba(175, 47, 47, 0.4);
+}
+
+/* ── Search: embedded ripgrep over the store. */
+
+.search-input {
+  width: 100%;
+  padding: 14px 16px;
+  font: inherit;
+  font-size: 20px;
+  font-weight: 300;
+  line-height: 1.4em;
+  color: inherit;
+  border: none;
+  border-bottom: 1px solid #ededed;
+  background: rgba(0, 0, 0, 0.003);
+  box-shadow: inset 0 -2px 1px rgba(0, 0, 0, 0.03);
+  box-sizing: border-box;
+}
+
+.search-input::placeholder {
+  font-style: italic;
+  font-weight: 400;
+  color: rgba(0, 0, 0, 0.4);
+}
+
+.search-input:focus {
+  outline: 0;
+  box-shadow:
+    inset 0 -2px 1px rgba(0, 0, 0, 0.03),
+    0 0 2px 2px #cf7d7d;
+}
+
+.result-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.result-row {
+  display: block;
+  width: 100%;
+  padding: 12px 15px;
+  border: none;
+  border-bottom: 1px solid #ededed;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.result-row:hover {
+  background: rgba(0, 0, 0, 0.014);
+}
+
+.result-title {
+  display: block;
+  font-size: 18px;
+  font-weight: 300;
+  color: #484848;
+}
+
+.result-title.done {
+  color: #949494;
+  text-decoration: line-through;
+}
+
+.result-hit {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-top: 4px;
+  font-size: 13px;
+  color: #777;
+}
+
+.result-origin {
+  flex: none;
+  padding: 0 4px;
+  font-size: 10px;
+  color: #b5b5b5;
+  border: 1px solid #ededed;
+  border-radius: 3px;
+}
+
+mark {
+  padding: 0 1px;
+  background: rgba(255, 214, 0, 0.35);
+  color: inherit;
+}
+
+/* ── Checklist rollup: every `- [ ]` line across every record body. */
+
+.checklist-group {
+  padding: 10px 0 12px;
+  border-bottom: 1px solid #ededed;
+}
+
+.checklist-todo {
+  display: block;
+  width: 100%;
+  padding: 4px 15px;
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 300;
+  color: #484848;
+  text-align: left;
+  cursor: pointer;
+}
+
+.checklist-todo:hover {
+  color: #b83f45;
+}
+
+.checklist-todo.done {
+  color: #949494;
+  text-decoration: line-through;
+}
+
+.checklist-items {
+  margin: 0;
+  padding: 0 15px 0 24px;
+  list-style: none;
+}
+
+.checklist-items li {
+  padding: 3px 0;
+}
+
+.checklist-items label {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  font-size: 14px;
+  color: #4d4d4d;
+  cursor: pointer;
+}
+
+.checklist-items input[type="checkbox"] {
+  accent-color: #5dc2af;
+  cursor: pointer;
+}
+
+.checklist-items label.done span {
+  color: #b5b5b5;
+  text-decoration: line-through;
+}
+
+/* ── Activity: log.md, the store's append-only timeline. */
+
+.log-date {
+  padding: 8px 15px 4px;
+  font-size: 11px;
+  color: #b5b5b5;
+  background: rgba(0, 0, 0, 0.008);
+  border-bottom: 1px solid #f3f3f3;
+}
+
+.log-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.log-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  width: 100%;
+  padding: 8px 15px;
+  border: none;
+  border-bottom: 1px solid #f3f3f3;
+  background: none;
+  font: inherit;
+  color: #4d4d4d;
+  text-align: left;
+  cursor: pointer;
+}
+
+.log-row:disabled {
+  color: #4d4d4d;
+  cursor: default;
+}
+
+.log-row:not(:disabled):hover {
+  background: rgba(0, 0, 0, 0.014);
+}
+
+.log-kind {
+  flex: none;
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #d9d9d9;
+}
+
+.kind-create {
+  background: #87a06f;
+}
+
+.kind-update {
+  background: #c9a227;
+}
+
+.kind-delete {
+  background: #b83f45;
+}
+
+.log-body {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.log-object {
+  margin-right: 8px;
+  color: #484848;
+}
+
+.log-note {
+  color: #949494;
+}
+
+.log-time {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #b5b5b5;
+}
+
+/* ── Store: the store about itself (health, shape, contract). */
+
+.store-section {
+  padding: 14px 15px 6px;
+  border-bottom: 1px solid #ededed;
+}
+
+.store-section h3 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  color: #b5b5b5;
+}
+
+.store-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  align-items: baseline;
+  font-size: 14px;
+  color: #4d4d4d;
+}
+
+.store-row code,
+.store-note code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #a08585;
+}
+
+.store-chip {
+  padding: 1px 6px;
+  font-size: 11px;
+  color: #777;
+  border: 1px solid #ededed;
+  border-radius: 3px;
+}
+
+.store-muted {
+  font-size: 13px;
+  color: #949494;
+}
+
+.store-note {
+  margin: 8px 0 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #9c9c9c;
+}
+
+.health-ok {
+  color: #59a193;
+  font-weight: 500;
+}
+
+.health-issues {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.health-issues li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 0;
+  font-size: 13px;
+  border-bottom: 1px dashed #f0f0f0;
+}
+
+.issue-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #b83f45;
+}
+
+.severity-warning .issue-code {
+  color: #c9a227;
+}
+
+.issue-file {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #949494;
+}
+
+.issue-message {
+  color: #4d4d4d;
+}
+
+.issue-suggestion {
+  font-size: 12px;
+  font-style: italic;
+  color: #9c9c9c;
+}
+
+.store-stats strong {
+  font-weight: 500;
+  color: #303030;
+}
+
+.stat-bad {
+  color: #b83f45;
+}
+
+.schema-fields {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+
+.schema-type {
+  padding-bottom: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #b5b5b5;
+}
+
+.schema-fields li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 0;
+}
+
+.schema-name {
+  min-width: 70px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  color: #484848;
+}
+
+/* ── Toast: one quiet notice at a time (op failures, the RM_LINKED
+   confirm). */
+
+.toast {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(480px, calc(100vw - 40px));
+  padding: 14px 16px;
+  background: #fff;
+  border: 1px solid #ededed;
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.2),
+    0 10px 24px rgba(0, 0, 0, 0.1);
+  font-size: 13px;
+  color: #4d4d4d;
+  z-index: 100;
+}
+
+.toast-message {
+  line-height: 1.5;
+}
+
+.toast-detail {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #949494;
+}
+
+.toast-actions {
+  display: flex;
+  gap: 18px;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.toast-actions button {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  color: #777;
+  cursor: pointer;
+}
+
+.toast-actions button:hover {
+  text-decoration: underline;
+}
+
+.toast-actions button.danger {
+  color: #b83f45;
+}
+
+/* ── Ask: the embedded harness — natural language over the same files. */
+
+.ask-form {
+  position: relative;
+}
+
+.ask-form .search-input {
+  padding-right: 132px;
+}
+
+.ask-writes {
+  position: absolute;
+  right: 15px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #949494;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ask-writes input {
+  accent-color: #b83f45;
+  cursor: pointer;
+}
+
+.ask-transcript {
+  max-height: 420px;
+  overflow-y: auto;
+  padding: 12px 15px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ask-prompt {
+  align-self: flex-end;
+  max-width: 85%;
+  padding: 7px 12px;
+  font-size: 14px;
+  color: #4d4d4d;
+  background: #f5efee;
+  border-radius: 12px 12px 3px 12px;
+}
+
+.ask-tool {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #9c9c9c;
+  overflow-wrap: anywhere;
+}
+
+.ask-tool code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #a08585;
+}
+
+.ask-tool.error code {
+  color: #b83f45;
+}
+
+.ask-tool-note {
+  margin-left: 8px;
+  font-size: 11px;
+  color: #b5b5b5;
+}
+
+.ask-tool.error .ask-tool-note {
+  color: #b83f45;
+}
+
+.ask-answer {
+  font-size: 14px;
+  line-height: 1.7;
+  color: #4d4d4d;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ask-answer.streaming::after {
+  content: "▎";
+  color: #cf7d7d;
+  animation: ask-caret 1s steps(1) infinite;
+}
+
+@keyframes ask-caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ask-answer.streaming::after {
+    animation: none;
+  }
+}
+
+.ask-notice {
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #7d6a3f;
+  background: #fbf6e9;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+
+.ask-running {
+  font-size: 12px;
+  font-style: italic;
+  color: #b5b5b5;
+}
