@@ -35,8 +35,6 @@ serde_norway = "0.9"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 grep = "0.3"
-ignore = "0.4"
-walkdir = "2"
 # `.sevralocal` is local sync policy: deterministic, case-sensitive glob
 # matching over portable store-relative paths. MIT OR Apache-2.0.
 globset = { version = "0.4", default-features = false }

@@ -11,8 +11,8 @@ coding agent, and the toolkit still ships no SDK and no vendor.
 ## One binary, many subcommands
 
 `dbmd` follows the git / cargo / kubectl shape: a single binary with
-subcommands. It embeds ripgrep (via the `grep` + `ignore` crates) for
-fast search and builds its own document extraction (`dbmd extract`),
+subcommands. It embeds ripgrep (via its `grep` crate) for fast
+search and builds its own document extraction (`dbmd extract`),
 so there are no external tools to install or license.
 
 - **All Rust.** Built for velocity the way ripgrep is.

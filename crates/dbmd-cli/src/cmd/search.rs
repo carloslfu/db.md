@@ -19,8 +19,8 @@
 //!   arbitrary-regex file scan, and shelling out to `rg` is forbidden).
 //!
 //! When no structured/link filter is given, the candidate set is every content
-//! file under `sources/` / `records/` — a path-only `ignore` walk
-//! (the same engine `rg` uses), not a frontmatter parse. Meta files (`DB.md`,
+//! file under `sources/` / `records/` — `dbmd-core`'s path-only secure store
+//! walk (`Store::walk`), not a frontmatter parse. Meta files (`DB.md`,
 //! `index.md`, `index.jsonl`, `log.md`) are never content and never match.
 //!
 //! Output is `file:line:text` (`rg`-compatible) by default, or a structured
@@ -224,7 +224,7 @@ fn resolve_candidates(
 
     let mut resolved: Vec<PathBuf> = match set {
         // No structured filter, no link filter: scan every content file. This
-        // is the `ignore` walker (paths only), not a frontmatter parse.
+        // is the secure store walk (paths only), not a frontmatter parse.
         None => content_files(store)?,
         Some(s) => s.into_iter().collect(),
     };

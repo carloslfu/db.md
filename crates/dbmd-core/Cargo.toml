@@ -2,9 +2,9 @@
 #
 # Owns ALL toolkit logic: parsing, store walk, graph, validation, stats,
 # query, render, summary composition, index maintenance, and the log.
-# Zero AI/LLM dependencies; no embeddings/vectors/ANN; embedded ripgrep
-# via the `grep` + `ignore` crates (never a bundled `rg`, never shelling
-# out). Every dependency is permissive — MIT / Apache-2.0 / BSD-2/3-Clause+0BSD
+# Zero AI/LLM dependencies; no embeddings/vectors/ANN; never a bundled `rg`
+# and never a shell-out (the `dbmd` binary embeds ripgrep's `grep` crate for
+# `dbmd search`). Every dependency is permissive — MIT / Apache-2.0 / BSD-2/3-Clause+0BSD
 # / Unlicense / MPL-2.0 / Zlib / Unicode-3.0 — and is recorded in
 # /THIRD_PARTY_NOTICES. No GPL/AGPL/LGPL-static.
 
@@ -24,9 +24,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
 regex = { workspace = true }
-grep = { workspace = true }
-ignore = { workspace = true }
-walkdir = { workspace = true }
 globset = { workspace = true }
 # Unicode NFC normalization for the wiki-link edge comparison key (graph
 # matching). Deterministic Unicode algorithm — zero AI/LLM, zero embeddings.

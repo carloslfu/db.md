@@ -122,7 +122,8 @@ After the controller converges:
 1. Take the five digests from the release's `SHA256SUMS`. By then the
    controller has byte-compared every binary with its own rebuild.
 2. Add them to the Sevra platform's trusted release list, set its `latest`,
-   and deploy it. Its `DISTRIBUTION.md` names the exact files.
+   and deploy it. The list is `TOOL_RELEASES.dbmd` in the Sevra repository's
+   `lib/releases.ts`; pushing its `main` deploys it.
 3. Confirm `curl -fsS https://www.sevrahq.com/api/hub/releases/dbmd/latest`
    prints `X.Y.Z`, then run `sh scripts/install.sh` and check that it reports
    `checksum: verified` and installs `X.Y.Z`.

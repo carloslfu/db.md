@@ -9,7 +9,7 @@
 #
 # Hard invariants enforced here:
 #   - Zero AI/LLM dependencies. clap + serde + dbmd-core, plus the embedded-
-#     ripgrep trio (grep + ignore + regex) that `dbmd search`'s free-text scan
+#     ripgrep `grep` crate (plus `regex`) that `dbmd search`'s free-text scan
 #     needs in-handler (plan Block 4) — never a bundled `rg`, never a shell-out.
 #   - No interactive prompts ever — flags only (agent-primary ergonomics).
 #   - Every dependency is permissive — MIT / Apache-2.0 / BSD-2/3-Clause+0BSD /
@@ -48,11 +48,9 @@ base64 = { workspace = true }
 serde_norway = { workspace = true }
 # `dbmd search`'s free-text step is an embedded-ripgrep scan run in the handler
 # over the candidate set that `dbmd-core` (`query` + `graph`) already resolved.
-# Plan Block 4 names these three explicitly; the same crates back `dbmd-core`,
-# so licenses (MIT / Unlicense / Apache-2.0) are already vetted in
-# /THIRD_PARTY_NOTICES.
+# `grep` (MIT OR Unlicense) runs the scan; `regex` validates the query. Both
+# licenses are recorded in /THIRD_PARTY_NOTICES.
 grep = { workspace = true }
-ignore = { workspace = true }
 regex = { workspace = true }
 # `dbmd serve` opens mirrored metadata relative to a held directory capability
 # with openat/O_NOFOLLOW before core re-verifies it.

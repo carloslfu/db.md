@@ -12,8 +12,8 @@ accepted SPDX license identifiers is:
 
 No GPL, no AGPL, no LGPL-static. Zero AI/LLM dependencies — no provider
 SDKs, no API keys, no model calls, no embeddings/vector/ANN crates of any
-kind. Ripgrep is embedded via the `grep` + `ignore` libraries (no bundled
-`rg` binary, no shelling out). The toolkit never phones home on its own (no
+kind. Ripgrep is embedded via its `grep` library (no bundled `rg` binary,
+no shelling out). The toolkit never phones home on its own (no
 telemetry, no auto-update): the only network I/O is the link.md client verbs
 (`dbmd resolve/sync/grant/propose/subscribe`), which run only when explicitly
 invoked against a hub the user configured, over the TLS stack recorded below.
@@ -93,9 +93,6 @@ after any dependency change.
                                                   (maintained serde_yaml fork;
                                                   advisory-free backend)
 - regex            1.x      MIT OR Apache-2.0   — wiki-link + section extraction
-- grep             0.3.x    MIT OR Unlicense    — embedded ripgrep search engine
-- ignore           0.4.x    MIT OR Unlicense    — embedded ripgrep dir walk / gitignore
-- walkdir          2.x      MIT OR Unlicense    — recursive store walk (sweep ops)
 - globset          0.4.x    MIT OR Apache-2.0   — deterministic `.sevralocal`
                                                   local-policy path matching
 - unicode-normalization
@@ -221,11 +218,11 @@ Direct Rust dependencies (dbmd-cli — the thin `dbmd` binary)
 ============================================================
 
 `dbmd-cli` parses args + formats output. Beyond the shared library deps
-(serde / serde_json) it adds the argument parser, plus the embedded-
-ripgrep trio that `dbmd search`'s free-text step runs in-handler over the
-candidate set `dbmd-core` resolves (plan Block 4). The ripgrep crates are
-the same ones `dbmd-core` already depends on (re-listed here because they
-are now also direct dependencies of the binary crate):
+(serde / serde_json) it adds the argument parser, plus ripgrep's `grep`
+library, which `dbmd search`'s free-text step runs in-handler over the
+candidate set `dbmd-core` resolves (plan Block 4). `regex` and
+`serde_norway` are shared with `dbmd-core` and re-listed here because they
+are also direct dependencies of the binary crate:
 
 - clap             4.x      MIT OR Apache-2.0   — derive-based subcommand
                                                   parser, --help, exit codes
@@ -234,8 +231,6 @@ are now also direct dependencies of the binary crate):
    utf8parse, strsim — all MIT OR Apache-2.0)
 - grep             0.3.x    MIT OR Unlicense    — embedded ripgrep search engine
                                                   (`dbmd search` free-text scan)
-- ignore           0.4.x    MIT OR Unlicense    — embedded ripgrep dir walk
-                                                  (no-filter candidate set)
 - regex            1.x      MIT OR Apache-2.0   — query-regex validation +
                                                   link-target normalization
 - serde_norway     0.9.x    MIT OR Apache-2.0   — render a frontmatter YAML

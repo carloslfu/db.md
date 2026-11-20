@@ -18,6 +18,19 @@ Two things version independently:
   release and test workflows. GitHub no longer offers the `macos-14` runner, so
   that leg was cancelled before it ran for 0.15.0.
 
+### Removed
+
+- Unused dependencies: `grep`, `ignore` and `walkdir` from `dbmd-core`, and
+  `ignore` from `dbmd-cli`. `dbmd search` still embeds ripgrep's `grep` crate,
+  and the store walk is `dbmd-core`'s own secure walker. Six crates leave the
+  dependency tree (`ignore`, `walkdir`, `same-file` and three `crossbeam`
+  crates), and the set of licenses is unchanged.
+
+### Docs
+
+- `RELEASING.md` names the installers' trusted release list directly
+  (`lib/releases.ts` in the Sevra repository).
+
 ## [0.15.0] - 2026-11-20
 
 ### Security

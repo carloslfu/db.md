@@ -104,7 +104,7 @@ deny = [
     { name = "candle-transformers" },
     { name = "tch" },
     { name = "ort" },
-    # --- Bundled ripgrep binary: ripgrep is EMBEDDED via grep + ignore ---
+    # --- Bundled ripgrep binary: ripgrep is EMBEDDED via the grep crate ---
     { name = "ripgrep" },
 ]
 

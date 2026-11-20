@@ -40,8 +40,8 @@ workspace:
   asserting a vendor's first-party identity is refused, whichever vendor it
   is.
 - **All logic in `dbmd-core`; `dbmd-cli` is thin wrappers.**
-- **Embedded ripgrep** via the `grep` + `ignore` crates — never bundle or shell
-  out to `rg`.
+- **Embedded ripgrep** via its `grep` crate — never bundle or shell out to
+  `rg`.
 - **Permissive dependency licenses only** (MIT / Apache-2.0 / BSD / 0BSD /
   Unlicense / MPL-2.0 / Zlib / Unicode-3.0 / ISC / CDLA-Permissive-2.0);
   record every new dep in
