@@ -156,10 +156,8 @@ fn is_oversized_int_literal(s: &str) -> bool {
     }
     let canon = if neg { format!("-{digits}") } else { digits };
     // Fits i64 / u64 → handled losslessly; leave untouched.
-    if canon.parse::<i64>().is_ok() || (!neg && canon.parse::<u64>().is_ok()) {
-        return false;
-    }
-    true
+    let fits = canon.parse::<i64>().is_ok() || (!neg && canon.parse::<u64>().is_ok());
+    !fits
 }
 
 /// Byte index where the scalar VALUE begins on a simple block line
